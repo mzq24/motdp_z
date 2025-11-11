@@ -67,11 +67,14 @@ def unnormalize_data(ndata, stats):
     return data
 
 class DiffusionDiTCarlaPolicy(nn.Module):
-    def __init__(self, config: Dict, action_stats: Optional[Dict[str, torch.Tensor]] = None):
+    def __init__(self, config: Dict, action_stats: Optional[Dict[str, torch.Tensor]] = None, 
+                 device: str = 'cuda', use_vlm_features: bool = True):
         super().__init__()
         
         # config
         self.cfg = config
+        self.device = device
+        self.use_vlm_features = use_vlm_features
         policy_cfg = config['policy']
         noise_scheduler_cfg = config['noise_scheduler']
 
@@ -116,7 +119,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             print("  Continuing with random initialization...")
         
         self.obs_encoder = obs_encoder
-        self.obs_encoder.cuda()
 
         # TODO load vlm and vlm encoder model）
         self.vlm_backbone = None
@@ -136,10 +138,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 self.vlm_backbone = None
         else:
             print("⚠ VLM backbone not available, using simulated features")
-        self._init_fixed_vlm_features()
-        # self.feature_encoder = nn.Linear(2560, 1536)
-        # self.feature_encoder.eval()
-        # self._init_loaded_vlm_features()
+        self.feature_encoder = nn.Linear(2560, 1536)
+        if not self.use_vlm_features:
+            self.feature_encoder.eval()
+            self._init_loaded_vlm_features()
 
 
         # create diffusion model
@@ -279,14 +281,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
             target_point = obs_dict['target_point'].to(dtype=torch.float32)
             command = obs_dict['next_command'].to(dtype=torch.float32)
-            state = torch.cat([speed, target_point, command], 1).to('cuda')
+            state = torch.cat([speed, target_point, command], 1).to(self.device)
             
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
             
             if use_precomputed:
                 # 模式1: 使用预处理好的BEV特征（快速）
-                lidar_token = obs_dict['lidar_token'].to(device='cuda', dtype=torch.float32)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device='cuda', dtype=torch.float32)
+                lidar_token = obs_dict['lidar_token'].to(device=self.device, dtype=torch.float32)
+                lidar_token_global = obs_dict['lidar_token_global'].to(device=self.device, dtype=torch.float32)
                 
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
@@ -310,7 +312,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
-                lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)
+                lidar_bev_img = obs_dict['lidar_bev'].to(device=self.device, dtype=torch.float32)
                 
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
@@ -368,7 +370,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     nobs[field] = batch[field].to(device)
 
         raw_agent_pos = batch['agent_pos'].to(device)
-
+        if 'vqa' not in batch:
+            assert self.use_vlm_features == False, "VLM features expected but 'vqa' not found in batch"
+        if not self.use_vlm_features:
+            vl_features, vl_mask = self.generate_simulated_vlm_outputs(raw_agent_pos.shape[0], device)
+            batch['vqa'] = vl_features
         # (B, horizon, 2)
         To = self.n_obs_steps
         nactions = raw_agent_pos
@@ -882,7 +888,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                                 self.vlm_backbone.model = self.vlm_backbone.model.cpu()
                                 del self.vlm_backbone.model
                                 self.vlm_backbone.model = None
-                                torch.cuda.empty_cache()
+                                #torch.cuda.empty_cache()
                                 print("✓ VLM model moved to CPU and GPU memory cleared")
                             
                             return

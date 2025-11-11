@@ -136,12 +136,12 @@ def validate_model(policy, val_loader, device):
         
     return averaged_metrics
 
-def train_carla_policy(config_path):
+def train_carla_policy(config_path, device_str, use_vlm_features=True):
     print("Initializing CARLA driving policy training...")
     config = create_carla_config(config_path=config_path)
     
     # 支持wandb离线模式和断网恢复
-    wandb_mode = os.environ.get('WANDB_MODE', 'online')  # 可通过环境变量设置: export WANDB_MODE=offline
+    wandb_mode = os.environ.get('WANDB_MODE', 'offline')  # 可通过环境变量设置: export WANDB_MODE=offline
     use_wandb = config.get('logging', {}).get('use_wandb', True)
     
     if use_wandb:
@@ -174,7 +174,7 @@ def train_carla_policy(config_path):
     else:
         print("⚠ WandB disabled in config")
         use_wandb = False
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
 
     # dataset
     dataset_path_root = config.get('training', {}).get('dataset_path')
@@ -224,7 +224,7 @@ def train_carla_policy(config_path):
     )
     
     print("Initializing policy model...")
-    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)  
+    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats, device=device, use_vlm_features=use_vlm_features).to(device)  
     print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
     
     lr = config.get('optimizer', {}).get('lr', 5e-5)
@@ -368,5 +368,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train CARLA Driving Policy with Diffusion DiT")
     parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/carla.yaml", help='Path to the configuration YAML file')
+    parser.add_argument('--device', type=str, default="cuda:1", help='Device to use for training (e.g., "cuda:0", "cpu")')
+    parser.add_argument('--use_vlm_features', action='store_true', help='Whether to use VLM features during training')
     args = parser.parse_args()
-    train_carla_policy(config_path=args.config_path)
+    train_carla_policy(config_path=args.config_path, device_str=args.device, use_vlm_features=args.use_vlm_features)

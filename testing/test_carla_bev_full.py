@@ -213,6 +213,7 @@ def test_model(policy, test_loader, config, device='cuda'):
                 'speed': batch['speed'][:, :obs_horizon],
                 'target_point': batch['target_point'][:, :obs_horizon],
                 'next_command': batch['next_command'][:, :obs_horizon],  
+                'vqa': batch['vqa'] if 'vqa' in batch else None,
             }
             
             try:

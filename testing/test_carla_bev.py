@@ -38,11 +38,17 @@ def load_best_model(checkpoint_path, config, device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # 提取action统计信息
+#     action_stats = {
+#     'min': torch.tensor([-21.217477798461914, -22.13955307006836]),
+#     'max': torch.tensor([33.02915954589844, 26.23844337463379]),
+#     'mean': torch.tensor([3.9731080532073975, -0.05837925150990486]),
+#     'std': torch.tensor([4.942440032958984, 1.4319489002227783]),
+# }
     action_stats = {
-    'min': torch.tensor([-21.217477798461914, -22.13955307006836]),
-    'max': torch.tensor([33.02915954589844, 26.23844337463379]),
-    'mean': torch.tensor([3.9731080532073975, -0.05837925150990486]),
-    'std': torch.tensor([4.942440032958984, 1.4319489002227783]),
+    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
+    'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
+    'std': torch.tensor([14.96833324432373, 3.419595956802368]),
 }
     
     # 初始化模型
@@ -188,7 +194,7 @@ def project_waypoints_to_image(waypoints, camera_intrinsics=None, image_shape=(2
 
 
 def visualize_prediction(sample, prediction, ground_truth, sample_idx, save_dir, 
-                        attention_map=None, denoising_steps=None, policy=None):
+                         filename=None, attention_map=None, denoising_steps=None, policy=None):
     """
     可视化预测结果，包含四个部分：
     1. 预测轨迹和真实轨迹比较
@@ -235,7 +241,7 @@ def visualize_prediction(sample, prediction, ground_truth, sample_idx, save_dir,
             label='Ground Truth', markersize=8, linewidth=2, alpha=0.8)
     
     # 绘制目标点
-    if 'target_point' in sample and sample['target_point'] is not None:
+    if 'target_point' in sample and sample['target_point'] is not None and False:
         target_point = sample['target_point'][0].cpu().numpy()
         ax1.plot(target_point[1], target_point[0], 'g*', 
                 markersize=20, label='Target Point', 
@@ -451,7 +457,7 @@ def compute_metrics(predictions, ground_truths):
     return metrics
 
 
-def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5, device='cuda'):
+def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5, device='cuda', folder_name=None):
     """
     测试模型并可视化结果
     
@@ -482,7 +488,10 @@ def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5
     print(f"Visualizing samples: {visualize_indices}\n")
     
     # 创建保存目录
-    save_dir = os.path.join(project_root, 'image', 'test_results')
+    if folder_name is not None:
+        save_dir = os.path.join(project_root, 'image', folder_name)
+    else:
+        save_dir = os.path.join(project_root, 'image', 'test_results')
     os.makedirs(save_dir, exist_ok=True)
     
     predictions = []
@@ -514,6 +523,8 @@ def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5
                 obs_dict['image'] = batch['image'][:, :obs_horizon]
             if 'lidar_bev' in batch:
                 obs_dict['lidar_bev'] = batch['lidar_bev'][:, :obs_horizon]
+            if 'vqa' in batch:
+                obs_dict['vqa'] = batch['vqa']
 
             # 预测动作/轨迹
             try:
@@ -629,15 +640,16 @@ def main(args):
     
     # 运行测试
     num_test_samples = 50  # 测试样本数量
-    num_visualize = 10    # 可视化样本数量
-    
+    num_visualize = 50    # 可视化样本数量
+    folder_name = args.get('evaluation', {}).get("folder_name", None)
     metrics, predictions, ground_truths = test_model(
         policy=policy,
         test_dataset=test_dataset,
         config=config,
         num_samples=num_test_samples,
         visualize_samples=num_visualize,
-        device=device
+        device=device,
+        folder_name=folder_name
     )
     
     print(f"\n{'='*60}")
