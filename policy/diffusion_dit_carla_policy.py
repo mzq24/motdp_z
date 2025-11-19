@@ -12,6 +12,16 @@ from model.interfuser_bev_encoder import load_lidar_submodules
 import os
 from collections import OrderedDict
 from collections import deque
+from PIL import Image
+
+import sys
+bagel_path = "/root/z_projects/code/Bagel"
+if bagel_path not in sys.path:
+    sys.path.insert(0, bagel_path)
+from modeling.bagel import SiglipVisionConfig, SiglipVisionModel
+from data.data_utils import pil_img2rgb, patchify, add_special_tokens
+from data.transforms import ImageTransform
+from modeling.qwen2 import Qwen2Tokenizer
 
 VLMDriveBackbone = None
 VLM_AVAILABLE = False
@@ -72,7 +82,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         super().__init__()
         
         # config
-        self.cfg = config
+        self.config = config
         self.device = device
         self.use_vlm_features = use_vlm_features
         policy_cfg = config['policy']
@@ -95,30 +105,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             print("⚠ Action normalization disabled")
             self.action_stats = None
         
-
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
         
-        # Load BEV encoder configuration from config file
-        bev_encoder_cfg = config.get('bev_encoder', {})
-        obs_encoder = InterfuserBEVEncoder(
-            perception_backbone=None,
-            state_dim=bev_encoder_cfg.get('state_dim', 9),
-            feature_dim=bev_encoder_cfg.get('feature_dim', 256),
-            use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
-            freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
-            bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
-        )
-        
-        # Load pretrained weights from config
-        pretrained_path = bev_encoder_cfg.get('pretrained_path', None)
-        if pretrained_path is not None and os.path.exists(pretrained_path):
-            load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
-            print(f"✓ BEV encoder loaded from: {pretrained_path}")
-        else:
-            print(f"⚠ BEV encoder pretrained_path not found or not specified: {pretrained_path}")
-            print("  Continuing with random initialization...")
-        
+        # load lidar bev encoder
+        obs_encoder = self.load_lidar_bev_encoder()
         self.obs_encoder = obs_encoder
+
+        # load image encoder
+        self.vit_model, self.vit_transform, self.vit_config = self.load_vit_model()
+        self.vit_connector = nn.Linear(self.vit_config.hidden_size, 256)
 
         # TODO load vlm and vlm encoder model）
         self.vlm_backbone = None
@@ -154,7 +149,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         #     self.j_ctrl_norm = nn.GroupNorm(num_groups=8, num_channels=256)
         #     print("✓ GroupNorm enabled for j_ctrl features")  
 
-        model = TransformerForDiffusion(
+        self.model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
             output_dim=policy_cfg.get('output_dim', 2),
             horizon=policy_cfg.get('horizon', 16),
@@ -169,8 +164,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             obs_as_cond=obs_as_global_cond,
             n_cond_layers=policy_cfg.get('n_cond_layers', 4)
         )
-
-        self.model = model
+        
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=noise_scheduler_cfg.get('num_diffusion_steps', 100),
             beta_start=noise_scheduler_cfg.get('beta_start', 0.0001),
@@ -259,86 +253,141 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def extract_tcp_features(self, obs_dict, return_attention=False):
         """
-        使用InterfuserBEVEncoder提取特征
-        支持两种模式：
-        1. 使用预处理好的BEV特征（推荐，快速）
-        2. 使用原始lidar_bev图像（兼容模式，慢）
+        使用InterfuserBEVEncoder和VIT提取特征
+        支持多种输入模式。
         
         Args:
             obs_dict: 观测字典，应包含：
-                - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
-                - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
-                - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'speed', 'target_point', 'next_command': 状态信息
+                - 'lidar_token', 'lidar_token_global': 预处理的BEV特征
+                - 'lidar_bev': 原始BEV图像
+                - 'image': 原始RGB图像
+                - 'speed', 'target_point', 'next_command', 'heading': 状态信息
             return_attention: 是否返回attention map
             
         Returns:
-            如果return_attention=False: j_ctrl特征 (B, 256)
-            如果return_attention=True: (j_ctrl特征, attention_map) 
+            j_ctrl特征 (B, 256) 或 (j_ctrl特征, attention_map)
         """
-        try:
-            # 准备状态信息
-            speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
-            target_point = obs_dict['target_point'].to(dtype=torch.float32)
-            command = obs_dict['next_command'].to(dtype=torch.float32)
-            state = torch.cat([speed, target_point, command], 1).to(self.device)
+        #try:
+        # 准备状态信息
+        speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
+        target_point = obs_dict['target_point'].to(dtype=torch.float32)
+        command = obs_dict['next_command'].to(dtype=torch.float32)
+        heading = obs_dict.get('heading', torch.zeros_like(speed)).to(dtype=torch.float32).view(-1, 1) # (B, 2)
+        state = torch.cat([speed, target_point, command, heading], 1).to(self.device)
+        
+        # 提取图像特征
+        # img_feature = self.extract_vit_feature(obs_dict['image'])
+
+        use_precomputed_lidar = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
+        
+        if use_precomputed_lidar:
+            # 模式1: 使用预处理好的BEV特征
+            lidar_token = obs_dict['lidar_token'].to(device=self.device, dtype=torch.float32)
+            lidar_token_global = obs_dict['lidar_token_global'].to(device=self.device, dtype=torch.float32)
             
-            use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
+            j_ctrl, attention_map = self.obs_encoder(
+                state=state,
+                lidar_token=lidar_token,
+                lidar_token_global=lidar_token_global,
+                normalize=True,
+                return_attention=True
+            )
+        else:
+            # 模式2: 使用原始lidar_bev图像
+            if 'lidar_bev' not in obs_dict:
+                raise KeyError("Neither pre-computed LiDAR features nor raw BEV images found in obs_dict")
             
-            if use_precomputed:
-                # 模式1: 使用预处理好的BEV特征（快速）
-                lidar_token = obs_dict['lidar_token'].to(device=self.device, dtype=torch.float32)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device=self.device, dtype=torch.float32)
-                
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(
-                        state=state,
-                        lidar_token=lidar_token,
-                        lidar_token_global=lidar_token_global,
-                        normalize=True,
-                        return_attention=True
-                    )
-                else:
-                    j_ctrl = self.obs_encoder(
-                        state=state,
-                        lidar_token=lidar_token,
-                        lidar_token_global=lidar_token_global,
-                        normalize=True,
-                        return_attention=False
-                    )
-                    attention_map = None
-            else:
-                # 模式2: 使用原始lidar_bev图像（兼容模式，慢）
-                if 'lidar_bev' not in obs_dict:
-                    raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
-                
-                lidar_bev_img = obs_dict['lidar_bev'].to(device=self.device, dtype=torch.float32)
-                
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(
-                        image=lidar_bev_img,
-                        state=state,
-                        normalize=True,
-                        return_attention=True
-                    )
-                else:
-                    j_ctrl = self.obs_encoder(
-                        image=lidar_bev_img,
-                        state=state,
-                        normalize=True,
-                        return_attention=False
-                    )
-                    attention_map = None
+            lidar_bev_img = obs_dict['lidar_bev'].to(device=self.device, dtype=torch.float32)
             
-            if return_attention:
-                return j_ctrl, attention_map
-            else:
-                return j_ctrl
+            j_ctrl, attention_map = self.obs_encoder(
+                image=lidar_bev_img,
+                state=state,
+                normalize=True,
+                return_attention=True
+            )
+        
+        if return_attention:
+            return j_ctrl, attention_map
+        else:
+            return j_ctrl
                 
-        except KeyError as e:
-            raise KeyError(f"Missing required field in obs_dict for TCP feature extraction: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Error in TCP feature extraction: {e}")
+        # except KeyError as e:
+        #     raise KeyError(f"Missing required field in obs_dict for feature extraction: {e}")
+        # except Exception as e:
+        #     import traceback
+        #     traceback.print_exc()
+        #     raise RuntimeError(f"Error in feature extraction: {e}")
+
+    def extract_vit_feature(self, image_tensor):
+    
+        if image_tensor.ndim != 4:
+            raise ValueError(f"Expected a 4D tensor (B, C, H, W), but got shape {image_tensor.shape}")
+
+        device = self.device
+        image_tensor = image_tensor.to(device)
+        B, C, H, W = image_tensor.shape
+
+        vit_patch_size = 14
+        vit_max_num_patch_per_side = 70
+        
+        # Get position IDs
+        vit_position_ids = self.get_flattened_position_ids_extrapolate(H, W, vit_patch_size, 
+            max_num_patches_per_side=vit_max_num_patch_per_side).to(device)
+        
+        # Patchify image
+        vit_tokens = self.patchify(image_tensor, vit_patch_size)    # (B, L, patch_dim)
+        
+        # Prepare inputs for the model
+        # The model expects packed sequences, but here we have only one sequence.
+        num_img_tokens = vit_tokens.shape[1] # L from (N, L, patch_dim)
+        packed_vit_tokens = vit_tokens.reshape(B * num_img_tokens, -1)
+        
+        vit_token_seqlens = torch.tensor([num_img_tokens] * B, dtype=torch.int, device=device)
+        packed_vit_position_ids = vit_position_ids.unsqueeze(0).repeat(B, 1).reshape(B * num_img_tokens)
+
+        # Compute cumulative sequence lengths
+        cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0)).to(torch.int32)
+        max_seqlen = num_img_tokens
+        
+        # Extract features
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                packed_vit_token_embed = self.vit_model(
+                    packed_pixel_values=packed_vit_tokens, 
+                    packed_flattened_position_ids=packed_vit_position_ids,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+        packed_vit_token_embed = self.vit_connector(packed_vit_token_embed)
+        feature_dim = packed_vit_token_embed.shape[-1]
+        batched_embed = packed_vit_token_embed.reshape(B, num_img_tokens, feature_dim)
+
+        return batched_embed
+
+    @staticmethod
+    def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_patches_per_side):
+        """Generate position IDs using extrapolation method"""
+        num_patches_h, num_patches_w = img_h // patch_size, img_w // patch_size
+        coords_h = torch.arange(0, num_patches_h)
+        coords_w = torch.arange(0, num_patches_w)
+        pos_ids = (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
+        return pos_ids
+
+    @staticmethod
+    def patchify(imgs, patch_size):
+        """
+        Convert a batch of images into patches.
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 * 3)
+        """
+        p = patch_size
+        assert imgs.shape[2] % p == 0 and imgs.shape[3] % p == 0
+        h = imgs.shape[2] // p
+        w = imgs.shape[3] // p
+        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p * p * 3))
+        return x
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -361,7 +410,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         nobs = {}
         
         # 支持预处理特征和原始图像两种模式
-        carla_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'next_command', 'speed', 'target_point', 'agent_pos']
+        carla_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'next_command', 'speed', 'target_point', 'agent_pos', 'heading']
         for field in carla_fields:
             if field in batch:
                 if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
@@ -399,6 +448,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             
             # 堆叠所有时间步的特征: (B, To, feature_dim)
             cond = torch.stack(obs_features_list, dim=1).float()  
+            # add vit features
+            if 'image' in batch:
+                batch_image = batch['image'][:,-1,:,:,:]                # (B, num_img, C, H, W)
+                vit_features = self.extract_vit_feature(batch_image)    # (B, num_token, feat_dim)
+                cond = torch.concatenate([cond, vit_features], dim=1)       # (B, To + num_token, feature_dim)
         else:
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
             nobs_features = self.extract_tcp_features(this_nobs)
@@ -460,7 +514,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         loss = loss.mean()
         return loss
     
-
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None, vl_features=None,
@@ -783,6 +836,93 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         return trajectory, denoising_steps
 
+    def load_lidar_bev_encoder(self):
+        # Load BEV encoder configuration from config file
+        bev_encoder_cfg = self.config.get('bev_encoder', {})
+        obs_encoder = InterfuserBEVEncoder(
+            perception_backbone=None,
+            state_dim=bev_encoder_cfg.get('state_dim', 10),
+            feature_dim=bev_encoder_cfg.get('feature_dim', 256),
+            use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
+            freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
+            bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
+        )
+        
+        # Load pretrained weights from config
+        pretrained_path = bev_encoder_cfg.get('pretrained_path', None)
+        if pretrained_path is not None and os.path.exists(pretrained_path):
+            load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
+            print(f"✓ BEV encoder loaded from: {pretrained_path}")
+        else:
+            print(f"⚠ BEV encoder pretrained_path not found or not specified: {pretrained_path}")
+            print("  Continuing with random initialization...")
+        return obs_encoder
+
+    def load_vit_model(self):
+        """
+        Load the VIT model with pretrained weights
+        
+        Args:
+            model_path: Path to the pretrained model directory
+            device: Device to load the model on
+            
+        Returns:
+            vit_model: Loaded VIT model in eval mode
+            vit_transform: Image transformation function
+            vit_config: VIT configuration
+        """
+        vit_model_path = self.config.get('vit_model_path', None)
+        image_transform_args = self.config.get('image_transform_args', {})
+        print(f"Loading VIT model from: {vit_model_path}")
+        
+        # Initialize tokenizer (required for add_special_tokens)
+        tokenizer = Qwen2Tokenizer.from_pretrained(vit_model_path)
+        tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
+        
+        # Load VIT config
+        vit_config = SiglipVisionConfig.from_json_file(os.path.join(vit_model_path, "vit_config.json"))
+        vit_select_layer = -2 
+        vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + vit_select_layer
+        vit_config.rope = True
+        
+        # Create VIT model
+        vit_model = SiglipVisionModel(vit_config)
+        vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
+        
+        # Create image transform
+        vit_transform = ImageTransform(**image_transform_args)
+        
+        # Move to device and set to eval mode
+        vit_model = vit_model.to(self.device)
+        vit_model.eval()
+        
+        # Freeze all parameters
+        for param in vit_model.parameters():
+            param.requires_grad = False
+        
+        print("✓ VIT model loaded successfully")
+        
+        return vit_model, vit_transform, vit_config
+    
+    def preprocess_rgb_image(image_path, vit_transform):
+        """
+        Load and preprocess an RGB image
+        
+        Args:
+            image_path: Path to the RGB image
+            vit_transform: Image transformation function
+            
+        Returns:
+            image_tensor: Preprocessed image tensor
+        """
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        image = pil_img2rgb(image)
+        
+        # Apply VIT transform
+        image_tensor = vit_transform(image, img_num=1)
+        
+        return image_tensor
     # ========= VLM feature simulati, temporary! TODO   ============
 
     def _init_loaded_vlm_features(self):
@@ -804,7 +944,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             print("⚠ VLM feature file not found, using simulated features")
             self._init_fixed_vlm_features()
-
 
     def _init_fixed_vlm_features(self):
         """

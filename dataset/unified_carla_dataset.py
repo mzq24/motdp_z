@@ -16,7 +16,7 @@ import io
 import sys
 import pickle
 import glob
-from tqdm import tqdm  
+from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torchvision.transforms as transforms
@@ -24,6 +24,13 @@ import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import textwrap
 
+bagel_path = "/root/z_projects/code/Bagel"
+if bagel_path not in sys.path:
+    sys.path.insert(0, bagel_path)
+from modeling.bagel import SiglipVisionConfig, SiglipVisionModel
+from data.data_utils import pil_img2rgb, patchify, add_special_tokens
+from data.transforms import ImageTransform
+from modeling.qwen2 import Qwen2Tokenizer
 
 class CARLAImageDataset(torch.utils.data.Dataset):
     """
@@ -44,13 +51,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __init__(self,
                  dataset_path: str,
                  image_data_root: str,
-                 mode: str = 'train'        # train or val
+                 mode: str = 'train',        # train or val
+                 use_image: bool = False, # Whether to use vit_transform for image processing
+                 vit_transform_args: dict = None,
                  ):
 
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
         self.mode = mode
-
+        self.use_image = use_image
+        if vit_transform_args is None:
+            vit_transform_args = {'image_stride': 14, 'max_image_size': 980, 'min_image_size': 518,  'max_pixels': 2_007_040}
+        self.vit_transform = ImageTransform(**vit_transform_args)
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
             transforms.ToTensor(),
@@ -59,7 +71,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 std=[0.229, 0.224, 0.225]
             )
         ])
-        
+
         self.lidar_bev_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
@@ -95,11 +107,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         with open(sample_path, 'rb') as f:
             sample = pickle.load(f)
 
-        # load image data for visualization 
-        if self.mode == 'val':
-            image_paths = sample.get('rgb_hist_jpg', [])
-            images_tensor = self.load_image(image_paths, sample_path)
-
+        # load image data for visualization
+        image_paths = sample.get('rgb_hist_jpg', [])
+        if self.use_image or self.mode == 'val':
+            images_tensor, images_demo_tensor = self.load_image(image_paths, sample_path)
 
         # Load LiDAR BEV features
         lidar_bev_paths = sample.get('lidar_bev_hist', [])
@@ -164,9 +175,12 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Convert sample data
         final_sample = dict()
         for key, value in sample.items():
-            if key == 'rgb_hist_jpg' and self.mode == 'val':
+            if key == 'rgb_hist_jpg':
                 final_sample['rgb_hist_jpg'] = image_paths  
-                final_sample['image'] = images_tensor
+                if self.use_image or self.mode == 'val':
+                    final_sample['image'] = images_tensor
+                    if images_demo_tensor is not None:
+                        final_sample['image_demo'] = images_demo_tensor
             if key == 'lidar_bev_hist':
                 if self.mode == 'val':
                     final_sample['lidar_bev'] = lidar_bev_tensor
@@ -175,13 +189,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample['lidar_token'] = lidar_token_tensor
                     final_sample['lidar_token_global'] = lidar_token_global_tensor
             elif key == 'speed_hist':
-                speed_data = sample['speed_hist']
-                if isinstance(speed_data, np.ndarray):
-                    final_sample['speed'] = torch.from_numpy(speed_data).float()
-                elif isinstance(speed_data, (list, tuple)):
-                    final_sample['speed'] = torch.tensor(speed_data, dtype=torch.float32)
-                else:
-                    final_sample['speed'] = speed_data
+                final_sample['speed'] = self.get_certain_data(sample, key_name='speed_hist')
+            elif key == 'theta_hist':   
+                final_sample['heading'] = self.get_certain_data(sample, key_name='theta_hist')
             elif key == 'ego_waypoints':
                 final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
             elif key == 'vqa':
@@ -248,8 +258,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         return final_sample
 
+    def get_certain_data(self, sample, key_name=None):
+        assert key_name is not None, "key_name must be provided"
+        certain_data = sample[key_name]
+        if isinstance(certain_data, np.ndarray):
+            certain_data = torch.from_numpy(certain_data).float()
+        elif isinstance(certain_data, (list, tuple)):
+            certain_data = torch.tensor(certain_data, dtype=torch.float32)
+        else:
+            certain_data = certain_data
+        return certain_data
+
     def load_image(self, image_paths, sample_path):
         images = []
+        images_demo = []
         for img_path in image_paths:
             if img_path is None:
                 # 如果路径为None，创建一个黑色图像
@@ -258,21 +280,30 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 full_img_path = os.path.join(self.image_data_root, img_path)
                 try:
-                    img = Image.open(full_img_path)
-                    img_tensor = self.image_transform(img)
-                    images.append(img_tensor)
+                    img = Image.open(full_img_path).convert('RGB')
+                    image = pil_img2rgb(img)
+                    image_tensor = self.vit_transform(image, img_num=1)
+                    images.append(image_tensor)
+                    if self.mode == 'val':
+                        img_tensor_demo = self.image_transform(img)
+                        images_demo.append(img_tensor_demo)
                 except Exception as e:
                     print(f"Error loading image {full_img_path}: {e}")
-                    images.append(torch.zeros(3, 256, 928))
+                    images.append(torch.zeros(3, 490, 980))
+                    images_demo.append(torch.zeros(3, 256, 928))
         
         # 堆叠图像
+        images_demo_tensor = None
         if len(images) > 0:
             images_tensor = torch.stack(images)
+            if self.mode == 'val':
+                images_demo_tensor = torch.stack(images_demo)
         else:
-            images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
-
-        return images_tensor
-
+            images_tensor = torch.zeros(2, 3, 490, 980)  # 默认obs_horizon=2
+            if self.mode == 'val':
+                images_demo_tensor = torch.zeros(2, 3, 256, 928)
+        return images_tensor, images_demo_tensor
+    
     def load_lidar_bev(self, bev_paths, sample_path):
         images = []
         for bev_path in bev_paths:
@@ -292,6 +323,29 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         return images_tensor
 
+    # no space for image feature preprocessing
+    def load_image_feature(self, image_path):
+        """Load a single image and apply transformations."""
+        full_img_path = os.path.join(self.image_data_root, image_path)
+        image_feat = torch.load(full_img_path, weights_only=True)
+        return image_feat
+
+    def get_image_tensor_paths(self, lidar_bev_paths, folder_dir='rgb_features'):
+        """Generate image tensor paths from LiDAR BEV paths."""
+        if folder_dir is None:
+            folder_dir = 'rgb_features'
+        image_tensor_paths = []
+        for bev_path in lidar_bev_paths:
+            if bev_path is None:
+                continue
+            
+            bev_dir = os.path.dirname(bev_path)
+            frame_id = os.path.splitext(os.path.basename(bev_path))[0]
+            image_tensor_dir = bev_dir.replace('lidar_bev', folder_dir)
+            image_tensor_path = os.path.join(image_tensor_dir, f'{frame_id}_tensor.pt')
+            image_tensor_paths.append(image_tensor_path)
+        
+        return image_tensor_paths
 # ============================================================================
 # Visualization Functions
 # ============================================================================

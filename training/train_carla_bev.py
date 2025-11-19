@@ -181,8 +181,9 @@ def train_carla_policy(config_path, device_str, use_vlm_features=True):
     train_dataset_path = os.path.join(dataset_path_root, 'train')
     val_dataset_path = os.path.join(dataset_path_root, 'val')
     image_data_root = config.get('training', {}).get('image_data_root')
-    train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
-    val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
+    dataset_args = config.get('training', {}).get('dataset_args', {})
+    train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root, **dataset_args)
+    val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root, **dataset_args)
 
     print(f"\nTraining samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")

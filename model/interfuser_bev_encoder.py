@@ -40,8 +40,11 @@ class InterfuserBEVEncoder(nn.Module):
     def __init__(
         self, 
         perception_backbone: Optional[nn.Module] = None,
-        state_dim: int = 9,  # speed(1) + target_point(2) + command(6)
+        state_dim: int = 10,  # speed(1) + target_point(2) + command(6) + heading(1)
         feature_dim: int = 256,
+        bev_embed_dim: int = 256,
+        measurement_embed_dim: int = 128,
+        token_dim: int = 512,
         use_group_norm: bool = True,
         freeze_backbone: bool = True,
         bev_input_size: Tuple[int, int] = (448, 448)  # LiDAR BEV图像尺寸
@@ -49,8 +52,14 @@ class InterfuserBEVEncoder(nn.Module):
         """
         Args:
             perception_backbone: 视觉backbone 
-            state_dim: 状态维度 (速度+目标点+指令)
+            state_dim: 状态维度
             feature_dim: 输出特征维度
+            bev_embed_dim: BEV backbone 输出的 embedding 维度
+            measurement_embed_dim: 状态信息编码后的维度
+            token_dim: token 的统一维度，用于 Transformer
+            fusion_hidden_dim: 最终特征融合层的隐藏维度
+            img_feature_dim: 输入图像特征的维度
+            transformer_ff_dim: Transformer 解码器中前馈网络的维度
             use_group_norm: 是否使用GroupNorm标准化输出特征
             freeze_backbone: 是否冻结backbone参数
             bev_input_size: BEV图像输入尺寸，默认(448, 448)
@@ -71,15 +80,15 @@ class InterfuserBEVEncoder(nn.Module):
                 out_indices=[4],   
             )
             self.perception=lidar_backbone
-            embed_dim=256
+            embed_dim=bev_embed_dim
             self.lidar_embed_layer = partial(HybridEmbed, backbone=lidar_backbone)
-            self.lidar_connector = MLPconnector(256, 512, 'gelu')
-            # LiDAR patch embed：把 512 通道通过 1×1 conv 投到 embed_dim=256
+            self.lidar_connector = MLPconnector(bev_embed_dim, token_dim, 'gelu')
+            # LiDAR patch embed：把 token_dim 通道通过 1×1 conv 投到 embed_dim=bev_embed_dim
             self.bev_model_mot = self.lidar_embed_layer(
                 img_size=224,      # LiDAR BEV 输入分辨率，默认 224×224
                 patch_size=16,     # 与 RGB 保持一致；这里仅记录，不影响 backbone 计算
                 in_chans=3,
-                embed_dim=embed_dim,     # baseline 用 256
+                embed_dim=embed_dim,     # baseline 用 bev_embed_dim
             )
             self.position_encoding = PositionEmbeddingSine(embed_dim // 2, normalize=True)
 
@@ -88,9 +97,9 @@ class InterfuserBEVEncoder(nn.Module):
 
         # 2. 测量编码器 (state -> measurement features)
         self.measurements = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, measurement_embed_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 128),
+            nn.Linear(measurement_embed_dim, measurement_embed_dim),
             nn.ReLU(inplace=True),
         )
         
@@ -113,7 +122,7 @@ class InterfuserBEVEncoder(nn.Module):
         spatial_size = feat_h * feat_w
         
         self.init_att = nn.Sequential(
-            nn.Linear(128, 256),
+            nn.Linear(measurement_embed_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, spatial_size),  # 14 * 14 = 196 for 448x448 input
             nn.Softmax(dim=1)
@@ -122,14 +131,14 @@ class InterfuserBEVEncoder(nn.Module):
         # 4. 特征融合模块
         # 融合视觉特征(经过注意力加权)和测量特征
         self.join_ctrl = nn.Sequential(
-            nn.Linear(512 + 128, 512),
+            nn.Linear(token_dim + measurement_embed_dim, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, feature_dim),
             nn.ReLU(inplace=True),
         )
-        
+
         # 5. GroupNorm 
         self.use_group_norm = use_group_norm
         if use_group_norm:
@@ -138,7 +147,7 @@ class InterfuserBEVEncoder(nn.Module):
         
         if freeze_backbone and self.perception is not None:
             self._freeze_backbone()
-    
+
     def _freeze_backbone(self):
         for param in self.perception.parameters():
             param.requires_grad = False
@@ -163,65 +172,40 @@ class InterfuserBEVEncoder(nn.Module):
         2. Pre-computed features (lidar_token + lidar_token_global + state) - uses cached features
         
         Args:
-            image: Raw BEV image (B, 3, H, W) - optional if using pre-computed features
-            state: State information (B, state_dim)
-            normalize: Whether to apply GroupNorm
-            return_attention: Whether to return attention weights
-            lidar_token: Pre-computed local tokens (B, seq_len, 512) - optional
-            lidar_token_global: Pre-computed global token (B, 1, 512) - optional
+            image (torch.Tensor, optional): Input BEV image tensor (B, C, H, W). Defaults to None.
+            state (torch.Tensor, optional): Input state tensor (B, state_dim). Defaults to None.
+            lidar_token (torch.Tensor, optional): Precomputed spatial lidar tokens. Defaults to None.
+            lidar_token_global (torch.Tensor, optional): Precomputed global lidar token. Defaults to None.
+            normalize (bool): Whether to normalize the state. Defaults to True.
+            return_attention (bool): Whether to return the attention map from the last cross-attention layer.
+        
+        Returns:
+            - j_ctrl (torch.Tensor): Control features (B, 256)
+            - attention_map (torch.Tensor, optional): Attention map if return_attention is True
         """
-        
-        # Determine which mode to use
-        use_precomputed = lidar_token is not None and lidar_token_global is not None
-        
-        if use_precomputed:
-            # Mode 1: Use pre-computed features (fast path)
-            batch_size = lidar_token.shape[0]
+        if image is not None:
+            # Mode 1: Process raw BEV image
+            lidar_token, lidar_token_global = self.bev_model_mot(image)
+            lidar_token = lidar_token + self.position_encoding(lidar_token)
+            lidar_token = lidar_token.flatten(2).permute(2, 0, 1)
+            lidar_token_global = lidar_token_global.permute(2, 0, 1)
             
-            # lidar_token: (B, seq_len, 512)
-            # lidar_token_global: (B, 1, 512)
-            # These are already processed through bev_model_mot + position encoding + connector
-            
-        else:
-            # Mode 2: Extract features from raw image (slow path)
-            if self.perception is None:
-                raise RuntimeError("Perception backbone not initialized. Set self.perception before forward.")
-            if image is None:
-                raise ValueError("image is required when not using pre-computed features")
-            
-            batch_size = image.shape[0]
-            
-            # Step 1: 使用 bev_model_mot 处理原始图像
-            lidar_token_raw, lidar_token_global_raw = self.bev_model_mot(image)
-            
-            # 添加位置编码
-            lidar_token_raw = lidar_token_raw + self.position_encoding(lidar_token_raw)
-            
-            # 重塑为序列格式
-            lidar_token_raw = lidar_token_raw.flatten(2).permute(2, 0, 1)  # (seq_len, batch, embed_dim)
-            lidar_token_global_raw = lidar_token_global_raw.permute(2, 0, 1)  # (1, batch, embed_dim)
-            
-            # 连接局部和全局token
-            lidar_tokens = torch.cat([lidar_token_raw, lidar_token_global_raw], dim=0)
-            
-            # 通过connector
+            lidar_tokens = torch.cat([lidar_token, lidar_token_global], dim=0)
             lidar_tokens = self.lidar_connector(lidar_tokens)
             
-            # 转换为 (batch, seq_len, 512) 格式
-            lidar_token = lidar_tokens[:-1].permute(1, 0, 2)  # (batch, seq_len, 512)
-            lidar_token_global = lidar_tokens[-1:].permute(1, 0, 2)  # (batch, 1, 512)
+            lidar_token = lidar_tokens[:-1].permute(1, 0, 2)
+            lidar_token_global = lidar_tokens[-1:].permute(1, 0, 2)
         
-        # From here, both paths use the same code
-        # lidar_token: (batch, seq_len, 512)
-        # lidar_token_global: (batch, 1, 512)
-        
-        # Step 2: 测量编码
+        elif lidar_token is None or lidar_token_global is None:
+            raise ValueError("Either 'image' or both 'lidar_token' and 'lidar_token_global' must be provided.")
+
         if state is None:
             raise ValueError("state is required for forward pass")
         measurement_feature = self.measurements(state)
         
         # Step 3: 空间注意力机制
         # 使用 measurement_feature 生成空间注意力权重
+        batch_size = lidar_token.shape[0]
         spatial_size = lidar_token.shape[1]  # seq_len
         attention_weights = self.init_att(measurement_feature)  # (batch, expected_spatial_size)
         
