@@ -91,11 +91,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             bev_feature_upsample_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature_upsample'])
             transfuser_bev_feature_upsample = torch.load(bev_feature_upsample_path, weights_only=True).squeeze(0)
         
-        # Load VQA feature from pt file
-        vqa_path = sample.get('vqa', None)
-        vqa_feature = {}
-        full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-        vqa_feature = torch.load(full_vqa_path, weights_only=True)
+        # # Load VQA feature from pt file
+        # vqa_path = sample.get('vqa', None)
+        # vqa_feature = {}
+        # full_vqa_path = os.path.join(self.image_data_root, vqa_path)
+        # vqa_feature = torch.load(full_vqa_path, weights_only=True)
   
         
         # Convert sample data
@@ -111,23 +111,17 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 ego_waypoints = torch.from_numpy(sample['ego_waypoints'][1:]).float()
                 final_sample['agent_pos'] = ego_waypoints
             elif key == 'vqa':
-                # Load pred_traj as anchor
-                anchor = vqa_feature['pred_traj']
-                # Remove extra batch dimension if present: (1, T, 2) -> (T, 2)
-                if anchor.dim() == 3 and anchor.shape[0] == 1:
-                    anchor = anchor.squeeze(0)
-                final_sample['anchor'] = anchor
-                
-                # Load reasoning_feat as reasoning_query_tokens (take first 7)
-                reasoning_feat = vqa_feature['reasoning_feat']  # shape: (8, 2560)
-                # Take first 7 tokens
-                final_sample['reasoning_query_tokens'] = reasoning_feat[:7]  # shape: (7, 2560)
+                # Skip VQA field - we no longer use it
+                continue
             elif key == 'route':
                 # Load route waypoints (expected shape: (20, 2))
                 route_data = torch.from_numpy(value).float()
                 final_sample['route'] = route_data
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
+                continue
+            elif value is None:
+                # Skip None values to avoid DataLoader collate errors
                 continue
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()

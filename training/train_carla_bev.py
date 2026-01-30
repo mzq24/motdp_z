@@ -171,13 +171,12 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 loss = model_for_inference.compute_loss(batch)
                 val_metrics['loss'].append(loss.item())
                 
-                # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
+                # Multimodal model: only needs bev_feature, bev_feature_upsample, ego_status
+                # No more reasoning_query_tokens or anchor needed (anchor is loaded from wp_tokens.pkl)
                 obs_dict = {
                     'transfuser_bev_feature': batch['transfuser_bev_feature'],
                     'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
-                    'reasoning_query_tokens': batch['reasoning_query_tokens'],
-                    'anchor': batch['anchor']  # Pass anchor for truncated diffusion
                 }
                 target_actions = batch['agent_pos']  
                 
@@ -288,7 +287,7 @@ def train_pdm_policy(config_path):
     print(f'Rank: {rank}, Device: {device}, World size: {world_size}')
     
     # Only rank 0 should initialize wandb
-    wandb_mode = os.environ.get('WANDB_MODE', 'online') 
+    wandb_mode = os.environ.get('WANDB_MODE', 'offline') 
     use_wandb = config.get('logging', {}).get('use_wandb', True) and (rank == 0)
     
     if use_wandb:

@@ -1290,28 +1290,23 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
 
 class TransformerForDiffusion(ModuleAttrMixin):
     """
-    Decoder-Only Transformer for Diffusion-based Trajectory Prediction (DiffusionDriveV2 style).
+    Multimodal Transformer for Trajectory Prediction (DiffusionDrive style).
     
     Key features:
-    - Unified decoder with heterogeneous queries for trajectory + route
-    - Cross-attention to: Transfuser features (bev_feature, bev_feature_upsample) + Reasoning
-    - DiffusionDriveV2-style GridSampleCrossBEVAttention for spatial BEV
-    - ego_status history used for AdaLN conditioning only (not cross-attention)
-    - Segment embeddings to distinguish query types
-    - MLP output heads (no GRU)
-    - AdaLN modulation based on timestep + current_ego_status + GRU(history)
+    - Multimodal prediction: outputs predictions for all anchor modes simultaneously
+    - Classification head: predicts which mode is best
+    - Regression head: predicts trajectory refinement for each mode
+    - Cross-attention to: Transfuser features (bev_feature, bev_feature_upsample)
+    - ego_status history used for AdaLN conditioning only
+    - MLP output heads
     
-    Query structure: [trajectory (horizon) | route (20)]
-    Cross-attention sources (following DiffusionDriveV2):
-    - bev_feature: (B, 1512, 8, 8) - Original BEV from lidar
-    - bev_feature_upsample: (B, 64, 64, 64) - FPN output p3 (for spatial attention)
-    - Reasoning tokens
+    Input:
+    - anchors: (B, num_modes, anchor_num_points, 2) - all anchor trajectories
     
-    Note: fused_features and image_feature_grid are NOT used, following DiffusionDriveV2.
-    
-    Loss design:
-    - Trajectory loss: for longitudinal control (speed/acceleration)
-    - Route loss: for lateral control (steering direction)
+    Output:
+    - poses_reg: (B, num_modes, horizon, 2) - trajectory predictions for each mode
+    - poses_cls: (B, num_modes) - classification logits for mode selection
+    - route_pred: (B, num_waypoints, 2) - route prediction
     """
     def __init__(
         self,
@@ -1335,6 +1330,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         transfuser_bev_dim: int = 1512,        # bev_feature channel dim
         transfuser_bev_upsample_dim: int = 64,  # bev_feature_upsample channel dim
         num_waypoints: int = 20,
+        num_modes: int = 32,  # Number of anchor modes
     ) -> None:
         super().__init__()
         
@@ -1344,16 +1340,25 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.n_obs_steps = n_obs_steps
         self.horizon = horizon
         self.num_waypoints = num_waypoints
+        self.num_modes = num_modes
         self.status_dim = status_dim
-        self.reasoning_emb_dim = reasoning_emb_dim
         self.transfuser_bev_dim = transfuser_bev_dim
         self.transfuser_bev_upsample_dim = transfuser_bev_upsample_dim
         self.T = horizon
+        self.output_dim = output_dim
         
-        # Input embedding for noisy trajectory
-        self.input_emb = nn.Linear(input_dim, n_emb)
+        # ========== Anchor Embedding ==========
+        # Embed anchor trajectories: (B, num_modes, anchor_points, 2) -> (B, num_modes, n_emb)
+        self.anchor_emb = nn.Sequential(
+            nn.Linear(input_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
         
-        # Position embeddings for trajectory queries
+        # Learnable mode queries for each anchor
+        self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
+        
+        # Position embeddings for trajectory queries within each mode
         self.pos_emb = nn.Parameter(torch.zeros(1, horizon, n_emb))
         
         self.drop = nn.Dropout(p_drop_emb)
@@ -1361,45 +1366,71 @@ class TransformerForDiffusion(ModuleAttrMixin):
         
         # Conditioning: timestep + current_status + GRU-encoded history
         self.time_emb = SinusoidalPosEmb(n_emb)
-        self.ego_status_proj = nn.Linear(status_dim, n_emb)  # For current status only
-        self.history_encoder = HistoryEncoder(status_dim, n_emb)  # GRU for global history encoding
+        self.ego_status_proj = nn.Linear(status_dim, n_emb)
+        self.history_encoder = HistoryEncoder(status_dim, n_emb)
         
-        # Route-specific conditioning generator (key for stability)
-        # This provides route queries with independent conditioning pathway
+        # Route-specific conditioning generator
         self.route_status_proj = nn.Sequential(
             nn.Linear(status_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
         
-        # Unified Decoder with heterogeneous queries (DiffusionDriveV2 style)
-        # Uses transfuser features (bev_feature, bev_feature_upsample) only
-        self.decoder = UnifiedDecoderOnlyTransformer(
-            d_model=n_emb,
-            nhead=n_head,
-            num_layers=n_layer,
-            dim_feedforward=4 * n_emb,
-            dropout=p_drop_attn,
-            transfuser_bev_dim=transfuser_bev_dim,
-            transfuser_bev_upsample_dim=transfuser_bev_upsample_dim,
-            reasoning_dim=reasoning_emb_dim,
-            horizon=horizon,
-            num_waypoints=num_waypoints,
+        # ========== BEV Feature Processing ==========
+        # Project BEV features
+        self.bev_feature_proj = nn.Sequential(
+            nn.Linear(transfuser_bev_dim, n_emb),
+            nn.LayerNorm(n_emb)
         )
         
-        # Causal mask for trajectory queries (route queries can attend to all)
-        self.causal_attn = causal_attn
-        # Note: We create mask dynamically in forward() to handle variable lengths
+        # GridSampleCrossBEVAttention for spatial BEV features
+        self.bev_spatial_attn = GridSampleCrossBEVAttention(
+            embed_dims=n_emb,
+            num_heads=n_head,
+            in_bev_dims=transfuser_bev_upsample_dim,
+            num_points=horizon,
+            lidar_max_x=32.0,
+            lidar_max_y=32.0
+        )
         
-        # Output heads with Route Guidance
-        # TrajectoryHead now receives route features for guidance
-        self.trajectory_head = TrajectoryMLPHead(n_emb, output_dim, p_drop_emb, num_heads=n_head)
-        # RouteHead with independent conditioning support (key for closed-loop stability)
-        self.route_head = RouteMLPHead(n_emb, status_dim=status_dim, output_dim=2, p_drop=p_drop_emb)
+        # ========== Transformer Decoder Layers ==========
+        # Simple transformer decoder for processing mode queries with BEV features
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=n_emb,
+            nhead=n_head,
+            dim_feedforward=4 * n_emb,
+            dropout=p_drop_attn,
+            batch_first=True,
+            norm_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layer)
+        
+        # ========== Output Heads ==========
+        # Trajectory regression head: outputs (B, num_modes, horizon, 2)
+        self.trajectory_head = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, horizon * output_dim),
+        )
+        
+        # Classification head: outputs (B, num_modes)
+        self.cls_head = nn.Sequential(
+            nn.Linear(n_emb, n_emb // 2),
+            nn.SiLU(),
+            nn.Linear(n_emb // 2, 1),
+        )
+        
+        # Route head: separate processing for route prediction
+        self.route_queries = nn.Parameter(torch.randn(1, num_waypoints, n_emb))
+        self.route_head = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, 2),
+        )
         
         self.apply(self._init_weights)
         
-        logger.info("TransformerForDiffusion (Unified Decoder-Only with Transfuser) - parameters: %e", 
+        logger.info("TransformerForDiffusion (Multimodal) - parameters: %e", 
                    sum(p.numel() for p in self.parameters()))
     
     def _init_weights(self, module):
@@ -1443,7 +1474,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         for name in param_dict:
             if 'pos_emb' in name or '_dummy_variable' in name or 'segment_emb' in name:
                 no_decay.add(name)
-            elif 'route_queries' in name or 'pool_query' in name:
+            elif 'route_queries' in name or 'pool_query' in name or 'mode_queries' in name:
                 no_decay.add(name)
             elif 'gating_factor' in name:
                 no_decay.add(name)
@@ -1486,111 +1517,124 @@ class TransformerForDiffusion(ModuleAttrMixin):
     
     def forward(
         self,
-        sample: torch.Tensor,
+        anchors: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
-        cond: torch.Tensor,
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
-        reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
-        reasoning_mask: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """
-        Forward pass with unified decoder and transfuser features (DiffusionDriveV2 style).
+        Multimodal forward pass for trajectory prediction.
         
         Args:
-            sample: (B, T, input_dim) - noisy trajectory
-            timestep: diffusion timestep
-            cond: (B, T_obs, cond_dim) - for API compatibility (not used)
+            anchors: (B, num_modes, anchor_num_points, 2) - all anchor trajectories
+            timestep: diffusion timestep (for conditioning, can be 0 at inference)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature from transfuser
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upsampled BEV for spatial attention
-            reasoning_query_tokens: (B, T_r, reasoning_dim) - reasoning tokens
-            ego_status: (B, T_obs, status_dim) - ego status history (complete 4 frames)
-            
-        Note: transfuser_fused_features and transfuser_image_feature_grid are NOT used,
-        following DiffusionDriveV2's approach.
+            ego_status: (B, T_obs, status_dim) - ego status history
             
         Returns:
-            trajectory: (B, T, output_dim) - for longitudinal control
-            route_pred: (B, num_waypoints, 2) - for lateral control
-            
-        History status utilization:
-            AdaLN conditioning: current_status (last frame) + GRU-encoded global history
+            poses_reg: (B, num_modes, horizon, 2) - trajectory predictions for each mode
+            poses_cls: (B, num_modes) - classification logits for mode selection
+            route_pred: (B, num_waypoints, 2) - route prediction
         """
         model_dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
         
-        sample = sample.contiguous().to(dtype=model_dtype)
-        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(dtype=model_dtype)
-        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(dtype=model_dtype)
-        reasoning_tokens = reasoning_query_tokens.contiguous().to(dtype=model_dtype)
-        ego_status = ego_status.to(dtype=model_dtype)
+        anchors = anchors.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
+        ego_status = ego_status.to(device=device, dtype=model_dtype)
         
-        B = sample.shape[0]
-        T_traj = sample.shape[1]
+        B = anchors.shape[0]
+        num_modes = anchors.shape[1]
+        anchor_num_points = anchors.shape[2]
         
-        # Timestep handling
+        # ========== Timestep handling ==========
         if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+            timestep = torch.tensor([timestep], dtype=torch.long, device=device)
         elif len(timestep.shape) == 0:
-            timestep = timestep[None].to(sample.device)
+            timestep = timestep[None].to(device)
         timesteps = timestep.expand(B)
         
         # ========== Conditioning ==========
         # 1. Timestep embedding
-        time_emb = self.time_emb(timesteps).to(dtype=model_dtype)
+        time_emb = self.time_emb(timesteps).to(dtype=model_dtype)  # (B, n_emb)
         
-        # 2. Current status embedding (last frame only for AdaLN)
+        # 2. Current status embedding (last frame only)
         current_status = ego_status[:, -1, :]  # (B, status_dim)
-        status_emb = self.ego_status_proj(current_status)
+        status_emb = self.ego_status_proj(current_status)  # (B, n_emb)
         
-        # 3. GRU-encoded global history for AdaLN
+        # 3. GRU-encoded global history
         hist_global_emb = self.history_encoder(ego_status)  # (B, n_emb)
         
-        # Combined conditioning for trajectory AdaLN modulation
-        conditioning = time_emb + status_emb + hist_global_emb
+        # Combined conditioning
+        conditioning = time_emb + status_emb + hist_global_emb  # (B, n_emb)
         
-        # 4. Route-specific conditioning (independent pathway for stability)
-        # Uses separate status projection + shared time embedding
-        route_status_emb = self.route_status_proj(current_status)
-        route_conditioning = time_emb + route_status_emb + hist_global_emb
+        # ========== BEV Feature Processing ==========
+        # bev_feature: (B, 1512, 8, 8) -> flatten -> (B, 64, 1512) -> project -> (B, 64, n_emb)
+        bev_flat = transfuser_bev_feature.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
+        bev_tokens = self.bev_feature_proj(bev_flat)  # (B, 64, n_emb)
         
-        # ========== Trajectory Query Embedding ==========
-        traj_emb = self.input_emb(sample)  # (B, T_traj, n_emb)
-        pos_emb = self.pos_emb[:, :T_traj, :]
-        traj_emb = traj_emb + pos_emb
-        traj_emb = self.drop(traj_emb)
-        traj_emb = self.pre_decoder_norm(traj_emb)
+        # ========== Anchor Embedding ==========
+        # anchors: (B, num_modes, anchor_num_points, 2) 
+        # Flatten anchor points and embed: -> (B, num_modes, n_emb)
+        anchors_flat = anchors.mean(dim=2)  # (B, num_modes, 2) - average anchor position
+        anchor_emb = self.anchor_emb(anchors_flat)  # (B, num_modes, n_emb)
         
-        # ========== Padding Masks ==========
-        reasoning_padding_mask = ~reasoning_mask if reasoning_mask is not None else (torch.norm(reasoning_tokens, dim=-1) == 0)
+        # Add learnable mode queries
+        mode_queries = self.mode_queries.expand(B, -1, -1)  # (B, num_modes, n_emb)
         
-        # ========== Unified Decoder (DiffusionDriveV2 style) ==========
-        # Note: Unidirectional self-attention mask is created internally by decoder
-        # - Trajectory can see: trajectory + route (route guides trajectory)
-        # - Route can only see: route (independent planning)
-        # Cross-attention: Transfuser features (bev) + Reasoning (following DiffusionDriveV2)
-        # Route-specific processing: independent Q adapters, temperature/bias, AdaLN
-        traj_out, route_out = self.decoder(
-            traj_emb,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            reasoning_tokens=reasoning_tokens,
-            conditioning=conditioning,
-            traj_points=sample,  # Use noisy trajectory for spatial BEV attention
-            reasoning_padding_mask=reasoning_padding_mask,
-            route_conditioning=route_conditioning,
-        )
+        # Combine: anchor embedding + mode queries + conditioning
+        mode_emb = anchor_emb + mode_queries + conditioning.unsqueeze(1)  # (B, num_modes, n_emb)
+        mode_emb = self.drop(mode_emb)
+        mode_emb = self.pre_decoder_norm(mode_emb)
+        
+        # ========== Build Route Queries ==========
+        route_queries = self.route_queries.expand(B, -1, -1)  # (B, num_waypoints, n_emb)
+        route_conditioning = self.route_status_proj(current_status)  # (B, n_emb)
+        route_queries = route_queries + route_conditioning.unsqueeze(1)
+        
+        # ========== Unified Transformer Decoder (single forward) ==========
+        # Concatenate mode queries and route queries: [mode_emb | route_queries]
+        # mode_emb: (B, num_modes, n_emb), route_queries: (B, num_waypoints, n_emb)
+        unified_queries = torch.cat([mode_emb, route_queries], dim=1)  # (B, num_modes + num_waypoints, n_emb)
+        
+        # Single decoder forward with cross-attention to BEV tokens
+        unified_out = self.decoder(unified_queries, bev_tokens)  # (B, num_modes + num_waypoints, n_emb)
+        
+        # Split outputs back into mode and route
+        mode_out = unified_out[:, :num_modes, :]  # (B, num_modes, n_emb)
+        route_out = unified_out[:, num_modes:, :]  # (B, num_waypoints, n_emb)
         
         # ========== Output Heads ==========
-        # Route head processes first (no dependency on trajectory)
-        # Pass current_status for route-specific conditioning (key for stability)
-        route_pred = self.route_head(route_out, conditioning, ego_status=current_status)
+        # 1. Trajectory regression: (B, num_modes, n_emb) -> (B, num_modes, horizon * 2)
+        traj_flat = self.trajectory_head(mode_out)  # (B, num_modes, horizon * output_dim)
+        poses_reg = traj_flat.view(B, num_modes, self.horizon, self.output_dim)  # (B, num_modes, horizon, 2)
         
-        # Trajectory head with Route Guidance (attends to route features)
-        trajectory = self.trajectory_head(traj_out, conditioning, route_features=route_out)
+        # Add anchor as residual (predict refinement)
+        # Interpolate anchor to match horizon if needed
+        if anchor_num_points != self.horizon:
+            # Interpolate: (B, num_modes, anchor_num_points, 2) -> (B, num_modes, horizon, 2)
+            anchors_interp = F.interpolate(
+                anchors.permute(0, 1, 3, 2).reshape(B * num_modes, 2, anchor_num_points),
+                size=self.horizon,
+                mode='linear',
+                align_corners=True
+            ).view(B, num_modes, 2, self.horizon).permute(0, 1, 3, 2)
+        else:
+            anchors_interp = anchors
         
-        return trajectory, route_pred
+        poses_reg = poses_reg + anchors_interp  # Residual prediction
+        
+        # 2. Classification: (B, num_modes, n_emb) -> (B, num_modes, 1) -> (B, num_modes)
+        poses_cls = self.cls_head(mode_out).squeeze(-1)  # (B, num_modes)
+        
+        # 3. Route prediction from unified decoder output
+        route_pred = self.route_head(route_out)  # (B, num_waypoints, 2)
+        
+        return poses_reg, poses_cls, route_pred
 
 
 # =============================================================================
@@ -1598,10 +1642,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
 # =============================================================================
 
 def test():
-    """Test the unified decoder-only architecture with transfuser features (DiffusionDriveV2 style)."""
+    """Test the multimodal architecture."""
     print("=" * 60)
-    print("Testing TransformerForDiffusion (Unified Decoder-Only)")
-    print("With Transfuser Features + Reasoning (DiffusionDriveV2 style)")
+    print("Testing TransformerForDiffusion (Multimodal)")
     print("=" * 60)
     
     transformer = TransformerForDiffusion(
@@ -1614,66 +1657,62 @@ def test():
         n_head=8,
         n_emb=512,
         causal_attn=True,
-        reasoning_emb_dim=1536,
-        status_dim=14,  # Updated: speed(1) + theta(1) + command(6) + target_point(2) + target_point_next(2) + waypoints(2)
-        # Transfuser feature dimensions (following DiffusionDriveV2)
+        status_dim=14,
         transfuser_bev_dim=1512,
         transfuser_bev_upsample_dim=64,
         num_waypoints=20,
+        num_modes=32,
     )
     
     print(f"Model parameters: {sum(p.numel() for p in transformer.parameters()):,}")
     
     B = 4
     timestep = torch.tensor(0)
-    sample = torch.randn((B, 8, 2))
-    cond = torch.zeros((B, 4, 10))
+    anchors = torch.randn((B, 32, 5, 2))  # (B, num_modes, anchor_num_points, 2)
     
     # Transfuser features (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
     transfuser_bev_feature = torch.randn((B, 1512, 8, 8))
     transfuser_bev_feature_upsample = torch.randn((B, 64, 64, 64))
     
-    reasoning_tokens = torch.randn((B, 10, 1536))
     ego_status = torch.randn((B, 4, 14))  # 4 frames of history with updated dim
     
-    print("\nTest 1: Basic forward pass")
-    trajectory, route_pred = transformer(
-        sample=sample, timestep=timestep, cond=cond,
+    print("\nTest 1: Basic forward pass (multimodal)")
+    poses_reg, poses_cls, route_pred = transformer(
+        anchors=anchors, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-        reasoning_query_tokens=reasoning_tokens,
         ego_status=ego_status,
     )
-    print(f"  Trajectory: {trajectory.shape} (for longitudinal control)")
-    print(f"  Route: {route_pred.shape} (for lateral control)")
-    assert trajectory.shape == (B, 8, 2), f"Expected (B, 8, 2), got {trajectory.shape}"
+    print(f"  poses_reg: {poses_reg.shape} (trajectory predictions for each mode)")
+    print(f"  poses_cls: {poses_cls.shape} (classification logits)")
+    print(f"  route_pred: {route_pred.shape} (route prediction)")
+    assert poses_reg.shape == (B, 32, 8, 2), f"Expected (B, 32, 8, 2), got {poses_reg.shape}"
+    assert poses_cls.shape == (B, 32), f"Expected (B, 32), got {poses_cls.shape}"
     assert route_pred.shape == (B, 20, 2), f"Expected (B, 20, 2), got {route_pred.shape}"
     
-    print("\nTest 2: Different transfuser features affect output")
+    print("\nTest 2: Different BEV features affect output")
     transfuser_bev_feature2 = torch.randn((B, 1512, 8, 8))
-    traj2, _ = transformer(
-        sample=sample, timestep=timestep, cond=cond,
+    poses_reg2, _, _ = transformer(
+        anchors=anchors, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature2,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-        reasoning_query_tokens=reasoning_tokens,
         ego_status=ego_status,
     )
-    diff = torch.abs(trajectory - traj2).mean()
+    diff = torch.abs(poses_reg - poses_reg2).mean()
     print(f"  Difference: {diff:.6f}")
-    assert diff > 0, "Transfuser features should affect output"
+    assert diff > 0, "BEV features should affect output"
     
-    print("\nTest 3: Different ego_status affects conditioning")
-    ego_status2 = torch.randn((B, 4, 14))
-    traj3, _ = transformer(
-        sample=sample, timestep=timestep, cond=cond,
+    print("\nTest 3: Different anchors affect output")
+    anchors2 = torch.randn((B, 32, 5, 2))
+    poses_reg3, _, _ = transformer(
+        anchors=anchors2, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-        reasoning_query_tokens=reasoning_tokens,
-        ego_status=ego_status2,
+        ego_status=ego_status,
     )
-    diff_hist = torch.abs(trajectory - traj3).mean()
-    print(f"  Difference: {diff_hist:.6f}")
-    assert diff_hist > 0, "Ego status should affect conditioning"
+    diff_anchors = torch.abs(poses_reg - poses_reg3).mean()
+    print(f"  Difference: {diff_anchors:.6f}")
+    assert diff_anchors > 0, "Anchors should affect output"
     
     print("\nTest 4: Optimizer")
     opt = transformer.configure_optimizers()
@@ -1682,36 +1721,16 @@ def test():
     print("\n" + "=" * 60)
     print("✓ All tests passed!")
     print("=" * 60)
-    print("\nArchitecture (DiffusionDriveV2 style):")
-    print("  1. Transfuser Features (following DiffusionDriveV2):")
-    print("     - bev_feature: (1512, 8, 8) -> flattened cross-attention")
-    print("     - bev_feature_upsample: (64, 64, 64) -> GridSampleCrossBEVAttention")
-    print("     - NOTE: fused_features and image_feature_grid are NOT used")
-    print("\n  2. GridSampleCrossBEVAttention (DiffusionDriveV2 style):")
-    print("     - Samples BEV features at trajectory point locations")
-    print("     - Attention-weighted aggregation of sampled features")
-    print("     - More efficient than full spatial cross-attention")
-    print("\n  3. Route-to-Trajectory Guidance:")
-    print("     - TrajectoryHead attends to route features")
-    print("     - Gated residual connection for controlled influence")
-    print("     - Improves trajectory-route consistency")
-    print("\n  4. Unified Position Encoding:")
-    print("     - Sinusoidal encoding shared by trajectory & route")
-    print("     - Learnable scaling per modality")
-    print("     - Segment embeddings for type differentiation")
-    print("\n  5. Unidirectional Self-Attention:")
-    print("     - Trajectory can see: trajectory + route")
-    print("     - Route can only see: route (independent)")
-    print("\n  6. Route-Specific Components (Stability Enhancement):")
-    print("     - Route-specific Q adapters for cross-attention")
-    print("     - Route-specific temperature & bias for attention")
-    print("     - Route-specific AdaLN modulation")
-    print("     - Route-specific conditioning pathway")
-    print("     - Route residual path (bypasses shared decoder)")
-    print("     - Final AdaLN in RouteMLPHead")
-    print("\nOutput Heads:")
-    print("  - RouteMLPHead: with independent conditioning + final AdaLN")
-    print("  - TrajectoryMLPHead: with route guidance + conditioning")
+    print("\nArchitecture (Multimodal DiffusionDrive style):")
+    print("  1. Input: anchors (B, num_modes, anchor_points, 2)")
+    print("  2. Output: ")
+    print("     - poses_reg: (B, num_modes, horizon, 2) - trajectory predictions")
+    print("     - poses_cls: (B, num_modes) - mode classification logits")
+    print("     - route_pred: (B, num_waypoints, 2) - route prediction")
+    print("  3. Loss:")
+    print("     - Focal loss for classification (select best mode)")
+    print("     - L1 loss for regression (only on best mode)")
+    print("     - L1 loss for route prediction (optional)")
     print("=" * 60)
 
 

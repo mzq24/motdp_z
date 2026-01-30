@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Callable, Union
 from collections import defaultdict
 import numpy as np
+import pickle
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from model.transformer_for_diffusion_multi_head import TransformerForDiffusion
@@ -53,8 +54,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.bev_feature_dim = transfuser_cfg.get('bev_feature_dim', 1512)
         self.bev_feature_upsample_dim = transfuser_cfg.get('bev_feature_upsample_dim', 64)
 
-        vlm_feature_dim = 2560  # 隐藏层维度
-        self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
+        # ========== Load Anchor Centers from wp_tokens.pkl ==========
+        anchor_path = config.get('anchor_path', 'wp_tokens.pkl')
+        self.num_modes = config.get('num_modes', 32)  # Number of anchor modes
+        self._load_anchor_centers(anchor_path)
 
         obs_feature_dim = 256  
 
@@ -90,6 +93,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             transfuser_bev_dim=self.bev_feature_dim,
             transfuser_bev_upsample_dim=self.bev_feature_upsample_dim,
             num_waypoints=num_waypoints,  # Number of route waypoints
+            num_modes=self.num_modes,  # Number of anchor modes for multimodal prediction
         )
 
         self.model = model
@@ -113,6 +117,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Route prediction auxiliary loss weight (横向控制重要性)
         self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
         
+        # DiffusionDrive-style multimodal loss weights
+        self.cls_loss_weight = config.get('cls_loss_weight', 0.5)
+        self.reg_loss_weight = config.get('reg_loss_weight', 1.0)
+        
         # DDIMScheduler for variance computation (DiffusionDriveV2 style)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
@@ -125,6 +133,18 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.obs_feature_dim = obs_feature_dim
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
+
+    def _cumulate_trajectory(self, traj_deltas: torch.Tensor) -> torch.Tensor:
+        """
+        Convert per-step (dx, dy) deltas into absolute trajectory by cumulative sum.
+
+        Args:
+            traj_deltas: (..., T, 2) trajectory deltas
+
+        Returns:
+            (..., T, 2) cumulative trajectory
+        """
+        return torch.cumsum(traj_deltas, dim=-2)
     
     # ========== Normalization Functions ==========
     def norm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
@@ -159,7 +179,92 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         return torch.cat([odo_info_fut_x, odo_info_fut_y], dim=-1)
 
+    def _load_anchor_centers(self, anchor_path: str):
+        """
+        Load anchor centers from wp_tokens.pkl file.
+        
+        The file contains:
+        - centers: (num_modes, num_points, 2) - cluster centers as trajectories
+        - labels: (N,) - cluster labels for each sample  
+        - centers_flat: (num_modes, num_points*2) - flattened centers
+        """
+        if os.path.exists(anchor_path):
+            with open(anchor_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            centers = data['centers']  # (32, 5, 2)
+            self.anchor_num_points = centers.shape[1]  # 5 waypoints per anchor
+            
+            # Register as buffer (not trainable, but moves with model)
+            self.register_buffer('anchor_centers', torch.from_numpy(centers).float())
+            print(f"[DiffusionDiTCarlaPolicy] Loaded {self.num_modes} anchor centers from {anchor_path}")
+            print(f"  - Shape: {centers.shape} (num_modes, num_points, 2)")
+        else:
+            print(f"[Warning] Anchor file not found: {anchor_path}, using default initialization")
+            # Initialize with zeros - should be loaded later
+            self.anchor_num_points = 5
+            self.register_buffer('anchor_centers', torch.zeros(self.num_modes, self.anchor_num_points, 2))
     
+    def get_best_anchor_idx(self, trajectory: torch.Tensor) -> torch.Tensor:
+        """
+        Find the closest anchor center for each trajectory in the batch.
+        
+        Args:
+            trajectory: (B, T, 2) - ground truth trajectory
+            
+        Returns:
+            best_idx: (B,) - index of closest anchor for each sample
+        """
+        B = trajectory.shape[0]
+        T = trajectory.shape[1]
+        
+        # Sample trajectory at anchor waypoint positions
+        # anchor_centers: (num_modes, 5, 2), trajectory: (B, T, 2)
+        # We need to interpolate trajectory to match anchor's 5 points
+        if T != self.anchor_num_points:
+            # Linearly interpolate trajectory to anchor_num_points
+            indices = torch.linspace(0, T-1, self.anchor_num_points).long()
+            traj_sampled = trajectory[:, indices, :]  # (B, anchor_num_points, 2)
+        else:
+            traj_sampled = trajectory
+        
+        # Compute L2 distance between trajectory and each anchor
+        # traj_sampled: (B, 5, 2), anchor_centers: (32, 5, 2)
+        # Expand for broadcasting: (B, 1, 5, 2) - (1, 32, 5, 2) -> (B, 32, 5, 2)
+        traj_expanded = traj_sampled.unsqueeze(1)  # (B, 1, 5, 2)
+        anchor_expanded = self.anchor_centers.unsqueeze(0)  # (1, 32, 5, 2)
+        
+        # L2 distance per point, then mean over points
+        dist = torch.norm(traj_expanded - anchor_expanded, dim=-1)  # (B, 32, 5)
+        dist = dist.mean(dim=-1)  # (B, 32)
+        
+        # Find closest anchor
+        best_idx = torch.argmin(dist, dim=-1)  # (B,)
+        
+        return best_idx
+    
+    def get_anchor_for_sample(self, batch_size: int, device: torch.device, dtype: torch.dtype, 
+                               mode_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Get anchor trajectories for the batch, optionally using specific mode indices.
+        
+        Args:
+            batch_size: number of samples
+            device: target device
+            dtype: target dtype
+            mode_idx: (B,) optional - specific mode indices to use
+            
+        Returns:
+            anchors: (B, anchor_num_points, 2) - anchor trajectories
+        """
+        if mode_idx is not None:
+            # Use specified mode indices
+            anchors = self.anchor_centers[mode_idx]  # (B, 5, 2)
+        else:
+            # Use all modes (for inference - return all anchors)
+            anchors = self.anchor_centers.unsqueeze(0).expand(batch_size, -1, -1, -1)  # (B, 32, 5, 2)
+        
+        return anchors.to(device=device, dtype=dtype)
 
     def add_multiplicative_noise_scheduled(
         self, 
@@ -330,35 +435,37 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
+        DiffusionDrive-style multimodal loss computation.
+        
         batch: {
             # Transfuser features (single frame, no temporal)
-            # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
             'transfuser_bev_feature': (B, 1512, 8, 8) - BEV feature
             'transfuser_bev_feature_upsample': (B, 64, 64, 64) - Upscaled BEV feature
             
-            'agent_pos': (B, horizon, 2) - 未来轨迹点
+            'agent_pos': (B, horizon, 2) - 未来轨迹点 (GT trajectory)
             'ego_status': (B, obs_horizon, state_dim) - 车辆状态
-            'anchor': (B, horizon, 2) - anchor轨迹点（用于truncated diffusion）
             'route': (B, num_waypoints, 2) - 路线waypoints（可选，用于route预测辅助任务）
         }
+        
+        The model predicts:
+        - poses_reg: (B, num_modes, horizon, 2) - trajectory regression for each mode
+        - poses_cls: (B, num_modes) - classification scores for each mode
+        - route_pred: (B, num_waypoints, 2) - route prediction
+        
+        Loss:
+        - Classification loss: focal loss to select the best matching anchor
+        - Regression loss: L1 loss on the best matching mode's prediction
+        - Route loss: L1 loss on route prediction (optional)
         """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
 
         raw_agent_pos = batch['agent_pos'].to(device)
-
-        To = self.n_obs_steps
-        nactions = raw_agent_pos
-        batch_size = nactions.shape[0]
-        horizon = nactions.shape[1]
+        batch_size = raw_agent_pos.shape[0]
+        horizon = raw_agent_pos.shape[1]
         
         # Get ground truth trajectory
-        trajectory = nactions.to(dtype=model_dtype)  # (B, horizon, 2)
-        
-        # Get anchor trajectory for truncated diffusion
-        anchor = batch.get('anchor', None)
-        if anchor is not None:
-            anchor = anchor.to(device=device, dtype=model_dtype)  # (B, horizon, 2)
+        trajectory = raw_agent_pos.to(dtype=model_dtype)  # (B, horizon, 2)
         
         # Get route ground truth for auxiliary task
         route_gt = batch.get('route', None)
@@ -366,25 +473,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
         # Load transfuser features (single frame, no temporal)
-        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-
-        # Prepare reasoning tokens
-        reasoning_query_tokens = batch['reasoning_query_tokens']
-        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)
-        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
         
         # Get ego_status
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
-        # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
-        loss = self._compute_truncated_diffusion_loss(
+        # ========== Compute Multimodal Loss (DiffusionDrive style) ==========
+        loss = self._compute_multimodal_loss(
             trajectory=trajectory,
-            anchor=anchor,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
             route_gt=route_gt,
             device=device,
@@ -393,227 +492,186 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         return loss
     
-    def _compute_truncated_diffusion_loss(
+    def _compute_multimodal_loss(
         self,
         trajectory: torch.Tensor,
-        anchor: torch.Tensor,
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
-        reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         device: torch.device,
         model_dtype: torch.dtype,
         route_gt: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute loss using truncated diffusion (DiffusionDriveV2 style).
-        Instead of starting from pure noise, we start from anchor with multiplicative noise.
-        The model predicts the clean sample directly.
+        Compute DiffusionDrive-style multimodal loss.
         
-        Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
+        The model outputs predictions for all anchor modes, and we:
+        1. Find the best matching anchor based on GT trajectory
+        2. Compute focal loss for classification (select best mode)
+        3. Compute L1 loss for regression (only on best mode)
         
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory
-            anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
-            reasoning_query_tokens: (B, seq_len, dim) - reasoning tokens
             ego_status: (B, To, status_dim) - ego vehicle status
             device: torch device
             model_dtype: model dtype (e.g., bfloat16)
             route_gt: (B, num_waypoints, 2) - optional ground truth route for auxiliary loss
         """
         batch_size = trajectory.shape[0]
+        horizon = trajectory.shape[1]
         
-        # 1. Normalize trajectories using DiffusionDriveV2 style normalization
-        trajectory_norm = self.norm_odo(trajectory)  # (B, T, 2)
-        anchor_norm = self.norm_odo(anchor)  # (B, T, 2)
+        # ========== Forward pass with all anchor modes ==========
+        # Get all anchor centers: (num_modes, anchor_num_points, 2)
+        # We need to expand to batch: (B, num_modes, anchor_num_points, 2)
+        all_anchors = self.anchor_centers.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        all_anchors = all_anchors.to(device=device, dtype=model_dtype)
         
-        # 2. Sample random timesteps within truncated range (like DiffusionDrive training)
+        # Sample timestep (use small truncated timestep for training stability)
         timesteps = torch.randint(
-            0, self.train_trunc_timesteps,  # Training uses larger range [0, 50)
+            0, self.train_trunc_timesteps,
             (batch_size,), device=device
         ).long()
         
-        # 3. Add scheduler-based multiplicative noise to anchor (DiffusionDriveV2 style)
-        noisy_anchor = self.add_multiplicative_noise_scheduled_batch(
-            anchor_norm,
-            timesteps=timesteps,
-            eta=1.0,
-            std_min=0.04
-        )
-        
-        # 4. Clamp to valid range
-        noisy_anchor = torch.clamp(noisy_anchor, min=-1, max=1)
-        
-        # 5. Denormalize for model input (model expects denormalized coordinates)
-        noisy_trajectory_denorm = self.denorm_odo(noisy_anchor)
-        
-        # 6. Create dummy cond for API compatibility (not used in decoder-only)
-        cond = torch.zeros(batch_size, ego_status.shape[1], 256, device=device, dtype=model_dtype)
-        
-        # 7. Predict clean sample and route using decoder-only model
-        pred, route_pred = self.model(
-            sample=noisy_trajectory_denorm,
+        # Forward pass: predict for all modes
+        # poses_reg: (B, num_modes, horizon, 2), poses_cls: (B, num_modes), route_pred: (B, num_waypoints, 2)
+        poses_reg, poses_cls, route_pred = self.model(
+            anchors=all_anchors,  # (B, num_modes, anchor_num_points, 2)
             timestep=timesteps,
-            cond=cond,  # For API compatibility
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status
         )
+
+        # Model predicts per-step deltas; accumulate to absolute trajectory
+        poses_reg = self._cumulate_trajectory(poses_reg)
         
-        # 8. Compute trajectory loss - predict clean sample (not noise)
-        target = trajectory
+        # ========== Find best matching anchor ==========
+        # Compute distance between GT trajectory and each anchor
+        # trajectory: (B, horizon, 2), all_anchors: (B, num_modes, anchor_num_points, 2)
+        # Need to interpolate anchor to match trajectory horizon
+        if horizon != self.anchor_num_points:
+            # Interpolate anchors to trajectory horizon
+            # (B, num_modes, anchor_num_points, 2) -> (B, num_modes, horizon, 2)
+            # Reshape to 3D for linear interpolation: (B*num_modes, 2, anchor_num_points)
+            B_modes = batch_size * self.num_modes
+            anchors_3d = all_anchors.reshape(B_modes, self.anchor_num_points, 2).permute(0, 2, 1)  # (B*num_modes, 2, anchor_num_points)
+            anchors_interp_3d = F.interpolate(
+                anchors_3d,
+                size=horizon,
+                mode='linear',
+                align_corners=True
+            )  # (B*num_modes, 2, horizon)
+            anchors_interp = anchors_interp_3d.permute(0, 2, 1).reshape(batch_size, self.num_modes, horizon, 2)  # (B, num_modes, horizon, 2)
+        else:
+            anchors_interp = all_anchors
         
-        traj_loss = F.l1_loss(pred, target, reduction='none')
+        # Compute L2 distance: (B, num_modes)
+        traj_expanded = trajectory.unsqueeze(1)  # (B, 1, horizon, 2)
+        dist = torch.norm(traj_expanded - anchors_interp, dim=-1)  # (B, num_modes, horizon)
+        dist = dist.mean(dim=-1)  # (B, num_modes)
         
-        if traj_loss.shape[-1] > 2:
-            traj_loss = traj_loss[..., :2]
+        # Best mode index
+        mode_idx = torch.argmin(dist, dim=-1)  # (B,)
         
-        traj_loss = reduce(traj_loss, 'b ... -> b (...)', 'mean')
-        traj_loss = traj_loss.mean()
+        # ========== Classification Loss (Focal Loss) ==========
+        # Create one-hot target
+        target_onehot = torch.zeros(batch_size, self.num_modes, device=device, dtype=model_dtype)
+        target_onehot.scatter_(1, mode_idx.unsqueeze(1), 1)
         
-        # 9. Compute route loss (auxiliary task)
-        total_loss = traj_loss
-        if route_gt is not None:
-            route_loss = F.l1_loss(route_pred, route_gt, reduction='none')
-            route_loss = reduce(route_loss, 'b ... -> b (...)', 'mean')
-            route_loss = route_loss.mean()
-            
-            route_loss_weight = getattr(self, 'route_loss_weight', 0.1)
-            total_loss = traj_loss + route_loss_weight * route_loss
+        # Focal loss
+        loss_cls = self._focal_loss(poses_cls, target_onehot)
+        
+        # ========== Regression Loss (L1 on best mode) ==========
+        # Gather best mode predictions: (B, horizon, 2)
+        mode_idx_expanded = mode_idx.view(batch_size, 1, 1, 1).expand(-1, 1, horizon, 2)
+        best_reg = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
+        
+        # L1 loss
+        loss_reg = F.l1_loss(best_reg, trajectory, reduction='mean')
+        
+        # ========== Route Loss (Optional) ==========
+        total_loss = self.cls_loss_weight * loss_cls + self.reg_loss_weight * loss_reg
+        
+        if route_gt is not None and route_pred is not None:
+            route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+            total_loss = total_loss + self.route_loss_weight * route_loss
         
         return total_loss
+    
+    def _focal_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        gamma: float = 2.0,
+        alpha: float = 0.25
+    ) -> torch.Tensor:
+        """
+        Compute focal loss for classification.
+        
+        Args:
+            pred: (B, num_modes) - predicted logits
+            target: (B, num_modes) - one-hot target
+            gamma: focusing parameter
+            alpha: balancing parameter
+        """
+        pred_sigmoid = pred.sigmoid()
+        pt = (1 - pred_sigmoid) * target + pred_sigmoid * (1 - target)
+        focal_weight = (alpha * target + (1 - alpha) * (1 - target)) * pt.pow(gamma)
+        loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none') * focal_weight
+        return loss.mean()
 
     def conditional_sample(self, 
             transfuser_bev_feature: torch.Tensor,
             transfuser_bev_feature_upsample: torch.Tensor,
-            reasoning_query_tokens: torch.Tensor,
             ego_status: torch.Tensor,
-            anchor: torch.Tensor,
             device: torch.device,
             model_dtype: torch.dtype,
             generator=None,
             **kwargs
             ):
         """
-        Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
+        Generate trajectory samples using multimodal prediction.
         
         Args:
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
-            reasoning_query_tokens: (B, seq_len, 1536) - reasoning tokens
             ego_status: (B, To, status_dim) - ego status history
-            anchor: (B, T, 2) - anchor trajectory
             
         Returns:
             (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
         """
-        result = self._truncated_diffusion_sample(
-            anchor=anchor,
+        bs = transfuser_bev_feature.shape[0]
+        
+        # Get all anchor centers
+        all_anchors = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
+        all_anchors = all_anchors.to(device=device, dtype=model_dtype)
+        
+        # Use timestep 0 for inference (clean prediction)
+        timesteps = torch.zeros(bs, dtype=torch.long, device=device)
+        
+        # Forward pass: predict for all modes
+        poses_reg, poses_cls, route_pred = self.model(
+            anchors=all_anchors,
+            timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            reasoning_query_tokens=reasoning_query_tokens,
-            device=device,
-            model_dtype=model_dtype,
-            generator=generator
+            ego_status=ego_status
         )
 
-        return result
-    
-    def _truncated_diffusion_sample(
-        self,
-        anchor: torch.Tensor,
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        reasoning_query_tokens: torch.Tensor,
-        device: torch.device,
-        model_dtype: torch.dtype,
-        generator=None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Truncated diffusion sampling (DiffusionDriveV2 style with multiplicative noise).
-        Start from anchor with multiplicative noise, denoise for few steps.
+        # Model predicts per-step deltas; accumulate to absolute trajectory
+        poses_reg = self._cumulate_trajectory(poses_reg)
         
-        Key insight:
-        - The model predicts the CLEAN trajectory directly (not noise, not residual)
-        - Uses multiplicative noise with scheduler-based variance (timestep-dependent)
-        - Final output is the model's direct prediction
-            
-        Returns:
-            (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
-        """
-        bs = anchor.shape[0]
+        # Select best mode based on classification scores
+        best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
         
-        # Set up scheduler
-        self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device)
+        # Gather best mode trajectory
+        horizon = poses_reg.shape[2]
+        mode_idx_expanded = best_mode_idx.view(bs, 1, 1, 1).expand(-1, 1, horizon, 2)
+        best_trajectory = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
         
-        # Compute rollout timesteps
-        step_ratio = 20 / self.num_diffusion_steps
-        roll_timesteps = (np.arange(0, self.num_diffusion_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
-        
-        # Create dummy cond for API compatibility
-        cond = torch.zeros(bs, ego_status.shape[1], 256, device=device, dtype=model_dtype)
-        
-        # 1. Normalize anchor
-        diffusion_output = self.norm_odo(anchor)  # (B, T, 2)
-        
-        # 2. Add initial multiplicative noise using truncated timestep (scheduler-based)
-        diffusion_output = self.add_multiplicative_noise_scheduled(
-            diffusion_output, 
-            timestep=self.trunc_timesteps,
-            eta=1.0,
-            std_min=0.04
-        )
-        
-        # 3. Denoising loop
-        pred = None
-        route_pred = None
-        for i, k in enumerate(roll_timesteps):
-            # Clamp and denormalize
-            x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
-            noisy_traj_points = self.denorm_odo(x_boxes)  # (B, T, 2)
-            
-            # Get timestep
-            timesteps = k
-            if not torch.is_tensor(timesteps):
-                timesteps = torch.tensor([timesteps], dtype=torch.long, device=device)
-            elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-                timesteps = timesteps[None].to(device)
-            timesteps = timesteps.expand(bs)
-            
-            # Predict clean sample using decoder-only model
-            pred, route_pred = self.model(
-                sample=noisy_traj_points.to(dtype=model_dtype),
-                timestep=timesteps,
-                cond=cond,
-                transfuser_bev_feature=transfuser_bev_feature,
-                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                reasoning_query_tokens=reasoning_query_tokens,
-                ego_status=ego_status,
-            )
-            
-            # For next iteration, use the normalized prediction as input
-            x_start = self.norm_odo(pred)  # (B, T, 2)
-            
-            # Add noise for next iteration based on the next timestep
-            if i < len(roll_timesteps) - 1:
-                next_k = roll_timesteps[i + 1]
-                diffusion_output = self.add_multiplicative_noise_scheduled(
-                    x_start,
-                    timestep=next_k,
-                    eta=1.0,
-                    std_min=0.02
-                )
-            else:
-                diffusion_output = x_start
-        
-        # 4. Return the model's direct prediction
-        return pred, route_pred
+        return best_trajectory, route_pred
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
@@ -622,40 +680,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         value = next(iter(nobs.values()))
         B = value.shape[0]
-        T = self.horizon
         Da = self.action_dim
-        To = self.n_obs_steps
 
         # Load transfuser features (single frame, no temporal)
-        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-
-        # Process reasoning tokens
-        reasoning_query_tokens = nobs['reasoning_query_tokens']
-        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)
-        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
         
         # Get ego_status
         ego_status = nobs['ego_status']
         ego_status = ego_status.to(dtype=model_dtype)
         
-        # Get anchor for truncated diffusion
-        anchor = nobs.get('anchor', None)
-        if anchor is not None:
-            anchor = anchor.to(device=device, dtype=model_dtype)
-            if anchor.dim() == 2:
-                anchor = anchor.unsqueeze(0)
-            if anchor.shape[0] != B:
-                anchor = anchor.expand(B, -1, -1)
-        
-        # Generate samples using truncated diffusion
+        # Generate samples using multimodal prediction
         nsample, route_pred = self.conditional_sample(
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
-            anchor=anchor,
             device=device,
             model_dtype=model_dtype,
         )

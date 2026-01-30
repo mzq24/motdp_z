@@ -2,7 +2,7 @@ device:
   gpu_ids:
   - 0
 dataloader:
-  batch_size: 64
+  batch_size: 256
   num_workers: 8
   persistent_workers: true
   pin_memory: true
@@ -91,24 +91,31 @@ truncated_diffusion:
   norm_y_offset: 45.0
   norm_y_range: 88.0 #  Extended range: x=[-16.0, 76.0], y=[-45.0, 43.0]
   route_loss_weight: 0.6  # Route is equally important (lateral control) as waypoint (longitudinal control)
+
+# ========== Multimodal Anchor Configuration ==========
+anchor_path: /media/z/data/mzq/others/MoT-DP/wp_tokens.pkl  # Path to anchor centers file
+num_modes: 32  # Number of anchor modes (cluster centers)
+cls_loss_weight: 0.5  # Classification loss weight (focal loss)
+reg_loss_weight: 1.0  # Regression loss weight (L1 loss on best mode)
+
 training:
   num_epochs: 500
   max_grad_norm: 1.0
   warmup_epochs: 5
   use_lr_scheduler: true
-  dataset_path: /home/wang/Dataset/pdm_lite_mini/tmp_data
-  image_data_root: /home/wang/Dataset/pdm_lite_mini
+  dataset_path: /media/z/data/dataset/pdm_lite_mini
+  image_data_root: /media/z/data/dataset/pdm_lite_mini
   sample_interval: 1
   lr_final: 1e-7
   validation_freq: 5
   save_freq: 5
   early_stopping_patience: 10
-  checkpoint_dir: /home/wang/Project/MoT-DP/checkpoints/carla_dit_best
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit_best
 logging:
   use_wandb: true
   wandb_project: carla-diffusion-policy
   run_name: carla_dit_optimized
-  checkpoint_dir: /home/wang/Project/MoT-DP/checkpoints/carla_dit_best
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit_best
   save_every: 5
   log_freq: 50  # Log to wandb every 50 batches to reduce overhead
   wandb_entity: wangzhidong2000-nanyang-technological-university-singapore
