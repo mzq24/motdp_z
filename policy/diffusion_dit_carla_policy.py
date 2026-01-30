@@ -523,17 +523,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         batch_size = trajectory.shape[0]
         horizon = trajectory.shape[1]
         
-        # ========== Sample timestep and add noise to GT trajectory ==========
+        # ========== Normalize trajectory to [-1, 1] ==========
+        # Diffusion operates in normalized space for stable training
+        trajectory_normed = self.norm_odo(trajectory)  # (B, horizon, 2) in [-1, 1]
+        
+        # ========== Sample timestep and add noise to normalized GT trajectory ==========
         # Sample timestep (truncated for training stability, DiffusionDrive uses 0-50)
         timesteps = torch.randint(
             0, self.train_trunc_timesteps,
             (batch_size,), device=device
         ).long()
         
-        # Add multiplicative noise to GT trajectory (DiffusionDrive V2 style)
+        # Add multiplicative noise to normalized GT trajectory (DiffusionDrive V2 style)
         # This creates the "noisy" input that the model learns to denoise
         noisy_trajectory = self.add_multiplicative_noise_scheduled_batch(
-            trajectory, timesteps, eta=self.diffusion_eta
+            trajectory_normed, timesteps, eta=self.diffusion_eta
         )
         
         # ========== Prepare anchors ==========
@@ -582,9 +586,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             anchors_interp = all_anchors
         
-        # Compute L2 distance: (B, num_modes)
-        traj_expanded = trajectory.unsqueeze(1)  # (B, 1, horizon, 2)
-        dist = torch.norm(traj_expanded - anchors_interp, dim=-1)  # (B, num_modes, horizon)
+        # Compute L2 distance in normalized space: (B, num_modes)
+        # Use normalized trajectory for anchor matching
+        traj_expanded = trajectory_normed.unsqueeze(1)  # (B, 1, horizon, 2)
+        # Normalize anchors for fair comparison
+        anchors_interp_normed = self.norm_odo(anchors_interp)
+        dist = torch.norm(traj_expanded - anchors_interp_normed, dim=-1)  # (B, num_modes, horizon)
         dist = dist.mean(dim=-1)  # (B, num_modes)
         
         # Best mode index
@@ -598,13 +605,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Focal loss
         loss_cls = self._focal_loss(poses_cls, target_onehot)
         
-        # ========== Regression Loss (L1 on best mode) ==========
+        # ========== Regression Loss (L1 on best mode in normalized space) ==========
         # Gather best mode predictions: (B, horizon, 2)
         mode_idx_expanded = mode_idx.view(batch_size, 1, 1, 1).expand(-1, 1, horizon, 2)
         best_reg = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
         
-        # L1 loss
-        loss_reg = F.l1_loss(best_reg, trajectory, reduction='mean')
+        # L1 loss in normalized space (model outputs are in normalized space)
+        loss_reg = F.l1_loss(best_reg, trajectory_normed, reduction='mean')
         
         # ========== Route Loss (Optional) ==========
         total_loss = self.cls_loss_weight * loss_cls + self.reg_loss_weight * loss_reg
@@ -721,10 +728,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Select best mode based on classification scores
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
         
-        # Gather best mode trajectory
+        # Gather best mode trajectory (in normalized space)
         horizon = poses_reg.shape[2]
         mode_idx_expanded = best_mode_idx.view(bs, 1, 1, 1).expand(-1, 1, horizon, 2)
-        best_trajectory = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
+        best_trajectory_normed = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
+        
+        # Denormalize trajectory back to original scale (meters)
+        best_trajectory = self.denorm_odo(best_trajectory_normed)  # (B, horizon, 2)
         
         return best_trajectory, route_pred
 
