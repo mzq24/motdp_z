@@ -1,0 +1,153 @@
+
+dataloader:
+  batch_size: 128              # 增加批大小以减少epoch中的batch数
+  num_workers: 8               # 增加工作进程数以加速数据加载
+  persistent_workers: True     # 保持工作进程以避免启动/销毁开销
+  pin_memory: true             # 锁定内存以加速GPU传输
+  prefetch_factor: 2           # 预取因子，提前加载下个batch
+  shuffle: true
+
+# Horizon settings 
+obs_horizon: 8         
+pred_horizon: 20        
+action_horizon: 4      
+n_obs_steps: 8
+
+# EMA settings
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+# Optimizer settings
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9        
+  - 0.999
+  eps: 1.0e-08
+  lr: 5.0e-05  
+  weight_decay: 1.0e-05  # weight decay防止过拟合
+
+# Shape meta - CARLA数据集
+shape_meta:
+  action:
+    shape:
+    - 2           
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1  
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+
+# Action normalization settings
+enable_action_normalization: true  
+
+# BEV Encoder configuration
+bev_encoder:
+  pretrained_path: '/media/z/data/mzq/others/MoT-DP/checkpoints/interfuser/lidar_bev_encoder_only.pth'
+  state_dim: 9           # speed(1) + target_point(2) + command(6)
+  feature_dim: 256
+  use_group_norm: true
+  freeze_backbone: false
+  bev_input_size: [448, 448]
+
+# Policy configuration for DiT 
+policy:
+  input_dim: 2        # action_dim 
+  output_dim: 2       # action_dim  
+  horizon: 20         # 与action_horizon保持一致
+  n_obs_steps: 8      # obs_horizon
+  cond_dim: 256       # TCP模型j_ctrl特征维度
+  obs_as_global_cond: true
+  
+  # Transformer architecture 
+  n_layer: 8          
+  n_head: 8           
+  n_emb: 512          
+  p_drop_emb: 0.1    
+  p_drop_attn: 0.1   
+  
+  # Attention settings
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 4    
+  action_horizon: 4
+  num_inference_steps: 100  
+
+# Noise scheduler configuration 
+noise_scheduler:
+  num_diffusion_steps: 100    
+  beta_start: 0.0001
+  beta_end: 0.02
+  beta_schedule: "squaredcos_cap_v2"  
+  clip_sample: false
+  prediction_type: "epsilon" # 预测目标为噪声/目标动作
+
+# Training settings 
+training:
+  num_epochs: 300            
+  max_grad_norm: 1.0        
+  dataset_path: '/root/data/z_projects/b2d_8obs_20pred'
+  image_data_root: '/root/data/Bench2Drive-base/'  
+  sample_interval: 1         # 增加采样间隔以减少数据量
+  lr_final: 1e-7           
+  validation_freq: 3         # 每隔3个epoch进行一次评估
+  save_freq: 3               # 每隔3个epoch保存一次checkpoint
+  early_stopping_patience: 10  
+  checkpoint_dir: "/media/z/data/mzq/others/MoT-DP/checkpoints/b2d_8obs_20pred"
+  interfuser_ckpt_dir: "/media/z/data/mzq/others/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth"
+
+
+evaluation:
+  results_dir: "/media/z/data/mzq/others/MoT-DP/eval_results/b2d_8obs_20pred"
+
+# Logging - wandb配置
+logging:
+  use_wandb: true
+  wandb_project: "carla-diffusion-policy-b2d"
+  run_name: "carla_dit_optimized"
+  save_every: 5
+  log_freq: 10             
+
+# Evaluation settings 
+eval:
+  num_episodes: 10         
+  max_steps: 500          
+  success_threshold: 0.1   
+  eval_freq: 20            
+
+# Data augmentation 
+data_augmentation:
+  enable: true
+  image_noise_std: 0.02   
+  action_noise_std: 0.01 
+  random_crop: false      
+
+# Model optimization 
+model_optimization:
+  use_mixed_precision: true    # 使用混合精度训练
+  gradient_accumulation_steps: 2  # 梯度累积步数
+  warmup_steps: 500           # 学习率预热步数
+  lr_scheduler: "cosine"      # 余弦学习率调度

@@ -5,7 +5,7 @@
 # pkill -9 -f "train_carla_bev"
 
 # Select GPUs 0-7
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # Default values
 NUM_GPUS=${1:-8}  # Default to 8 GPUs (GPU 0-7)
