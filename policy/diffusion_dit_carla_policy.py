@@ -182,44 +182,59 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def _load_anchor_centers(self, anchor_path: str):
         """
         Load anchor centers from wp_tokens.pkl file.
-        
+
         The file contains:
         - centers: (num_modes, num_points, 2) - cluster centers as trajectories
-        - labels: (N,) - cluster labels for each sample  
+        - labels: (N,) - cluster labels for each sample
         - centers_flat: (num_modes, num_points*2) - flattened centers
+
+        We store two versions:
+        - anchor_centers: per-step deltas (for model input, cumsum to get trajectory)
+        - anchor_centers_abs: absolute coordinates (for anchor matching with GT)
         """
         if os.path.exists(anchor_path):
             with open(anchor_path, 'rb') as f:
                 data = pickle.load(f)
-            
-            centers = data['centers']  # (32, 5, 2)
+
+            centers = data['centers']  # (32, 5, 2) - absolute coordinates
             self.anchor_num_points = centers.shape[1]  # 5 waypoints per anchor
-            
-            # Register as buffer (not trainable, but moves with model)
-            self.register_buffer('anchor_centers', torch.from_numpy(centers).float())
+
+            # Convert to per-step deltas: delta[0] = pos[0], delta[i] = pos[i] - pos[i-1]
+            centers_tensor = torch.from_numpy(centers).float()
+            centers_delta = torch.zeros_like(centers_tensor)
+            centers_delta[:, 0, :] = centers_tensor[:, 0, :]  # First point is absolute
+            centers_delta[:, 1:, :] = centers_tensor[:, 1:, :] - centers_tensor[:, :-1, :]  # Subsequent are deltas
+
+            # Register as buffers (not trainable, but moves with model)
+            self.register_buffer('anchor_centers', centers_delta)  # Per-step deltas for model input
+            self.register_buffer('anchor_centers_abs', centers_tensor)  # Absolute coords for matching
+
             print(f"[DiffusionDiTCarlaPolicy] Loaded {self.num_modes} anchor centers from {anchor_path}")
             print(f"  - Shape: {centers.shape} (num_modes, num_points, 2)")
+            print(f"  - Converted to per-step deltas for model input")
         else:
             print(f"[Warning] Anchor file not found: {anchor_path}, using default initialization")
             # Initialize with zeros - should be loaded later
             self.anchor_num_points = 5
             self.register_buffer('anchor_centers', torch.zeros(self.num_modes, self.anchor_num_points, 2))
+            self.register_buffer('anchor_centers_abs', torch.zeros(self.num_modes, self.anchor_num_points, 2))
     
     def get_best_anchor_idx(self, trajectory: torch.Tensor) -> torch.Tensor:
         """
         Find the closest anchor center for each trajectory in the batch.
-        
+        Uses anchor_centers_abs (absolute coordinates) for distance computation.
+
         Args:
-            trajectory: (B, T, 2) - ground truth trajectory
-            
+            trajectory: (B, T, 2) - ground truth trajectory (absolute coordinates)
+
         Returns:
             best_idx: (B,) - index of closest anchor for each sample
         """
         B = trajectory.shape[0]
         T = trajectory.shape[1]
-        
+
         # Sample trajectory at anchor waypoint positions
-        # anchor_centers: (num_modes, 5, 2), trajectory: (B, T, 2)
+        # anchor_centers_abs: (num_modes, 5, 2), trajectory: (B, T, 2)
         # We need to interpolate trajectory to match anchor's 5 points
         if T != self.anchor_num_points:
             # Linearly interpolate trajectory to anchor_num_points
@@ -227,20 +242,20 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             traj_sampled = trajectory[:, indices, :]  # (B, anchor_num_points, 2)
         else:
             traj_sampled = trajectory
-        
-        # Compute L2 distance between trajectory and each anchor
-        # traj_sampled: (B, 5, 2), anchor_centers: (32, 5, 2)
+
+        # Compute L2 distance between trajectory and each anchor (use absolute coords)
+        # traj_sampled: (B, 5, 2), anchor_centers_abs: (32, 5, 2)
         # Expand for broadcasting: (B, 1, 5, 2) - (1, 32, 5, 2) -> (B, 32, 5, 2)
         traj_expanded = traj_sampled.unsqueeze(1)  # (B, 1, 5, 2)
-        anchor_expanded = self.anchor_centers.unsqueeze(0)  # (1, 32, 5, 2)
-        
+        anchor_expanded = self.anchor_centers_abs.unsqueeze(0)  # (1, 32, 5, 2)
+
         # L2 distance per point, then mean over points
         dist = torch.norm(traj_expanded - anchor_expanded, dim=-1)  # (B, 32, 5)
         dist = dist.mean(dim=-1)  # (B, 32)
-        
+
         # Find closest anchor
         best_idx = torch.argmin(dist, dim=-1)  # (B,)
-        
+
         return best_idx
     
     def get_anchor_for_sample(self, batch_size: int, device: torch.device, dtype: torch.dtype, 
@@ -503,14 +518,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         route_gt: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute DiffusionDrive-style multimodal loss with diffusion noise.
-        
-        Training flow (DiffusionDrive V2 style):
-        1. Add multiplicative noise to GT trajectory based on sampled timestep
-        2. Find best matching anchor for the clean GT trajectory
+        Compute DiffusionDrive-style multimodal loss with truncated diffusion.
+
+        Truncated Diffusion Training Flow:
+        1. Sample timestep from truncated range [0, train_trunc_timesteps)
+        2. Add multiplicative noise to ANCHOR trajectories (not GT!)
         3. Model predicts: denoised trajectory for each mode + classification logits
         4. Loss = focal_cls (select best mode) + L1_reg (only on best mode, compare with clean GT)
-        
+
+        Key insight: Unlike standard diffusion (start from white noise), truncated diffusion
+        starts from anchor + partial noise. Model learns to denoise anchor → clean trajectory.
+
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory (clean)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
@@ -522,41 +540,47 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         batch_size = trajectory.shape[0]
         horizon = trajectory.shape[1]
-        
+
         # ========== Normalize trajectory to [-1, 1] ==========
         # Diffusion operates in normalized space for stable training
         trajectory_normed = self.norm_odo(trajectory)  # (B, horizon, 2) in [-1, 1]
-        
-        # ========== Sample timestep and add noise to normalized GT trajectory ==========
-        # Sample timestep (truncated for training stability, DiffusionDrive uses 0-50)
+
+        # ========== Sample timestep ==========
+        # Truncated range [0, train_trunc_timesteps) instead of [0, 1000)
         timesteps = torch.randint(
             0, self.train_trunc_timesteps,
             (batch_size,), device=device
         ).long()
-        
-        # Add multiplicative noise to normalized GT trajectory (DiffusionDrive V2 style)
-        # This creates the "noisy" input that the model learns to denoise
-        noisy_trajectory = self.add_multiplicative_noise_scheduled_batch(
-            trajectory_normed, timesteps, eta=self.diffusion_eta
-        )
-        
-        # ========== Prepare anchors ==========
-        # Get all anchor centers: (num_modes, anchor_num_points, 2)
+
+        # ========== Prepare anchors and add noise ==========
+        # Get all anchor centers (per-step deltas): (num_modes, anchor_num_points, 2)
         # Expand to batch: (B, num_modes, anchor_num_points, 2)
         all_anchors = self.anchor_centers.unsqueeze(0).expand(batch_size, -1, -1, -1)
         all_anchors = all_anchors.to(device=device, dtype=model_dtype)
-        
-        # ========== Forward pass with noisy trajectory as condition ==========
-        # The model receives:
-        # - anchors: all anchor trajectories
-        # - timestep: noise level indicator
-        # - noisy_trajectory: passed implicitly through anchors (we can add explicit conditioning later)
-        # For now, the anchors serve as the starting point, and model predicts refinement
-        
-        # Forward pass: predict for all modes
+
+        # ========== Add noise to anchors (Truncated Diffusion) ==========
+        # Multiplicative noise: x * (1 + noise) is scale-invariant
+        # So we can directly add noise to deltas without cumsum
+        # (noise on delta ≡ noise on abs for multiplicative noise)
+        B, M, T_anchor, D = all_anchors.shape
+        anchors_flat = all_anchors.contiguous().view(B * M, T_anchor, D)  # (B*M, T_anchor, 2)
+
+        # Expand timesteps for all modes: (B,) -> (B*M,)
+        timesteps_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B * M)
+
+        # Add multiplicative noise directly to deltas
+        noisy_anchors_flat = self.add_multiplicative_noise_scheduled_batch(
+            anchors_flat, timesteps_expanded, eta=self.diffusion_eta
+        )  # (B*M, T_anchor, 2)
+
+        # Reshape back to (B, M, T_anchor, 2)
+        noisy_anchors_delta = noisy_anchors_flat.view(B, M, T_anchor, D)
+
+        # ========== Forward pass with noisy anchors ==========
+        # Model receives noisy anchors and learns to predict clean trajectory
         # poses_reg: (B, num_modes, horizon, 2), poses_cls: (B, num_modes), route_pred: (B, num_waypoints, 2)
         poses_reg, poses_cls, route_pred = self.model(
-            anchors=all_anchors,  # (B, num_modes, anchor_num_points, 2)
+            anchors=noisy_anchors_delta,  # Noisy anchors (per-step deltas)
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -567,33 +591,35 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         poses_reg = self._cumulate_trajectory(poses_reg)
         
         # ========== Find best matching anchor ==========
-        # Compute distance between GT trajectory and each anchor
-        # trajectory: (B, horizon, 2), all_anchors: (B, num_modes, anchor_num_points, 2)
+        # Use anchor_centers_abs (absolute coordinates) for distance computation
+        # trajectory: (B, horizon, 2), anchor_centers_abs: (num_modes, anchor_num_points, 2)
+        all_anchors_abs = self.anchor_centers_abs.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        all_anchors_abs = all_anchors_abs.to(device=device, dtype=model_dtype)
+
         # Need to interpolate anchor to match trajectory horizon
         if horizon != self.anchor_num_points:
             # Interpolate anchors to trajectory horizon
             # (B, num_modes, anchor_num_points, 2) -> (B, num_modes, horizon, 2)
-            # Reshape to 3D for linear interpolation: (B*num_modes, 2, anchor_num_points)
             B_modes = batch_size * self.num_modes
-            anchors_3d = all_anchors.reshape(B_modes, self.anchor_num_points, 2).permute(0, 2, 1)  # (B*num_modes, 2, anchor_num_points)
+            anchors_3d = all_anchors_abs.reshape(B_modes, self.anchor_num_points, 2).permute(0, 2, 1)
             anchors_interp_3d = F.interpolate(
                 anchors_3d,
                 size=horizon,
                 mode='linear',
                 align_corners=True
             )  # (B*num_modes, 2, horizon)
-            anchors_interp = anchors_interp_3d.permute(0, 2, 1).reshape(batch_size, self.num_modes, horizon, 2)  # (B, num_modes, horizon, 2)
+            anchors_interp_abs = anchors_interp_3d.permute(0, 2, 1).reshape(batch_size, self.num_modes, horizon, 2)
         else:
-            anchors_interp = all_anchors
-        
+            anchors_interp_abs = all_anchors_abs
+
         # Compute L2 distance in normalized space: (B, num_modes)
         # Use normalized trajectory for anchor matching
         traj_expanded = trajectory_normed.unsqueeze(1)  # (B, 1, horizon, 2)
         # Normalize anchors for fair comparison
-        anchors_interp_normed = self.norm_odo(anchors_interp)
+        anchors_interp_normed = self.norm_odo(anchors_interp_abs)
         dist = torch.norm(traj_expanded - anchors_interp_normed, dim=-1)  # (B, num_modes, horizon)
         dist = dist.mean(dim=-1)  # (B, num_modes)
-        
+
         # Best mode index
         mode_idx = torch.argmin(dist, dim=-1)  # (B,)
         
@@ -644,7 +670,41 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none') * focal_weight
         return loss.mean()
 
-    def conditional_sample(self, 
+    def _add_noise_to_anchors(
+        self,
+        anchors_delta: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Add multiplicative noise to anchor trajectories for truncated diffusion.
+
+        Multiplicative noise x * (1 + noise) is scale-invariant, so we can
+        directly add noise to deltas without cumsum (noise on delta ≡ noise on abs).
+
+        Args:
+            anchors_delta: (B, num_modes, anchor_num_points, 2) - anchor trajectories in delta form
+            timesteps: (B,) - timesteps for noise level
+
+        Returns:
+            noisy_anchors_delta: (B, num_modes, anchor_num_points, 2) - noisy anchors in delta form
+        """
+        B, M, T_anchor, D = anchors_delta.shape
+
+        # Flatten for noise addition: (B, M, T_anchor, 2) -> (B*M, T_anchor, 2)
+        anchors_flat = anchors_delta.contiguous().view(B * M, T_anchor, D)
+
+        # Expand timesteps for all modes: (B,) -> (B*M,)
+        timesteps_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B * M)
+
+        # Add multiplicative noise directly to deltas
+        noisy_anchors_flat = self.add_multiplicative_noise_scheduled_batch(
+            anchors_flat, timesteps_expanded, eta=self.diffusion_eta
+        )
+
+        # Reshape back
+        return noisy_anchors_flat.view(B, M, T_anchor, D)
+
+    def conditional_sample(self,
             transfuser_bev_feature: torch.Tensor,
             transfuser_bev_feature_upsample: torch.Tensor,
             ego_status: torch.Tensor,
@@ -656,64 +716,65 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             ):
         """
         Generate trajectory samples using multimodal prediction with truncated diffusion.
-        
-        DiffusionDrive V2 style inference:
-        1. Start from anchors with small noise (truncated timestep)
-        2. Optionally iterate denoising for num_denoise_steps
+
+        Truncated Diffusion Inference:
+        1. Start from anchors + noise (at truncated timestep, e.g., t=8)
+        2. Iteratively denoise: noisy_anchor → model → prediction → new anchor
         3. Select best mode based on classification scores
-        
+
         Args:
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
             ego_status: (B, To, status_dim) - ego status history
             num_denoise_steps: number of denoising iterations (default: self.num_diffusion_steps)
-            
+
         Returns:
             (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
         """
         bs = transfuser_bev_feature.shape[0]
-        
+
         if num_denoise_steps is None:
             num_denoise_steps = self.num_diffusion_steps
-        
-        # Get all anchor centers
+
+        # Get all anchor centers (per-step deltas)
         all_anchors = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
         all_anchors = all_anchors.to(device=device, dtype=model_dtype)
-        
+
         # ========== Truncated Diffusion Inference ==========
-        # Start from truncated timestep (small noise level)
+        # Start from truncated timestep (small noise level, e.g., t=8 instead of t=1000)
         current_timestep = self.trunc_timesteps
-        
-        # Store route_pred from last iteration
+
+        # Store outputs
         route_pred = None
         poses_reg = None
         poses_cls = None
-        
-        # Iterative denoising (DiffusionDrive V2 style)
+
+        # Iterative denoising
         for step in range(num_denoise_steps):
             # Current timestep for this denoising step
             timesteps = torch.full((bs,), current_timestep, dtype=torch.long, device=device)
-            
-            # Forward pass: predict for all modes
+
+            # Add noise to anchors at current timestep
+            noisy_anchors = self._add_noise_to_anchors(all_anchors, timesteps)
+
+            # Forward pass: model denoises noisy_anchors → predicted trajectory
             poses_reg, poses_cls, route_pred = self.model(
-                anchors=all_anchors,
+                anchors=noisy_anchors,
                 timestep=timesteps,
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                 ego_status=ego_status
             )
-            
+
             # Model predicts per-step deltas; accumulate to absolute trajectory
             poses_reg = self._cumulate_trajectory(poses_reg)
-            
+
             # Decrease timestep for next iteration
             step_ratio = self.trunc_timesteps // max(num_denoise_steps, 1)
             current_timestep = max(current_timestep - step_ratio, 0)
-            
-            # For multi-step denoising, the predicted trajectory becomes the new "anchor"
-            # This is optional - DiffusionDrive V2 often uses just 1-2 steps
+
+            # For multi-step denoising, predicted trajectory becomes new anchor
             if step < num_denoise_steps - 1 and num_denoise_steps > 1:
-                # Use predicted trajectory as new anchor for next iteration
                 # Interpolate back to anchor_num_points if needed
                 if poses_reg.shape[2] != self.anchor_num_points:
                     B_modes = bs * self.num_modes
@@ -721,9 +782,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     poses_interp = F.interpolate(
                         poses_3d, size=self.anchor_num_points, mode='linear', align_corners=True
                     ).permute(0, 2, 1).reshape(bs, self.num_modes, self.anchor_num_points, 2)
-                    all_anchors = poses_interp
+                    poses_abs = poses_interp
                 else:
-                    all_anchors = poses_reg
+                    poses_abs = poses_reg
+
+                # Convert absolute trajectory back to per-step deltas
+                poses_delta = torch.zeros_like(poses_abs)
+                poses_delta[:, :, 0, :] = poses_abs[:, :, 0, :]
+                poses_delta[:, :, 1:, :] = poses_abs[:, :, 1:, :] - poses_abs[:, :, :-1, :]
+                all_anchors = poses_delta
         
         # Select best mode based on classification scores
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
