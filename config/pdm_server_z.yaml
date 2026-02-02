@@ -93,7 +93,7 @@ truncated_diffusion:
   route_loss_weight: 0.6  # Route is equally important (lateral control) as waypoint (longitudinal control)
 
 # ========== Multimodal Anchor Configuration ==========
-anchor_path: /media/z/data/mzq/others/MoT-DP/wp_tokens.pkl  # Path to anchor centers file
+anchor_path: /root/z_projects/code/MoT-DP/wp_tokens.pkl  # Path to anchor centers file
 num_modes: 32  # Number of anchor modes (cluster centers)
 cls_loss_weight: 0.5  # Classification loss weight (focal loss)
 reg_loss_weight: 1.0  # Regression loss weight (L1 loss on best mode)
@@ -103,23 +103,23 @@ training:
   max_grad_norm: 1.0
   warmup_epochs: 5
   use_lr_scheduler: true
-  dataset_path: /media/z/data/dataset/pdm_lite_mini
-  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  dataset_path: /share-data/pdm_lite/tmp_data
+  image_data_root: /share-data/pdm_lite
   sample_interval: 1
   lr_final: 1e-7
   validation_freq: 5
   save_freq: 5
   early_stopping_patience: 10
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit_best
+  checkpoint_dir: /root/z_projects/code/MoT-DP/checkpoints/transfuser_dp
 logging:
   use_wandb: true
-  wandb_project: carla-diffusion-policy
-  run_name: carla_dit_optimized
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit_best
+  wandb_project: B2D_transfuser
+  run_name: transfuser_dp
+  checkpoint_dir: /root/z_projects/code/MoT-DP/checkpoints/transfuser_dp
   save_every: 5
   log_freq: 50  # Log to wandb every 50 batches to reduce overhead
-  wandb_entity: wangzhidong2000-nanyang-technological-university-singapore
-  wandb_api_key: a0d403cb4dc1be3c5c7df4677a1b42d1c3e71b4f
+  wandb_entity: m240117_z
+  wandb_api_key: bddb5a05a0820c1157702750c9f0ce60bcac2bba
 eval:
   num_episodes: 10
   max_steps: 500
