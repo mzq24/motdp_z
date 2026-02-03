@@ -565,12 +565,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         Truncated Diffusion Training Flow:
         1. Sample timestep from truncated range [0, train_trunc_timesteps)
-        2. Add multiplicative noise to ANCHOR trajectories (not GT!)
-        3. Model predicts: denoised trajectory for each mode + classification logits
-        4. Loss = focal_cls (select best mode) + L1_reg (only on best mode, compare with clean GT)
+        2. Normalize anchors, add multiplicative noise, then denormalize
+        3. Model predicts in ORIGINAL delta scale (not normalized!)
+        4. Loss = focal_cls (select best mode) + L1_reg (in original delta scale)
 
-        Key insight: Unlike standard diffusion (start from white noise), truncated diffusion
-        starts from anchor + partial noise. Model learns to denoise anchor → clean trajectory.
+        Key insight: Normalization is ONLY for noise addition (to ensure proper noise scale).
+        Model predicts and loss is computed in original delta scale to match route loss scale.
 
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory (clean)
@@ -584,10 +584,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         batch_size = trajectory.shape[0]
         horizon = trajectory.shape[1]
 
-        # ========== Convert GT trajectory to delta and normalize ==========
-        # Model predicts normalized delta, not absolute coords
-        trajectory_delta = self._traj_to_delta(trajectory)  # (B, horizon, 2) delta
-        trajectory_delta_normed = self.norm_delta(trajectory_delta)  # (B, horizon, 2) in [-1, 1]
+        # ========== Convert GT trajectory to delta (original scale, NOT normalized) ==========
+        # Model predicts in original delta scale for proper loss weighting
+        trajectory_delta = self._traj_to_delta(trajectory)  # (B, horizon, 2) delta in original scale
 
         # ========== Sample timestep ==========
         # Truncated range [0, train_trunc_timesteps) instead of [0, 1000)
@@ -597,11 +596,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         ).long()
 
         # ========== Prepare anchors (delta) and add noise ==========
-        # anchor_centers is already in delta form
+        # anchor_centers is already in delta form (original scale)
         all_anchors_delta = self.anchor_centers.unsqueeze(0).expand(batch_size, -1, -1, -1)
         all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)
 
-        # Normalize delta to [-1, 1]
+        # Normalize delta to [-1, 1] for noise addition only
         all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
 
         # ========== Add noise to normalized delta anchors (Truncated Diffusion) ==========
@@ -619,19 +618,23 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Reshape back to (B, M, T_anchor, 2)
         noisy_anchors_delta_normed = noisy_anchors_flat.view(B, M, T_anchor, D)
 
-        # ========== Forward pass with noisy delta anchors ==========
-        # Model receives noisy anchors (normalized delta) and predicts clean delta
-        # poses_reg: (B, num_modes, horizon, 2) - normalized delta
+        # ========== CRITICAL: Denormalize after noise addition ==========
+        # Model operates in original delta scale, not normalized space
+        noisy_anchors_delta = self.denorm_delta(noisy_anchors_delta_normed)  # (B, M, T_anchor, 2)
+
+        # ========== Forward pass with noisy delta anchors (original scale) ==========
+        # Model receives noisy anchors (original delta scale) and predicts clean delta
+        # poses_reg: (B, num_modes, horizon, 2) - original delta scale
         poses_reg, poses_cls, route_pred = self.model(
-            anchors=noisy_anchors_delta_normed,  # Noisy anchors (normalized delta)
+            anchors=noisy_anchors_delta,  # Noisy anchors (original delta scale)
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
             ego_status=ego_status
         )
 
-        # poses_reg is normalized delta (model output = residual + anchor, both in normalized delta space)
-        
+        # poses_reg is in original delta scale (model output = residual + anchor)
+
         # ========== Find best matching anchor (in absolute space) ==========
         # Use anchor_centers_abs (absolute coordinates) for distance computation
         # Ensure anchor_num_points == horizon (no interpolation for delta prediction)
@@ -659,21 +662,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Focal loss
         loss_cls = self._focal_loss(poses_cls, target_onehot)
 
-        # ========== Regression Loss (L1 on best mode in normalized delta space) ==========
+        # ========== Regression Loss (L1 on best mode in ORIGINAL delta scale) ==========
         # Gather best mode predictions: (B, horizon, 2)
         mode_idx_expanded = mode_idx.view(batch_size, 1, 1, 1).expand(-1, 1, horizon, 2)
         best_reg = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
 
-        # L1 loss in normalized delta space (model predicts normalized delta)
-        loss_reg = F.l1_loss(best_reg, trajectory_delta_normed, reduction='mean')
-        
+        # L1 loss in ORIGINAL delta scale (same scale as route loss)
+        loss_reg = F.l1_loss(best_reg, trajectory_delta, reduction='mean')
+
         # ========== Route Loss (Optional) ==========
         total_loss = self.cls_loss_weight * loss_cls + self.reg_loss_weight * loss_reg
-        
+
         if route_gt is not None and route_pred is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
             total_loss = total_loss + self.route_loss_weight * route_loss
-        
+
         return total_loss
     
     def _focal_loss(
@@ -744,8 +747,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         Truncated Diffusion Inference:
         1. Start from anchors + noise (at truncated timestep, e.g., t=8)
-        2. Iteratively denoise: noisy_anchor → model → prediction → new anchor
-        3. Select best mode based on classification scores
+        2. Normalize anchors, add noise, denormalize before passing to model
+        3. Model predicts in original delta scale
+        4. Select best mode based on classification scores
 
         Args:
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
@@ -761,12 +765,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if num_denoise_steps is None:
             num_denoise_steps = self.num_diffusion_steps
 
-        # Get all anchor centers (per-step deltas), normalize delta
+        # Get all anchor centers (per-step deltas) in original scale
         all_anchors_delta = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
-        all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)
-
-        # Normalize delta to [-1, 1]
-        all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
+        all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)  # (B, M, T_anchor, 2)
 
         # ========== Truncated Diffusion Inference ==========
         # Start from truncated timestep (small noise level, e.g., t=8 instead of t=1000)
@@ -782,39 +783,44 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             # Current timestep for this denoising step
             timesteps = torch.full((bs,), current_timestep, dtype=torch.long, device=device)
 
-            # Add noise to normalized delta anchors at current timestep
-            noisy_anchors = self._add_noise_to_anchors_normed(all_anchors_delta_normed, timesteps)
+            # Normalize delta for noise addition
+            all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
 
-            # Forward pass: model denoises noisy_anchors → predicted delta
+            # Add noise to normalized delta anchors at current timestep
+            noisy_anchors_normed = self._add_noise_to_anchors_normed(all_anchors_delta_normed, timesteps)
+
+            # Denormalize after noise addition - model operates in original scale
+            noisy_anchors_delta = self.denorm_delta(noisy_anchors_normed)  # (B, M, T_anchor, 2)
+
+            # Forward pass: model denoises noisy_anchors → predicted delta (original scale)
             poses_reg, poses_cls, route_pred = self.model(
-                anchors=noisy_anchors,  # Noisy anchors (normalized delta)
+                anchors=noisy_anchors_delta,  # Noisy anchors (original delta scale)
                 timestep=timesteps,
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                 ego_status=ego_status
             )
 
-            # poses_reg is normalized delta
+            # poses_reg is in original delta scale
 
             # Decrease timestep for next iteration
             step_ratio = self.trunc_timesteps // max(num_denoise_steps, 1)
             current_timestep = max(current_timestep - step_ratio, 0)
 
-            # For multi-step denoising, predicted delta becomes new anchor
+            # For multi-step denoising, predicted delta becomes new anchor (original scale)
             # (anchor_num_points == horizon is guaranteed, no interpolation needed)
             if step < num_denoise_steps - 1 and num_denoise_steps > 1:
-                all_anchors_delta_normed = poses_reg
+                all_anchors_delta = poses_reg
 
         # Select best mode based on classification scores
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
 
-        # Gather best mode trajectory (in normalized delta space)
+        # Gather best mode trajectory (in original delta scale)
         horizon = poses_reg.shape[2]
         mode_idx_expanded = best_mode_idx.view(bs, 1, 1, 1).expand(-1, 1, horizon, 2)
-        best_delta_normed = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
+        best_delta = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
 
-        # Denormalize delta, then cumsum to get absolute trajectory
-        best_delta = self.denorm_delta(best_delta_normed)  # (B, horizon, 2)
+        # Cumsum to get absolute trajectory (already in original scale, no denorm needed)
         best_trajectory = self._cumulate_trajectory(best_delta)  # (B, horizon, 2)
 
         return best_trajectory, route_pred
