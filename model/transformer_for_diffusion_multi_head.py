@@ -1614,19 +1614,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         poses_reg = traj_flat.view(B, num_modes, self.horizon, self.output_dim)  # (B, num_modes, horizon, 2)
         
         # Add anchor as residual (predict refinement)
-        # Interpolate anchor to match horizon if needed
-        if anchor_num_points != self.horizon:
-            # Interpolate: (B, num_modes, anchor_num_points, 2) -> (B, num_modes, horizon, 2)
-            anchors_interp = F.interpolate(
-                anchors.permute(0, 1, 3, 2).reshape(B * num_modes, 2, anchor_num_points),
-                size=self.horizon,
-                mode='linear',
-                align_corners=True
-            ).view(B, num_modes, 2, self.horizon).permute(0, 1, 3, 2)
-        else:
-            anchors_interp = anchors
-        
-        poses_reg = poses_reg + anchors_interp  # Residual prediction
+        # Anchor num_points must match horizon (no interpolation for delta prediction)
+        assert anchor_num_points == self.horizon, \
+            f"anchor_num_points ({anchor_num_points}) must equal horizon ({self.horizon}). " \
+            f"Interpolating deltas is incorrect - ensure config aligns these values."
+
+        poses_reg = poses_reg + anchors  # Residual prediction
         
         # 2. Classification: (B, num_modes, n_emb) -> (B, num_modes, 1) -> (B, num_modes)
         poses_cls = self.cls_head(mode_out).squeeze(-1)  # (B, num_modes)

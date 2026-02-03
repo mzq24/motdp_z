@@ -242,13 +242,18 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
         return {}
 
 @record  # Records error and tracebacks in case of failure
-def train_pdm_policy(config_path):
+def train_pdm_policy(config_path, resume_path=None, val_only=False):
     """
     Multi-GPU distributed training for PDM policy
-    
+
     Args:
         config_path: 配置文件路径
+        resume_path: checkpoint路径，用于恢复训练或只跑验证
+        val_only: 如果为True，只跑验证不训练（需要配合resume_path使用）
     """
+    if val_only and resume_path is None:
+        raise ValueError("--val_only requires --resume to specify a checkpoint")
+
     torch.cuda.empty_cache()
     
     print("Initializing pdm driving policy training...")
@@ -418,7 +423,20 @@ def train_pdm_policy(config_path):
     if rank == 0:
         print("Initializing policy model...")
     policy = DiffusionDiTCarlaPolicy(config).to(device)
-    
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if resume_path is not None:
+        if rank == 0:
+            print(f"Loading checkpoint from {resume_path}...")
+        checkpoint = torch.load(resume_path, map_location=device)
+        policy.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        if rank == 0:
+            print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            if 'val_metrics' in checkpoint:
+                print(f"  Previous val_metrics: {checkpoint['val_metrics']}")
+
     # Wrap model with DistributedDataParallel for multi-GPU training
     if world_size > 1:
         policy = torch.nn.parallel.DistributedDataParallel(
@@ -500,9 +518,33 @@ def train_pdm_policy(config_path):
     best_val_loss = float('inf')
     best_l2_avg = float('inf')  # Use average L2 error as best metric
     val_loss = None  # 初始化验证损失
-    val_metrics = {}  # 初始化验证指标  
-    
-    for epoch in range(num_epochs):
+    val_metrics = {}  # 初始化验证指标
+
+    # ========== Val Only Mode ==========
+    if val_only:
+        if rank == 0:
+            print("=" * 60)
+            print("Running validation only (--val_only mode)")
+            print("=" * 60)
+        try:
+            val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size)
+            if rank == 0:
+                print(f"\n✓ Validation completed")
+                print(f"Validation metrics: (total {len(val_metrics)} metrics)")
+                for key, value in val_metrics.items():
+                    print(f"  {key}: {value:.4f}")
+        except Exception as e:
+            if rank == 0:
+                print(f"✗ Error during validation: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Clean up and exit
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
+        return
+
+    for epoch in range(start_epoch, num_epochs):
         # Update the seed depending on the epoch for distributed sampler
         if world_size > 1:
             sampler_train.set_epoch(epoch)
@@ -731,7 +773,11 @@ def train_pdm_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
-    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml", 
+    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml",
                         help='Path to the configuration YAML file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--val_only', action='store_true',
+                        help='Only run validation (requires --resume)')
     args = parser.parse_args()
-    train_pdm_policy(config_path=args.config_path)
+    train_pdm_policy(config_path=args.config_path, resume_path=args.resume, val_only=args.val_only)

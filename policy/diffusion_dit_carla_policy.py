@@ -634,30 +634,18 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         # ========== Find best matching anchor (in absolute space) ==========
         # Use anchor_centers_abs (absolute coordinates) for distance computation
-        # trajectory: (B, horizon, 2), anchor_centers_abs: (num_modes, anchor_num_points, 2)
+        # Ensure anchor_num_points == horizon (no interpolation for delta prediction)
+        assert horizon == self.anchor_num_points, \
+            f"horizon ({horizon}) must equal anchor_num_points ({self.anchor_num_points}). " \
+            f"Interpolating deltas is incorrect - ensure config aligns these values."
+
         all_anchors_abs = self.anchor_centers_abs.unsqueeze(0).expand(batch_size, -1, -1, -1)
         all_anchors_abs = all_anchors_abs.to(device=device, dtype=model_dtype)
-
-        # Need to interpolate anchor to match trajectory horizon
-        if horizon != self.anchor_num_points:
-            # Interpolate anchors to trajectory horizon
-            # (B, num_modes, anchor_num_points, 2) -> (B, num_modes, horizon, 2)
-            B_modes = batch_size * self.num_modes
-            anchors_3d = all_anchors_abs.reshape(B_modes, self.anchor_num_points, 2).permute(0, 2, 1)
-            anchors_interp_3d = F.interpolate(
-                anchors_3d,
-                size=horizon,
-                mode='linear',
-                align_corners=True
-            )  # (B*num_modes, 2, horizon)
-            anchors_interp_abs = anchors_interp_3d.permute(0, 2, 1).reshape(batch_size, self.num_modes, horizon, 2)
-        else:
-            anchors_interp_abs = all_anchors_abs
 
         # Compute L2 distance in absolute space: (B, num_modes)
         # Use absolute trajectory for anchor matching (more intuitive)
         traj_expanded = trajectory.unsqueeze(1)  # (B, 1, horizon, 2)
-        dist = torch.norm(traj_expanded - anchors_interp_abs, dim=-1)  # (B, num_modes, horizon)
+        dist = torch.norm(traj_expanded - all_anchors_abs, dim=-1)  # (B, num_modes, horizon)
         dist = dist.mean(dim=-1)  # (B, num_modes)
 
         # Best mode index
@@ -813,17 +801,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             current_timestep = max(current_timestep - step_ratio, 0)
 
             # For multi-step denoising, predicted delta becomes new anchor
+            # (anchor_num_points == horizon is guaranteed, no interpolation needed)
             if step < num_denoise_steps - 1 and num_denoise_steps > 1:
-                # Interpolate back to anchor_num_points if needed (already in normalized delta space)
-                if poses_reg.shape[2] != self.anchor_num_points:
-                    B_modes = bs * self.num_modes
-                    poses_3d = poses_reg.reshape(B_modes, poses_reg.shape[2], 2).permute(0, 2, 1)
-                    poses_interp = F.interpolate(
-                        poses_3d, size=self.anchor_num_points, mode='linear', align_corners=True
-                    ).permute(0, 2, 1).reshape(bs, self.num_modes, self.anchor_num_points, 2)
-                    all_anchors_delta_normed = poses_interp
-                else:
-                    all_anchors_delta_normed = poses_reg
+                all_anchors_delta_normed = poses_reg
 
         # Select best mode based on classification scores
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)

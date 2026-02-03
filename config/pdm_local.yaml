@@ -118,8 +118,8 @@ logging:
   checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit_best
   save_every: 5
   log_freq: 50  # Log to wandb every 50 batches to reduce overhead
-  wandb_entity: wangzhidong2000-nanyang-technological-university-singapore
-  wandb_api_key: a0d403cb4dc1be3c5c7df4677a1b42d1c3e71b4f
+  wandb_entity: m240117_z
+  wandb_api_key: bddb5a05a0820c1157702750c9f0ce60bcac2bba
 eval:
   num_episodes: 10
   max_steps: 500
