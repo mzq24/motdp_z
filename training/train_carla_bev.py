@@ -168,8 +168,13 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                     if isinstance(batch[key], torch.Tensor):
                         batch[key] = batch[key].to(device)
 
-                loss = model_for_inference.compute_loss(batch)
+                loss_dict = model_for_inference.compute_loss(batch)
+                loss = loss_dict['total_loss']
                 val_metrics['loss'].append(loss.item())
+                # Track individual losses
+                val_metrics['cls_loss'].append(loss_dict['cls_loss'].item())
+                val_metrics['reg_loss'].append(loss_dict['reg_loss'].item())
+                val_metrics['route_loss'].append(loss_dict['route_loss'].item())
                 
                 # Multimodal model: only needs bev_feature, bev_feature_upsample, ego_status
                 # No more reasoning_query_tokens or anchor needed (anchor is loaded from wp_tokens.pkl)
@@ -565,19 +570,21 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             # IMPORTANT: zero_grad BEFORE forward pass, not after
             # This is the standard PyTorch training pattern
             optimizer.zero_grad()
-            
+
             # Call policy(batch) which invokes forward() method
             # DDP only synchronizes gradients when forward() is called
             # This ensures proper gradient synchronization across all GPUs
-            loss = policy(batch)
-            
+            # return_loss_dict=True to get individual losses for logging
+            loss_dict = policy(batch, return_loss_dict=True)
+            loss = loss_dict['total_loss']
+
             # Check for NaN/Inf loss to prevent gradient explosion
             if torch.isnan(loss) or torch.isinf(loss):
                 if rank == 0:
                     print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, skipping this batch")
                 optimizer.zero_grad()
                 continue
-            
+
             loss.backward()
             
             # Gradient clipping for training stability (CRITICAL for multi-GPU training)
@@ -605,25 +612,35 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             if rank == 0:
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{np.mean(train_losses):.4f}',
-                    'grad_norm': f'{grad_norm_value:.4f}',
-                    'clipped': '✂' if was_clipped else ''
+                    'cls': f'{loss_dict["cls_loss"].item():.3f}',
+                    'reg': f'{loss_dict["reg_loss"].item():.3f}',
+                    'route': f'{loss_dict["route_loss"].item():.3f}',
+                    'grad': f'{grad_norm_value:.2f}{"✂" if was_clipped else ""}'
                 })
             
             # Log to wandb less frequently to reduce overhead
             log_freq = config.get('logging', {}).get('log_freq', 50)
             if batch_idx % log_freq == 0 and rank == 0:
                 step = epoch * len(train_loader) + batch_idx
-                safe_wandb_log({
+                log_data = {
                     "train/loss_step": loss.item(),
-                    "train/epoch":  epoch ,
+                    "train/epoch":  epoch,
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx,
                     "train/grad_norm_before_clip": grad_norm_value,
                     "train/grad_norm_clipped": min(grad_norm_value, max_grad_norm),
-                    "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0
-                }, use_wandb)
+                    "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0,
+                    # Individual losses (unweighted)
+                    "train/cls_loss": loss_dict['cls_loss'].item(),
+                    "train/reg_loss": loss_dict['reg_loss'].item(),
+                    "train/route_loss": loss_dict['route_loss'].item(),
+                    # Weighted losses (for debugging loss scale)
+                    "train/cls_loss_weighted": loss_dict['cls_loss_weighted'].item(),
+                    "train/reg_loss_weighted": loss_dict['reg_loss_weighted'].item(),
+                    "train/route_loss_weighted": loss_dict['route_loss_weighted'].item(),
+                }
+                safe_wandb_log(log_data, use_wandb)
         
         if rank == 0:
             pbar.close() 

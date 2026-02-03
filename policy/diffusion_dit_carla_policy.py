@@ -482,14 +482,26 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         return noisy_sample
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], return_loss_dict: bool = False):
         """
         Forward method for DDP compatibility.
         DDP only synchronizes gradients when forward() is called, not for other methods.
         This method simply calls compute_loss() to enable proper gradient synchronization
         in distributed training.
+
+        Args:
+            batch: input batch dict
+            return_loss_dict: if True, return dict with all losses; if False, return total_loss only
+
+        Returns:
+            If return_loss_dict=False: total_loss tensor (for backward)
+            If return_loss_dict=True: dict with total_loss, cls_loss, reg_loss, route_loss, etc.
         """
-        return self.compute_loss(batch)
+        loss_dict = self.compute_loss(batch)
+        if return_loss_dict:
+            return loss_dict
+        else:
+            return loss_dict['total_loss']
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -538,7 +550,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
         # ========== Compute Multimodal Loss (DiffusionDrive style) ==========
-        loss = self._compute_multimodal_loss(
+        loss_dict = self._compute_multimodal_loss(
             trajectory=trajectory,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -547,8 +559,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             device=device,
             model_dtype=model_dtype
         )
-        
-        return loss
+
+        return loss_dict
     
     def _compute_multimodal_loss(
         self,
@@ -673,11 +685,24 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # ========== Route Loss (Optional) ==========
         total_loss = self.cls_loss_weight * loss_cls + self.reg_loss_weight * loss_reg
 
+        route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if route_gt is not None and route_pred is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
             total_loss = total_loss + self.route_loss_weight * route_loss
 
-        return total_loss
+        # Return dict with all losses for logging
+        loss_dict = {
+            'total_loss': total_loss,
+            'cls_loss': loss_cls,
+            'reg_loss': loss_reg,
+            'route_loss': route_loss,
+            # Weighted losses (for debugging loss scale)
+            'cls_loss_weighted': self.cls_loss_weight * loss_cls,
+            'reg_loss_weighted': self.reg_loss_weight * loss_reg,
+            'route_loss_weighted': self.route_loss_weight * route_loss,
+        }
+
+        return loss_dict
     
     def _focal_loss(
         self,
