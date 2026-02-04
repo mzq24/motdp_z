@@ -765,77 +765,63 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             model_dtype: torch.dtype,
             generator=None,
             num_denoise_steps: Optional[int] = None,
+            no_noise: bool = False,
             **kwargs
             ):
         """
         Generate trajectory samples using multimodal prediction with truncated diffusion.
 
-        Truncated Diffusion Inference:
+        Truncated Diffusion Inference (Single-step, matching training):
         1. Start from anchors + noise (at truncated timestep, e.g., t=8)
-        2. Normalize anchors, add noise, denormalize before passing to model
-        3. Model predicts in original delta scale
-        4. Select best mode based on classification scores
+        2. Model directly predicts clean delta in one step
+        3. Select best mode based on classification scores
+
+        Note: Multi-step denoising with multiplicative noise is complex.
+        For simplicity, we use single-step inference which matches the training objective.
 
         Args:
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
             ego_status: (B, To, status_dim) - ego status history
-            num_denoise_steps: number of denoising iterations (default: self.num_diffusion_steps)
+            num_denoise_steps: ignored, always use single-step for multiplicative noise
+            no_noise: if True, skip noise addition (for debugging model capability)
 
         Returns:
             (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
         """
         bs = transfuser_bev_feature.shape[0]
 
-        if num_denoise_steps is None:
-            num_denoise_steps = self.num_diffusion_steps
-
         # Get all anchor centers (per-step deltas) in original scale
         all_anchors_delta = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
         all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)  # (B, M, T_anchor, 2)
 
-        # ========== Truncated Diffusion Inference ==========
-        # Start from truncated timestep (small noise level, e.g., t=8 instead of t=1000)
-        current_timestep = self.trunc_timesteps
+        # ========== Single-step Truncated Diffusion Inference ==========
+        # Use truncated timestep (small noise level, e.g., t=8)
+        timesteps = torch.full((bs,), self.trunc_timesteps, dtype=torch.long, device=device)
 
-        # Store outputs
-        route_pred = None
-        poses_reg = None
-        poses_cls = None
-
-        # Iterative denoising
-        for step in range(num_denoise_steps):
-            # Current timestep for this denoising step
-            timesteps = torch.full((bs,), current_timestep, dtype=torch.long, device=device)
-
+        if no_noise:
+            # Debug mode: no noise, just use clean anchors
+            noisy_anchors_delta = all_anchors_delta
+        else:
             # Normalize delta for noise addition
             all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
 
-            # Add noise to normalized delta anchors at current timestep
+            # Add noise to normalized delta anchors (only once!)
             noisy_anchors_normed = self._add_noise_to_anchors_normed(all_anchors_delta_normed, timesteps)
 
             # Denormalize after noise addition - model operates in original scale
             noisy_anchors_delta = self.denorm_delta(noisy_anchors_normed)  # (B, M, T_anchor, 2)
 
-            # Forward pass: model denoises noisy_anchors → predicted delta (original scale)
-            poses_reg, poses_cls, route_pred = self.model(
-                anchors=noisy_anchors_delta,  # Noisy anchors (original delta scale)
-                timestep=timesteps,
-                transfuser_bev_feature=transfuser_bev_feature,
-                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                ego_status=ego_status
-            )
+        # Forward pass: model directly predicts clean delta (original scale)
+        poses_reg, poses_cls, route_pred = self.model(
+            anchors=noisy_anchors_delta,  # Noisy anchors (original delta scale)
+            timestep=timesteps,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status
+        )
 
-            # poses_reg is in original delta scale
-
-            # Decrease timestep for next iteration
-            step_ratio = self.trunc_timesteps // max(num_denoise_steps, 1)
-            current_timestep = max(current_timestep - step_ratio, 0)
-
-            # For multi-step denoising, predicted delta becomes new anchor (original scale)
-            # (anchor_num_points == horizon is guaranteed, no interpolation needed)
-            if step < num_denoise_steps - 1 and num_denoise_steps > 1:
-                all_anchors_delta = poses_reg
+        # poses_reg is in original delta scale (B, num_modes, horizon, 2)
 
         # Select best mode based on classification scores
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
@@ -850,7 +836,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         return best_trajectory, route_pred
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], no_noise: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        Predict action from observation.
+
+        Args:
+            obs_dict: observation dictionary
+            no_noise: if True, skip noise addition in inference (for debugging)
+
+        Returns:
+            dict with 'action', 'action_pred', 'route_pred'
+        """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
@@ -862,15 +858,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Load transfuser features (single frame, no temporal)
         transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        
+
         # Get ego_status
         ego_status = nobs['ego_status']
         ego_status = ego_status.to(dtype=model_dtype)
-        
+
         # Generate samples using multimodal prediction
         nsample, route_pred = self.conditional_sample(
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            no_noise=no_noise,
             ego_status=ego_status,
             device=device,
             model_dtype=model_dtype,
