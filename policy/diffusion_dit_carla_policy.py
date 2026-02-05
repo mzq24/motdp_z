@@ -575,14 +575,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         Compute DiffusionDrive-style multimodal loss with truncated diffusion.
 
-        Truncated Diffusion Training Flow:
+        Truncated Diffusion Training Flow (DDIM additive noise):
         1. Sample timestep from truncated range [0, train_trunc_timesteps)
-        2. Normalize anchors, add multiplicative noise, then denormalize
+        2. Normalize anchors, add DDIM additive noise (scheduler.add_noise), then denormalize
         3. Model predicts in ORIGINAL delta scale (not normalized!)
         4. Loss = focal_cls (select best mode) + L1_reg (in original delta scale)
 
         Key insight: Normalization is ONLY for noise addition (to ensure proper noise scale).
         Model predicts and loss is computed in original delta scale to match route loss scale.
+        DDIM additive noise enables multi-step denoising at inference via scheduler.step().
 
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory (clean)
@@ -615,16 +616,20 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Normalize delta to [-1, 1] for noise addition only
         all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
 
-        # ========== Add noise to normalized delta anchors (Truncated Diffusion) ==========
+        # ========== Add DDIM additive noise to normalized delta anchors ==========
+        # DDIM forward: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
         B, M, T_anchor, D = all_anchors_delta_normed.shape
         anchors_flat = all_anchors_delta_normed.contiguous().view(B * M, T_anchor, D)
 
         # Expand timesteps for all modes: (B,) -> (B*M,)
         timesteps_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B * M)
 
-        # Add multiplicative noise to normalized delta
-        noisy_anchors_flat = self.add_multiplicative_noise_scheduled_batch(
-            anchors_flat, timesteps_expanded, eta=self.diffusion_eta
+        # DDIM additive Gaussian noise (matching DiffusionDriveV2)
+        noise = torch.randn_like(anchors_flat)
+        noisy_anchors_flat = self.diffusion_scheduler.add_noise(
+            original_samples=anchors_flat,
+            noise=noise,
+            timesteps=timesteps_expanded
         )
 
         # Reshape back to (B, M, T_anchor, 2)
@@ -769,70 +774,124 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             **kwargs
             ):
         """
-        Generate trajectory samples using multimodal prediction with truncated diffusion.
+        Generate trajectory samples using DDIM multi-step denoising (DiffusionDriveV2 style).
 
-        Truncated Diffusion Inference (Single-step, matching training):
-        1. Start from anchors + noise (at truncated timestep, e.g., t=8)
-        2. Model directly predicts clean delta in one step
-        3. Select best mode based on classification scores
-
-        Note: Multi-step denoising with multiplicative noise is complex.
-        For simplicity, we use single-step inference which matches the training objective.
+        DDIM Multi-step Inference:
+        1. Normalize anchors to [-1, 1]
+        2. Add DDIM additive noise at truncated timestep (e.g., t=8)
+        3. Multi-step DDIM denoising loop:
+           a. Clamp & denormalize → original delta scale (model input)
+           b. Model predicts clean delta (original scale)
+           c. Normalize prediction → [-1, 1]
+           d. scheduler.step(eta=0) → deterministic DDIM update → x_{t-1}
+        4. Final denormalization → original delta scale
+        5. Select best mode via cls scores, cumsum → absolute trajectory
 
         Args:
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
             ego_status: (B, To, status_dim) - ego status history
-            num_denoise_steps: ignored, always use single-step for multiplicative noise
+            num_denoise_steps: number of DDIM denoising steps (default: self.num_diffusion_steps)
             no_noise: if True, skip noise addition (for debugging model capability)
 
         Returns:
             (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
         """
         bs = transfuser_bev_feature.shape[0]
+        num_steps = num_denoise_steps or self.num_diffusion_steps
 
         # Get all anchor centers (per-step deltas) in original scale
         all_anchors_delta = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
-        all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)  # (B, M, T_anchor, 2)
-
-        # ========== Single-step Truncated Diffusion Inference ==========
-        # Use truncated timestep (small noise level, e.g., t=8)
-        timesteps = torch.full((bs,), self.trunc_timesteps, dtype=torch.long, device=device)
+        all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)  # (B, M, T, 2)
 
         if no_noise:
-            # Debug mode: no noise, just use clean anchors
-            noisy_anchors_delta = all_anchors_delta
+            # Debug mode: single forward pass with clean anchors, no denoising loop
+            timesteps = torch.zeros((bs,), dtype=torch.long, device=device)
+            poses_reg, poses_cls, route_pred = self.model(
+                anchors=all_anchors_delta,
+                timestep=timesteps,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status
+            )
+            final_delta = poses_reg  # (B, M, T, 2) in original delta scale
         else:
-            # Normalize delta for noise addition
-            all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
+            # ========== DDIM Multi-step Denoising ==========
+            # Normalize delta to [-1, 1] for diffusion operations
+            all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T, 2)
 
-            # Add noise to normalized delta anchors (only once!)
-            noisy_anchors_normed = self._add_noise_to_anchors_normed(all_anchors_delta_normed, timesteps)
+            # Setup DDIM scheduler (step_size = 1 for fine-grained control)
+            self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device=device)
 
-            # Denormalize after noise addition - model operates in original scale
-            noisy_anchors_delta = self.denorm_delta(noisy_anchors_normed)  # (B, M, T_anchor, 2)
+            # Add DDIM additive noise at truncated timestep
+            noise = torch.randn_like(all_anchors_delta_normed)
+            trunc_ts = torch.full((bs,), self.trunc_timesteps, dtype=torch.long, device=device)
+            noisy_delta_normed = self.diffusion_scheduler.add_noise(
+                original_samples=all_anchors_delta_normed,
+                noise=noise,
+                timesteps=trunc_ts
+            )
 
-        # Forward pass: model directly predicts clean delta (original scale)
-        poses_reg, poses_cls, route_pred = self.model(
-            anchors=noisy_anchors_delta,  # Noisy anchors (original delta scale)
-            timestep=timesteps,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status
-        )
+            # Compute denoising timestep schedule (from trunc_timesteps down to 0)
+            # Following DiffusionDriveV2 pattern: evenly spaced timesteps
+            if num_steps == 1:
+                roll_timesteps = np.array([self.trunc_timesteps])
+            else:
+                roll_timesteps = np.linspace(
+                    self.trunc_timesteps, 0, num_steps
+                ).round().astype(np.int64)
 
-        # poses_reg is in original delta scale (B, num_modes, horizon, 2)
+            # DDIM denoising loop
+            route_pred = None
+            poses_cls = None
+            for i, t in enumerate(roll_timesteps):
+                t_int = int(t)
+                t_tensor = torch.full((bs,), t_int, dtype=torch.long, device=device)
 
-        # Select best mode based on classification scores
+                # Clamp to [-1, 1] and denormalize → original delta scale for model
+                noisy_delta_clamped = torch.clamp(noisy_delta_normed, min=-1, max=1)
+                noisy_anchors_delta = self.denorm_delta(noisy_delta_clamped)  # (B, M, T, 2)
+
+                # Model forward: predicts clean delta (original scale)
+                poses_reg, poses_cls, route_pred = self.model(
+                    anchors=noisy_anchors_delta,
+                    timestep=t_tensor,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    ego_status=ego_status
+                )
+                # poses_reg: (B, M, T, 2) in original delta scale
+
+                # Normalize model prediction to [-1, 1] for DDIM step
+                pred_normed = self.norm_delta(poses_reg)  # (B, M, T, 2)
+
+                # DDIM step: x_t → x_{t-1} (deterministic with eta=0)
+                B_c, M_c, T_c, D_c = noisy_delta_normed.shape
+                noisy_flat = noisy_delta_normed.view(B_c * M_c, T_c, D_c)
+                pred_flat = pred_normed.view(B_c * M_c, T_c, D_c)
+
+                step_output = self.diffusion_scheduler.step(
+                    model_output=pred_flat,
+                    timestep=t_int,
+                    sample=noisy_flat,
+                    eta=0.0,  # Deterministic DDIM (no stochastic noise)
+                )
+                noisy_delta_normed = step_output.prev_sample.view(B_c, M_c, T_c, D_c)
+
+            # Final denormalization
+            final_delta_normed = torch.clamp(noisy_delta_normed, -1, 1)
+            final_delta = self.denorm_delta(final_delta_normed)  # (B, M, T, 2)
+
+        # Select best mode based on classification scores from last forward pass
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
 
         # Gather best mode trajectory (in original delta scale)
-        horizon = poses_reg.shape[2]
+        horizon = final_delta.shape[2]
         mode_idx_expanded = best_mode_idx.view(bs, 1, 1, 1).expand(-1, 1, horizon, 2)
-        best_delta = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
+        best_delta = torch.gather(final_delta, 1, mode_idx_expanded).squeeze(1)  # (B, T, 2)
 
-        # Cumsum to get absolute trajectory (already in original scale, no denorm needed)
-        best_trajectory = self._cumulate_trajectory(best_delta)  # (B, horizon, 2)
+        # Cumsum to get absolute trajectory
+        best_trajectory = self._cumulate_trajectory(best_delta)  # (B, T, 2)
 
         return best_trajectory, route_pred
 
