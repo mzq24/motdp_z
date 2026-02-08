@@ -820,9 +820,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             # Normalize delta to [-1, 1] for diffusion operations
             all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T, 2)
 
-            # Setup DDIM scheduler (step_size = 1 for fine-grained control)
-            self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device=device)
-
             # Add DDIM additive noise at truncated timestep
             noise = torch.randn_like(all_anchors_delta_normed)
             trunc_ts = torch.full((bs,), self.trunc_timesteps, dtype=torch.long, device=device)
@@ -841,7 +838,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     self.trunc_timesteps, 0, num_steps
                 ).round().astype(np.int64)
 
-            # DDIM denoising loop
+            # Precompute alphas_cumprod for DDIM steps
+            alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device)
+
+            # DDIM denoising loop (manual DDIM step with correct alpha values)
             route_pred = None
             poses_cls = None
             for i, t in enumerate(roll_timesteps):
@@ -865,18 +865,23 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 # Normalize model prediction to [-1, 1] for DDIM step
                 pred_normed = self.norm_delta(poses_reg)  # (B, M, T, 2)
 
-                # DDIM step: x_t → x_{t-1} (deterministic with eta=0)
-                B_c, M_c, T_c, D_c = noisy_delta_normed.shape
-                noisy_flat = noisy_delta_normed.view(B_c * M_c, T_c, D_c)
-                pred_flat = pred_normed.view(B_c * M_c, T_c, D_c)
+                # Manual DDIM step: x_t → x_{t_next} with correct alpha values
+                # (scheduler.step uses step_size=1 which is wrong for our roll_timesteps)
+                alpha_prod_t = alphas_cumprod[t_int]
+                # Next timestep from roll_timesteps (or -1 if last step)
+                if i + 1 < len(roll_timesteps):
+                    t_next = int(roll_timesteps[i + 1])
+                    alpha_prod_t_next = alphas_cumprod[t_next]
+                else:
+                    alpha_prod_t_next = torch.tensor(1.0, device=device)  # final step → clean
 
-                step_output = self.diffusion_scheduler.step(
-                    model_output=pred_flat,
-                    timestep=t_int,
-                    sample=noisy_flat,
-                    eta=0.0,  # Deterministic DDIM (no stochastic noise)
-                )
-                noisy_delta_normed = step_output.prev_sample.view(B_c, M_c, T_c, D_c)
+                # DDIM formula (eta=0, deterministic):
+                # pred_x0 = model_output (prediction_type="sample")
+                # pred_eps = (x_t - sqrt(alpha_t) * pred_x0) / sqrt(1 - alpha_t)
+                # x_{t_next} = sqrt(alpha_{t_next}) * pred_x0 + sqrt(1 - alpha_{t_next}) * pred_eps
+                pred_x0 = pred_normed
+                pred_eps = (noisy_delta_normed - alpha_prod_t.sqrt() * pred_x0) / (1 - alpha_prod_t).sqrt()
+                noisy_delta_normed = alpha_prod_t_next.sqrt() * pred_x0 + (1 - alpha_prod_t_next).sqrt() * pred_eps
 
             # Final denormalization
             final_delta_normed = torch.clamp(noisy_delta_normed, -1, 1)
