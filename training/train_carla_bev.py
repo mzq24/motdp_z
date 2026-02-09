@@ -187,7 +187,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 
                 try:
                     # Model always returns route prediction
-                    result = model_for_inference.predict_action(obs_dict)
+                    result = model_for_inference.predict_action(obs_dict, no_noise=True)
                     predicted_actions = torch.from_numpy(result['action']).to(device)
                     
                     if target_actions.dim() == 3:  # (B, T, 2)
