@@ -829,32 +829,26 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 timesteps=trunc_ts
             )
 
-            # Compute denoising timestep schedule (from trunc_timesteps down to 0)
-            # Following DiffusionDriveV2 pattern: evenly spaced timesteps
-            if num_steps == 1:
-                roll_timesteps = np.array([self.trunc_timesteps])
-            else:
-                roll_timesteps = np.linspace(
-                    self.trunc_timesteps, 0, num_steps
-                ).round().astype(np.int64)
+            # Compute roll_timesteps (same as zhidong old code: step_ratio = 20 / num_steps)
+            step_ratio = 20 / num_steps
+            roll_timesteps = (np.arange(0, num_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
 
-            # Setup DDIM scheduler
-            self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device=device)
-
-            # DDIM denoising loop
+            # Denoising loop (zhidong pattern: pred → add mul noise → next step)
             route_pred = None
             poses_cls = None
-            for i, t in enumerate(roll_timesteps):
-                t_int = int(t)
+            diffusion_output = noisy_delta_normed  # (B, M, T, 2) normalized
+
+            for i, k in enumerate(roll_timesteps):
+                t_int = int(k)
                 t_tensor = torch.full((bs,), t_int, dtype=torch.long, device=device)
 
                 # Clamp to [-1, 1] and denormalize → original delta scale for model
-                noisy_delta_clamped = torch.clamp(noisy_delta_normed, min=-1, max=1)
-                noisy_anchors_delta = self.denorm_delta(noisy_delta_clamped)  # (B, M, T, 2)
+                x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
+                input_delta = self.denorm_delta(x_boxes)  # (B, M, T, 2)
 
                 # Model forward: predicts clean delta (original scale)
                 poses_reg, poses_cls, route_pred = self.model(
-                    anchors=noisy_anchors_delta,
+                    anchors=input_delta,
                     timestep=t_tensor,
                     transfuser_bev_feature=transfuser_bev_feature,
                     transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -862,23 +856,26 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 )
                 # poses_reg: (B, M, T, 2) in original delta scale
 
-                # Normalize model prediction to [-1, 1] for DDIM step
-                pred_normed = self.norm_delta(poses_reg)  # (B, M, T, 2)
+                # Normalize prediction for next iteration
+                x_start = self.norm_delta(poses_reg)  # (B, M, T, 2)
 
-                # DDIM step: x_t → x_{t-1} (scheduler does tiny correction)
-                B_c, M_c, T_c, D_c = noisy_delta_normed.shape
-                noisy_flat = noisy_delta_normed.view(B_c * M_c, T_c, D_c)
-                pred_flat = pred_normed.view(B_c * M_c, T_c, D_c)
+                if i < len(roll_timesteps) - 1:
+                    # Add multiplicative noise to prediction for next step
+                    # Reshape (B, M, T, 2) → (B*M, T, 2) for noise function
+                    B_c, M_c, T_c, D_c = x_start.shape
+                    x_start_flat = x_start.view(B_c * M_c, T_c, D_c)
+                    next_k = int(roll_timesteps[i + 1])
+                    noisy_flat = self.add_multiplicative_noise_scheduled(
+                        x_start_flat,
+                        timestep=next_k,
+                        eta=1.0,
+                        std_min=0.02
+                    )
+                    diffusion_output = noisy_flat.view(B_c, M_c, T_c, D_c)
+                else:
+                    diffusion_output = x_start
 
-                step_output = self.diffusion_scheduler.step(
-                    model_output=pred_flat,
-                    timestep=t_int,
-                    sample=noisy_flat,
-                    eta=0.0,
-                )
-                noisy_delta_normed = step_output.prev_sample.view(B_c, M_c, T_c, D_c)
-
-            # Final output: use last model prediction directly (avoid clamp distortion)
+            # Final output: last model prediction directly (original delta scale)
             final_delta = poses_reg
 
         # Select best mode based on classification scores from last forward pass
