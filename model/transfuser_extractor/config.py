@@ -3,8 +3,17 @@ Config class that contains all the hyperparameters needed to build any model.
 """
 
 import os
-import carla
 import numpy as np
+
+try:
+  import carla
+except ImportError:
+  # Mock carla.Color for environments without CARLA simulator
+  class _MockCarla:
+    class Color:
+      def __init__(self, *args):
+        self.args = args
+  carla = _MockCarla()
 
 
 class GlobalConfig:

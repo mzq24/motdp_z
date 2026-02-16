@@ -21,12 +21,23 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __init__(self,
                  dataset_path: str,
                  image_data_root: str,
-                 mode: str = 'train'        # train or val
+                 mode: str = 'train',        # train or val
+                 anchor_centers_abs: np.ndarray = None,  # (num_modes, num_points, 2)
+                 semantic_behavior_cfg: dict = None,      # semantic behavior config
                  ):
 
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
         self.mode = mode
+
+        # Semantic behavior labeling
+        self.anchor_centers_abs = anchor_centers_abs
+        self.semantic_behavior_enabled = (
+            anchor_centers_abs is not None
+            and semantic_behavior_cfg is not None
+            and semantic_behavior_cfg.get('enabled', False)
+        )
+        self.semantic_behavior_cfg = semantic_behavior_cfg or {}
 
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
@@ -134,6 +145,112 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             final_sample['transfuser_bev_feature'] = transfuser_bev_feature
         if transfuser_bev_feature_upsample is not None:
             final_sample['transfuser_bev_feature_upsample'] = transfuser_bev_feature_upsample
+
+        # ========== Semantic Behavior Labeling (on-the-fly) ==========
+        if self.semantic_behavior_enabled:
+            from tools.anchor_semantic_labeler import label_anchors_semantic, classify_scene_buckets
+            import json, gzip
+
+            feature_rel = sample.get('transfuser_bev_feature', '')
+            # Derive base dir and frame id from feature path
+            # e.g. "Accident/Town12_.../transfuser_feature/0010_feature.pt"
+            base_dir = os.path.dirname(os.path.dirname(feature_rel))  # "Accident/Town12_..."
+            frame_str = os.path.basename(feature_rel).replace('_feature.pt', '')  # "0010"
+
+            bev_rel = feature_rel.replace('transfuser_feature/', 'bev_semantics/').replace('_feature.pt', '.png')
+            bev_path = os.path.join(self.image_data_root, bev_rel)
+
+            if os.path.exists(bev_path):
+                bev_semantic = np.array(Image.open(bev_path))
+
+                # Load current frame boxes for BEV filtering
+                boxes = None
+                boxes_rel = feature_rel.replace('transfuser_feature/', 'boxes/').replace('_feature.pt', '.json.gz')
+                boxes_path = os.path.join(self.image_data_root, boxes_rel)
+                if os.path.exists(boxes_path):
+                    try:
+                        with gzip.open(boxes_path, 'rt') as bf:
+                            boxes = json.load(bf)
+                    except Exception:
+                        boxes = None
+
+                # Load measurements for hazard flags (light_hazard, etc.)
+                measurements = None
+                meas_rel = feature_rel.replace('transfuser_feature/', 'measurements/').replace('_feature.pt', '.json.gz')
+                meas_path = os.path.join(self.image_data_root, meas_rel)
+                if os.path.exists(meas_path):
+                    try:
+                        with gzip.open(meas_path, 'rt') as mf:
+                            measurements = json.load(mf)
+                    except Exception:
+                        measurements = None
+
+                # Load future frame boxes for dynamic collision (simlingo-style)
+                ego_matrix_current = None
+                future_frames_data = None
+                if measurements is not None:
+                    ego_matrix_current = measurements.get('ego_matrix', None)
+
+                if ego_matrix_current is not None:
+                    frame_id = int(frame_str)
+                    num_points = self.anchor_centers_abs.shape[1]
+                    future_frames_data = []
+                    for k in range(1, num_points + 1):
+                        future_frame_str = f"{frame_id + k:04d}"
+                        fut_boxes_path = os.path.join(
+                            self.image_data_root, base_dir,
+                            'boxes', f'{future_frame_str}.json.gz')
+                        fut_meas_path = os.path.join(
+                            self.image_data_root, base_dir,
+                            'measurements', f'{future_frame_str}.json.gz')
+                        if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
+                            try:
+                                with gzip.open(fut_boxes_path, 'rt') as bf:
+                                    fut_boxes = json.load(bf)
+                                with gzip.open(fut_meas_path, 'rt') as mf:
+                                    fut_meas = json.load(mf)
+                                fut_ego_matrix = fut_meas.get('ego_matrix', None)
+                                if fut_ego_matrix is not None:
+                                    future_frames_data.append((fut_boxes, fut_ego_matrix))
+                                else:
+                                    future_frames_data.append(None)
+                            except Exception:
+                                future_frames_data.append(None)
+                        else:
+                            future_frames_data.append(None)
+
+                # GT trajectory for false-positive suppression
+                gt_traj = sample.get('ego_waypoints', None)
+                if gt_traj is not None:
+                    gt_traj = gt_traj[1:]  # skip origin (t=0)
+
+                behavior_labels, allowed_flags, _ = label_anchors_semantic(
+                    self.anchor_centers_abs, bev_semantic,
+                    ppm=self.semantic_behavior_cfg.get('bev_ppm', 2.0),
+                    bev_size=self.semantic_behavior_cfg.get('bev_size', 256),
+                    boxes=boxes,
+                    measurements=measurements,
+                    ego_matrix_current=ego_matrix_current,
+                    future_frames_data=future_frames_data,
+                    gt_trajectory=gt_traj,
+                )
+                final_sample['behavior_labels'] = torch.from_numpy(behavior_labels).long()
+                final_sample['allowed_flags'] = torch.from_numpy(allowed_flags.astype(np.float32))
+
+                # Scene bucket classification (for long-tail identification)
+                bucket_flags = classify_scene_buckets(
+                    measurements=measurements,
+                    boxes=boxes,
+                    ego_waypoints=gt_traj,
+                )
+                final_sample['scene_buckets'] = torch.from_numpy(bucket_flags.astype(np.float32))
+            else:
+                # Fallback: all follow_road + allowed
+                n_modes = self.anchor_centers_abs.shape[0]
+                final_sample['behavior_labels'] = torch.zeros(n_modes, dtype=torch.long)
+                final_sample['allowed_flags'] = torch.ones(n_modes, dtype=torch.float32)
+                from tools.anchor_semantic_labeler import NUM_BUCKET_CATEGORIES
+                final_sample['scene_buckets'] = torch.zeros(NUM_BUCKET_CATEGORIES, dtype=torch.float32)
 
         # Build ego_status: concatenate historical low-dimensional states
         # Order: speed_hist, theta_hist, command_hist, waypoints_hist

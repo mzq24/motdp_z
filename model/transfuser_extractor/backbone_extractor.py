@@ -149,9 +149,10 @@ class TransFuserBackboneExtractor(nn.Module):
                 - 'fused_features': 全局融合特征
                 - 'image_feature_grid': 图像特征网格 (如果配置启用)
         """
-        # 确保输入在正确的设备上
-        rgb = rgb.to(self.device)
-        lidar_bev = lidar_bev.to(self.device)
+        # 获取模型参数所在设备，确保输入在正确的设备上
+        param_device = next(self.backbone.parameters()).device
+        rgb = rgb.to(param_device)
+        lidar_bev = lidar_bev.to(param_device)
         
         # 调用原始的 forward 方法，但我们需要修改以获取中间特征
         # 原始 forward 返回: features (p3), fused_features, image_feature_grid

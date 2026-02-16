@@ -346,12 +346,33 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             use_wandb = False
 
     # dataset
-    dataset_path_root = config.get('training', {}).get('dataset_path')
-    train_dataset_path = os.path.join(dataset_path_root, 'train')
-    val_dataset_path = os.path.join(dataset_path_root, 'val')
-    image_data_root = config.get('training', {}).get('image_data_root')
-    train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
-    val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
+    scene_cfg = config.get('scene_dataset', {})
+    if scene_cfg.get('enabled', False):
+        from dataset.cached_carla_dataset import CachedCARLADataset
+        raw_root = scene_cfg['raw_data_root']
+        cache_dir = scene_cfg.get('cache_dir', None)
+        cache_gb = scene_cfg.get('cache_size_limit_gb', 100)
+        tf_cfg_path = scene_cfg.get('transfuser_config_path', None)
+        common_kwargs = dict(
+            cache_dir=cache_dir, cache_size_limit_gb=cache_gb,
+            obs_horizon=scene_cfg.get('obs_horizon', 4),
+            pred_horizon=scene_cfg.get('pred_horizon', 6),
+            skip_first_n_frames=scene_cfg.get('skip_first_n_frames', 3),
+            val_towns=scene_cfg.get('val_towns', [13]),
+            prefetch_scene=scene_cfg.get('prefetch_scene', True),
+            transfuser_config_path=tf_cfg_path,
+        )
+        train_dataset = CachedCARLADataset(
+            raw_data_root=raw_root, split='train', mode='train', **common_kwargs)
+        val_dataset = CachedCARLADataset(
+            raw_data_root=raw_root, split='val', mode='val', **common_kwargs)
+    else:
+        dataset_path_root = config.get('training', {}).get('dataset_path')
+        train_dataset_path = os.path.join(dataset_path_root, 'train')
+        val_dataset_path = os.path.join(dataset_path_root, 'val')
+        image_data_root = config.get('training', {}).get('image_data_root')
+        train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
+        val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
 
     if rank == 0:
         print(f"\nTraining samples: {len(train_dataset)}")
@@ -514,7 +535,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print("✓ No learning rate scheduler used")
 
     # 设置 checkpoint 目录
-    checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit")
+    checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit")
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"✓ Checkpoint directory: {checkpoint_dir}")
