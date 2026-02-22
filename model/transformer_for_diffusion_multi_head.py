@@ -1299,11 +1299,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
 
         # ========== Output Heads ==========
-        # Trajectory regression head: (B, num_modes, n_emb) -> (B, num_modes, horizon, 2)
-        self.trajectory_head = nn.Sequential(
-            nn.Linear(n_emb, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, horizon * output_dim),
+        # Trajectory regression head: (B, num_modes, n_emb) -> (B, num_modes, horizon*2)
+        # Route guidance cross-attention allows trajectory to attend to route features
+        self.trajectory_head = TrajectoryMLPHead(
+            n_emb=n_emb,
+            output_dim=horizon * output_dim,
+            p_drop=p_drop_emb,
+            num_heads=n_head,
         )
 
         # Classification head: (B, num_modes, n_emb) -> (B, num_modes)
@@ -1314,10 +1316,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
-        self.route_head = nn.Sequential(
-            nn.Linear(n_emb, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, 2),
+        # AdaLN modulation from ego_status for stable closed-loop route prediction
+        self.route_head = RouteMLPHead(
+            n_emb=n_emb,
+            status_dim=status_dim,
+            output_dim=2,
+            p_drop=p_drop_emb,
         )
         
         self.apply(self._init_weights)
@@ -1497,7 +1501,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         
         # ========== Output Heads ==========
         # 1. Trajectory regression: (B, num_modes, n_emb) -> (B, num_modes, horizon * 2)
-        traj_flat = self.trajectory_head(mode_out)  # (B, num_modes, horizon * output_dim)
+        traj_flat = self.trajectory_head(mode_out, conditioning, route_features=route_out)  # (B, num_modes, horizon * output_dim)
         poses_reg = traj_flat.view(B, num_modes, self.horizon, self.output_dim)  # (B, num_modes, horizon, 2)
         
         # Add anchor as residual (predict refinement)
@@ -1512,7 +1516,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         poses_cls = self.cls_head(mode_out).squeeze(-1)  # (B, num_modes)
         
         # 3. Route prediction from unified decoder output
-        route_pred = self.route_head(route_out)  # (B, num_waypoints, 2)
+        route_pred = self.route_head(route_out, conditioning, current_status)  # (B, num_waypoints, 2)
         
         return poses_reg, poses_cls, route_pred
 
