@@ -114,7 +114,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.norm_delta_x_range = diffusion_cfg.get('norm_delta_x_range', 14.0)
         self.norm_delta_y_offset = diffusion_cfg.get('norm_delta_y_offset', 10.0)  # maps [-10, 10] to [-1, 1]
         self.norm_delta_y_range = diffusion_cfg.get('norm_delta_y_range', 20.0)
-
+        # print(f"[DiffusionDiTCarlaPolicy] Delta normalization params: x_offset={self.norm_delta_x_offset}, \
+        #       x_range={self.norm_delta_x_range}, y_offset={self.norm_delta_y_offset}, \
+        #         y_range={self.norm_delta_y_range}")
         # Keep old params for absolute coords (used for anchor matching)
         self.norm_x_offset = diffusion_cfg.get('norm_x_offset', 2.0)  # x range: [-2, 78]
         self.norm_x_range = diffusion_cfg.get('norm_x_range', 80.0)
@@ -140,62 +142,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.obs_feature_dim = obs_feature_dim
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
-
-        # ========== Optional: TransFuser backbone for on-the-fly feature extraction ==========
-        self.transfuser_backbone = None
-        transfuser_config_path = config.get('scene_dataset', {}).get('transfuser_config_path', None)
-        if transfuser_config_path is not None and config.get('scene_dataset', {}).get('enabled', False):
-            try:
-                import sys as _sys
-                _sys.path.insert(0, os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    'model', 'transfuser_extractor'))
-                from backbone_extractor import TransFuserBackboneExtractor
-                self.transfuser_backbone = TransFuserBackboneExtractor(
-                    config_path=transfuser_config_path,
-                    device='cpu',  # Will be moved with the model
-                )
-                print("[Policy] TransFuser backbone loaded for on-the-fly feature extraction")
-            except Exception as e:
-                print(f"[Policy] WARNING: Failed to load TransFuser backbone: {e}")
-                self.transfuser_backbone = None
-
-    @torch.no_grad()
-    def _extract_bev_features(self, batch, device, model_dtype):
-        """Extract transfuser BEV features from batch.
-
-        Supports two modes:
-        1. Pre-extracted: batch contains 'transfuser_bev_feature' tensors
-        2. On-the-fly: batch contains 'rgb_raw' + 'lidar_bev', run backbone
-
-        Returns:
-            (transfuser_bev_feature, transfuser_bev_feature_upsample)
-        """
-        if 'transfuser_bev_feature' in batch:
-            # Mode 1: pre-extracted features
-            bev_feat = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-            bev_feat_up = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-            return bev_feat, bev_feat_up
-
-        if self.transfuser_backbone is not None and 'rgb_raw' in batch:
-            # Mode 2: on-the-fly extraction
-            rgb = batch['rgb_raw']       # (B, 3, H, W) float32 [0,255]
-            lidar = batch['lidar_bev']   # (B, C, H, W) float32
-
-            # Move entire backbone module to same device if needed
-            if next(self.transfuser_backbone.parameters()).device != device:
-                self.transfuser_backbone.to(device)
-
-            # backbone.forward will auto-move inputs to the correct device
-            out = self.transfuser_backbone(rgb, lidar)
-            bev_feat = out['bev_feature'].to(dtype=model_dtype)
-            bev_feat_up = out['bev_feature_upscale'].to(dtype=model_dtype)
-            return bev_feat, bev_feat_up
-
-        raise ValueError(
-            "Batch must contain either 'transfuser_bev_feature' (pre-extracted) "
-            "or 'rgb_raw'+'lidar_bev' (on-the-fly) with transfuser_backbone configured"
-        )
 
     def _cumulate_trajectory(self, traj_deltas: torch.Tensor) -> torch.Tensor:
         """
@@ -599,10 +545,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
-        # Load transfuser features (pre-extracted or on-the-fly)
-        transfuser_bev_feature, transfuser_bev_feature_upsample = \
-            self._extract_bev_features(batch, device, model_dtype)
-
+        # Load transfuser features (single frame, no temporal)
+        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        
         # Get ego_status
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
@@ -996,9 +942,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         B = value.shape[0]
         Da = self.action_dim
 
-        # Load transfuser features (pre-extracted or on-the-fly)
-        transfuser_bev_feature, transfuser_bev_feature_upsample = \
-            self._extract_bev_features(nobs, device, model_dtype)
+        # Load transfuser features (single frame, no temporal)
+        transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
 
         # Get ego_status
         ego_status = nobs['ego_status']

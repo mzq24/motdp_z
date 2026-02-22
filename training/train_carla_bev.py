@@ -12,6 +12,7 @@ from collections import defaultdict
 import argparse
 import datetime
 from torch.distributed.elastic.multiprocessing.errors import record
+import debugpy
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
@@ -346,37 +347,20 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             use_wandb = False
 
     # dataset
-    scene_cfg = config.get('scene_dataset', {})
-    if scene_cfg.get('enabled', False):
-        from dataset.cached_carla_dataset import CachedCARLADataset
-        raw_root = scene_cfg['raw_data_root']
-        cache_dir = scene_cfg.get('cache_dir', None)
-        cache_gb = scene_cfg.get('cache_size_limit_gb', 100)
-        tf_cfg_path = scene_cfg.get('transfuser_config_path', None)
-        common_kwargs = dict(
-            cache_dir=cache_dir, cache_size_limit_gb=cache_gb,
-            obs_horizon=scene_cfg.get('obs_horizon', 4),
-            pred_horizon=scene_cfg.get('pred_horizon', 6),
-            skip_first_n_frames=scene_cfg.get('skip_first_n_frames', 3),
-            val_towns=scene_cfg.get('val_towns', [13]),
-            prefetch_scene=scene_cfg.get('prefetch_scene', True),
-            transfuser_config_path=tf_cfg_path,
-        )
-        train_dataset = CachedCARLADataset(
-            raw_data_root=raw_root, split='train', mode='train', **common_kwargs)
-        val_dataset = CachedCARLADataset(
-            raw_data_root=raw_root, split='val', mode='val', **common_kwargs)
+    dataset_path_root = config.get('training', {}).get('dataset_path')
+    train_dataset_path = os.path.join(dataset_path_root, 'train')
+    val_dataset_path = os.path.join(dataset_path_root, 'val')
+    image_data_root = config.get('training', {}).get('image_data_root')
+    train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
+    val_dataset_orig = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
+    if val_only:
+        val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
     else:
-        dataset_path_root = config.get('training', {}).get('dataset_path')
-        train_dataset_path = os.path.join(dataset_path_root, 'train')
-        val_dataset_path = os.path.join(dataset_path_root, 'val')
-        image_data_root = config.get('training', {}).get('image_data_root')
-        train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
-        val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
+        val_dataset = val_dataset_orig
 
     if rank == 0:
         print(f"\nTraining samples: {len(train_dataset)}")
-        print(f"Validation samples: {len(val_dataset)}")
+        print(f"Validation samples: {len(val_dataset)}" + (" (train+val combined)" if val_only else ""))
     
 
     
@@ -809,6 +793,16 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     if world_size > 1:
         torch.distributed.destroy_process_group()
 
+def attach_debugger(port=5678):
+    """Attach debugpy debugger and wait for client connection"""
+    try:
+        debugpy.listen(("0.0.0.0", port))
+        print(f"Waiting for debugger to attach on port {port}...")
+        debugpy.wait_for_client()
+        print("Debugger attached!")
+    except Exception as e:
+        print(f"Failed to attach debugger: {e}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
     parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml",
@@ -818,4 +812,5 @@ if __name__ == "__main__":
     parser.add_argument('--val_only', action='store_true',
                         help='Only run validation (requires --resume)')
     args = parser.parse_args()
+    # attach_debugger()
     train_pdm_policy(config_path=args.config_path, resume_path=args.resume, val_only=args.val_only)

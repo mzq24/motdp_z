@@ -346,68 +346,47 @@ class MultiSourceAttentionBlock(nn.Module):
             self.q_norm = nn.LayerNorm(self.head_dim)
             self.k_norm = nn.LayerNorm(self.head_dim)
         
-        # ========== Q projections (source-specific for better modality adaptation) ==========
+        # ========== Q projections (BEV only, no reasoning) ==========
         self.q_proj = nn.Linear(d_model, d_model)  # Shared base Q
-        # Small adaptation layers for cross-attention queries (low-rank for efficiency)
-        # For 2 transfuser sources: bev, reasoning (following DiffusionDriveV2)
+        # Small adaptation layers for BEV cross-attention queries (low-rank for efficiency)
         self.q_adapter_bev = nn.Linear(d_model, d_model // 4)
-        self.q_adapter_reason = nn.Linear(d_model, d_model // 4)
         self.q_adapter_out = nn.Linear(d_model // 4, d_model)
-        
+
         # ========== Self-attention K, V ==========
         self.k_self = nn.Linear(d_model, d_model)
         self.v_self = nn.Linear(d_model, d_model)
-        
-        # ========== Transfuser cross-attention K, V (for bev only, following DiffusionDriveV2) ==========
+
+        # ========== BEV cross-attention K, V ==========
         self.k_bev = nn.Linear(d_model, d_model)
         self.v_bev = nn.Linear(d_model, d_model)
-        
-        # ========== Reasoning cross-attention K, V ==========
-        self.k_reasoning = nn.Linear(d_model, d_model)
-        self.v_reasoning = nn.Linear(d_model, d_model)
-        
+
         # ========== Output projection ==========
         self.o_proj = nn.Linear(d_model, d_model)
-        
-        # ========== Gating factor for Reasoning tokens ==========
-        self.gating_factor = nn.Parameter(torch.zeros(1))
-        
+
         # ========== Per-source learnable temperature (log scale for stability) ==========
         self.temp_self = nn.Parameter(torch.zeros(1))
         self.temp_bev = nn.Parameter(torch.zeros(1))
-        self.temp_reason = nn.Parameter(torch.zeros(1))
-        
+
         # ========== Per-source learnable bias (attention prior) ==========
         self.bias_self = nn.Parameter(torch.zeros(1))
         self.bias_bev = nn.Parameter(torch.zeros(1))
-        self.bias_reason = nn.Parameter(torch.zeros(1))
-        
-        # ========== Source-Specific Residual Paths ==========
-        # BEV residual path
+
+        # ========== BEV Residual Path ==========
         self.bev_residual_proj = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Linear(d_model // 2, d_model),
         )
         self.bev_residual_gate = nn.Parameter(torch.zeros(1))
-        
-        # Reasoning residual path: attention pooling (query-based)
-        self.reason_residual_query = nn.Parameter(torch.randn(1, 1, d_model))
-        self.reason_residual_attn = nn.MultiheadAttention(d_model, num_heads=4, dropout=dropout, batch_first=True)
-        self.reason_residual_proj = nn.Linear(d_model, d_model)
-        self.reason_residual_gate = nn.Parameter(torch.zeros(1))
-        
+
         # ========== Route-Specific Components (Stability Enhancement) ==========
-        # Route-specific Q adapters
+        # Route-specific Q adapters (BEV only)
         self.route_q_adapter_bev = nn.Linear(d_model, d_model // 4)
-        self.route_q_adapter_reason = nn.Linear(d_model, d_model // 4)
         self.route_q_adapter_out = nn.Linear(d_model // 4, d_model)
-        
+
         # Route-specific attention temperature and bias
         self.route_temp_bev = nn.Parameter(torch.zeros(1))
-        self.route_temp_reason = nn.Parameter(torch.zeros(1))
         self.route_bias_bev = nn.Parameter(torch.zeros(1))
-        self.route_bias_reason = nn.Parameter(torch.zeros(1))
         
         # Route-specific AdaLN modulation
         self.route_adaLN_modulation = nn.Sequential(
@@ -458,36 +437,30 @@ class MultiSourceAttentionBlock(nn.Module):
         self,
         x: torch.Tensor,  # (B, T, d_model) - main sequence [trajectory | route]
         bev_tokens: torch.Tensor,     # (B, T_bev, d_model) - BEV tokens (already projected)
-        reasoning_tokens: torch.Tensor,  # (B, T_r, d_model) - reasoning tokens (already projected)
         conditioning: torch.Tensor,  # (B, d_model) - conditioning for AdaLN
         self_attn_mask: Optional[torch.Tensor] = None,
         bev_padding_mask: Optional[torch.Tensor] = None,
-        reasoning_padding_mask: Optional[torch.Tensor] = None,
         route_conditioning: Optional[torch.Tensor] = None,
         T_traj: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Forward pass with multi-source attention for transfuser features (DiffusionDriveV2 style).
-        
-        Cross-attention sources (following DiffusionDriveV2):
+        Forward pass with self-attention + BEV cross-attention.
+
+        Cross-attention sources:
         1. bev_tokens: flattened BEV feature (64 tokens)
-        2. reasoning_tokens: reasoning/VLM tokens
-        
-        Note: fused_tokens and image_tokens are removed following DiffusionDriveV2's approach.
         """
         B, T, C = x.shape
         T_bev = bev_tokens.shape[1]
-        T_r = reasoning_tokens.shape[1]
-        
+
         # Determine if we have route-specific processing
         if T_traj is None:
             T_traj = T
         T_route = T - T_traj
-        
+
         # ========== AdaLN modulation parameters ==========
         mod_params = self.adaLN_modulation(conditioning)
         shift_pre, scale_pre, gate_attn, shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(6, dim=1)
-        
+
         # Route-specific AdaLN
         if T_route > 0 and route_conditioning is not None:
             route_mod_params = self.route_adaLN_modulation(route_conditioning)
@@ -495,166 +468,118 @@ class MultiSourceAttentionBlock(nn.Module):
         else:
             route_shift_pre, route_scale_pre = shift_pre, scale_pre
             route_gate_attn, route_shift_ffn, route_scale_ffn, route_gate_ffn = gate_attn, shift_ffn, scale_ffn, gate_ffn
-        
+
         # ========== Pre-LayerNorm with modulation ==========
         x_norm_ln = self.norm_pre(x)
-        
+
         x_norm_traj = self.modulate(x_norm_ln[:, :T_traj, :], shift_pre, scale_pre)
         if T_route > 0:
             x_norm_route = self.modulate(x_norm_ln[:, T_traj:, :], route_shift_pre, route_scale_pre)
             x_norm = torch.cat([x_norm_traj, x_norm_route], dim=1)
         else:
             x_norm = x_norm_traj
-        
-        # ========== Gating factor for Reasoning ==========
-        g = self.gating_factor
-        ratio_g = torch.tanh(g)
-        
+
         # ========== Temperature scaling factors ==========
         temp_self = 1.0 + torch.nn.functional.softplus(self.temp_self)
         temp_bev = 1.0 + torch.nn.functional.softplus(self.temp_bev)
-        temp_reason = 1.0 + torch.nn.functional.softplus(self.temp_reason)
-        
+
         # Route-specific temperatures
         route_temp_bev = 1.0 + torch.nn.functional.softplus(self.route_temp_bev)
-        route_temp_reason = 1.0 + torch.nn.functional.softplus(self.route_temp_reason)
-        
+
         # ========== Q projection ==========
         q_base = self.q_proj(x_norm)
-        
-        # Trajectory Q adaptations
+
+        # Trajectory Q adaptation for BEV
         q_adapt_bev_traj = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm[:, :T_traj, :])))
-        q_adapt_reason_traj = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm[:, :T_traj, :])))
-        
-        # Route Q adaptations
+
+        # Route Q adaptation for BEV
         if T_route > 0:
             q_adapt_bev_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_bev(x_norm[:, T_traj:, :])))
-            q_adapt_reason_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_reason(x_norm[:, T_traj:, :])))
-            
             q_adapt_bev = torch.cat([q_adapt_bev_traj, q_adapt_bev_route], dim=1)
-            q_adapt_reason = torch.cat([q_adapt_reason_traj, q_adapt_reason_route], dim=1)
         else:
             q_adapt_bev = q_adapt_bev_traj
-            q_adapt_reason = q_adapt_reason_traj
-        
+
         # ========== Self-attention K, V ==========
         k_self = self.k_self(x_norm)
         v_self = self.v_self(x_norm)
-        
-        # ========== Cross-attention K, V ==========
+
+        # ========== BEV cross-attention K, V ==========
         k_bev = self.k_bev(bev_tokens)
         v_bev = self.v_bev(bev_tokens)
-        k_reason = self.k_reasoning(reasoning_tokens)
-        v_reason = self.v_reasoning(reasoning_tokens)
-        
+
         # ========== Reshape to multi-head ==========
         q_base = self._reshape_heads(q_base, B, T)
         q_bev = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_bev, B, T)
-        q_reason = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_reason, B, T)
-        
+
         k_self = self._reshape_heads(k_self, B, T)
         v_self = self._reshape_heads(v_self, B, T)
         k_bev = self._reshape_heads(k_bev, B, T_bev)
         v_bev = self._reshape_heads(v_bev, B, T_bev)
-        k_reason = self._reshape_heads(k_reason, B, T_r)
-        v_reason = self._reshape_heads(v_reason, B, T_r)
-        
+
         # ========== Apply QK Normalization ==========
         q_base, k_self = self._apply_qk_norm(q_base, k_self)
         q_bev, k_bev = self._apply_qk_norm(q_bev, k_bev)
-        q_reason, k_reason = self._apply_qk_norm(q_reason, k_reason)
-        
+
         # ========== Apply RoPE ==========
         cos_main, sin_main = self._get_rope_embed(T, x.device, x.dtype)
         cos_main = cos_main.unsqueeze(0).unsqueeze(0)
         sin_main = sin_main.unsqueeze(0).unsqueeze(0)
         q_base = apply_rope_single(q_base, cos_main, sin_main)
         k_self = apply_rope_single(k_self, cos_main, sin_main)
-        
         q_bev = apply_rope_single(q_bev, cos_main, sin_main)
-        q_reason = apply_rope_single(q_reason, cos_main, sin_main)
-        
+
         # K gets RoPE for cross-attention
         cos_bev, sin_bev = self._get_rope_embed(T_bev, x.device, x.dtype)
         cos_bev = cos_bev.unsqueeze(0).unsqueeze(0)
         sin_bev = sin_bev.unsqueeze(0).unsqueeze(0)
         k_bev = apply_rope_single(k_bev, cos_bev, sin_bev)
-        
-        cos_r, sin_r = self._get_rope_embed(T_r, x.device, x.dtype)
-        cos_r = cos_r.unsqueeze(0).unsqueeze(0)
-        sin_r = sin_r.unsqueeze(0).unsqueeze(0)
-        k_reason = apply_rope_single(k_reason, cos_r, sin_r)
-        
+
         # ========== Compute attention scores ==========
         scale = math.sqrt(self.head_dim)
-        
+
         attn_self = torch.matmul(q_base, k_self.transpose(-2, -1)) * temp_self + self.bias_self
-        
         attn_bev_raw = torch.matmul(q_bev, k_bev.transpose(-2, -1))
-        attn_reason_raw = torch.matmul(q_reason, k_reason.transpose(-2, -1)) * ratio_g
-        
+
         if T_route > 0:
-            # Trajectory-specific temperature/bias
             attn_bev_traj = attn_bev_raw[:, :, :T_traj, :] * temp_bev + self.bias_bev
-            attn_reason_traj = attn_reason_raw[:, :, :T_traj, :] * temp_reason + self.bias_reason
-            
-            # Route-specific temperature/bias
             attn_bev_route = attn_bev_raw[:, :, T_traj:, :] * route_temp_bev + self.route_bias_bev
-            attn_reason_route = attn_reason_raw[:, :, T_traj:, :] * route_temp_reason + self.route_bias_reason
-            
             attn_bev = torch.cat([attn_bev_traj, attn_bev_route], dim=2)
-            attn_reason = torch.cat([attn_reason_traj, attn_reason_route], dim=2)
         else:
             attn_bev = attn_bev_raw * temp_bev + self.bias_bev
-            attn_reason = attn_reason_raw * temp_reason + self.bias_reason
-        
-        # Concatenate all attention scores
-        attn_scores = torch.cat([attn_self, attn_bev, attn_reason], dim=-1)
+
+        # Concatenate attention scores: [self | bev]
+        attn_scores = torch.cat([attn_self, attn_bev], dim=-1)
         attn_scores = attn_scores / scale
-        
+
         # Apply self-attention mask if provided
         if self_attn_mask is not None:
-            total_kv_len = T + T_bev + T_r
+            total_kv_len = T + T_bev
             full_mask = torch.zeros(T, total_kv_len, device=x.device, dtype=x.dtype)
             full_mask[:, :T] = self_attn_mask
             attn_scores = attn_scores + full_mask.unsqueeze(0).unsqueeze(0)
-        
-        # Apply padding masks
-        offset = T
+
+        # Apply BEV padding mask if provided
         if bev_padding_mask is not None:
             mask = bev_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, offset:offset+T_bev] = attn_scores[:, :, :, offset:offset+T_bev].masked_fill(mask, float('-inf'))
-        offset += T_bev
-        
-        if reasoning_padding_mask is not None:
-            mask = reasoning_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, offset:] = attn_scores[:, :, :, offset:].masked_fill(mask, float('-inf'))
-        
+            attn_scores[:, :, :, T:T+T_bev] = attn_scores[:, :, :, T:T+T_bev].masked_fill(mask, float('-inf'))
+
         # Softmax and weighted sum
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
-        
-        v_combined = torch.cat([v_self, v_bev, v_reason], dim=2)
+
+        v_combined = torch.cat([v_self, v_bev], dim=2)
         output = torch.matmul(attn_weights, v_combined)
-        
+
         # Reshape and output projection
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(output)
-        
-        # ========== Source-Specific Residual Paths ==========
+
+        # ========== BEV Residual Path ==========
         bev_gate = torch.sigmoid(self.bev_residual_gate)
         bev_pooled = bev_tokens.mean(dim=1, keepdim=True)
         bev_residual = self.bev_residual_proj(bev_pooled).expand(-1, T, -1)
-        
-        reason_gate = torch.sigmoid(self.reason_residual_gate)
-        reason_query = self.reason_residual_query.expand(B, -1, -1)
-        reason_pooled, _ = self.reason_residual_attn(
-            query=reason_query, key=reasoning_tokens, value=reasoning_tokens,
-            key_padding_mask=reasoning_padding_mask
-        )
-        reason_residual = self.reason_residual_proj(reason_pooled).expand(-1, T, -1)
-        
-        output = output + bev_gate * bev_residual + reason_gate * reason_residual
+
+        output = output + bev_gate * bev_residual
         
         # ========== Residual with segment-specific gate ==========
         if T_route > 0:
@@ -1016,7 +941,6 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Transfuser feature dimensions (following DiffusionDriveV2)
         transfuser_bev_dim: int = 1512,       # bev_feature channel dim
         transfuser_bev_upsample_dim: int = 64, # bev_feature_upsample channel dim
-        reasoning_dim: int = 1536,
         horizon: int = 8,
         num_waypoints: int = 20,
         max_seq_len: int = 64,  # Max length for unified position encoding
@@ -1031,12 +955,6 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, d_model)
         self.bev_feature_proj = nn.Sequential(
             nn.Linear(transfuser_bev_dim, d_model), 
-            nn.LayerNorm(d_model)
-        )
-        
-        # Reasoning tokens projection
-        self.reasoning_proj = nn.Sequential(
-            nn.Linear(reasoning_dim, d_model), 
             nn.LayerNorm(d_model)
         )
         
@@ -1174,13 +1092,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
     
     def forward(
         self,
-        traj_emb: torch.Tensor,  # (B, horizon, d_model) - trajectory query embeddings
+        traj_emb: torch.Tensor,  # (B, T_traj, d_model) - trajectory query embeddings
         transfuser_bev_feature: torch.Tensor,       # (B, 1512, 8, 8)
         transfuser_bev_feature_upsample: torch.Tensor,  # (B, 64, 64, 64)
-        reasoning_tokens: torch.Tensor,             # (B, T_r, reasoning_dim)
         conditioning: torch.Tensor,                 # (B, d_model)
-        traj_points: Optional[torch.Tensor] = None,  # (B, horizon, 2) for GridSampleCrossBEVAttention
-        reasoning_padding_mask: Optional[torch.Tensor] = None,
+        traj_points: Optional[torch.Tensor] = None,  # (B, T_traj, 2) or (B, T_traj, horizon, 2) for GridSampleCrossBEVAttention
         route_conditioning: Optional[torch.Tensor] = None,  # (B, d_model) - route-specific conditioning
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1243,27 +1159,22 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         if bev_proj.shape[1] <= self.combined_pos_emb.shape[1]:
             bev_proj = bev_proj + self.combined_pos_emb[:, :bev_proj.shape[1], :]
         
-        # Project reasoning tokens
-        reasoning_proj = self.reasoning_proj(reasoning_tokens)
-        
         # ========== Apply GridSampleCrossBEVAttention for spatial BEV (DiffusionDriveV2 style) ==========
         # This enhances trajectory queries with spatially-sampled BEV features
         if traj_points is not None:
             x_traj = x[:, :T_traj, :]  # (B, T_traj, d_model)
             x_traj = self.bev_spatial_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
             x = torch.cat([x_traj, x[:, T_traj:, :]], dim=1)
-        
+
         # Decoder layers with multi-source attention
         # Pass separate feature tokens and T_traj for route-specific processing
         for layer in self.layers:
             x = layer(
-                x, 
+                x,
                 bev_proj,           # bev_tokens: (B, 64, d_model)
-                reasoning_proj,     # reasoning_tokens
                 conditioning,
-                self_attn_mask, 
+                self_attn_mask,
                 None,               # bev_padding_mask
-                reasoning_padding_mask,
                 route_conditioning=route_conditioning,
                 T_traj=T_traj,
             )
@@ -1323,7 +1234,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
         causal_attn: bool = False,
         obs_as_cond: bool = False,
         n_cond_layers: int = 4,
-        reasoning_emb_dim: int = 1536,
         status_dim: int = 15,
         ego_status_seq_len: int = 1,
         # Transfuser feature dimensions (following DiffusionDriveV2)
@@ -1354,74 +1264,56 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
-        
+
         # Learnable mode queries for each anchor
         self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
-        
-        # Position embeddings for trajectory queries within each mode
-        self.pos_emb = nn.Parameter(torch.zeros(1, horizon, n_emb))
-        
+
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
-        
+
         # Conditioning: timestep + current_status + GRU-encoded history
         self.time_emb = SinusoidalPosEmb(n_emb)
         self.ego_status_proj = nn.Linear(status_dim, n_emb)
         self.history_encoder = HistoryEncoder(status_dim, n_emb)
-        
+
         # Route-specific conditioning generator
         self.route_status_proj = nn.Sequential(
             nn.Linear(status_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
-        
-        # ========== BEV Feature Processing ==========
-        # Project BEV features
-        self.bev_feature_proj = nn.Sequential(
-            nn.Linear(transfuser_bev_dim, n_emb),
-            nn.LayerNorm(n_emb)
-        )
-        
-        # GridSampleCrossBEVAttention for spatial BEV features
-        self.bev_spatial_attn = GridSampleCrossBEVAttention(
-            embed_dims=n_emb,
-            num_heads=n_head,
-            in_bev_dims=transfuser_bev_upsample_dim,
-            num_points=horizon,
-            lidar_max_x=32.0,
-            lidar_max_y=32.0
-        )
-        
-        # ========== Transformer Decoder Layers ==========
-        # Simple transformer decoder for processing mode queries with BEV features
-        decoder_layer = nn.TransformerDecoderLayer(
+
+        # ========== Unified Decoder (UnifiedDecoderOnlyTransformer) ==========
+        # Handles: BEV feature projection, GridSampleCrossBEVAttention, route queries,
+        # position encodings, segment embeddings, and multi-source attention layers.
+        self.decoder = UnifiedDecoderOnlyTransformer(
             d_model=n_emb,
             nhead=n_head,
+            num_layers=n_layer,
             dim_feedforward=4 * n_emb,
             dropout=p_drop_attn,
-            batch_first=True,
-            norm_first=True
+            transfuser_bev_dim=transfuser_bev_dim,
+            transfuser_bev_upsample_dim=transfuser_bev_upsample_dim,
+            horizon=horizon,        # used for GridSampleCrossBEVAttention.num_points
+            num_waypoints=num_waypoints,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layer)
-        
+
         # ========== Output Heads ==========
-        # Trajectory regression head: outputs (B, num_modes, horizon, 2)
+        # Trajectory regression head: (B, num_modes, n_emb) -> (B, num_modes, horizon, 2)
         self.trajectory_head = nn.Sequential(
             nn.Linear(n_emb, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, horizon * output_dim),
         )
-        
-        # Classification head: outputs (B, num_modes)
+
+        # Classification head: (B, num_modes, n_emb) -> (B, num_modes)
         self.cls_head = nn.Sequential(
             nn.Linear(n_emb, n_emb // 2),
             nn.SiLU(),
             nn.Linear(n_emb // 2, 1),
         )
-        
-        # Route head: separate processing for route prediction
-        self.route_queries = nn.Parameter(torch.randn(1, num_waypoints, n_emb))
+
+        # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         self.route_head = nn.Sequential(
             nn.Linear(n_emb, n_emb),
             nn.SiLU(),
@@ -1452,7 +1344,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
         elif isinstance(module, TransformerForDiffusion):
-            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            pass  # UnifiedDecoderOnlyTransformer handles its own init
     
     def get_optim_groups(self, weight_decay: float = 1e-3):
         decay = set()
@@ -1572,41 +1464,36 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Combined conditioning
         conditioning = time_emb + status_emb + hist_global_emb  # (B, n_emb)
         
-        # ========== BEV Feature Processing ==========
-        # bev_feature: (B, 1512, 8, 8) -> flatten -> (B, 64, 1512) -> project -> (B, 64, n_emb)
-        bev_flat = transfuser_bev_feature.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
-        bev_tokens = self.bev_feature_proj(bev_flat)  # (B, 64, n_emb)
-        
         # ========== Anchor Embedding ==========
-        # anchors: (B, num_modes, anchor_num_points, 2) 
-        # Flatten anchor points and embed: -> (B, num_modes, n_emb)
+        # anchors: (B, num_modes, anchor_num_points, 2)
+        # Embed using average anchor position -> (B, num_modes, n_emb)
         anchors_flat = anchors.mean(dim=2)  # (B, num_modes, 2) - average anchor position
         anchor_emb = self.anchor_emb(anchors_flat)  # (B, num_modes, n_emb)
-        
+
         # Add learnable mode queries
         mode_queries = self.mode_queries.expand(B, -1, -1)  # (B, num_modes, n_emb)
-        
+
         # Combine: anchor embedding + mode queries + conditioning
         mode_emb = anchor_emb + mode_queries + conditioning.unsqueeze(1)  # (B, num_modes, n_emb)
         mode_emb = self.drop(mode_emb)
         mode_emb = self.pre_decoder_norm(mode_emb)
-        
-        # ========== Build Route Queries ==========
-        route_queries = self.route_queries.expand(B, -1, -1)  # (B, num_waypoints, n_emb)
+
+        # Route-specific conditioning
         route_conditioning = self.route_status_proj(current_status)  # (B, n_emb)
-        route_queries = route_queries + route_conditioning.unsqueeze(1)
-        
-        # ========== Unified Transformer Decoder (single forward) ==========
-        # Concatenate mode queries and route queries: [mode_emb | route_queries]
-        # mode_emb: (B, num_modes, n_emb), route_queries: (B, num_waypoints, n_emb)
-        unified_queries = torch.cat([mode_emb, route_queries], dim=1)  # (B, num_modes + num_waypoints, n_emb)
-        
-        # Single decoder forward with cross-attention to BEV tokens
-        unified_out = self.decoder(unified_queries, bev_tokens)  # (B, num_modes + num_waypoints, n_emb)
-        
-        # Split outputs back into mode and route
-        mode_out = unified_out[:, :num_modes, :]  # (B, num_modes, n_emb)
-        route_out = unified_out[:, num_modes:, :]  # (B, num_waypoints, n_emb)
+
+        # ========== UnifiedDecoderOnlyTransformer ==========
+        # traj_emb = mode_emb (B, num_modes, n_emb) - each mode is one "trajectory query"
+        # traj_points = anchors (B, num_modes, horizon, 2) - each mode samples BEV at its anchor waypoints
+        # The decoder internally builds route_queries and returns (mode_out, route_out)
+        mode_out, route_out = self.decoder(
+            traj_emb=mode_emb,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            conditioning=conditioning,
+            traj_points=anchors,  # (B, num_modes, horizon, 2)
+            route_conditioning=route_conditioning,
+        )
+        # mode_out: (B, num_modes, n_emb), route_out: (B, num_waypoints, n_emb)
         
         # ========== Output Heads ==========
         # 1. Trajectory regression: (B, num_modes, n_emb) -> (B, num_modes, horizon * 2)
@@ -1661,7 +1548,7 @@ def test():
     
     B = 4
     timestep = torch.tensor(0)
-    anchors = torch.randn((B, 32, 5, 2))  # (B, num_modes, anchor_num_points, 2)
+    anchors = torch.randn((B, 32, 8, 2))  # (B, num_modes, anchor_num_points=horizon, 2)
     
     # Transfuser features (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
     transfuser_bev_feature = torch.randn((B, 1512, 8, 8))
@@ -1696,7 +1583,7 @@ def test():
     assert diff > 0, "BEV features should affect output"
     
     print("\nTest 3: Different anchors affect output")
-    anchors2 = torch.randn((B, 32, 5, 2))
+    anchors2 = torch.randn((B, 32, 8, 2))
     poses_reg3, _, _ = transformer(
         anchors=anchors2, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature,

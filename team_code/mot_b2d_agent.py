@@ -15,8 +15,6 @@ from PIL import Image
 from torchvision import transforms as T
 import imageio
 import random
-import sys
-import numpy as np
 from filterpy.kalman import MerweScaledSigmaPoints
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 
@@ -58,23 +56,25 @@ sys.path.append(mot_dp_path)
 sys.path.append(mot_path)
 sys.path = [str(p) for p in sys.path]
 
-from transformers import HfArgumentParser
-import json
-from dataclasses import dataclass, field
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
-from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
-from PIL import Image
-from safetensors.torch import load_file
-import glob
-from data.reasoning.data_utils import add_special_tokens
-from mot.modeling.automotive import (
-    AutoMoTConfig, AutoMoT,
-    Qwen3VLTextConfig, Qwen3VLTextModel, Qwen3VLForConditionalGenerationMoT
-)
-from dataset.unified_carla_dataset import CARLAImageDataset
-from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
-from mot.evaluation.inference import InterleaveInferencer
-from transformers import AutoTokenizer
+# ===== MoT LLM switch: set False to run DP-only without loading LLM =====
+USE_MOT = False
+
+if USE_MOT:
+    from transformers import HfArgumentParser
+    from dataclasses import dataclass, field
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+    from safetensors.torch import load_file
+    import glob
+    from data.reasoning.data_utils import add_special_tokens
+    from mot.modeling.automotive import (
+        AutoMoTConfig, AutoMoT,
+        Qwen3VLTextConfig, Qwen3VLTextModel, Qwen3VLForConditionalGenerationMoT
+    )
+    from dataset.unified_carla_dataset import CARLAImageDataset
+    from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
+    from mot.evaluation.inference import InterleaveInferencer
+    from transformers import AutoTokenizer
 
 # Import TransfuserData using importlib to avoid conflicts with mot/data
 import importlib.util
@@ -92,23 +92,24 @@ _transfuser_data_spec.loader.exec_module(_transfuser_data_module)
 TransfuserData = _transfuser_data_module.CARLA_Data
 
 # Import utility modules
-from team_code.mot_utils import (
-    ModelArguments, InferenceArguments,
-    load_model_mot, build_cleaned_prompt_and_modes,
-    parse_decision_sequence, split_prompt
-)
+if USE_MOT:
+    from team_code.mot_utils import (
+        ModelArguments, InferenceArguments,
+        load_model_mot, build_cleaned_prompt_and_modes,
+        parse_decision_sequence, split_prompt
+    )
 from team_code.lidar_utils import lidar_to_ego_coordinate, algin_lidar
 from team_code.ukf_utils import (
     bicycle_model_forward, measurement_function_hx,
     state_mean, measurement_mean,
     residual_state_x, residual_measurement_h
 )
-from team_code.display_interface import DisplayInterface
+# from team_code.display_interface import DisplayInterface
 
-try:
-    import pygame
-except ImportError:
-    raise RuntimeError("cannot import pygame, make sure pygame package is installed")
+# try:
+#     import pygame
+# except ImportError:
+#     raise RuntimeError("cannot import pygame, make sure pygame package is installed")
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
@@ -123,7 +124,7 @@ def get_entry_point():
 def create_carla_config(config_path=None):
     """Load CARLA configuration from YAML file."""
     if config_path is None:
-        config_path = "/home/wang/Project/MoT-DP/config/pdm_local.yaml"
+        config_path = "/media/z/data/mzq/others/MoT-DP/config/pdm_local.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -192,13 +193,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		print("Loading diffusion policy...")
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
-		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best_epoch129.pt")
+		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/add_noise_multi_infer_trunc20")
+		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
-		self.net = self.net.to(torch.bfloat16)
-		if hasattr(self.net, 'obs_encoder'):
-			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
-		print("✓ Diffusion policy loaded (bfloat16).")
+		print("✓ Diffusion policy loaded (float32).")
 		
 		# Aggressive memory cleanup before loading MoT model
 		gc.collect()
@@ -213,43 +211,46 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"[GPU Memory] After DP: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
 
 		# Load MoT model
-		print("Loading MoT model...")
-		parser = HfArgumentParser((ModelArguments, InferenceArguments))
-		model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
-		self.inference_args = inference_args  
-		self.AutoMoT = load_model_mot(device)
-		tokenizer = AutoTokenizer.from_pretrained(model_args.qwen3vl_path)
-		tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
-		self.AutoMoT.language_model.tokenizer = tokenizer
-		self.inferencer = InterleaveInferencer(
-        model=self.AutoMoT,
-        vae_model=None,
-        tokenizer=tokenizer,
-        vae_transform=None,
-        vit_transform=None,  # Not used for Qwen3VL, handled internally by model
-        new_token_ids=new_token_ids,
-        max_num_tokens=inference_args.max_num_tokens,
-        visual_gen=True,  # Enable visual generation to initialize query tokens
-        visual_und=True,  # Enable visual understanding
-    	)
-		print("✓ MoT model loaded.")
+		if USE_MOT:
+			print("Loading MoT model...")
+			parser = HfArgumentParser((ModelArguments, InferenceArguments))
+			model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
+			self.inference_args = inference_args
+			self.AutoMoT = load_model_mot(device)
+			tokenizer = AutoTokenizer.from_pretrained(model_args.qwen3vl_path)
+			tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
+			self.AutoMoT.language_model.tokenizer = tokenizer
+			self.inferencer = InterleaveInferencer(
+				model=self.AutoMoT,
+				vae_model=None,
+				tokenizer=tokenizer,
+				vae_transform=None,
+				vit_transform=None,
+				new_token_ids=new_token_ids,
+				max_num_tokens=inference_args.max_num_tokens,
+				visual_gen=True,
+				visual_und=True,
+			)
+			print("✓ MoT model loaded.")
+		else:
+			print("[USE_MOT=False] Skipping MoT model loading.")
 
 		# ========== Load TransFuser Backbone for DP features ==========
 		print("Loading TransFuser backbone for DP features...")
-		transfuser_config_path = "/home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns"
+		transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
+		transfuser_model_path = os.path.join(transfuser_config_path, "model_0030_1.pth")
 		self.transfuser_backbone = TransFuserBackboneExtractor(
 			config_path=transfuser_config_path,
+			model_path=transfuser_model_path,
 			device='cuda:0'
 		)
 		# Backbone is already frozen in TransFuserBackboneExtractor
 		self.transfuser_backbone.eval()
-		# Convert to bfloat16 to match DP model precision
-		self.transfuser_backbone = self.transfuser_backbone.to(torch.bfloat16)
 		# Get transfuser config for lidar processing
 		self.transfuser_config = self.transfuser_backbone.config
 		# Initialize TransfuserData for lidar histogram conversion
 		self.transfuser_data = TransfuserData(root=[], config=self.transfuser_config, shared_dict=None)
-		print("✓ TransFuser backbone loaded, frozen, and converted to bfloat16.")
+		print("✓ TransFuser backbone loaded, frozen, and using float32.")
 		
 		# Initialize transfuser lidar buffer for temporal alignment
 		self.transfuser_lidar_buffer = deque(maxlen=self.transfuser_config.lidar_seq_len * self.transfuser_config.data_save_freq)
@@ -361,9 +362,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.lidar_bev_history = deque(maxlen=obs_horizon*10) 
 		self.rgb_history = deque(maxlen=obs_horizon*10)
 		self.speed_history = deque(maxlen=obs_horizon*10)
-		self.theta_history = deque(maxlen=obs_horizon*10)		# tg = tick_data['target_point']
-		# tg[1] = 0.05
-		# target_point = torch.from_numpy(tg).unsqueeze(0).float().to('cuda', dtype=torch.float32)e(maxlen=obs_horizon*10)
+		self.theta_history = deque(maxlen=obs_horizon*10)
 		self.throttle_history = deque(maxlen=obs_horizon*10)
 		self.next_command_history = deque(maxlen=obs_horizon*10)
 		self.target_point_history = deque(maxlen=obs_horizon*10)
@@ -446,7 +445,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		self.initialized = True
 		self.metric_info = {}
-		self._hic = DisplayInterface()
+		# self._hic = DisplayInterface()
 
 	def _build_obs_dict(self, tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point, cmd_one_hot, waypoint):
 		"""
@@ -775,7 +774,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		transfuser_lidar_bev_tensor = torch.from_numpy(transfuser_lidar_bev).float().unsqueeze(0).to('cuda')
 		
 		# Process other sensors
-		bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
+		if IS_BENCH2DRIVE:
+			bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
+		else:
+			bev = np.zeros((512, 512, 3), dtype=np.uint8)
 		
 		result = {
 				'rgb_front': rgb_front,
@@ -846,11 +848,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass']) #result['compass'])
 
 		# Debug: print target point transformation
-		if self.step <= 5:
-			print(f"  target_point (world): {target_point[:2]}")
-			print(f"  ego position (gps): {result['gps']}")
-			print(f"  compass (heading): {result['compass']:.4f} rad ({np.rad2deg(result['compass']):.2f} deg)")
-			print(f"  ego_target_point: {ego_target_point}")
+		# if self.step <= 5:
+		# 	print(f"  target_point (world): {target_point[:2]}")
+		# 	print(f"  ego position (gps): {result['gps']}")
+		# 	print(f"  compass (heading): {result['compass']:.4f} rad ({np.rad2deg(result['compass']):.2f} deg)")
+		# 	print(f"  ego_target_point: {ego_target_point}")
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
 		result['next_target_point'] = ego_next_target_point  # numpy array (2,)
@@ -1006,8 +1008,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if len(truncated) < MIN_POINTS_THRESHOLD or truncated_length < MIN_LENGTH_THRESHOLD:
 			# Truncated route is too short, skip truncation and use original route
 			# This handles edge cases near destination where target_point is very close
-			print(f"[Lateral] Skip truncation: points={len(truncated)}, length={truncated_length:.2f}m "
-				  f"(thresholds: {MIN_POINTS_THRESHOLD} points, {MIN_LENGTH_THRESHOLD}m)")
+			# print(f"[Lateral] Skip truncation: points={len(truncated)}, length={truncated_length:.2f}m "
+			# 	  f"(thresholds: {MIN_POINTS_THRESHOLD} points, {MIN_LENGTH_THRESHOLD}m)")
 			return route_waypoints_np, -1
 		
 		return truncated, truncation_idx
@@ -1031,8 +1033,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if target_point is not None:
 			target_point_np = target_point[0].data.cpu().numpy()  # (2,)
 			route_waypoints_np, truncation_idx = self._truncate_route_by_target_point(route_waypoints_np, target_point_np)
-			if truncation_idx >= 0:
-				print(f"[Lateral] Route truncated at index {truncation_idx}, remaining points: {len(route_waypoints_np)}")
+			# if truncation_idx >= 0:
+			# 	print(f"[Lateral] Route truncated at index {truncation_idx}, remaining points: {len(route_waypoints_np)}")
 		
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
@@ -1131,7 +1133,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if self.step % 20 == 0:
 			tp = tick_data['target_point']
 			ntp = tick_data['next_target_point']
-			print(f"[Target Points] TP=({tp[0]:.1f},{tp[1]:.1f}), NTP=({ntp[0]:.1f},{ntp[1]:.1f})")
+			# print(f"[Target Points] TP=({tp[0]:.1f},{tp[1]:.1f}), NTP=({ntp[0]:.1f},{ntp[1]:.1f})")
 
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
@@ -1171,66 +1173,59 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				cmd_one_hot, waypoint
 			)
 			
-			rgb_pil_list = []
-			for i in range(rgb_stacked.shape[1]): 
-				rgb_tensor = rgb_stacked[0, i]  # (C, H, W)
-				rgb_np = (rgb_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-				rgb_pil = Image.fromarray(rgb_np, mode='RGB')
-				rgb_pil_list.append(rgb_pil)
-			
-			# lidar_stacked shape: (1, obs_horizon, C, H, W)
-			lidar_tensor = lidar_stacked[0, -1]  # (C, H, W) - last frame
-			lidar_np = (lidar_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-			lidar_pil = Image.fromarray(lidar_np, mode='RGB')
-			lidar_pil_list = [lidar_pil]  
-			
-			if self.stuck_helper > 0:
-				# When stuck, always use next_target_point (farther) to help get unstuck
-				target_point_speed=torch.cat([speed, next_target_point], dim=-1)
-				print("Get stucked! Trigger the stuck helper!")
+			if USE_MOT:
+				rgb_pil_list = []
+				for i in range(rgb_stacked.shape[1]):
+					rgb_tensor = rgb_stacked[0, i]  # (C, H, W)
+					rgb_np = (rgb_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+					rgb_pil = Image.fromarray(rgb_np, mode='RGB')
+					rgb_pil_list.append(rgb_pil)
+
+				lidar_tensor = lidar_stacked[0, -1]  # (C, H, W) - last frame
+				lidar_np = (lidar_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+				lidar_pil = Image.fromarray(lidar_np, mode='RGB')
+				lidar_pil_list = [lidar_pil]
+
+				if self.stuck_helper > 0:
+					target_point_speed = torch.cat([speed, next_target_point], dim=-1)
+					# print("Get stucked! Trigger the stuck helper!")
+				else:
+					target_point_speed = torch.cat([speed, target_point], dim=-1)  # (1, 3)
+
+				prompt_cleaned, understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point_speed)
+
+				predicted_answer = self.inferencer(
+					image=rgb_pil_list,
+					front=[rgb_pil_list[-1]],
+					lidar=lidar_pil_list,
+					v_target_point=target_point_speed,
+					text=prompt_cleaned,
+					understanding_output=understanding_output,
+					reasoning_output=reasoning_output,
+					max_think_token_n=self.inference_args.max_num_tokens,
+					do_sample=False,
+					text_temperature=0.0,
+				)
+
+				pred_traj = predicted_answer['traj']  # (1, 6, 2)
+				pred_decision = predicted_answer['text']
+				self.last_pred_traj = pred_traj.squeeze(0).float().cpu().numpy()
 			else:
-				target_point_speed=torch.cat([speed, target_point], dim=-1)  # (1, 3)
+				pred_traj = None
+				pred_decision = ""
+				prompt_cleaned = ""
 
-			prompt_cleaned, understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point_speed)
+			self.last_target_point = target_point.squeeze(0).float().cpu().numpy()
+			self.last_next_target_point = next_target_point.squeeze(0).float().cpu().numpy()
 
-			predicted_answer = self.inferencer(
-				image=rgb_pil_list,  
-				front=[rgb_pil_list[-1]],  
-				lidar=lidar_pil_list,
-				v_target_point=target_point_speed,
-				text=prompt_cleaned,
-				understanding_output=understanding_output,
-				reasoning_output=reasoning_output,
-				max_think_token_n=self.inference_args.max_num_tokens,
-				do_sample=False,
-				text_temperature=0.0,
-			)
-
-			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2) in ego frame [x_forward, y_left]
-			pred_decision = predicted_answer['text']
-			
-			self.last_pred_traj = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2) in [x, y] format
-			self.last_target_point = target_point.squeeze(0).float().cpu().numpy()  # (2,) in [x, y] format
-			self.last_next_target_point = next_target_point.squeeze(0).float().cpu().numpy()  # (2,) in [x, y] format
-		
-			# DP trajectory refinement
-			# Add batch dimension to features: (seq_len, feat_dim) -> (1, seq_len, feat_dim)
-			dp_vit_feat = predicted_answer['dp_vit_feat']
-			if dp_vit_feat.dim() == 2:
-				dp_vit_feat = dp_vit_feat.unsqueeze(0)  # (1, Nvit, C)
-			
-			reason_feat = predicted_answer['reasoning_feat']
-			if reason_feat.dim() == 2:
-				reason_feat = reason_feat.unsqueeze(0)  # (1, Nr, C)
-			
 			# ========== Run TransFuser backbone to get BEV features ==========
 			with torch.no_grad():
-				# Convert inputs to bfloat16 to match transfuser backbone
-				transfuser_rgb_bf16 = tick_data['transfuser_rgb'].to(torch.bfloat16)
-				transfuser_lidar_bev_bf16 = tick_data['transfuser_lidar_bev'].to(torch.bfloat16)
+				# Keep float32 inputs for full precision inference
+				transfuser_rgb_fp32 = tick_data['transfuser_rgb'].to(torch.float32)
+				transfuser_lidar_bev_fp32 = tick_data['transfuser_lidar_bev'].to(torch.float32)
 				transfuser_output = self.transfuser_backbone(
-					rgb=transfuser_rgb_bf16,  # (1, 3, H, W) on GPU, bfloat16
-					lidar_bev=transfuser_lidar_bev_bf16  # (1, C, H, W) on GPU, bfloat16
+					rgb=transfuser_rgb_fp32,  # (1, 3, H, W) on GPU, float32
+					lidar_bev=transfuser_lidar_bev_fp32  # (1, C, H, W) on GPU, float32
 				)
 			
 			# Extract transfuser features (following DiffusionDriveV2: only 2 features)
@@ -1242,16 +1237,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Build dp_obs_dict with transfuser features
 			dp_obs_dict = {
 				'ego_status': ego_status_stacked,
-				# TransFuser features (single frame, following DiffusionDriveV2)
 				'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
 				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
-				# Reasoning tokens from MoT
-				'reasoning_query_tokens': reason_feat[:, :7, :],  # (1, 7, C)
-				'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
 			}
-			dp_pred_traj = self.net.predict_action(dp_obs_dict)
+			dp_pred_traj = self.net.predict_action(dp_obs_dict, no_noise=True)
 			# self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
-			# print("dp_pred_traj:", dp_pred_traj)
+			# if self.step % 20 == 0:
+			# 	bev_f = transfuser_bev_feature.float()
+			# 	print(f"[bev_feature] dtype={transfuser_bev_feature.dtype}, mean={bev_f.mean().item():.3f}, std={bev_f.std().item():.3f}, min={bev_f.min().item():.3f}, max={bev_f.max().item():.3f}")
 
 			# ================== control_pid method ==================
 			# Following agent_simlingo convention:
@@ -1269,6 +1262,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			else:
 				route_waypoints = torch.from_numpy(route_pred).float()
 			self.last_route_pred = route_waypoints.squeeze(0).numpy().copy()  # (20, 2) for visualization
+			# if self.step % 20 == 0:
+			# 	rp = self.last_route_pred
+			# 	print(f"[route_pred] x_range=[{rp[:,0].min():.2f}, {rp[:,0].max():.2f}], y_range=[{rp[:,1].min():.2f}, {rp[:,1].max():.2f}]")
+			# 	print(f"  x values: {rp[:,0].round(1).tolist()}")
+			# 	dp_a = dp_pred_traj['action'].squeeze(0)
+			# 	print(f"[dp_traj]  x_range=[{dp_a[:,0].min():.2f}, {dp_a[:,0].max():.2f}], y_range=[{dp_a[:,1].min():.2f}, {dp_a[:,1].max():.2f}]")
+			# 	print(f"  ego_status last: speed={ego_status_stacked[0,-1,0].item():.2f}, tp={ego_status_stacked[0,-1,6:8].cpu().numpy().round(2).tolist()}")
 
 			
 			gt_velocity = tick_data['speed']
@@ -1293,9 +1293,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				throttle = max(self.creep_throttle, throttle)
 				brake = False
 				self.force_move -= 1
-				print(f"force_move: {self.force_move}")
+				# print(f"force_move: {self.force_move}")
 
-			print(f"stuck_detector: {self.stuck_detector}")
+			# print(f"stuck_detector: {self.stuck_detector}")
 
 			
 			control = carla.VehicleControl()
@@ -1308,7 +1308,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			if gt_velocity * 3.6 > 35:
 				control.throttle = 0.0
 				control.brake = 1.0
-				print(f"[Speed Limit] Speed {gt_velocity * 3.6:.2f} km/h > 35 km/h, forcing brake!")
+				# print(f"[Speed Limit] Speed {gt_velocity * 3.6:.2f} km/h > 35 km/h, forcing brake!")
 			
 			# Store metadata
 			self.pid_metadata = {
@@ -1336,45 +1336,48 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				color=[1, 1, 0], pixels_per_meter=10, max_distance=30,
 			)
 
-			# Prepare trajectory for rendering (pred_traj - green)
-			traj_for_render = pred_traj.squeeze(0).cpu().float().numpy().copy()  # (6, 2)
-			traj_for_render[:, 1] = -traj_for_render[:, 1]  # Negate y: left -> right
 			tp_for_render = target_point.cpu().float().numpy().copy()
 			if tp_for_render.ndim == 2:
 				tp_for_render = tp_for_render.squeeze(0)
 			tp_for_render[1] = -tp_for_render[1]  # Negate y: left -> right
-			
 
-			trajectory = np.concatenate((traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
-			trajectory = trajectory[:, [1, 0]]
-			trajectory[:, 0] = -trajectory[:, 0]  # y (now in col 0) 
-			trajectory[:, 1] = -trajectory[:, 1]  # x (now in col 1)
-			render_trajectory = render_waypoints(trajectory, pixels_per_meter=30, max_distance=20, color=(0, 255, 0))
-			
 			# Prepare dp_pred_traj for rendering (red)
 			dp_traj_for_render = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) - already numpy
 			dp_traj_for_render[:, 1] = -dp_traj_for_render[:, 1]  # Negate y: left -> right
 			dp_trajectory = np.concatenate((dp_traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
 			dp_trajectory = dp_trajectory[:, [1, 0]]
-			dp_trajectory[:, 0] = -dp_trajectory[:, 0]  # y (now in col 0) 
-			dp_trajectory[:, 1] = -dp_trajectory[:, 1]  # x (now in col 1)
+			dp_trajectory[:, 0] = -dp_trajectory[:, 0]
+			dp_trajectory[:, 1] = -dp_trajectory[:, 1]
 			render_dp_trajectory = render_waypoints(dp_trajectory, pixels_per_meter=30, max_distance=20, color=(255, 0, 0))
 
 			ego_car_map = cv2.resize(ego_car_map, (200, 200))
-			render_trajectory = cv2.resize(render_trajectory, (200, 200))
 			render_dp_trajectory = cv2.resize(render_dp_trajectory, (200, 200))
 
-			surround_map = np.clip(
-				(
-					ego_car_map.astype(np.float32)
-					+ render_trajectory.astype(np.float32)
-					+ render_dp_trajectory.astype(np.float32)
-				),
-				0,
-				255,
-			).astype(np.uint8)
+			if USE_MOT and pred_traj is not None:
+				# Prepare MoT pred_traj for rendering (green)
+				traj_for_render = pred_traj.squeeze(0).cpu().float().numpy().copy()
+				traj_for_render[:, 1] = -traj_for_render[:, 1]
+				trajectory = np.concatenate((traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
+				trajectory = trajectory[:, [1, 0]]
+				trajectory[:, 0] = -trajectory[:, 0]
+				trajectory[:, 1] = -trajectory[:, 1]
+				render_trajectory = cv2.resize(
+					render_waypoints(trajectory, pixels_per_meter=30, max_distance=20, color=(0, 255, 0)),
+					(200, 200)
+				)
+				surround_map = np.clip(
+					ego_car_map.astype(np.float32) + render_trajectory.astype(np.float32) + render_dp_trajectory.astype(np.float32),
+					0, 255,
+				).astype(np.uint8)
+				decision_1s, decision_2s, decision_3s = parse_decision_sequence(pred_decision)
+			else:
+				surround_map = np.clip(
+					ego_car_map.astype(np.float32) + render_dp_trajectory.astype(np.float32),
+					0, 255,
+				).astype(np.uint8)
+				decision_1s, decision_2s, decision_3s = "", "", ""
+
 			tick_data["predicted_trajectory"] = surround_map
-			decision_1s, decision_2s, decision_3s = parse_decision_sequence(pred_decision)
 			tick_data["decision_1s"] = decision_1s
 			tick_data["decision_2s"] = decision_2s
 			tick_data["decision_3s"] = decision_3s
@@ -1382,6 +1385,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			tick_data["rgb_raw"] = tick_data["rgb_front"]
 
 			tick_data["rgb"] = cv2.resize(tick_data["rgb_front"], (800, 600))
+			if 'bev_traj' not in tick_data:
+				tick_data["bev_traj"] = np.zeros((400, 400, 3), dtype=np.uint8)
 			tick_data["bev_traj"] = cv2.resize(tick_data["bev_traj"], (400, 400))
 
 			tick_data["control"] = "throttle: %.2f, steer: %.2f, brake: %.2f" % (
@@ -1391,15 +1396,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 			tick_data["speed"] = "speed: %.2f Km/h, target point x: %.2f m, target point y: %.2f m" % (gt_velocity*3.6, target_point.squeeze(0).cpu().float().numpy()[0], target_point.squeeze(0).cpu().float().numpy()[1])
 			
-			sentence1, sentence2 = split_prompt(prompt_cleaned)
-			tick_data["language_1"] = "Instruction: " + sentence1
-			tick_data["language_2"] = sentence2
+			if USE_MOT:
+				sentence1, sentence2 = split_prompt(prompt_cleaned)
+				tick_data["language_1"] = "Instruction: " + sentence1
+				tick_data["language_2"] = sentence2
+			else:
+				tick_data["language_1"] = ""
+				tick_data["language_2"] = ""
 
 			tick_data["mes"] = "speed: %.2f" % gt_velocity
 			tick_data["time"] = "time: %.3f" % timestamp
 
-			surface = self._hic.run_interface(tick_data)
-			tick_data["surface"] = surface
+			# surface = self._hic.run_interface(tick_data)
+			# tick_data["surface"] = surface
 
 		return control
 
@@ -1409,10 +1418,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Draw trajectory on BEV image if available
 		bev_img = tick_data['bev'].copy()
-		if self.last_pred_traj is not None:
+		if self.last_pred_traj is not None or self.last_dp_pred_traj is not None or self.last_route_pred is not None:
 			# Pass last_route_pred for visualization (20 waypoints for lateral control, blue points)
 			# Pass both target_point and next_target_point for visualization
-			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, 
+			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point,
 			                                        self.last_next_target_point, self.last_dp_pred_traj, self.last_route_pred)
 		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
@@ -1478,12 +1487,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		#     pixel_row = cy - x / meters_per_pixel (x forward -> -row, i.e., up)
 		
 		pixels = []
-		for i in range(len(traj)):
-			x, y = traj[i]  # x: forward, y: left (model convention)
-			# Negate y for visualization: left-positive -> right-positive
-			pixel_col = int(cx + y / meters_per_pixel)  # y_left negated: +y_left -> -col, so use + to flip
-			pixel_row = int(cy - x / meters_per_pixel)
-			pixels.append((pixel_col, pixel_row))
+		if traj is not None:
+			for i in range(len(traj)):
+				x, y = traj[i]  # x: forward, y: left (model convention)
+				# Negate y for visualization: left-positive -> right-positive
+				pixel_col = int(cx + y / meters_per_pixel)  # y_left negated: +y_left -> -col, so use + to flip
+				pixel_row = int(cy - x / meters_per_pixel)
+				pixels.append((pixel_col, pixel_row))
 		
 		# Draw trajectory using cv2
 		# Draw lines connecting waypoints
