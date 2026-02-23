@@ -664,21 +664,33 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # Get model state dict (handle DDP wrapper)
         model_to_save = policy.module if world_size > 1 else policy
         
-        # Save checkpoint at save_freq intervals (not every epoch to reduce I/O)
+        # Save checkpoint at save_freq intervals, keep only the latest max_keep checkpoints
         save_freq = config.get('training', {}).get('save_freq', 5)
+        max_keep_ckpts = config.get('training', {}).get('max_keep_ckpts', 5)
         if rank == 0 and (epoch + 1) % save_freq == 0:
-            # torch.save({
-            #             'model_state_dict': model_to_save.state_dict(),
-            #             'optimizer_state_dict': optimizer.state_dict(),
-            #             'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-            #             'config': config,
-            #             'epoch': epoch,
-            #             'val_loss': val_loss,
-            #             'train_loss': avg_train_loss,
-            #             'val_metrics': val_metrics
-            #             }, os.path.join(checkpoint_dir, "carla_policy.pt"))
-            # print(f"  Checkpoint saved at epoch {epoch+1}")
-            pass
+            ckpt_path = os.path.join(checkpoint_dir, f"dit_policy_epoch{epoch+1}.pt")
+            torch.save({
+                        'model_state_dict': model_to_save.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                        'config': config,
+                        'epoch': epoch,
+                        'val_loss': val_loss,
+                        'train_loss': avg_train_loss,
+                        'val_metrics': val_metrics
+                        }, ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
+
+            # Remove old periodic checkpoints, keep only the latest max_keep_ckpts
+            import glob as glob_module
+            periodic_ckpts = sorted(
+                glob_module.glob(os.path.join(checkpoint_dir, "dit_policy_epoch*.pt")),
+                key=os.path.getmtime
+            )
+            while len(periodic_ckpts) > max_keep_ckpts:
+                old_ckpt = periodic_ckpts.pop(0)
+                os.remove(old_ckpt)
+                print(f"  Removed old checkpoint: {old_ckpt}")
         
         if rank == 0:
             safe_wandb_log({
