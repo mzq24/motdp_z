@@ -2,7 +2,7 @@ device:
   gpu_ids:
   - 0
 dataloader:
-  batch_size: 256
+  batch_size: 128
   num_workers: 8
   persistent_workers: true
   pin_memory: true
@@ -82,22 +82,22 @@ policy:
   action_horizon: 6
 truncated_diffusion:
   num_train_timesteps: 1000
-  trunc_timesteps: 10
+  trunc_timesteps: 50
   train_trunc_timesteps: 100
-  num_diffusion_steps: 1
+  num_diffusion_steps: 5
   eta: 0.0
   prediction_type: "sample"
   norm_x_offset: 16.0
   norm_x_range: 92.0
   norm_y_offset: 45.0
   norm_y_range: 88.0 #  Extended range: x=[-16.0, 76.0], y=[-45.0, 43.0]
-  route_loss_weight: 0.6  # Route is equally important (lateral control) as waypoint (longitudinal control)
+  route_loss_weight: 0.2  # Reduced from 0.6: route converges faster than reg, avoid dominating early gradients
 
 # ========== Multimodal Anchor Configuration ==========
 anchor_path: /media/z/data/mzq/others/MoT-DP/wp_tokens.pkl  # Path to anchor centers file
 num_modes: 32  # Number of anchor modes (cluster centers)
-cls_loss_weight: 0.5  # Classification loss weight (focal loss)
-reg_loss_weight: 1.0  # Regression loss weight (L1 loss on best mode)
+cls_loss_weight: 0.1  # Reduced from 0.5: cls converges fast (discrete anchor assignment), keep gradient small
+reg_loss_weight: 1.0  # Anchor: diffusion regression is the primary task, hardest to converge
 
 training:
   num_epochs: 500

@@ -851,9 +851,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             # Normalize delta to [-1, 1] for diffusion operations
             all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T, 2)
 
+            max_train_t = max(0, min(self.train_trunc_timesteps - 1, self.num_train_timesteps - 1))
+            trunc_t = int(np.clip(self.trunc_timesteps, 0, max_train_t))
+
             # Add DDIM additive noise at truncated timestep
             noise = torch.randn_like(all_anchors_delta_normed)
-            trunc_ts = torch.full((bs,), self.trunc_timesteps, dtype=torch.long, device=device)
+            trunc_ts = torch.full((bs,), trunc_t, dtype=torch.long, device=device)
             x_t = self.diffusion_scheduler.add_noise(
                 original_samples=all_anchors_delta_normed,
                 noise=noise,
@@ -863,7 +866,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             # roll_timesteps: num_steps+1 points from trunc_timesteps to 0
             # e.g. trunc=100, steps=2 → [100, 50, 0], loop runs 2 iterations
             roll_timesteps = np.linspace(
-                self.trunc_timesteps, 0, num_steps + 1
+                trunc_t, 0, num_steps + 1
             ).round().astype(np.int64)
 
             # Precompute alphas_cumprod
@@ -909,6 +912,18 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             # Final output: denormalize the denoised result
             final_delta_normed = torch.clamp(x_t, -1, 1)
             final_delta = self.denorm_delta(final_delta_normed)  # (B, M, T, 2)
+
+            # Re-forward at t=0 using the fully denoised trajectories.
+            # Important: keep classification logits and trajectory candidates aligned.
+            t0 = torch.zeros((bs,), dtype=torch.long, device=device)
+            poses_reg_t0, poses_cls, route_pred = self.model(
+                anchors=final_delta,
+                timestep=t0,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status
+            )
+            final_delta = poses_reg_t0
 
         # Select best mode based on classification scores from last forward pass
         best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
