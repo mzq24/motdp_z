@@ -93,11 +93,8 @@ class TransFuserBackboneExtractor(nn.Module):
     def _load_weights(self, config_path: str, model_path: str = None):
         """加载模型权重"""
         if model_path is None:
-            # 自动查找权重文件
-            for file in os.listdir(config_path):
-                if file.endswith('.pth') and file.startswith('model'):
-                    model_path = os.path.join(config_path, file)
-                    break
+            # 默认使用指定的权重文件
+            model_path = os.path.join(config_path, 'model_0030_1.pth')
         
         if model_path is None:
             raise FileNotFoundError(f"No model weights found in {config_path}")
