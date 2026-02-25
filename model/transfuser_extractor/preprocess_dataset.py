@@ -164,64 +164,89 @@ class DatasetPreprocessor:
         
         return lidar_bev
     
+    def _load_frame(self, args):
+        """线程安全的单帧读取，供 ThreadPoolExecutor 调用"""
+        lidar_file, rgb_file, frame_num = args
+        try:
+            rgb = self.preprocess_rgb(str(rgb_file))
+            lidar_bev = self.preprocess_lidar(str(lidar_file))
+            return frame_num, rgb, lidar_bev
+        except Exception as e:
+            print(f"Error reading frame {frame_num}: {e}")
+            return frame_num, None, None
+
     def process_route(self, route_dir: Path):
         """
-        处理单个 route，提取并保存所有帧的特征
-        
-        Args:
-            route_dir: route 目录路径
+        处理单个 route，提取并保存所有帧的特征。
+        使用批处理 (batch_size) 和线程预取来提升吞吐量。
         """
-        # 创建特征保存目录
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         feature_dir = route_dir / self.feature_dir_name
         feature_dir.mkdir(exist_ok=True)
-        
-        # 获取帧数
+
         lidar_dir = route_dir / 'lidar'
         rgb_dir = route_dir / 'rgb'
-        
+
         frame_files = sorted(lidar_dir.glob('*.laz'))
-        
+
+        # 过滤已存在的帧
+        pending = []
         for lidar_file in frame_files:
-            # 获取帧号
-            frame_num = lidar_file.stem  # e.g., "0001"
-            
-            # 检查是否已存在 (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
+            frame_num = lidar_file.stem
             feature_path = feature_dir / f"{frame_num}_feature.pt"
             feature_upsample_path = feature_dir / f"{frame_num}_feature_upsample.pt"
-            
             if self.skip_existing and feature_path.exists() and feature_upsample_path.exists():
-                print('skipping')
                 continue
-            
-            # RGB 文件路径
             rgb_file = rgb_dir / f"{frame_num}.jpg"
-            
             if not rgb_file.exists():
                 print(f"Warning: RGB file not found: {rgb_file}")
                 continue
-            
+            pending.append((lidar_file, rgb_file, frame_num))
+
+        if not pending:
+            return
+
+        # 按 batch_size 分批，使用线程池并行读取 IO
+        io_workers = min(self.batch_size, 8)
+        for batch_start in range(0, len(pending), self.batch_size):
+            batch_args = pending[batch_start: batch_start + self.batch_size]
+
+            # 并行读取本批帧
+            loaded = {}
+            with ThreadPoolExecutor(max_workers=io_workers) as executor:
+                futures = {executor.submit(self._load_frame, args): args[2] for args in batch_args}
+                for future in as_completed(futures):
+                    frame_num, rgb, lidar_bev = future.result()
+                    if rgb is not None:
+                        loaded[frame_num] = (rgb, lidar_bev)
+
+            if not loaded:
+                continue
+
+            # 按顺序 stack 成 batch（保持帧号顺序）
+            ordered = [(fn, loaded[fn]) for _, _, fn in batch_args if fn in loaded]
+            frame_nums = [fn for fn, _ in ordered]
+            rgb_batch = torch.cat([d[0] for _, d in ordered], dim=0)    # (B, 3, H, W)
+            lidar_batch = torch.cat([d[1] for _, d in ordered], dim=0)  # (B, C, H, W)
+
             try:
-                # 预处理输入
-                rgb = self.preprocess_rgb(str(rgb_file))
-                lidar_bev = self.preprocess_lidar(str(lidar_file))
-                
-                # 提取特征
                 with torch.no_grad():
-                    output = self.extractor(rgb, lidar_bev)
-                
-                # 保存 bev_feature 和 bev_feature_upsample (移到 CPU)
-                # Following DiffusionDriveV2: only use these two features
-                bev_feature = output['bev_feature']
-                bev_feature_upsample = output['bev_feature_upscale']
-                
-                if bev_feature is not None:
-                    torch.save(bev_feature.cpu(), feature_path)
-                
-                if bev_feature_upsample is not None:
-                    torch.save(bev_feature_upsample.cpu(), feature_upsample_path)
-                    
+                    output = self.extractor(rgb_batch, lidar_batch)
+
+                bev_feature = output['bev_feature']          # (B, 1512, 8, 8)
+                bev_upsample = output['bev_feature_upscale'] # (B, 64, 64, 64)
+
+                for j, frame_num in enumerate(frame_nums):
+                    if bev_feature is not None:
+                        torch.save(bev_feature[j:j+1].cpu(),
+                                   feature_dir / f"{frame_num}_feature.pt")
+                    if bev_upsample is not None:
+                        torch.save(bev_upsample[j:j+1].cpu(),
+                                   feature_dir / f"{frame_num}_feature_upsample.pt")
+
             except Exception as e:
-                print(f"Error processing frame {frame_num} in {route_dir}: {e}")
+                print(f"Error processing batch in {route_dir}: {e}")
                 continue
     
     def run(self, num_workers: int = 1):
