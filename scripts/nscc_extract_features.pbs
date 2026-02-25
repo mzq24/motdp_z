@@ -1,0 +1,49 @@
+#!/bin/bash
+
+### Phase 2: Extract TransFuser BEV features (route_source.pt → route_features.pt)
+### Requires 1 GPU. Run after nscc_pack_source.pbs completes.
+### Submit: qsub scripts/nscc_extract_features.pbs
+### Or chain after pack job: qsub -W depend=afterok:<JOBID> scripts/nscc_extract_features.pbs
+
+#PBS -l select=1:ngpus=1:ncpus=8:mem=64G
+#PBS -l walltime=24:00:00
+#PBS -P personal-wh.huang
+#PBS -N mot_extract_features
+#PBS -j oe
+#PBS -o out.extract_features.txt
+#PBS -M m240117@e.ntu.edu.sg
+#PBS -m abe
+
+# ---- User config ----
+SCRATCH=/home/users/ntu/wh.huang/scratch
+DATASET_PATH=${SCRATCH}/datasets/pdm_lite
+CONFIG_PATH=${SCRATCH}/models/pretrained_models/all_towns
+MODEL_PATH=${CONFIG_PATH}/model_0030_1.pth
+CODE_DIR=${SCRATCH}/z_projects/code/MoT-DP
+CONDA_ENV=dpautomotive
+LOG_FILE=${SCRATCH}/logs/mot_extract_features_${PBS_JOBID}.log
+# ---------------------
+
+source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
+conda activate ${CONDA_ENV}
+
+cd ${CODE_DIR}
+mkdir -p ${SCRATCH}/logs
+
+echo "=== Phase 2: Extracting TransFuser features ===" | tee ${LOG_FILE}
+echo "Dataset: ${DATASET_PATH}"                         | tee -a ${LOG_FILE}
+echo "GPU:     $(nvidia-smi --query-gpu=name --format=csv,noheader)" | tee -a ${LOG_FILE}
+echo "Log:     ${LOG_FILE}"                             | tee -a ${LOG_FILE}
+echo "Start:   $(date)"                                 | tee -a ${LOG_FILE}
+
+# -u: 禁用 Python 输出缓冲，保证日志实时写入文件
+python -u model/transfuser_extractor/preprocess_dataset.py \
+  --dataset_path ${DATASET_PATH} \
+  --config_path  ${CONFIG_PATH} \
+  --model_path   ${MODEL_PATH} \
+  --batch_size   32 \
+  --device       cuda:0 \
+  --mode         extract \
+  >> ${LOG_FILE} 2>&1
+
+echo "Done: $(date)" | tee -a ${LOG_FILE}
