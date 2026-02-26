@@ -1,35 +1,53 @@
 """
 数据集预处理脚本
 ================
-加载 TransFuser backbone，处理 pdm_lite_mini 数据集，
-保存 BEV feature 和上采样后的 BEV feature。
+两阶段流水线，解决 Lustre MDS jitter（大量小文件 open/stat 导致的偶发延迟）：
 
-Following DiffusionDriveV2: only save bev_feature and bev_feature_upsample.
-fused_features and image_feature_grid are NOT used.
+  Phase 1 (pack_source):
+    读 .laz + .jpg → 预处理 → 打包为 route_source.pt（per-route 大文件）
+    每个 route 一个文件，彻底消除 Phase 2 的小文件 IO。
+    可在 CPU 节点上独立完成，之后无需重跑。
+
+  Phase 2 (extract):
+    读 route_source.pt（若存在）→ GPU TransFuser → 保存 route_features.pt
+    Route 级别预取：IO 线程加载 route[i+1] 时 GPU 处理 route[i]。
+    若 route_source.pt 不存在，回退到原有的 per-frame 并行 IO + 预取路径。
 
 使用方法:
-    python preprocess_dataset.py --dataset_path /home/wang/Dataset/pdm_lite_mini \
-                                 --config_path /home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns
+    # 全流程（先 pack 源数据，再 GPU 提取）
+    python preprocess_dataset.py --mode pack_and_extract ...
 
-输出:
-    在每个 route 目录下创建 transfuser_feature 子文件夹，保存:
-    - 0001_feature.pt: 融合后的原始 BEV 特征
-    - 0001_feature_upsample.pt: 上采样后的 BEV 特征
+    # 仅 pack 源数据（CPU 节点）
+    python preprocess_dataset.py --mode pack_source ...
+
+    # 仅 GPU 提取（源数据已 pack）
+    python preprocess_dataset.py --mode extract ...
+
+route_source.pt 格式:
+    {
+        'frame_nums': List[str],                  # ['0001', '0002', ...]
+        'rgbs':       Tensor (N, 3, H, W) uint8,  # 裁剪后的 RGB，节省约 75% 空间
+        'lidar_bevs': Tensor (N, C, 256, 256) float16,
+    }
+
+route_features.pt 格式:
+    {
+        'frame_nums':  List[str],
+        'bev_features':  Tensor (N, 1512, 8, 8),
+        'bev_upsamples': Tensor (N, 64, 64, 64),
+    }
 """
 
 import os
 import sys
 import argparse
-import gzip
 from pathlib import Path
 from tqdm import tqdm
-import re
 
 import torch
 import numpy as np
 import cv2
 import laspy
-import ujson
 
 # 添加当前目录到路径
 current_dir = Path(__file__).parent
@@ -42,35 +60,24 @@ import transfuser_utils as t_u
 class DatasetPreprocessor:
     """
     数据集预处理器
-    
-    遍历 pdm_lite 数据集，提取并保存 TransFuser BEV 特征
+
+    遍历 pdm_lite 数据集，提取并保存 TransFuser BEV 特征。
+    支持两阶段流水线以规避 Lustre MDS 小文件瓶颈。
     """
-    
-    def __init__(self, 
-                 dataset_path: str, 
-                 config_path: str, 
+
+    def __init__(self,
+                 dataset_path: str,
+                 config_path: str,
                  model_path: str = None,
                  device: str = 'cuda:0',
                  batch_size: int = 1,
                  skip_existing: bool = True):
-        """
-        初始化预处理器
-        
-        Args:
-            dataset_path: 数据集根目录路径
-            config_path: TransFuser 配置文件路径
-            model_path: 模型权重路径 (可选)
-            device: 运行设备
-            batch_size: 批处理大小
-            skip_existing: 是否跳过已存在的特征文件
-        """
         self.dataset_path = Path(dataset_path)
         self.config_path = config_path
         self.device = device
         self.batch_size = batch_size
         self.skip_existing = skip_existing
-        
-        # 创建特征提取器
+
         print("Initializing TransFuser Backbone Extractor...")
         self.extractor = TransFuserBackboneExtractor(
             config_path=config_path,
@@ -78,191 +85,349 @@ class DatasetPreprocessor:
             device=device
         )
         self.config = self.extractor.config
-        
-        # 特征保存目录名
+
         self.feature_dir_name = "transfuser_feature"
-        
+
+    # ------------------------------------------------------------------
+    # 数据集发现
+    # ------------------------------------------------------------------
+
     def find_all_routes(self):
         """
-        查找数据集中所有有效的 route 目录
-        
-        Returns:
-            list: route 目录路径列表
+        查找数据集中所有有效的 route 目录。
+
+        Lustre 优化：
+        - os.scandir 复用 readdir 返回的 d_type，避免每次 is_dir() 额外 stat
+        - 去掉 gzip.open 验证（仅做 exists 检查），消除 2500 次文件读取
+        - ThreadPoolExecutor 并行化 per-route 的 exists 检查
         """
-        routes = []
-        
-        # 遍历数据集目录
-        for scenario_dir in self.dataset_path.iterdir():
-            if not scenario_dir.is_dir():
-                continue
-            
-            # 遍历 scenario 下的 route 目录
-            for route_dir in scenario_dir.iterdir():
-                if not route_dir.is_dir():
-                    continue
-                
-                # 跳过失败的 route
-                if route_dir.name.startswith('FAILED_'):
-                    continue
-                
-                # 检查必要的文件是否存在
-                lidar_dir = route_dir / 'lidar'
-                rgb_dir = route_dir / 'rgb'
-                results_file = route_dir / 'results.json.gz'
-                
-                if lidar_dir.exists() and rgb_dir.exists() and results_file.exists():
-                    # 验证数据完整性
-                    try:
-                        with gzip.open(results_file, 'rt', encoding='utf-8') as f:
-                            results = ujson.load(f)
-                        # 可以在这里添加更多验证条件
-                        routes.append(route_dir)
-                    except Exception as e:
-                        print(f"Warning: Failed to read results for {route_dir}: {e}")
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _check_route(route_path: str):
+            p = Path(route_path)
+            if p.name.startswith('FAILED_'):
+                return None
+            if ((p / 'lidar').exists() and
+                    (p / 'rgb').exists() and
+                    (p / 'results.json.gz').exists()):
+                return p
+            return None
+
+        # 收集候选 route 路径（两层 scandir，利用 d_type 跳过非目录 stat）
+        candidates = []
+        try:
+            with os.scandir(self.dataset_path) as sit:
+                for scenario_entry in sit:
+                    if not scenario_entry.is_dir(follow_symlinks=False):
                         continue
-        
-        return routes
-    
+                    try:
+                        with os.scandir(scenario_entry.path) as rit:
+                            for route_entry in rit:
+                                if route_entry.is_dir(follow_symlinks=False):
+                                    candidates.append(route_entry.path)
+                    except PermissionError:
+                        continue
+        except PermissionError:
+            pass
+
+        # 并行 exists 检查（32 线程，每线程独立 stat）
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(_check_route, candidates))
+
+        return sorted(p for p in results if p is not None)
+
     def get_frame_count(self, route_dir: Path) -> int:
-        """获取 route 中的帧数"""
-        lidar_dir = route_dir / 'lidar'
-        return len(list(lidar_dir.glob('*.laz')))
-    
+        return len(list((route_dir / 'lidar').glob('*.laz')))
+
+    # ------------------------------------------------------------------
+    # 单帧预处理（线程安全）
+    # ------------------------------------------------------------------
+
     def preprocess_rgb(self, rgb_path: str) -> torch.Tensor:
-        """
-        预处理 RGB 图像 (与训练时完全一致)
-        """
-        # 读取图像
+        """读取并裁剪 RGB 图像，返回 (1, 3, H, W) float32 [0, 255]"""
         image = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # 裁剪
         image = t_u.crop_array(self.config, image)
-        
-        # 转换为 PyTorch 格式 (C, H, W)
         image = np.transpose(image, (2, 0, 1))
-        
-        # 转换为张量
-        image = torch.from_numpy(image).float().unsqueeze(0)
-        
-        return image
-    
+        return torch.from_numpy(image).float().unsqueeze(0)
+
     def preprocess_lidar(self, lidar_path: str) -> torch.Tensor:
-        """
-        预处理 LiDAR 点云 (与训练时完全一致)
-        """
-        # 读取 LiDAR 数据
+        """读取 .laz 并转换为 BEV histogram，返回 (1, C, 256, 256) float32"""
         las_object = laspy.read(lidar_path)
         lidar = las_object.xyz
-        
-        # 转换为 histogram features
         lidar_bev = self.extractor.lidar_to_histogram_features(
             lidar, use_ground_plane=self.config.use_ground_plane)
-        
-        # 转换为张量
-        lidar_bev = torch.from_numpy(lidar_bev).float().unsqueeze(0)
-        
-        return lidar_bev
-    
-    def process_route(self, route_dir: Path):
+        return torch.from_numpy(lidar_bev).float().unsqueeze(0)
+
+    def _load_frame(self, args):
+        """线程安全的单帧读取，供 ThreadPoolExecutor 调用"""
+        lidar_file, rgb_file, frame_num = args
+        try:
+            rgb = self.preprocess_rgb(str(rgb_file))
+            lidar_bev = self.preprocess_lidar(str(lidar_file))
+            return frame_num, rgb, lidar_bev
+        except Exception as e:
+            print(f"Error reading frame {frame_num}: {e}")
+            return frame_num, None, None
+
+    # ------------------------------------------------------------------
+    # Phase 1: 打包源数据
+    # ------------------------------------------------------------------
+
+    def pack_source_route(self, route_dir: Path):
         """
-        处理单个 route，提取并保存所有帧的特征
-        
-        Args:
-            route_dir: route 目录路径
+        将 route 下所有 .laz + .jpg 预处理并打包为 route_source.pt。
+
+        存储格式：
+          rgbs:       (N, 3, H, W) uint8   — 比 float32 节省 75% 空间
+          lidar_bevs: (N, C, 256, 256) float16 — 比 float32 节省 50% 空间
+
+        所有帧并行读取（无 GPU），最多 32 个 IO 线程。
         """
-        # 创建特征保存目录
-        feature_dir = route_dir / self.feature_dir_name
-        feature_dir.mkdir(exist_ok=True)
-        
-        # 获取帧数
+        from concurrent.futures import ThreadPoolExecutor
+
+        source_pack_path = route_dir / 'route_source.pt'
+        if self.skip_existing and source_pack_path.exists():
+            return
+
         lidar_dir = route_dir / 'lidar'
         rgb_dir = route_dir / 'rgb'
-        
         frame_files = sorted(lidar_dir.glob('*.laz'))
-        
+
+        pending = []
         for lidar_file in frame_files:
-            # 获取帧号
-            frame_num = lidar_file.stem  # e.g., "0001"
-            
-            # 检查是否已存在 (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
-            feature_path = feature_dir / f"{frame_num}_feature.pt"
-            feature_upsample_path = feature_dir / f"{frame_num}_feature_upsample.pt"
-            
-            if self.skip_existing and feature_path.exists() and feature_upsample_path.exists():
-                print('skipping')
-                continue
-            
-            # RGB 文件路径
+            frame_num = lidar_file.stem
             rgb_file = rgb_dir / f"{frame_num}.jpg"
-            
             if not rgb_file.exists():
                 print(f"Warning: RGB file not found: {rgb_file}")
                 continue
-            
-            try:
-                # 预处理输入
-                rgb = self.preprocess_rgb(str(rgb_file))
-                lidar_bev = self.preprocess_lidar(str(lidar_file))
-                
-                # 提取特征
-                with torch.no_grad():
-                    output = self.extractor(rgb, lidar_bev)
-                
-                # 保存 bev_feature 和 bev_feature_upsample (移到 CPU)
-                # Following DiffusionDriveV2: only use these two features
-                bev_feature = output['bev_feature']
-                bev_feature_upsample = output['bev_feature_upscale']
-                
-                if bev_feature is not None:
-                    torch.save(bev_feature.cpu(), feature_path)
-                
-                if bev_feature_upsample is not None:
-                    torch.save(bev_feature_upsample.cpu(), feature_upsample_path)
-                    
-            except Exception as e:
-                print(f"Error processing frame {frame_num} in {route_dir}: {e}")
-                continue
-    
-    def run(self, num_workers: int = 1):
+            pending.append((lidar_file, rgb_file, frame_num))
+
+        if not pending:
+            return
+
+        # 全部帧并行读取（IO bound，无 GPU）
+        io_workers = min(len(pending), 32)
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=io_workers) as executor:
+            futures = [executor.submit(self._load_frame, args) for args in pending]
+            for future in tqdm(futures, desc="  reading frames", unit="frame", leave=False):
+                fn, rgb, lidar_bev = future.result()
+                if rgb is not None:
+                    # squeeze batch dim，存为紧凑格式
+                    results[fn] = (rgb.squeeze(0).to(torch.uint8),   # (3, H, W) uint8
+                                   lidar_bev.squeeze(0).half())       # (C, 256, 256) float16
+
+        if not results:
+            return
+
+        sorted_fns = sorted(results.keys())
+        rgbs = torch.stack([results[fn][0] for fn in sorted_fns])       # (N, 3, H, W) uint8
+        lidar_bevs = torch.stack([results[fn][1] for fn in sorted_fns]) # (N, C, 256, 256) float16
+
+        torch.save({
+            'frame_nums': sorted_fns,
+            'rgbs': rgbs,
+            'lidar_bevs': lidar_bevs,
+        }, source_pack_path)
+
+    # ------------------------------------------------------------------
+    # Phase 2: 提取 TransFuser features
+    # ------------------------------------------------------------------
+
+    def process_route(self, route_dir: Path, source_pack: dict = None):
         """
-        运行数据集预处理
-        
+        提取单个 route 的 BEV feature，保存为 route_features.pt。
+
+        source_pack 传入时走快速路径（无 IO，直接从内存 tensor 批量推理）。
+        source_pack 为 None 时回退到 per-frame 并行 IO + batch 预取路径。
+        """
+        feature_dir = route_dir / self.feature_dir_name
+        feature_dir.mkdir(exist_ok=True)
+
+        packed_path = feature_dir / 'route_features.pt'
+        if self.skip_existing and packed_path.exists():
+            return
+
+        all_frame_nums = []
+        all_bev_features = []
+        all_bev_upsamples = []
+
+        if source_pack is not None:
+            # ---- 快速路径：源数据已在内存，无文件 IO ----
+            frame_nums = source_pack['frame_nums']
+            rgbs = source_pack['rgbs'].float()        # uint8 → float32 [0, 255]
+            lidar_bevs = source_pack['lidar_bevs'].float()  # float16 → float32
+
+            n_batches = (len(frame_nums) + self.batch_size - 1) // self.batch_size
+            for i in tqdm(range(0, len(frame_nums), self.batch_size),
+                          desc="  GPU batches", unit="batch", total=n_batches, leave=False):
+                batch_frame_nums = frame_nums[i:i + self.batch_size]
+                rgb_batch = rgbs[i:i + self.batch_size]
+                lidar_batch = lidar_bevs[i:i + self.batch_size]
+                try:
+                    with torch.no_grad():
+                        output = self.extractor(rgb_batch, lidar_batch)
+                    all_frame_nums.extend(batch_frame_nums)
+                    all_bev_features.append(output['bev_feature'].cpu())
+                    all_bev_upsamples.append(output['bev_feature_upscale'].cpu())
+                except Exception as e:
+                    print(f"Error processing batch in {route_dir}: {e}")
+                    continue
+
+        else:
+            # ---- 慢速回退路径：per-frame 并行 IO + batch 预取 ----
+            from concurrent.futures import ThreadPoolExecutor
+
+            lidar_dir = route_dir / 'lidar'
+            rgb_dir = route_dir / 'rgb'
+            frame_files = sorted(lidar_dir.glob('*.laz'))
+
+            pending = []
+            for lidar_file in frame_files:
+                frame_num = lidar_file.stem
+                rgb_file = rgb_dir / f"{frame_num}.jpg"
+                if not rgb_file.exists():
+                    print(f"Warning: RGB file not found: {rgb_file}")
+                    continue
+                pending.append((lidar_file, rgb_file, frame_num))
+
+            if not pending:
+                return
+
+            batches = [pending[i:i + self.batch_size]
+                       for i in range(0, len(pending), self.batch_size)]
+
+            io_workers = min(self.batch_size, 32)
+
+            with ThreadPoolExecutor(max_workers=io_workers) as executor:
+                def _submit_batch(batch_args):
+                    return {executor.submit(self._load_frame, a): a[2] for a in batch_args}
+
+                pending_futures = _submit_batch(batches[0])
+
+                for i, batch_args in tqdm(enumerate(batches), desc="  GPU batches",
+                                          unit="batch", total=len(batches), leave=False):
+                    loaded = {}
+                    for future in pending_futures:
+                        fn, rgb, lidar_bev = future.result()
+                        if rgb is not None:
+                            loaded[fn] = (rgb, lidar_bev)
+
+                    if i + 1 < len(batches):
+                        pending_futures = _submit_batch(batches[i + 1])
+
+                    if not loaded:
+                        continue
+
+                    ordered = [(fn, loaded[fn]) for _, _, fn in batch_args if fn in loaded]
+                    batch_frame_nums = [fn for fn, _ in ordered]
+                    rgb_batch = torch.cat([d[0] for _, d in ordered], dim=0)
+                    lidar_batch = torch.cat([d[1] for _, d in ordered], dim=0)
+
+                    try:
+                        with torch.no_grad():
+                            output = self.extractor(rgb_batch, lidar_batch)
+                        all_frame_nums.extend(batch_frame_nums)
+                        all_bev_features.append(output['bev_feature'].cpu())
+                        all_bev_upsamples.append(output['bev_feature_upscale'].cpu())
+                    except Exception as e:
+                        print(f"Error processing batch in {route_dir}: {e}")
+                        continue
+
+        if not all_bev_features:
+            return
+
+        torch.save({
+            'frame_nums': all_frame_nums,
+            'bev_features': torch.cat(all_bev_features, dim=0),   # (N, 1512, 8, 8)
+            'bev_upsamples': torch.cat(all_bev_upsamples, dim=0),  # (N, 64, 64, 64)
+        }, packed_path)
+
+    # ------------------------------------------------------------------
+    # 提取循环（带 route 级别预取）
+    # ------------------------------------------------------------------
+
+    def _run_extract(self, routes: list):
+        """
+        带 route 级别预取的特征提取主循环。
+
+        IO 线程在后台加载 route[i+1] 的 route_source.pt，
+        同时 GPU 处理 route[i] 的推理。两者充分重叠。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _load_source_pack(route_dir: Path):
+            path = route_dir / 'route_source.pt'
+            if path.exists():
+                return torch.load(path, weights_only=True)
+            return None  # 触发慢速回退路径
+
+        with ThreadPoolExecutor(max_workers=1) as io_executor:
+            # 预提交第一个 route 的 IO
+            next_future = io_executor.submit(_load_source_pack, routes[0])
+
+            for i, route_dir in enumerate(tqdm(routes, desc="Extracting")):
+                source_pack = next_future.result()  # 等待当前 route 的 IO 完成
+
+                # 立即提交下一个 route 的 IO（与当前 GPU 推理并行）
+                if i + 1 < len(routes):
+                    next_future = io_executor.submit(_load_source_pack, routes[i + 1])
+
+                frame_count = self.get_frame_count(route_dir)
+                tqdm.write(f"  {route_dir.name} ({frame_count} frames)"
+                           f"{'  [source pack]' if source_pack is not None else '  [fallback IO]'}")
+
+                self.process_route(route_dir, source_pack=source_pack)
+
+    # ------------------------------------------------------------------
+    # 公共入口
+    # ------------------------------------------------------------------
+
+    def run(self, mode: str = 'extract'):
+        """
+        运行预处理流水线。
+
         Args:
-            num_workers: 工作进程数 (目前仅支持单进程)
+            mode: 运行模式
+                'pack_source'      — 仅 Phase 1：打包源数据（CPU 节点可用）
+                'extract'          — 仅 Phase 2：提取 BEV feature（需 GPU）
+                'pack_and_extract' — Phase 1 + Phase 2 连续执行
         """
         print("\n" + "=" * 60)
-        print("Starting Dataset Preprocessing")
+        print(f"Dataset Preprocessing  [mode={mode}]")
         print("=" * 60)
-        print(f"Dataset path: {self.dataset_path}")
-        print(f"Feature directory name: {self.feature_dir_name}")
+        print(f"Dataset path:  {self.dataset_path}")
         print(f"Skip existing: {self.skip_existing}")
-        
-        # 查找所有 route
+
         print("\nFinding all routes...")
         routes = self.find_all_routes()
         print(f"Found {len(routes)} valid routes")
-        
-        if len(routes) == 0:
+
+        if not routes:
             print("No valid routes found. Exiting.")
             return
-        
-        # 统计总帧数
+
         total_frames = sum(self.get_frame_count(r) for r in routes)
-        print(f"Total frames to process: {total_frames}")
-        
-        # 处理每个 route
-        print("\nProcessing routes...")
-        for route_dir in tqdm(routes, desc="Routes"):
-            frame_count = self.get_frame_count(route_dir)
-            
-            # 使用内部进度条
-            tqdm.write(f"\nProcessing: {route_dir.name} ({frame_count} frames)")
-            
-            self.process_route(route_dir)
-        
+        print(f"Total frames:  {total_frames}")
+
+        # Phase 1
+        if mode in ('pack_source', 'pack_and_extract'):
+            print("\n[Phase 1] Packing source data → route_source.pt ...")
+            for route_dir in tqdm(routes, desc="Packing source"):
+                self.pack_source_route(route_dir)
+            print("Phase 1 complete.")
+
+        # Phase 2
+        if mode in ('extract', 'pack_and_extract'):
+            print("\n[Phase 2] Extracting TransFuser features → route_features.pt ...")
+            self._run_extract(routes)
+            print("Phase 2 complete.")
+
         print("\n" + "=" * 60)
-        print("Dataset preprocessing completed!")
+        print("Done.")
         print("=" * 60)
 
 
@@ -270,55 +435,36 @@ def main():
     parser = argparse.ArgumentParser(
         description="Preprocess pdm_lite dataset and extract TransFuser BEV features"
     )
-    parser.add_argument(
-        '--dataset_path', 
-        type=str, 
-        default='/home/wang/Dataset/pdm_lite_mini',
-        help='Path to the pdm_lite_mini dataset'
-    )
-    parser.add_argument(
-        '--config_path', 
-        type=str, 
-        default='/home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns',
-        help='Path to TransFuser config directory'
-    )
-    parser.add_argument(
-        '--model_path', 
-        type=str, 
-        default=None,
-        help='Path to model weights (optional, auto-detected from config_path)'
-    )
-    parser.add_argument(
-        '--device', 
-        type=str, 
-        default='cuda:0',
-        help='Device to use for inference'
-    )
-    parser.add_argument(
-        '--batch_size', 
-        type=int, 
-        default=1,
-        help='Batch size for processing'
-    )
-    parser.add_argument(
-        '--no_skip_existing', 
-        action='store_true',
-        help='Do not skip existing feature files'
-    )
-    
+    parser.add_argument('--dataset_path', type=str,
+                        default='/home/wang/Dataset/pdm_lite_mini')
+    parser.add_argument('--config_path', type=str,
+                        default='/home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to model weights (optional, auto-detected from config_path)')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--no_skip_existing', action='store_true',
+                        help='Do not skip existing output files')
+    parser.add_argument('--mode', type=str, default='extract',
+                        choices=['pack_source', 'extract', 'pack_and_extract'],
+                        help=(
+                            'pack_source: Phase 1 only — pack .laz+.jpg into route_source.pt (CPU node); '
+                            'extract: Phase 2 only — GPU TransFuser inference (needs route_source.pt or falls back); '
+                            'pack_and_extract: run both phases sequentially'
+                        ))
+
     args = parser.parse_args()
-    
-    # 创建预处理器并运行
+
     preprocessor = DatasetPreprocessor(
         dataset_path=args.dataset_path,
         config_path=args.config_path,
         model_path=args.model_path,
         device=args.device,
         batch_size=args.batch_size,
-        skip_existing=not args.no_skip_existing
+        skip_existing=not args.no_skip_existing,
     )
-    
-    preprocessor.run()
+
+    preprocessor.run(mode=args.mode)
 
 
 if __name__ == "__main__":

@@ -108,12 +108,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.prediction_type = diffusion_cfg.get('prediction_type', 'sample')  # "sample" or "epsilon"
         
         # Normalization parameters for DELTA (per-step displacement)
-        # Based on anchor statistics: dx [-0.31, 11.13], dy [-9.84, 7.88]
-        # Formula: 2*(x + offset)/range - 1
-        self.norm_delta_x_offset = diffusion_cfg.get('norm_delta_x_offset', 1.0)   # maps [-1, 13] to [-1, 1]
-        self.norm_delta_x_range = diffusion_cfg.get('norm_delta_x_range', 14.0)
-        self.norm_delta_y_offset = diffusion_cfg.get('norm_delta_y_offset', 10.0)  # maps [-10, 10] to [-1, 1]
-        self.norm_delta_y_range = diffusion_cfg.get('norm_delta_y_range', 20.0)
+        # Based on waypoint delta statistics: dx mean=1.84 std=2.37, dy mean=-0.07 std=0.90
+        # Use mean±4std coverage, clamp outliers. Formula: 2*(x + offset)/range - 1
+        self.norm_delta_x_offset = diffusion_cfg.get('norm_delta_x_offset', 0.5)   # maps [-0.5, 12.5] to [-1, 1]
+        self.norm_delta_x_range = diffusion_cfg.get('norm_delta_x_range', 13.0)
+        self.norm_delta_y_offset = diffusion_cfg.get('norm_delta_y_offset', 4.0)   # maps [-4, 4] to [-1, 1]
+        self.norm_delta_y_range = diffusion_cfg.get('norm_delta_y_range', 8.0)
         # print(f"[DiffusionDiTCarlaPolicy] Delta normalization params: x_offset={self.norm_delta_x_offset}, \
         #       x_range={self.norm_delta_x_range}, y_offset={self.norm_delta_y_offset}, \
         #         y_range={self.norm_delta_y_range}")
@@ -191,7 +191,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def norm_delta(self, delta: torch.Tensor) -> torch.Tensor:
         """
         Normalize per-step delta (displacement) to [-1, 1] range.
-        Based on anchor statistics: dx [-0.31, 11.13], dy [-9.84, 7.88]
+        Based on waypoint delta stats: dx mean=1.84 std=2.37, dy mean=-0.07 std=0.90
+        Default range: dx [-0.5, 12.5], dy [-4, 4] (mean±4std, outliers clamped)
         """
         delta_x = delta[..., 0:1]
         delta_y = delta[..., 1:2]

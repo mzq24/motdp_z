@@ -188,7 +188,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 
                 try:
                     # Model always returns route prediction
-                    result = model_for_inference.predict_action(obs_dict, no_noise=True)
+                    result = model_for_inference.predict_action(obs_dict, no_noise=False)
                     predicted_actions = torch.from_numpy(result['action']).to(device)
                     
                     if target_actions.dim() == 3:  # (B, T, 2)
@@ -368,6 +368,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
     persistent_workers = config.get('dataloader', {}).get('persistent_workers', True)
     prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
+    pin_memory = config.get('dataloader', {}).get('pin_memory', True)
     
     # Use DistributedSampler for multi-GPU training
     if world_size > 1:
@@ -381,21 +382,31 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # For validation, only rank 0 needs the full dataset
         # Other ranks don't participate in validation
         sampler_val = None
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=sampler_train,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers if num_workers > 0 else False,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            drop_last=True
+        )
     else:
         sampler_train = None
         sampler_val = None
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size,
-        sampler=sampler_train,
-        shuffle=(sampler_train is None),  # Only shuffle if not using sampler
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=persistent_workers if num_workers > 0 else False,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        drop_last=True
-    )
+        # Route-grouped batching: samples in the same batch come from the same route(s),
+        # so route_features.pt pack cache hits are maximized (1-2 loads per batch vs ~batch_size)
+        train_batch_sampler = train_dataset.get_route_batch_sampler(
+            batch_size=batch_size, shuffle=True, drop_last=True)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers if num_workers > 0 else False,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        )
     
     # Validation loader: only create meaningful loader for rank 0
     # Other ranks get an empty loader since they don't validate
@@ -424,7 +435,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             sampler=sampler_val,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
             persistent_workers=persistent_workers if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             drop_last=True

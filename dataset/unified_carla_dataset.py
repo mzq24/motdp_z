@@ -6,13 +6,55 @@ import io
 import sys
 import pickle
 import glob
-from tqdm import tqdm  
+import random
+from collections import defaultdict
+from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import textwrap
+
+
+class RouteBatchSampler:
+    """Batch sampler that groups samples by route to maximize route_features.pt cache hits.
+
+    Each batch's samples come from the same or adjacent routes, so only 1-2 packs
+    need to be loaded instead of ~batch_size packs with random shuffling.
+    Route order is shuffled each epoch for training randomness.
+    """
+    def __init__(self, route_groups, batch_size, shuffle=True, drop_last=False):
+        self.route_groups = route_groups  # list of list[int]
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+    def __iter__(self):
+        groups = [list(g) for g in self.route_groups]
+        if self.shuffle:
+            random.shuffle(groups)
+            for g in groups:
+                random.shuffle(g)
+        # Flatten: samples from the same route are consecutive
+        all_indices = []
+        for g in groups:
+            all_indices.extend(g)
+        # Yield consecutive batches
+        batch = []
+        for idx in all_indices:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        n = sum(len(g) for g in self.route_groups)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
 
 
 class CARLAImageDataset(torch.utils.data.Dataset):
@@ -29,6 +71,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
         self.mode = mode
+        # Route-level packed feature cache: {packed_path: {'frame_num_to_idx': dict, ...}}
+        # Small size (4 routes) to limit per-worker memory; each worker has its own copy.
+        self._route_pack_cache = {}
+        self._route_pack_cache_maxsize = 4
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -63,7 +109,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
         val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
         direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
-        
+
         if train_files or val_files:
             self.sample_files = sorted(train_files + val_files)
             print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}' "
@@ -74,33 +120,70 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         else:
             raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories.")
 
+        # Preload all pkl files into memory to eliminate per-sample file IO overhead
+        print(f"Preloading {len(self.sample_files)} pkl files into memory...")
+        self._sample_cache = [None] * len(self.sample_files)
+        for i, path in enumerate(tqdm(self.sample_files, desc="Loading pkl", leave=False)):
+            with open(path, 'rb') as f:
+                self._sample_cache[i] = pickle.load(f)
+        print(f"Preloaded {len(self._sample_cache)} samples ({sum(sys.getsizeof(s) for s in self._sample_cache) / 1e6:.1f} MB).")
+
+        # Build route groups: group sample indices by route directory for batch sampling
+        route_to_indices = defaultdict(list)
+        for i, sample in enumerate(self._sample_cache):
+            feat_rel = sample.get('transfuser_bev_feature', '')
+            route_key = os.path.dirname(feat_rel)  # e.g. "Accident/Town12_.../transfuser_feature"
+            route_to_indices[route_key].append(i)
+        self._route_groups = list(route_to_indices.values())
+        print(f"Grouped into {len(self._route_groups)} routes for batch sampling.")
+
+    def get_route_batch_sampler(self, batch_size, shuffle=True, drop_last=False):
+        """Return a RouteBatchSampler for this dataset."""
+        return RouteBatchSampler(self._route_groups, batch_size, shuffle=shuffle, drop_last=drop_last)
+
     def __len__(self):
         return len(self.sample_files)
 
-    def __getitem__(self, idx):
-        # Load the pickle file
-        sample_path = self.sample_files[idx]
-        with open(sample_path, 'rb') as f:
-            sample = pickle.load(f)
+    def _get_route_pack(self, packed_path: str) -> dict:
+        """加载并缓存 route_features.pt 打包文件，避免重复 IO。"""
+        if packed_path not in self._route_pack_cache:
+            if len(self._route_pack_cache) >= self._route_pack_cache_maxsize:
+                # 清空最旧的一条（简单 FIFO）
+                self._route_pack_cache.pop(next(iter(self._route_pack_cache)))
+            pack = torch.load(packed_path, weights_only=True)
+            # 建立 frame_num → index 的快速查找表
+            pack['frame_num_to_idx'] = {fn: i for i, fn in enumerate(pack['frame_nums'])}
+            self._route_pack_cache[packed_path] = pack
+        return self._route_pack_cache[packed_path]
 
-        # load image data for visualization 
-        if self.mode == 'val':
-            image_paths = sample.get('rgb_hist_jpg', [])
-            images_tensor = self.load_image(image_paths, sample_path)
+    def __getitem__(self, idx):
+        sample = self._sample_cache[idx]
 
         # --- Load Transfuser Features (single frame, no temporal) ---
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
         transfuser_bev_feature = None
         transfuser_bev_feature_upsample = None
-        
+
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
-            transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)  # Remove batch dim
-        
-        if 'transfuser_bev_feature_upsample' in sample:
-            bev_feature_upsample_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature_upsample'])
-            transfuser_bev_feature_upsample = torch.load(bev_feature_upsample_path, weights_only=True).squeeze(0)
+            # Prefer packed route file (fewer files → better Lustre performance)
+            packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
+            if os.path.exists(packed_path):
+                frame_num = os.path.basename(bev_feature_path).replace('_feature.pt', '')
+                pack = self._get_route_pack(packed_path)
+                fidx = pack['frame_num_to_idx'].get(frame_num)
+                if fidx is not None:
+                    transfuser_bev_feature = pack['bev_features'][fidx]          # (1512, 8, 8)
+                    transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx] # (64, 64, 64)
+            else:
+                # Fallback: individual per-frame files
+                transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)
+                if 'transfuser_bev_feature_upsample' in sample:
+                    bev_feature_upsample_path = os.path.join(
+                        self.image_data_root, sample['transfuser_bev_feature_upsample'])
+                    transfuser_bev_feature_upsample = torch.load(
+                        bev_feature_upsample_path, weights_only=True).squeeze(0)
         
         # # Load VQA feature from pt file
         # vqa_path = sample.get('vqa', None)
@@ -112,9 +195,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Convert sample data
         final_sample = dict()
         for key, value in sample.items():
-            if key == 'rgb_hist_jpg' and self.mode == 'val':
-                final_sample['rgb_hist_jpg'] = image_paths  
-                final_sample['image'] = images_tensor
+            if key == 'rgb_hist_jpg':
+                continue
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
                 final_sample['speed'] = torch.from_numpy(speed_data).float()
@@ -288,7 +370,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
 
 
-    def load_image(self, image_paths, sample_path):
+    def load_image(self, image_paths):
         images = []
         for img_path in image_paths:
             full_img_path = os.path.join(self.image_data_root, img_path)

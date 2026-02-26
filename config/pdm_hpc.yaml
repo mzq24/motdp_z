@@ -1,12 +1,15 @@
 device:
   gpu_ids:
   - 0
+  - 1
+  - 2
+  - 3
 dataloader:
   batch_size: 256
-  num_workers: 8
+  num_workers: 16
   persistent_workers: true
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4
   shuffle: true
 obs_horizon: 4
 pred_horizon: 10
@@ -54,15 +57,6 @@ shape_meta:
       - 2
       type: low_dim
 enable_action_normalization: true
-bev_encoder:
-  pretrained_path: /home/wang/Project/MoT-DP/checkpoints/interfuser/lidar_bev_encoder_only.pth
-  state_dim: 14
-  feature_dim: 256
-  use_group_norm: true
-  freeze_backbone: false
-  bev_input_size:
-  - 448
-  - 448
 policy:
   input_dim: 2
   output_dim: 2
@@ -71,8 +65,8 @@ policy:
   cond_dim: 256
   obs_as_global_cond: true
   n_layer: 8
-  n_head: 8
-  n_emb: 512
+  n_head: 16
+  n_emb: 1024
   p_drop_emb: 0.1
   p_drop_attn: 0.1
   causal_attn: true
@@ -82,9 +76,9 @@ policy:
   action_horizon: 6
 truncated_diffusion:
   num_train_timesteps: 1000
-  trunc_timesteps: 8
+  trunc_timesteps: 50
   train_trunc_timesteps: 100
-  num_diffusion_steps: 1
+  num_diffusion_steps: 5
   eta: 0.0
   prediction_type: "sample"
   norm_x_offset: 16.0
@@ -101,31 +95,31 @@ truncated_diffusion:
   route_loss_weight: 0.6  # Route is equally important (lateral control) as waypoint (longitudinal control)
 
 # ========== Multimodal Anchor Configuration ==========
-anchor_path: /media/z/data/mzq/others/MoT-DP/wp_tokens.pkl  # Path to anchor centers file
-num_modes: 32  # Number of anchor modes (cluster centers)
-cls_loss_weight: 0.5  # Classification loss weight (focal loss)
-reg_loss_weight: 1.0  # Regression loss weight (L1 loss on best mode)
+anchor_path: /home/users/ntu/wh.huang/scratch/z_projects/code/motdp_z/wp_tokens.pkl
+num_modes: 32
+cls_loss_weight: 0.1
+reg_loss_weight: 1.0
 
 training:
   num_epochs: 500
   max_grad_norm: 1.0
   warmup_epochs: 5
   use_lr_scheduler: true
-  dataset_path: /media/z/data/dataset/pdm_lite_mini
-  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  dataset_path: /home/users/ntu/wh.huang/scratch/z_projects/dataset/pdm_lite/tmp_data
+  image_data_root: /home/users/ntu/wh.huang/scratch/z_projects/dataset/pdm_lite
   sample_interval: 1
   lr_final: 1e-7
   validation_freq: 5
   save_freq: 5
   early_stopping_patience: 10
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/server_folder/MoT-DP/checkpoints/add_noise_dp_multi_infer/
+  checkpoint_dir: /home/users/ntu/wh.huang/scratch/z_projects/code/motdp_z/checkpoints/hpc_run
 logging:
   use_wandb: true
   wandb_project: carla-diffusion-policy
-  run_name: carla_dit_optimized
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/server_folder/MoT-DP/checkpoints/add_noise_dp_multi_infer/
+  run_name: hpc_full_dataset
+  checkpoint_dir: /home/users/ntu/wh.huang/scratch/z_projects/code/motdp_z/checkpoints/hpc_run
   save_every: 5
-  log_freq: 50  # Log to wandb every 50 batches to reduce overhead
+  log_freq: 50
   wandb_entity: m240117_z
   wandb_api_key: bddb5a05a0820c1157702750c9f0ce60bcac2bba
 eval:
