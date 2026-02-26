@@ -1,0 +1,51 @@
+#!/bin/bash
+
+### 4-GPU Distributed Training on NSCC ASPIRE 2A
+### Submit: qsub scripts/nscc_train.pbs
+
+#PBS -l select=1:ngpus=4:ncpus=32:mem=440G
+#PBS -l walltime=48:00:00
+#PBS -P personal-wh.huang
+#PBS -N mot_train
+#PBS -j oe
+#PBS -o out.train.txt
+#PBS -M m240117@e.ntu.edu.sg
+#PBS -m abe
+
+# ---- User config ----
+SCRATCH=/home/users/ntu/wh.huang/scratch
+CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
+CONFIG_PATH=${CODE_DIR}/config/pdm_hpc.yaml
+CONDA_ENV=dpautomotive
+LOG_FILE=${SCRATCH}/logs/mot_train_${PBS_JOBID}.log
+# ---------------------
+
+source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
+conda activate ${CONDA_ENV}
+
+cd ${CODE_DIR}
+mkdir -p ${SCRATCH}/logs
+mkdir -p ${SCRATCH}/z_projects/code/motdp_z/checkpoints/hpc_run
+
+echo "=== MoT-DP Training ===" | tee ${LOG_FILE}
+echo "Config:  ${CONFIG_PATH}"  | tee -a ${LOG_FILE}
+echo "GPUs:    $(nvidia-smi --query-gpu=name --format=csv,noheader)" | tee -a ${LOG_FILE}
+echo "Log:     ${LOG_FILE}"     | tee -a ${LOG_FILE}
+echo "Start:   $(date)"         | tee -a ${LOG_FILE}
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=1
+
+torchrun \
+    --nnodes=1 \
+    --nproc_per_node=4 \
+    --max_restarts=0 \
+    --rdzv_id=100 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=localhost:29500 \
+    training/train_carla_bev.py \
+    --config_path "${CONFIG_PATH}" \
+    2>&1 | tee -a ${LOG_FILE}
+
+echo "Done: $(date)" | tee -a ${LOG_FILE}

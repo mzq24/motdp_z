@@ -29,6 +29,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
         self.mode = mode
+        # Route-level packed feature cache: {packed_path: {'frame_num_to_idx': dict, ...}}
+        # Small size (4 routes) to limit per-worker memory; each worker has its own copy.
+        self._route_pack_cache = {}
+        self._route_pack_cache_maxsize = 4
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -77,6 +81,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sample_files)
 
+    def _get_route_pack(self, packed_path: str) -> dict:
+        """加载并缓存 route_features.pt 打包文件，避免重复 IO。"""
+        if packed_path not in self._route_pack_cache:
+            if len(self._route_pack_cache) >= self._route_pack_cache_maxsize:
+                # 清空最旧的一条（简单 FIFO）
+                self._route_pack_cache.pop(next(iter(self._route_pack_cache)))
+            pack = torch.load(packed_path, weights_only=True)
+            # 建立 frame_num → index 的快速查找表
+            pack['frame_num_to_idx'] = {fn: i for i, fn in enumerate(pack['frame_nums'])}
+            self._route_pack_cache[packed_path] = pack
+        return self._route_pack_cache[packed_path]
+
     def __getitem__(self, idx):
         # Load the pickle file
         sample_path = self.sample_files[idx]
@@ -93,14 +109,26 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
         transfuser_bev_feature = None
         transfuser_bev_feature_upsample = None
-        
+
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
-            transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)  # Remove batch dim
-        
-        if 'transfuser_bev_feature_upsample' in sample:
-            bev_feature_upsample_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature_upsample'])
-            transfuser_bev_feature_upsample = torch.load(bev_feature_upsample_path, weights_only=True).squeeze(0)
+            # Prefer packed route file (fewer files → better Lustre performance)
+            packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
+            if os.path.exists(packed_path):
+                frame_num = os.path.basename(bev_feature_path).replace('_feature.pt', '')
+                pack = self._get_route_pack(packed_path)
+                fidx = pack['frame_num_to_idx'].get(frame_num)
+                if fidx is not None:
+                    transfuser_bev_feature = pack['bev_features'][fidx]          # (1512, 8, 8)
+                    transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx] # (64, 64, 64)
+            else:
+                # Fallback: individual per-frame files
+                transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)
+                if 'transfuser_bev_feature_upsample' in sample:
+                    bev_feature_upsample_path = os.path.join(
+                        self.image_data_root, sample['transfuser_bev_feature_upsample'])
+                    transfuser_bev_feature_upsample = torch.load(
+                        bev_feature_upsample_path, weights_only=True).squeeze(0)
         
         # # Load VQA feature from pt file
         # vqa_path = sample.get('vqa', None)

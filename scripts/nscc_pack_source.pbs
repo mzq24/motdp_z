@@ -42,6 +42,6 @@ python -u model/transfuser_extractor/preprocess_dataset.py \
   --batch_size   32 \
   --device       cpu \
   --mode         pack_source \
-  >> ${LOG_FILE} 2>&1
+  2>&1 | tee -a ${LOG_FILE}
 
 echo "Done: $(date)" | tee -a ${LOG_FILE}

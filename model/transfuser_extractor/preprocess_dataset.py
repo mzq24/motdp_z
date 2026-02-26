@@ -41,7 +41,6 @@ route_features.pt 格式:
 import os
 import sys
 import argparse
-import gzip
 from pathlib import Path
 from tqdm import tqdm
 
@@ -49,7 +48,6 @@ import torch
 import numpy as np
 import cv2
 import laspy
-import ujson
 
 # 添加当前目录到路径
 current_dir = Path(__file__).parent
@@ -95,27 +93,49 @@ class DatasetPreprocessor:
     # ------------------------------------------------------------------
 
     def find_all_routes(self):
-        """查找数据集中所有有效的 route 目录"""
-        routes = []
-        for scenario_dir in self.dataset_path.iterdir():
-            if not scenario_dir.is_dir():
-                continue
-            for route_dir in scenario_dir.iterdir():
-                if not route_dir.is_dir():
-                    continue
-                if route_dir.name.startswith('FAILED_'):
-                    continue
-                lidar_dir = route_dir / 'lidar'
-                rgb_dir = route_dir / 'rgb'
-                results_file = route_dir / 'results.json.gz'
-                if lidar_dir.exists() and rgb_dir.exists() and results_file.exists():
+        """
+        查找数据集中所有有效的 route 目录。
+
+        Lustre 优化：
+        - os.scandir 复用 readdir 返回的 d_type，避免每次 is_dir() 额外 stat
+        - 去掉 gzip.open 验证（仅做 exists 检查），消除 2500 次文件读取
+        - ThreadPoolExecutor 并行化 per-route 的 exists 检查
+        """
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _check_route(route_path: str):
+            p = Path(route_path)
+            if p.name.startswith('FAILED_'):
+                return None
+            if ((p / 'lidar').exists() and
+                    (p / 'rgb').exists() and
+                    (p / 'results.json.gz').exists()):
+                return p
+            return None
+
+        # 收集候选 route 路径（两层 scandir，利用 d_type 跳过非目录 stat）
+        candidates = []
+        try:
+            with os.scandir(self.dataset_path) as sit:
+                for scenario_entry in sit:
+                    if not scenario_entry.is_dir(follow_symlinks=False):
+                        continue
                     try:
-                        with gzip.open(results_file, 'rt', encoding='utf-8') as f:
-                            ujson.load(f)
-                        routes.append(route_dir)
-                    except Exception as e:
-                        print(f"Warning: Failed to read results for {route_dir}: {e}")
-        return routes
+                        with os.scandir(scenario_entry.path) as rit:
+                            for route_entry in rit:
+                                if route_entry.is_dir(follow_symlinks=False):
+                                    candidates.append(route_entry.path)
+                    except PermissionError:
+                        continue
+        except PermissionError:
+            pass
+
+        # 并行 exists 检查（32 线程，每线程独立 stat）
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(_check_route, candidates))
+
+        return sorted(p for p in results if p is not None)
 
     def get_frame_count(self, route_dir: Path) -> int:
         return len(list((route_dir / 'lidar').glob('*.laz')))
