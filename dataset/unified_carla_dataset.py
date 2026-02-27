@@ -72,10 +72,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
         self.mode = mode
-        # Route-level packed feature cache: {packed_path: {'frame_num_to_idx': dict, ...}}
-        # Small size (4 routes) to limit per-worker memory; each worker has its own copy.
+        # Feature loading: memmap (shared across DDP ranks, zero-copy) or LRU fallback
+        self._feat_mmap = None       # numpy memmap for bev_features
+        self._ups_mmap = None        # numpy memmap for bev_upsamples
+        self._feat_index = None      # dict: packed_path -> {offset, n_frames, frame_num_to_idx}
+        # LRU fallback (used when memmap cache not built yet)
         self._route_pack_cache = {}
-        self._route_pack_cache_maxsize = 4
+        self._route_pack_cache_maxsize = 32
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -227,6 +230,27 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._route_groups = list(route_to_indices.values())
         print(f"Grouped into {len(self._route_groups)} routes for batch sampling.")
 
+        # ===== Load feature cache (memmap, shared across DDP ranks) =====
+        cache_dir = os.path.join(image_data_root, 'tmp_data')
+        index_path = os.path.join(cache_dir, 'feature_index.pkl')
+        feat_bin = os.path.join(cache_dir, 'bev_features_fp16.bin')
+        ups_bin = os.path.join(cache_dir, 'bev_upsamples_fp16.bin')
+
+        if os.path.exists(index_path) and os.path.exists(feat_bin) and os.path.exists(ups_bin):
+            with open(index_path, 'rb') as f:
+                cache_meta = pickle.load(f)
+            self._feat_index = cache_meta['index']
+            self._feat_mmap = np.memmap(feat_bin, dtype=np.float16, mode='r',
+                                        shape=tuple(cache_meta['bev_feat_shape']))
+            self._ups_mmap = np.memmap(ups_bin, dtype=np.float16, mode='r',
+                                       shape=tuple(cache_meta['bev_ups_shape']))
+            print(f"[Rank {rank}] Feature memmap loaded: {len(self._feat_index)} routes, "
+                  f"{cache_meta['total_frames']} frames (shared across ranks).")
+        else:
+            print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
+                  f"Using LRU fallback (slow). Run: python scripts/build_feature_cache_fp16.py")
+
+
     def get_route_batch_sampler(self, batch_size, shuffle=True, drop_last=False):
         """Return a RouteBatchSampler for this dataset."""
         return RouteBatchSampler(self._route_groups, batch_size, shuffle=shuffle, drop_last=drop_last)
@@ -234,35 +258,66 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sample_files)
 
-    def _get_route_pack(self, packed_path: str) -> dict:
-        """Load and cache route_features.pt with frame_num lookup table."""
+    def _get_route_pack_lru(self, packed_path: str) -> dict:
+        """Fallback: load route_features.pt into LRU cache (used when memmap not available)."""
         if packed_path not in self._route_pack_cache:
             if len(self._route_pack_cache) >= self._route_pack_cache_maxsize:
                 self._route_pack_cache.pop(next(iter(self._route_pack_cache)))
             pack = torch.load(packed_path, weights_only=True)
-            pack['frame_num_to_idx'] = {fn: i for i, fn in enumerate(pack['frame_nums'])}
-            self._route_pack_cache[packed_path] = pack
+            self._route_pack_cache[packed_path] = {
+                'frame_num_to_idx': {fn: i for i, fn in enumerate(pack['frame_nums'])},
+                'bev_features': pack['bev_features'].half(),
+                'bev_upsamples': pack['bev_upsamples'].half(),
+            }
         return self._route_pack_cache[packed_path]
 
     def __getitem__(self, idx):
         sample = self._sample_cache[idx]
 
-        # --- Load Transfuser Features (single frame, no temporal) ---
-        # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
+        # --- Load Transfuser Features ---
+        # Memmap path: zero-copy from shared memory (all DDP ranks share same pages)
+        # LRU fallback: per-worker cache (slow, only if memmap cache not built)
         transfuser_bev_feature = None
         transfuser_bev_feature_upsample = None
 
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
             frame_num = os.path.basename(bev_feature_path).replace('_feature.pt', '')
-
-            # Load from route_features.pt (packed per-route file)
             packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
-            pack = self._get_route_pack(packed_path)
-            fidx = pack['frame_num_to_idx'].get(frame_num)
-            if fidx is not None:
-                transfuser_bev_feature = pack['bev_features'][fidx]          # (1512, 8, 8)
-                transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx] # (64, 64, 64)
+
+            if self._feat_index is not None:
+                # Fast path: memmap (zero IO after pages are faulted in)
+                route_info = self._feat_index.get(packed_path)
+                if route_info is not None:
+                    fidx = route_info['frame_num_to_idx'].get(frame_num)
+                    if fidx is not None:
+                        abs_idx = route_info['offset'] + fidx
+                        transfuser_bev_feature = torch.from_numpy(
+                            self._feat_mmap[abs_idx].copy())        # (1512, 8, 8) float16
+                        transfuser_bev_feature_upsample = torch.from_numpy(
+                            self._ups_mmap[abs_idx].copy())         # (64, 64, 64) float16
+                    else:
+                        import warnings
+                        warnings.warn(
+                            f"[Dataset] frame_num '{frame_num}' not found in memmap index for {packed_path}",
+                            stacklevel=2)
+                else:
+                    import warnings
+                    warnings.warn(
+                        f"[Dataset] route not in memmap index: {packed_path}",
+                        stacklevel=2)
+            else:
+                # Slow fallback: LRU cache with disk IO
+                pack = self._get_route_pack_lru(packed_path)
+                fidx = pack['frame_num_to_idx'].get(frame_num)
+                if fidx is not None:
+                    transfuser_bev_feature = pack['bev_features'][fidx]
+                    transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx]
+                else:
+                    import warnings
+                    warnings.warn(
+                        f"[Dataset] frame_num '{frame_num}' not found in route_features.pt: {packed_path}",
+                        stacklevel=2)
         
         # # Load VQA feature from pt file
         # vqa_path = sample.get('vqa', None)
@@ -302,10 +357,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
+        # Always include keys to avoid KeyError in collate when batch has mixed samples
         if transfuser_bev_feature is not None:
             final_sample['transfuser_bev_feature'] = transfuser_bev_feature
+        else:
+            final_sample['transfuser_bev_feature'] = torch.zeros(1512, 8, 8, dtype=torch.float16)
         if transfuser_bev_feature_upsample is not None:
             final_sample['transfuser_bev_feature_upsample'] = transfuser_bev_feature_upsample
+        else:
+            final_sample['transfuser_bev_feature_upsample'] = torch.zeros(64, 64, 64, dtype=torch.float16)
 
         # ========== Semantic Behavior Labeling (on-the-fly) ==========
         if self.semantic_behavior_enabled:
