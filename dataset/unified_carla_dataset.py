@@ -7,6 +7,7 @@ import sys
 import pickle
 import glob
 import random
+import time
 from collections import defaultdict
 from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -111,40 +112,44 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         packed_path = os.path.join(dataset_path, 'samples_packed.pkl')
 
-        if not os.path.exists(packed_path) and rank == 0:
-            # Rank 0: load individual pkl files and save packed file
-            train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
-            val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
-            direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
+        if not os.path.exists(packed_path):
+            if rank == 0:
+                # Rank 0: load individual pkl files and save packed file
+                train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
+                val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
+                direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
 
-            if train_files or val_files:
-                sample_files = sorted(train_files + val_files)
-                print(f"Found {len(sample_files)} preprocessed samples in '{dataset_path}' "
-                      f"({len(train_files)} train, {len(val_files)} val).")
-            elif direct_files:
-                sample_files = sorted(direct_files)
-                print(f"Found {len(sample_files)} preprocessed samples in '{dataset_path}'.")
+                if train_files or val_files:
+                    sample_files = sorted(train_files + val_files)
+                    print(f"Found {len(sample_files)} preprocessed samples in '{dataset_path}' "
+                          f"({len(train_files)} train, {len(val_files)} val).")
+                elif direct_files:
+                    sample_files = sorted(direct_files)
+                    print(f"Found {len(sample_files)} preprocessed samples in '{dataset_path}'.")
+                else:
+                    raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories.")
+
+                print(f"[Rank 0] Preloading {len(sample_files)} pkl files into memory...")
+                cache = [None] * len(sample_files)
+                for i, path in enumerate(tqdm(sample_files, desc="Loading pkl", leave=False)):
+                    with open(path, 'rb') as f:
+                        cache[i] = pickle.load(f)
+
+                # Save packed file for all ranks (atomic write)
+                tmp_path = packed_path + f'.tmp.{os.getpid()}'
+                print(f"[Rank 0] Saving packed samples to {packed_path}...")
+                with open(tmp_path, 'wb') as f:
+                    pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.rename(tmp_path, packed_path)
+                print(f"[Rank 0] Packed file saved ({os.path.getsize(packed_path) / 1e6:.1f} MB).")
+                del cache
             else:
-                raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories.")
-
-            print(f"[Rank 0] Preloading {len(sample_files)} pkl files into memory...")
-            cache = [None] * len(sample_files)
-            for i, path in enumerate(tqdm(sample_files, desc="Loading pkl", leave=False)):
-                with open(path, 'rb') as f:
-                    cache[i] = pickle.load(f)
-
-            # Save packed file for all ranks (atomic write)
-            tmp_path = packed_path + f'.tmp.{os.getpid()}'
-            print(f"[Rank 0] Saving packed samples to {packed_path}...")
-            with open(tmp_path, 'wb') as f:
-                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.rename(tmp_path, packed_path)
-            print(f"[Rank 0] Packed file saved ({os.path.getsize(packed_path) / 1e6:.1f} MB).")
-            del cache  # free before loading from file to keep memory consistent
-
-        # Synchronize: non-rank-0 processes wait until rank 0 finishes saving
-        if ddp_active:
-            torch.distributed.barrier()
+                # Other ranks: wait for rank 0 to create packed file (no NCCL timeout issue)
+                print(f"[Rank {rank}] Waiting for rank 0 to create {packed_path}...")
+                while not os.path.exists(packed_path):
+                    time.sleep(5)
+                # Small delay to ensure rank 0 has finished rename
+                time.sleep(2)
 
         # All ranks load from packed file (single large sequential read, fast on Lustre)
         print(f"[Rank {rank}] Loading packed samples from {packed_path}...")
