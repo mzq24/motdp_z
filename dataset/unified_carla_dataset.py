@@ -177,6 +177,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Patch transfuser_bev_feature path and filter samples
         before_count = len(all_samples)
         patched = 0
+        missing_routes = set()
         self._sample_cache = []
         for s in all_samples:
             route = s.get('route_name', '')
@@ -184,6 +185,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
             # Skip if route has no route_features.pt
             if route not in route_has_features:
+                missing_routes.add(route)
                 continue
 
             # Derive transfuser_bev_feature path if missing
@@ -203,7 +205,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if patched > 0:
             print(f"[Rank {rank}] Patched {patched} samples with derived transfuser_bev_feature path.")
         if dropped > 0:
-            print(f"[Rank {rank}] Dropped {dropped}/{before_count} samples (no features on disk).")
+            print(f"[Rank {rank}] WARNING: Dropped {dropped}/{before_count} samples "
+                  f"({len(missing_routes)} routes missing route_features.pt).")
+            if len(missing_routes) <= 20:
+                for r in sorted(missing_routes):
+                    print(f"  [Rank {rank}]   missing: {r}")
+            else:
+                for r in sorted(missing_routes)[:10]:
+                    print(f"  [Rank {rank}]   missing: {r}")
+                print(f"  [Rank {rank}]   ... and {len(missing_routes) - 10} more")
 
         self.sample_files = list(range(len(self._sample_cache)))
         print(f"[Rank {rank}] Loaded {len(self._sample_cache)} samples from packed file.")
