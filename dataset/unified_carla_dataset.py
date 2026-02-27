@@ -105,44 +105,53 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if not os.path.isdir(dataset_path):
             raise FileNotFoundError(f"Processed data directory not found: {dataset_path}")
 
-        # Try packed file first (single IO), fall back to individual pkl files
+        # Detect DDP rank: only rank 0 does slow IO, others wait for packed file
+        ddp_active = torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if ddp_active else 0
+
         packed_path = os.path.join(dataset_path, 'samples_packed.pkl')
-        if os.path.exists(packed_path):
-            print(f"Loading packed samples from {packed_path}...")
-            with open(packed_path, 'rb') as f:
-                self._sample_cache = pickle.load(f)
-            self.sample_files = list(range(len(self._sample_cache)))
-            print(f"Loaded {len(self._sample_cache)} samples from packed file.")
-        else:
-            # Load individual pkl files
+
+        if not os.path.exists(packed_path) and rank == 0:
+            # Rank 0: load individual pkl files and save packed file
             train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
             val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
             direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
 
             if train_files or val_files:
-                self.sample_files = sorted(train_files + val_files)
-                print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}' "
+                sample_files = sorted(train_files + val_files)
+                print(f"Found {len(sample_files)} preprocessed samples in '{dataset_path}' "
                       f"({len(train_files)} train, {len(val_files)} val).")
             elif direct_files:
-                self.sample_files = sorted(direct_files)
-                print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}'.")
+                sample_files = sorted(direct_files)
+                print(f"Found {len(sample_files)} preprocessed samples in '{dataset_path}'.")
             else:
                 raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories.")
 
-            print(f"Preloading {len(self.sample_files)} pkl files into memory...")
-            self._sample_cache = [None] * len(self.sample_files)
-            for i, path in enumerate(tqdm(self.sample_files, desc="Loading pkl", leave=False)):
+            print(f"[Rank 0] Preloading {len(sample_files)} pkl files into memory...")
+            cache = [None] * len(sample_files)
+            for i, path in enumerate(tqdm(sample_files, desc="Loading pkl", leave=False)):
                 with open(path, 'rb') as f:
-                    self._sample_cache[i] = pickle.load(f)
-            print(f"Preloaded {len(self._sample_cache)} samples.")
+                    cache[i] = pickle.load(f)
 
-            # Auto-save packed file for next time (atomic write)
-            tmp_path = packed_path + '.tmp'
-            print(f"Saving packed samples to {packed_path} for faster future loading...")
+            # Save packed file for all ranks (atomic write)
+            tmp_path = packed_path + f'.tmp.{os.getpid()}'
+            print(f"[Rank 0] Saving packed samples to {packed_path}...")
             with open(tmp_path, 'wb') as f:
-                pickle.dump(self._sample_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.rename(tmp_path, packed_path)
-            print(f"Packed file saved ({os.path.getsize(packed_path) / 1e6:.1f} MB).")
+            print(f"[Rank 0] Packed file saved ({os.path.getsize(packed_path) / 1e6:.1f} MB).")
+            del cache  # free before loading from file to keep memory consistent
+
+        # Synchronize: non-rank-0 processes wait until rank 0 finishes saving
+        if ddp_active:
+            torch.distributed.barrier()
+
+        # All ranks load from packed file (single large sequential read, fast on Lustre)
+        print(f"[Rank {rank}] Loading packed samples from {packed_path}...")
+        with open(packed_path, 'rb') as f:
+            self._sample_cache = pickle.load(f)
+        self.sample_files = list(range(len(self._sample_cache)))
+        print(f"[Rank {rank}] Loaded {len(self._sample_cache)} samples from packed file.")
 
         # Build route groups: group sample indices by route directory for batch sampling
         route_to_indices = defaultdict(list)
