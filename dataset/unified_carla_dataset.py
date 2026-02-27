@@ -154,7 +154,57 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # All ranks load from packed file (single large sequential read, fast on Lustre)
         print(f"[Rank {rank}] Loading packed samples from {packed_path}...")
         with open(packed_path, 'rb') as f:
-            self._sample_cache = pickle.load(f)
+            all_samples = pickle.load(f)
+
+        # Build route_name -> event_name mapping from disk (event_name is None in old pkl)
+        route_name_to_event = {}
+        for entry in os.scandir(image_data_root):
+            if not entry.is_dir() or entry.name == 'tmp_data':
+                continue
+            for route_entry in os.scandir(entry.path):
+                if route_entry.is_dir():
+                    route_name_to_event[route_entry.name] = entry.name
+        print(f"[Rank {rank}] Scanned {len(route_name_to_event)} routes on disk.")
+
+        # Build set of routes that have route_features.pt
+        route_has_features = set()
+        for rn, ev in route_name_to_event.items():
+            feat_pt = os.path.join(image_data_root, ev, rn, 'transfuser_feature', 'route_features.pt')
+            if os.path.exists(feat_pt):
+                route_has_features.add(rn)
+        print(f"[Rank {rank}] Routes with route_features.pt: {len(route_has_features)}/{len(route_name_to_event)}")
+
+        # Patch transfuser_bev_feature path and filter samples
+        before_count = len(all_samples)
+        patched = 0
+        self._sample_cache = []
+        for s in all_samples:
+            route = s.get('route_name', '')
+            fid = s.get('frame_id', None)
+
+            # Skip if route has no route_features.pt
+            if route not in route_has_features:
+                continue
+
+            # Derive transfuser_bev_feature path if missing
+            if not s.get('transfuser_bev_feature', ''):
+                if fid is not None:
+                    event = route_name_to_event[route]
+                    s['transfuser_bev_feature'] = os.path.join(
+                        event, route, 'transfuser_feature', f'{int(fid):04d}_feature.pt')
+                    patched += 1
+                else:
+                    continue
+
+            self._sample_cache.append(s)
+
+        dropped = before_count - len(self._sample_cache)
+        del all_samples
+        if patched > 0:
+            print(f"[Rank {rank}] Patched {patched} samples with derived transfuser_bev_feature path.")
+        if dropped > 0:
+            print(f"[Rank {rank}] Dropped {dropped}/{before_count} samples (no features on disk).")
+
         self.sample_files = list(range(len(self._sample_cache)))
         print(f"[Rank {rank}] Loaded {len(self._sample_cache)} samples from packed file.")
 
@@ -175,13 +225,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         return len(self.sample_files)
 
     def _get_route_pack(self, packed_path: str) -> dict:
-        """加载并缓存 route_features.pt 打包文件，避免重复 IO。"""
+        """Load and cache route_features.pt with frame_num lookup table."""
         if packed_path not in self._route_pack_cache:
             if len(self._route_pack_cache) >= self._route_pack_cache_maxsize:
-                # 清空最旧的一条（简单 FIFO）
                 self._route_pack_cache.pop(next(iter(self._route_pack_cache)))
             pack = torch.load(packed_path, weights_only=True)
-            # 建立 frame_num → index 的快速查找表
             pack['frame_num_to_idx'] = {fn: i for i, fn in enumerate(pack['frame_nums'])}
             self._route_pack_cache[packed_path] = pack
         return self._route_pack_cache[packed_path]
@@ -190,30 +238,21 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         sample = self._sample_cache[idx]
 
         # --- Load Transfuser Features (single frame, no temporal) ---
-        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
         transfuser_bev_feature = None
         transfuser_bev_feature_upsample = None
 
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
-            # Prefer packed route file (fewer files → better Lustre performance)
+            frame_num = os.path.basename(bev_feature_path).replace('_feature.pt', '')
+
+            # Load from route_features.pt (packed per-route file)
             packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
-            if os.path.exists(packed_path):
-                frame_num = os.path.basename(bev_feature_path).replace('_feature.pt', '')
-                pack = self._get_route_pack(packed_path)
-                fidx = pack['frame_num_to_idx'].get(frame_num)
-                if fidx is not None:
-                    transfuser_bev_feature = pack['bev_features'][fidx]          # (1512, 8, 8)
-                    transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx] # (64, 64, 64)
-            else:
-                # Fallback: individual per-frame files
-                transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)
-                if 'transfuser_bev_feature_upsample' in sample:
-                    bev_feature_upsample_path = os.path.join(
-                        self.image_data_root, sample['transfuser_bev_feature_upsample'])
-                    transfuser_bev_feature_upsample = torch.load(
-                        bev_feature_upsample_path, weights_only=True).squeeze(0)
+            pack = self._get_route_pack(packed_path)
+            fidx = pack['frame_num_to_idx'].get(frame_num)
+            if fidx is not None:
+                transfuser_bev_feature = pack['bev_features'][fidx]          # (1512, 8, 8)
+                transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx] # (64, 64, 64)
         
         # # Load VQA feature from pt file
         # vqa_path = sample.get('vqa', None)
