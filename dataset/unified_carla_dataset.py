@@ -384,8 +384,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         target_point_data = final_sample['target_point_hist']
         ego_status_components.append(target_point_data)  # (obs_horizon, 2)
         
-        # 7. target point next
-        target_point_next_data = final_sample['target_point_next_hist']
+        # 7. target point next (may be missing in older preprocessed data)
+        target_point_next_data = final_sample.get('target_point_next_hist', torch.zeros_like(target_point_data))
         ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
         
         # 8. waypoints_hist (shape: (obs_horizon, 2))
