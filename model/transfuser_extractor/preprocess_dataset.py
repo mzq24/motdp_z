@@ -249,7 +249,6 @@ class DatasetPreprocessor:
 
         packed_path = feature_dir / 'route_features.pt'
         if self.skip_existing and packed_path.exists():
-            tqdm.write(f"    [SKIP] {route_dir.name} — route_features.pt already exists")
             return
 
         all_frame_nums = []
@@ -366,39 +365,42 @@ class DatasetPreprocessor:
                 return torch.load(path, weights_only=True)
             return None  # 触发慢速回退路径
 
-        extracted_count = 0
-        skipped_count = 0
+        # 先快速过滤：只对需要 extract 的 route 做 IO 和 GPU 推理
+        if self.skip_existing:
+            to_extract = []
+            skipped_count = 0
+            for route_dir in routes:
+                packed_path = route_dir / self.feature_dir_name / 'route_features.pt'
+                if packed_path.exists():
+                    skipped_count += 1
+                else:
+                    to_extract.append(route_dir)
+            print(f"\nSkipped {skipped_count} routes (already have route_features.pt), "
+                  f"{len(to_extract)} routes to extract.")
+        else:
+            to_extract = routes
+            skipped_count = 0
+
+        if not to_extract:
+            print("Nothing to extract. All routes already done.")
+            return
 
         with ThreadPoolExecutor(max_workers=1) as io_executor:
-            # 预提交第一个 route 的 IO
-            next_future = io_executor.submit(_load_source_pack, routes[0])
+            next_future = io_executor.submit(_load_source_pack, to_extract[0])
 
-            for i, route_dir in enumerate(tqdm(routes, desc="Extracting")):
-                # 先检查是否会被 skip，避免不必要的 IO 等待
-                packed_path = route_dir / self.feature_dir_name / 'route_features.pt'
-                if self.skip_existing and packed_path.exists():
-                    skipped_count += 1
-                    # 仍需消费当前 future，但不需要等下一个的 source_pack
-                    _ = next_future.result()
-                    if i + 1 < len(routes):
-                        next_future = io_executor.submit(_load_source_pack, routes[i + 1])
-                    self.process_route(route_dir, source_pack=None)
-                    continue
+            for i, route_dir in enumerate(tqdm(to_extract, desc="Extracting")):
+                source_pack = next_future.result()
 
-                source_pack = next_future.result()  # 等待当前 route 的 IO 完成
-
-                # 立即提交下一个 route 的 IO（与当前 GPU 推理并行）
-                if i + 1 < len(routes):
-                    next_future = io_executor.submit(_load_source_pack, routes[i + 1])
+                if i + 1 < len(to_extract):
+                    next_future = io_executor.submit(_load_source_pack, to_extract[i + 1])
 
                 frame_count = self.get_frame_count(route_dir)
-                extracted_count += 1
-                tqdm.write(f"  [EXTRACT {extracted_count}] {route_dir.name} ({frame_count} frames)"
+                tqdm.write(f"  [EXTRACT {i+1}/{len(to_extract)}] {route_dir.name} ({frame_count} frames)"
                            f"{'  [source pack]' if source_pack is not None else '  [fallback IO]'}")
 
                 self.process_route(route_dir, source_pack=source_pack)
 
-        print(f"\nExtract summary: {extracted_count} extracted, {skipped_count} skipped, {len(routes)} total")
+        print(f"\nExtract summary: {len(to_extract)} extracted, {skipped_count} skipped, {len(routes)} total")
 
     # ------------------------------------------------------------------
     # 公共入口
