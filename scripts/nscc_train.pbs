@@ -17,15 +17,15 @@ SCRATCH=/home/users/ntu/wh.huang/scratch
 CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
 CONFIG_PATH=${CODE_DIR}/config/pdm_hpc.yaml
 CONDA_ENV=dpautomotive
-LOG_FILE=${SCRATCH}/logs/mot_train_${PBS_JOBID}.log
+LOG_FILE=${CODE_DIR}/logs/mot_train_${PBS_JOBID}.log
 # ---------------------
 
 source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
 conda activate ${CONDA_ENV}
 
 cd ${CODE_DIR}
-mkdir -p ${SCRATCH}/logs
-mkdir -p ${SCRATCH}/z_projects/code/motdp_z/checkpoints/hpc_run
+mkdir -p ${CODE_DIR}/logs
+mkdir -p ${CODE_DIR}/checkpoints/hpc_run
 
 echo "=== MoT-DP Training ===" | tee ${LOG_FILE}
 echo "Config:  ${CONFIG_PATH}"  | tee -a ${LOG_FILE}

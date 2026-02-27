@@ -15,19 +15,19 @@
 
 # ---- User config ----
 SCRATCH=/home/users/ntu/wh.huang/scratch
-DATASET_PATH=${SCRATCH}/datasets/pdm_lite
-CONFIG_PATH=${SCRATCH}/models/pretrained_models/all_towns
+DATASET_PATH=${SCRATCH}/z_projects/dataset/pdm_lite
+CONFIG_PATH=${SCRATCH}/z_projects/models/transfuser/pretrained_models/all_towns
 MODEL_PATH=${CONFIG_PATH}/model_0030_1.pth
-CODE_DIR=${SCRATCH}/z_projects/code/MoT-DP
+CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
 CONDA_ENV=dpautomotive
-LOG_FILE=${SCRATCH}/logs/mot_pack_source_${PBS_JOBID}.log
+LOG_FILE=${CODE_DIR}/logs/mot_pack_source_${PBS_JOBID}.log
 # ---------------------
 
 source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
 conda activate ${CONDA_ENV}
 
 cd ${CODE_DIR}
-mkdir -p ${SCRATCH}/logs
+mkdir -p ${CODE_DIR}/logs
 
 echo "=== Phase 1: Packing source data ===" | tee ${LOG_FILE}
 echo "Dataset: ${DATASET_PATH}"             | tee -a ${LOG_FILE}
