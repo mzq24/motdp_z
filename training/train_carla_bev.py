@@ -720,6 +720,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         avg_train_loss = np.mean(train_losses)
         if rank == 0:
             print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
+            # Print dataset missing-field stats (if any)
+            ds = train_dataset
+            if hasattr(ds, '_tp_next_missing_count') and ds._tp_next_missing_count > 0:
+                print(f"  [Dataset stats] target_point_next_hist missing: "
+                      f"{ds._tp_next_missing_count}/{ds._tp_next_total_count} samples filled with zeros")
         
         # Update learning rate scheduler after each epoch
         if scheduler is not None:

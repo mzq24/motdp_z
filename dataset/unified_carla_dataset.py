@@ -382,17 +382,24 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         # Safety: ensure target_point_next_hist always exists for collate consistency
         if 'target_point_next_hist' not in final_sample:
-            if not hasattr(self, '_tp_next_warn_count'):
-                self._tp_next_warn_count = 0
-            self._tp_next_warn_count += 1
-            if self._tp_next_warn_count <= 5:
-                import warnings
-                warnings.warn(
-                    f"[Dataset] Sample missing 'target_point_next_hist', filling zeros "
-                    f"(warning {self._tp_next_warn_count}/5, further suppressed)",
-                    stacklevel=2)
+            if not hasattr(self, '_tp_next_missing_count'):
+                self._tp_next_missing_count = 0
+                self._tp_next_total_count = 0
+            self._tp_next_total_count += 1
+            self._tp_next_missing_count += 1
+            if self._tp_next_missing_count <= 3:
+                print(f"[Dataset WARNING] Sample missing 'target_point_next_hist', filling zeros "
+                      f"(count={self._tp_next_missing_count})", flush=True)
+            elif self._tp_next_missing_count in (100, 1000, 10000, 50000):
+                print(f"[Dataset WARNING] {self._tp_next_missing_count}/{self._tp_next_total_count} samples "
+                      f"missing 'target_point_next_hist' so far", flush=True)
             final_sample['target_point_next_hist'] = torch.zeros_like(
                 final_sample['target_point_hist'])
+        else:
+            if not hasattr(self, '_tp_next_total_count'):
+                self._tp_next_total_count = 0
+                self._tp_next_missing_count = 0
+            self._tp_next_total_count += 1
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
