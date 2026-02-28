@@ -2,6 +2,7 @@
 import os
 import sys
 import torch
+from torch.amp import autocast, GradScaler
 import yaml
 import wandb
 import numpy as np
@@ -13,7 +14,7 @@ from collections import defaultdict
 import argparse
 import datetime
 from torch.distributed.elastic.multiprocessing.errors import record
-import debugpy
+
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
@@ -63,13 +64,8 @@ def safe_wandb_log(data, use_wandb=True):
         
         if not cleaned_data:
             return
-        sys.stdout.flush()
-        sys.stderr.flush()
-    
+
         wandb.log(cleaned_data)
-        
-        sys.stdout.flush()
-        sys.stderr.flush()
         
     except Exception as e:
         import traceback
@@ -148,7 +144,7 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return safe_metrics
 
-def validate_model(policy, val_loader, device, rank=0, world_size=1):
+def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False):
     """
     Validation function for distributed training
     Only rank 0 will compute and log metrics
@@ -170,8 +166,9 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                     if isinstance(batch[key], torch.Tensor):
                         batch[key] = batch[key].to(device)
 
-                loss_dict = model_for_inference.compute_loss(batch)
-                loss = loss_dict['total_loss']
+                with autocast('cuda', enabled=use_amp):
+                    loss_dict = model_for_inference.compute_loss(batch)
+                    loss = loss_dict['total_loss']
                 val_metrics['loss'].append(loss.item())
                 # Track individual losses
                 val_metrics['cls_loss'].append(loss_dict['cls_loss'].item())
@@ -263,7 +260,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     torch.cuda.empty_cache()
     
-    print("Initializing pdm driving policy training...")
     config = load_config(config_path=config_path)
 
     # Initialize distributed training
@@ -273,10 +269,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     # Single GPU fallback
     if world_size == 1:
-        print("Running in single GPU mode")
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     else:
-        print(f'RANK, LOCAL_RANK and WORLD_SIZE: {rank}/{local_rank}/{world_size}')
         device = torch.device(f'cuda:{local_rank}')
         
         # Initialize process group
@@ -296,7 +290,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.allow_tf32 = True
     
-    print(f'Rank: {rank}, Device: {device}, World size: {world_size}')
+    if rank == 0:
+        print(f'Rank: {rank}, Device: {device}, World size: {world_size}')
     
     # Only rank 0 should initialize wandb
     wandb_mode = os.environ.get('WANDB_MODE', 'offline') 
@@ -313,7 +308,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 os.environ['WANDB_API_KEY'] = str(wandb_api_key)
                 try:
                     wandb.login(key=str(wandb_api_key))
-                    print("✓ WandB login succeeded using provided api key")
                 except Exception as e:
                     print(f"⚠ WandB login failed: {e}")
 
@@ -342,7 +336,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 init_kwargs['entity'] = wandb_entity
 
             wandb.init(**init_kwargs)
-            print(f"✓ WandB initialized in {wandb_mode} mode")
         except Exception as e:
             print(f"⚠ WandB initialization failed: {e}")
             use_wandb = False
@@ -371,56 +364,40 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
     pin_memory = config.get('dataloader', {}).get('pin_memory', True)
     
-    # Debug collate function: clone tensors to avoid "resize non-resizable storage"
-    # errors (from memory-mapped / sliced tensors), and print diagnostics on failure.
-    def debug_collate(batch):
-        """Wrapper around default_collate that clones tensors and prints debug info on failure."""
-        import sys as _sys
-        # Clone all tensors so they own their storage (fixes "not resizable" error)
-        safe_batch = []
-        for sample in batch:
-            safe_sample = {}
-            for key, val in sample.items():
-                if isinstance(val, torch.Tensor):
-                    safe_sample[key] = val.clone()
-                else:
-                    safe_sample[key] = val
-            safe_batch.append(safe_sample)
+    # Custom collate: wraps default_collate with diagnostics for shape/type mismatches.
+    # Tensors are already cloned in dataset.__getitem__ to ensure resizable storage.
+    def safe_collate(batch):
+        """Collate with diagnostic logging on failure (writes to /tmp for DDP visibility)."""
         try:
-            return default_collate(safe_batch)
-        except RuntimeError as e:
-            # Write to file since worker process stdout may not be visible in DDP
+            return default_collate(batch)
+        except (RuntimeError, KeyError) as e:
             import traceback as _tb
-            err_file = f"/tmp/collate_error_rank{os.environ.get('RANK','?')}_worker{torch.utils.data.get_worker_info().id if torch.utils.data.get_worker_info() else '?'}.txt"
-            with open(err_file, 'w') as _f:
-                _f.write(f"COLLATE ERROR: {e}\n")
-                _f.write(f"Batch size: {len(safe_batch)}\n\n")
-                keys = safe_batch[0].keys()
+            worker = torch.utils.data.get_worker_info()
+            worker_id = worker.id if worker else '?'
+            err_file = f"/tmp/collate_error_rank{os.environ.get('RANK', '?')}_w{worker_id}.txt"
+            with open(err_file, 'w') as f:
+                f.write(f"COLLATE ERROR: {e}\nBatch size: {len(batch)}\n\n")
+                keys = batch[0].keys()
                 for key in keys:
-                    vals = [b[key] for b in safe_batch]
-                    types = set(type(v).__name__ for v in vals)
-                    if len(types) > 1:
-                        _f.write(f"KEY '{key}': MIXED TYPES {types}\n")
+                    vals = [b.get(key) for b in batch]
+                    missing = [i for i, v in enumerate(vals) if v is None]
+                    if missing:
+                        f.write(f"KEY '{key}': MISSING in samples {missing}\n")
+                        continue
                     if all(isinstance(v, torch.Tensor) for v in vals):
                         shapes = [v.shape for v in vals]
-                        dtypes = set(str(v.dtype) for v in vals)
-                        unique_shapes = set(shapes)
-                        if len(unique_shapes) > 1:
-                            _f.write(f"KEY '{key}': SHAPE MISMATCH {unique_shapes}\n")
+                        unique = set(shapes)
+                        if len(unique) > 1:
+                            f.write(f"KEY '{key}': SHAPE MISMATCH {unique}\n")
                             for i, s in enumerate(shapes):
                                 if s != shapes[0]:
-                                    _f.write(f"  sample[{i}]: {s} (expected {shapes[0]})\n")
+                                    f.write(f"  sample[{i}]: {s} (expected {shapes[0]})\n")
+                        dtypes = set(str(v.dtype) for v in vals)
                         if len(dtypes) > 1:
-                            _f.write(f"KEY '{key}': DTYPE MISMATCH {dtypes}\n")
-                        try:
-                            torch.stack(vals)
-                        except Exception as e2:
-                            _f.write(f"KEY '{key}': torch.stack FAILED: {e2}\n")
-                    elif not all(isinstance(v, type(vals[0])) for v in vals):
-                        _f.write(f"KEY '{key}': mixed value types\n")
-                _f.write(f"\nTraceback:\n")
-                _tb.print_exc(file=_f)
-            print(f"[COLLATE] Debug info written to {err_file}", flush=True)
+                            f.write(f"KEY '{key}': DTYPE MISMATCH {dtypes}\n")
+                f.write(f"\nTraceback:\n")
+                _tb.print_exc(file=f)
+            print(f"[COLLATE] Diagnostic info written to {err_file}", flush=True)
             raise
 
     # Use DistributedSampler for multi-GPU training
@@ -444,7 +421,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             persistent_workers=persistent_workers if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             drop_last=True,
-            collate_fn=debug_collate,
+            collate_fn=safe_collate,
         )
     else:
         sampler_train = None
@@ -461,7 +438,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            collate_fn=debug_collate,
+            collate_fn=safe_collate,
         )
     
     # Validation loader: only create meaningful loader for rank 0
@@ -513,6 +490,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
             if 'val_metrics' in checkpoint:
                 print(f"  Previous val_metrics: {checkpoint['val_metrics']}")
+        # Restore scaler state if available (for AMP resume)
+        if use_amp and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            if rank == 0:
+                print("  ✓ AMP scaler state restored")
 
     # Wrap model with DistributedDataParallel for multi-GPU training
     if world_size > 1:
@@ -523,11 +505,10 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             find_unused_parameters=True  # Required: some parameters in obs_encoder may not be used in all forward passes
         )
         if rank == 0:
-            print(f"✓ Model wrapped with DistributedDataParallel (find_unused_parameters=True)")
-            print(f"Policy action steps (n_action_steps): {policy.module.n_action_steps}")
+            print(f"DDP enabled | n_action_steps: {policy.module.n_action_steps}")
     else:
         if rank == 0:
-            print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
+            print(f"Single GPU | n_action_steps: {policy.n_action_steps}")
     
     lr = config.get('optimizer', {}).get('lr', 5e-5)
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
@@ -585,6 +566,12 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print("✓ No learning rate scheduler used")
 
+    # Mixed precision (AMP) setup
+    use_amp = config.get('model_optimization', {}).get('use_mixed_precision', True)
+    scaler = GradScaler(enabled=use_amp)
+    if rank == 0:
+        print(f"✓ Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
+
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit")
     if rank == 0:
@@ -604,7 +591,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print("Running validation only (--val_only mode)")
             print("=" * 60)
         try:
-            val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size)
+            val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp)
             if rank == 0:
                 print(f"\n✓ Validation completed")
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
@@ -639,42 +626,37 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
             
-            # IMPORTANT: zero_grad BEFORE forward pass, not after
-            # This is the standard PyTorch training pattern
             optimizer.zero_grad()
 
-            # Call policy(batch) which invokes forward() method
-            # DDP only synchronizes gradients when forward() is called
-            # This ensures proper gradient synchronization across all GPUs
-            # return_loss_dict=True to get individual losses for logging
-            loss_dict = policy(batch, return_loss_dict=True)
-            loss = loss_dict['total_loss']
+            # Forward pass with AMP autocast
+            with autocast('cuda', enabled=use_amp):
+                loss_dict = policy(batch, return_loss_dict=True)
+                loss = loss_dict['total_loss']
 
-            # Check for NaN/Inf loss to prevent gradient explosion
+            # Check for NaN/Inf loss
             if torch.isnan(loss) or torch.isinf(loss):
                 if rank == 0:
-                    print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, skipping this batch")
-                optimizer.zero_grad()
+                    print(f"Warning: NaN/Inf loss at batch {batch_idx}, skipping")
                 continue
 
-            loss.backward()
+            # Backward pass with scaler
+            scaler.scale(loss).backward()
             
-            # Gradient clipping for training stability (CRITICAL for multi-GPU training)
-            # This prevents gradient explosion which can cause val_loss to spike
+            # Unscale before clipping so grad norms are in FP32 scale
+            scaler.unscale_(optimizer)
             max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
-            if world_size > 1:
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(policy.module.parameters(), max_norm=max_grad_norm)
-            else:
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            params = policy.module.parameters() if world_size > 1 else policy.parameters()
+            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
             
-            # Skip optimizer step if gradients are invalid
+            # Skip step if gradients are invalid
             if torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip):
                 if rank == 0:
-                    print(f"Warning: NaN/Inf gradient norm detected at batch {batch_idx}, skipping optimizer step")
+                    print(f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping")
                 optimizer.zero_grad()
                 continue
             
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_losses.append(loss.item())
             
             # Calculate if clipping occurred
@@ -723,8 +705,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             # Print dataset missing-field stats (if any)
             ds = train_dataset
             if hasattr(ds, '_tp_next_missing_count') and ds._tp_next_missing_count > 0:
-                print(f"  [Dataset stats] target_point_next_hist missing: "
-                      f"{ds._tp_next_missing_count}/{ds._tp_next_total_count} samples filled with zeros")
+                print(f"  [Dataset] target_point_next_hist missing: "
+                      f"{ds._tp_next_missing_count}/{ds._tp_next_total_count} samples (filled with target_point)")
         
         # Update learning rate scheduler after each epoch
         if scheduler is not None:
@@ -745,6 +727,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         'model_state_dict': model_to_save.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                        'scaler_state_dict': scaler.state_dict() if use_amp else None,
                         'config': config,
                         'epoch': epoch,
                         'val_loss': val_loss,
@@ -775,23 +758,16 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if (epoch + 1) % validation_freq == 0:
             if rank == 0:
                 print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
-                sys.stdout.flush()
             try:
-                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size)
-                if rank == 0:
-                    print(f"✓ Validation completed")
-                    sys.stdout.flush()
+                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp)
             except Exception as e:
                 if rank == 0:
                     print(f"✗ Error during validation: {e}")
                     import traceback
                     traceback.print_exc()
-                    sys.stdout.flush()
                 continue
 
             if rank == 0:
-                sys.stdout.flush()
-                    
                 log_dict = {
                         "epoch": epoch,
                         "train/loss": avg_train_loss,
@@ -819,10 +795,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         else:
                             log_dict[f"val/{key}"] = value
             
-                print("Logging to wandb...")
-                sys.stdout.flush()
                 safe_wandb_log(log_dict, use_wandb)
-                sys.stdout.flush()
 
             
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
@@ -877,16 +850,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     if world_size > 1:
         torch.distributed.destroy_process_group()
 
-def attach_debugger(port=5678):
-    """Attach debugpy debugger and wait for client connection"""
-    try:
-        debugpy.listen(("0.0.0.0", port))
-        print(f"Waiting for debugger to attach on port {port}...")
-        debugpy.wait_for_client()
-        print("Debugger attached!")
-    except Exception as e:
-        print(f"Failed to attach debugger: {e}")
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
     parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml",
@@ -896,5 +859,4 @@ if __name__ == "__main__":
     parser.add_argument('--val_only', action='store_true',
                         help='Only run validation (requires --resume)')
     args = parser.parse_args()
-    # attach_debugger()
     train_pdm_policy(config_path=args.config_path, resume_path=args.resume, val_only=args.val_only)

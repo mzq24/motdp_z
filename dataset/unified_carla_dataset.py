@@ -357,17 +357,14 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 route_data = torch.from_numpy(value).float()
                 final_sample['route'] = route_data
             elif key == 'target_point_hist':
-                # Normalize shape: old HPC format is (T, 4) = [tp, tp_next] concatenated,
-                # standard format is (T, 2). Always store as (T, 2) for collate compatibility.
+                # Two data formats exist:
+                #   Old HPC packed: (T, 4) = [target_point, target_point_next] concatenated
+                #   Standard:       (T, 2) = target_point only (target_point_next is separate key)
                 tp = torch.from_numpy(value).float()
                 final_sample['target_point_hist'] = tp[..., :2]
                 if tp.shape[-1] == 4:
-                    # Old HPC format: split out target_point_next_hist from concatenated tensor
                     final_sample['target_point_next_hist'] = tp[..., 2:]
-                # else: standard format — target_point_next_hist is a separate key in the pkl,
-                # it will be handled by the generic np.ndarray branch below.
             elif key == 'target_point_next_hist':
-                # Standard format: separate key for target_point_next_hist
                 final_sample['target_point_next_hist'] = torch.from_numpy(value).float()
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
@@ -380,7 +377,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 final_sample[key] = value
 
-        # Safety: ensure target_point_next_hist always exists for collate consistency
+        # Ensure target_point_next_hist always exists (required for collate consistency).
+        # Missing samples use target_point_hist as fallback (closely related navigation waypoint).
         if 'target_point_next_hist' not in final_sample:
             if not hasattr(self, '_tp_next_missing_count'):
                 self._tp_next_missing_count = 0
@@ -388,13 +386,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             self._tp_next_total_count += 1
             self._tp_next_missing_count += 1
             if self._tp_next_missing_count <= 3:
-                print(f"[Dataset WARNING] Sample missing 'target_point_next_hist', filling zeros "
+                print(f"[Dataset] target_point_next_hist missing, using target_point_hist "
                       f"(count={self._tp_next_missing_count})", flush=True)
-            elif self._tp_next_missing_count in (100, 1000, 10000, 50000):
-                print(f"[Dataset WARNING] {self._tp_next_missing_count}/{self._tp_next_total_count} samples "
-                      f"missing 'target_point_next_hist' so far", flush=True)
-            final_sample['target_point_next_hist'] = torch.zeros_like(
-                final_sample['target_point_hist'])
+            final_sample['target_point_next_hist'] = final_sample['target_point_hist'].clone()
         else:
             if not hasattr(self, '_tp_next_total_count'):
                 self._tp_next_total_count = 0
@@ -537,13 +531,12 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         command_data = final_sample['command_hist']
         ego_status_components.append(command_data)  # (obs_horizon, 6)
 
-        # 4. target_point_hist — already normalized to (obs_horizon, 2) during conversion
-        target_point_data = final_sample['target_point_hist']     # (obs_horizon, 2)
-        target_point_next_data = final_sample.get(
-            'target_point_next_hist', torch.zeros_like(target_point_data))
-        ego_status_components.append(target_point_data)           # (obs_horizon, 2)
+        # 4. target_point_hist (obs_horizon, 2) — normalized during data loading
+        target_point_data = final_sample['target_point_hist']
+        ego_status_components.append(target_point_data)  # (obs_horizon, 2)
         
-        # 5. target_point_next_hist (obs_horizon, 2)
+        # 5. target_point_next_hist (obs_horizon, 2) — guaranteed present after loading
+        target_point_next_data = final_sample['target_point_next_hist']
         ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
         
         # 6. waypoints_hist (obs_horizon, 2)
