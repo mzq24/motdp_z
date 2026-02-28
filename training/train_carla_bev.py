@@ -6,6 +6,7 @@ import yaml
 import wandb
 import numpy as np
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 import torch.nn.functional as F
 from collections import defaultdict
@@ -399,6 +400,38 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # so route_features.pt pack cache hits are maximized (1-2 loads per batch vs ~batch_size)
         train_batch_sampler = train_dataset.get_route_batch_sampler(
             batch_size=batch_size, shuffle=True, drop_last=True)
+        def debug_collate(batch):
+            """Wrapper around default_collate that prints debug info on failure."""
+            try:
+                return default_collate(batch)
+            except RuntimeError as e:
+                print(f"\n[COLLATE ERROR] {e}")
+                print(f"  Batch size: {len(batch)}")
+                # Check each key for shape/type mismatches
+                keys = batch[0].keys()
+                for key in keys:
+                    vals = [b[key] for b in batch]
+                    types = set(type(v).__name__ for v in vals)
+                    if len(types) > 1:
+                        print(f"  KEY '{key}': MIXED TYPES {types}")
+                    if all(isinstance(v, torch.Tensor) for v in vals):
+                        shapes = [v.shape for v in vals]
+                        dtypes = set(str(v.dtype) for v in vals)
+                        unique_shapes = set(shapes)
+                        if len(unique_shapes) > 1:
+                            print(f"  KEY '{key}': SHAPE MISMATCH {unique_shapes}")
+                            for i, s in enumerate(shapes):
+                                if s != shapes[0]:
+                                    print(f"    sample[{i}]: {s} (expected {shapes[0]})")
+                        if len(dtypes) > 1:
+                            print(f"  KEY '{key}': DTYPE MISMATCH {dtypes}")
+                        # Try stacking individually to find the exact problematic tensor
+                        try:
+                            torch.stack(vals)
+                        except Exception as e2:
+                            print(f"  KEY '{key}': torch.stack failed: {e2}")
+                raise
+
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
@@ -406,6 +439,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            collate_fn=debug_collate,
         )
     
     # Validation loader: only create meaningful loader for rank 0
