@@ -371,6 +371,51 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
     pin_memory = config.get('dataloader', {}).get('pin_memory', True)
     
+    # Debug collate function: clone tensors to avoid "resize non-resizable storage"
+    # errors (from memory-mapped / sliced tensors), and print diagnostics on failure.
+    def debug_collate(batch):
+        """Wrapper around default_collate that clones tensors and prints debug info on failure."""
+        import sys as _sys
+        # Clone all tensors so they own their storage (fixes "not resizable" error)
+        safe_batch = []
+        for sample in batch:
+            safe_sample = {}
+            for key, val in sample.items():
+                if isinstance(val, torch.Tensor):
+                    safe_sample[key] = val.clone()
+                else:
+                    safe_sample[key] = val
+            safe_batch.append(safe_sample)
+        try:
+            return default_collate(safe_batch)
+        except RuntimeError as e:
+            print(f"\n[COLLATE ERROR] {e}", flush=True)
+            print(f"  Batch size: {len(safe_batch)}", flush=True)
+            keys = safe_batch[0].keys()
+            for key in keys:
+                vals = [b[key] for b in safe_batch]
+                types = set(type(v).__name__ for v in vals)
+                if len(types) > 1:
+                    print(f"  KEY '{key}': MIXED TYPES {types}", flush=True)
+                if all(isinstance(v, torch.Tensor) for v in vals):
+                    shapes = [v.shape for v in vals]
+                    dtypes = set(str(v.dtype) for v in vals)
+                    unique_shapes = set(shapes)
+                    if len(unique_shapes) > 1:
+                        print(f"  KEY '{key}': SHAPE MISMATCH {unique_shapes}", flush=True)
+                        for i, s in enumerate(shapes):
+                            if s != shapes[0]:
+                                print(f"    sample[{i}]: {s} (expected {shapes[0]})", flush=True)
+                    if len(dtypes) > 1:
+                        print(f"  KEY '{key}': DTYPE MISMATCH {dtypes}", flush=True)
+                    try:
+                        torch.stack(vals)
+                    except Exception as e2:
+                        print(f"  KEY '{key}': torch.stack failed: {e2}", flush=True)
+            _sys.stdout.flush()
+            _sys.stderr.flush()
+            raise
+
     # Use DistributedSampler for multi-GPU training
     if world_size > 1:
         sampler_train = torch.utils.data.distributed.DistributedSampler(
@@ -391,7 +436,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            drop_last=True
+            drop_last=True,
+            collate_fn=debug_collate,
         )
     else:
         sampler_train = None
@@ -400,37 +446,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # so route_features.pt pack cache hits are maximized (1-2 loads per batch vs ~batch_size)
         train_batch_sampler = train_dataset.get_route_batch_sampler(
             batch_size=batch_size, shuffle=True, drop_last=True)
-        def debug_collate(batch):
-            """Wrapper around default_collate that prints debug info on failure."""
-            try:
-                return default_collate(batch)
-            except RuntimeError as e:
-                print(f"\n[COLLATE ERROR] {e}")
-                print(f"  Batch size: {len(batch)}")
-                # Check each key for shape/type mismatches
-                keys = batch[0].keys()
-                for key in keys:
-                    vals = [b[key] for b in batch]
-                    types = set(type(v).__name__ for v in vals)
-                    if len(types) > 1:
-                        print(f"  KEY '{key}': MIXED TYPES {types}")
-                    if all(isinstance(v, torch.Tensor) for v in vals):
-                        shapes = [v.shape for v in vals]
-                        dtypes = set(str(v.dtype) for v in vals)
-                        unique_shapes = set(shapes)
-                        if len(unique_shapes) > 1:
-                            print(f"  KEY '{key}': SHAPE MISMATCH {unique_shapes}")
-                            for i, s in enumerate(shapes):
-                                if s != shapes[0]:
-                                    print(f"    sample[{i}]: {s} (expected {shapes[0]})")
-                        if len(dtypes) > 1:
-                            print(f"  KEY '{key}': DTYPE MISMATCH {dtypes}")
-                        # Try stacking individually to find the exact problematic tensor
-                        try:
-                            torch.stack(vals)
-                        except Exception as e2:
-                            print(f"  KEY '{key}': torch.stack failed: {e2}")
-                raise
 
         train_loader = DataLoader(
             train_dataset,
