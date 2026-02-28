@@ -501,7 +501,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     ema_cfg = config.get('ema', {})
     model_for_ema = policy.module if world_size > 1 else policy
     ema_model = EMAModel(model_for_ema.parameters(), max_value=ema_cfg.get('max_value', 0.9999))
-    ema_model.to('cpu')  # Keep EMA on CPU to save GPU memory
+    ema_model.to(device)  # Keep EMA on same device as model for .step() compatibility
     ema_update_interval = ema_cfg.get('update_interval', 10)  # Update every N steps
     # Restore EMA state from checkpoint if available
     if checkpoint is not None and 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
