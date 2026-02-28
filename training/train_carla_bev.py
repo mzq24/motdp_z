@@ -14,6 +14,7 @@ from collections import defaultdict
 import argparse
 import datetime
 from torch.distributed.elastic.multiprocessing.errors import record
+from diffusers.training_utils import EMAModel
 
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,7 +102,7 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return metrics
 
-def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False):
+def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False, amp_dtype=torch.float16):
     """
     Validation function for distributed training
     Only rank 0 will compute and log metrics
@@ -123,7 +124,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                     if isinstance(batch[key], torch.Tensor):
                         batch[key] = batch[key].to(device, non_blocking=True)
 
-                with autocast('cuda', enabled=use_amp):
+                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
                     loss_dict = model_for_inference.compute_loss(batch)
                     loss = loss_dict['total_loss']
                 val_metrics['loss'].append(loss.item())
@@ -402,6 +403,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     # Resume from checkpoint if specified
     start_epoch = 0
+    checkpoint = None
     if resume_path is not None:
         if rank == 0:
             print(f"Loading checkpoint from {resume_path}...")
@@ -488,11 +490,25 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print("✓ No learning rate scheduler used")
 
-    # Mixed precision (AMP) setup
+    # Mixed precision (AMP) setup — prefer BF16 on supported hardware
     use_amp = config.get('model_optimization', {}).get('use_mixed_precision', True)
-    scaler = GradScaler(enabled=use_amp)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))  # BF16 doesn't need scaler
     if rank == 0:
-        print(f"✓ Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
+        print(f"✓ Mixed precision (AMP): {'enabled' if use_amp else 'disabled'} (dtype={amp_dtype})")
+
+    # EMA (Exponential Moving Average) for stable inference
+    ema_cfg = config.get('ema', {})
+    model_for_ema = policy.module if world_size > 1 else policy
+    ema_model = EMAModel(model_for_ema.parameters(), max_value=ema_cfg.get('max_value', 0.9999))
+    ema_model.to(device)
+    # Restore EMA state from checkpoint if available
+    if checkpoint is not None and 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
+        if rank == 0:
+            print("  ✓ EMA state restored")
+    if rank == 0:
+        print(f"✓ EMA initialized (max_value={ema_cfg.get('max_value', 0.9999)})")
 
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit")
@@ -513,7 +529,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print("Running validation only (--val_only mode)")
             print("=" * 60)
         try:
-            val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp)
+            val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp, amp_dtype=amp_dtype)
             if rank == 0:
                 print(f"\n✓ Validation completed")
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
@@ -551,7 +567,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             optimizer.zero_grad(set_to_none=True)
 
             # Forward pass with AMP autocast
-            with autocast('cuda', enabled=use_amp):
+            with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
                 loss_dict = policy(batch, return_loss_dict=True)
                 loss = loss_dict['total_loss']
 
@@ -579,6 +595,10 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             
             scaler.step(optimizer)
             scaler.update()
+
+            # Update EMA after optimizer step
+            ema_model.step(model_for_ema.parameters())
+
             train_losses.append(loss.item())
             
             # Calculate if clipping occurred
@@ -642,6 +662,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             ckpt_path = os.path.join(checkpoint_dir, f"dit_policy_epoch{epoch+1}.pt")
             torch.save({
                         'model_state_dict': model_to_save.state_dict(),
+                        'ema_state_dict': ema_model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                         'scaler_state_dict': scaler.state_dict() if use_amp else None,
@@ -673,15 +694,20 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
         validation_freq = config.get('training', {}).get('validation_freq', 1)
         if (epoch + 1) % validation_freq == 0:
+            # Apply EMA weights for validation
+            ema_model.store(model_for_ema.parameters())
+            ema_model.copy_to(model_for_ema.parameters())
+
             if rank == 0:
-                print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
+                print(f"Validating with EMA weights (Epoch {epoch+1}/{num_epochs})...")
             try:
-                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp)
+                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp, amp_dtype=amp_dtype)
             except Exception as e:
                 if rank == 0:
                     print(f"✗ Error during validation: {e}")
                     import traceback
                     traceback.print_exc()
+                ema_model.restore(model_for_ema.parameters())
                 continue
 
             if rank == 0:
@@ -709,8 +735,10 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         best_model_filename = "dit_policy_best.pt"
                     else:
                         best_model_filename = "dit_policy_best.pt"
+                    # Save EMA weights as the best model (already applied to model_for_ema)
                     torch.save({
                             'model_state_dict': model_to_save.state_dict(),
+                            'ema_state_dict': ema_model.state_dict(),
                             'config': config,
                             'epoch': epoch,
                             'val_loss': val_loss,
@@ -725,6 +753,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                             "best_model/val_loss": val_loss,
                             "best_model/train_loss": avg_train_loss
                         }, use_wandb)
+
+            # Restore training weights after validation/save
+            ema_model.restore(model_for_ema.parameters())
     
     if rank == 0:
         print("Training completed!")

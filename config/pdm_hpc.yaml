@@ -80,20 +80,19 @@ truncated_diffusion:
   num_train_timesteps: 1000
   trunc_timesteps: 10
   train_trunc_timesteps: 20
-  num_diffusion_steps: 2
+  num_diffusion_steps: 5
   eta: 0.0
   prediction_type: "sample"
   norm_x_offset: 16.0
   norm_x_range: 92.0
   norm_y_offset: 45.0
   norm_y_range: 88.0 #  Extended range: x=[-16.0, 76.0], y=[-45.0, 43.0]
-  # Delta normalization: based on waypoint delta statistics (mean±4std coverage)
-  # dx: min=-0.31, max=11.13, mean=1.84, std=2.37 → [-0.5, 12.5]
-  # dy: min=-9.84, max=7.88, mean=-0.07, std=0.90 → [-4.0, 4.0]
-  norm_delta_x_offset: 0.5
-  norm_delta_x_range: 13.0
-  norm_delta_y_offset: 4.0
-  norm_delta_y_range: 8.0
+  # Z-score normalization for delta: (x - mean) / std
+  # Based on waypoint delta statistics
+  norm_delta_x_mean: 1.84
+  norm_delta_x_std: 2.37
+  norm_delta_y_mean: -0.07
+  norm_delta_y_std: 0.90
   route_loss_weight: 0.6  # Route is equally important (lateral control) as waypoint (longitudinal control)
 
 # ========== Multimodal Anchor Configuration ==========
