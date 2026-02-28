@@ -527,6 +527,12 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
 
 
+        # Ensure all tensors have resizable storage (torch.from_numpy creates
+        # non-resizable storage which causes collate failures with num_workers>0)
+        for k, v in final_sample.items():
+            if isinstance(v, torch.Tensor) and not v.is_cuda:
+                final_sample[k] = v.clone()
+
         return final_sample
 
 
