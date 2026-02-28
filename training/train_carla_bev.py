@@ -389,31 +389,38 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         try:
             return default_collate(safe_batch)
         except RuntimeError as e:
-            print(f"\n[COLLATE ERROR] {e}", flush=True)
-            print(f"  Batch size: {len(safe_batch)}", flush=True)
-            keys = safe_batch[0].keys()
-            for key in keys:
-                vals = [b[key] for b in safe_batch]
-                types = set(type(v).__name__ for v in vals)
-                if len(types) > 1:
-                    print(f"  KEY '{key}': MIXED TYPES {types}", flush=True)
-                if all(isinstance(v, torch.Tensor) for v in vals):
-                    shapes = [v.shape for v in vals]
-                    dtypes = set(str(v.dtype) for v in vals)
-                    unique_shapes = set(shapes)
-                    if len(unique_shapes) > 1:
-                        print(f"  KEY '{key}': SHAPE MISMATCH {unique_shapes}", flush=True)
-                        for i, s in enumerate(shapes):
-                            if s != shapes[0]:
-                                print(f"    sample[{i}]: {s} (expected {shapes[0]})", flush=True)
-                    if len(dtypes) > 1:
-                        print(f"  KEY '{key}': DTYPE MISMATCH {dtypes}", flush=True)
-                    try:
-                        torch.stack(vals)
-                    except Exception as e2:
-                        print(f"  KEY '{key}': torch.stack failed: {e2}", flush=True)
-            _sys.stdout.flush()
-            _sys.stderr.flush()
+            # Write to file since worker process stdout may not be visible in DDP
+            import traceback as _tb
+            err_file = f"/tmp/collate_error_rank{os.environ.get('RANK','?')}_worker{torch.utils.data.get_worker_info().id if torch.utils.data.get_worker_info() else '?'}.txt"
+            with open(err_file, 'w') as _f:
+                _f.write(f"COLLATE ERROR: {e}\n")
+                _f.write(f"Batch size: {len(safe_batch)}\n\n")
+                keys = safe_batch[0].keys()
+                for key in keys:
+                    vals = [b[key] for b in safe_batch]
+                    types = set(type(v).__name__ for v in vals)
+                    if len(types) > 1:
+                        _f.write(f"KEY '{key}': MIXED TYPES {types}\n")
+                    if all(isinstance(v, torch.Tensor) for v in vals):
+                        shapes = [v.shape for v in vals]
+                        dtypes = set(str(v.dtype) for v in vals)
+                        unique_shapes = set(shapes)
+                        if len(unique_shapes) > 1:
+                            _f.write(f"KEY '{key}': SHAPE MISMATCH {unique_shapes}\n")
+                            for i, s in enumerate(shapes):
+                                if s != shapes[0]:
+                                    _f.write(f"  sample[{i}]: {s} (expected {shapes[0]})\n")
+                        if len(dtypes) > 1:
+                            _f.write(f"KEY '{key}': DTYPE MISMATCH {dtypes}\n")
+                        try:
+                            torch.stack(vals)
+                        except Exception as e2:
+                            _f.write(f"KEY '{key}': torch.stack FAILED: {e2}\n")
+                    elif not all(isinstance(v, type(vals[0])) for v in vals):
+                        _f.write(f"KEY '{key}': mixed value types\n")
+                _f.write(f"\nTraceback:\n")
+                _tb.print_exc(file=_f)
+            print(f"[COLLATE] Debug info written to {err_file}", flush=True)
             raise
 
     # Use DistributedSampler for multi-GPU training

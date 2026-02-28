@@ -356,6 +356,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 # Load route waypoints (expected shape: (20, 2))
                 route_data = torch.from_numpy(value).float()
                 final_sample['route'] = route_data
+            elif key == 'target_point_hist':
+                # Normalize shape: old HPC format is (T, 4) = [tp, tp_next] concatenated,
+                # standard format is (T, 2). Always store as (T, 2) for collate compatibility.
+                tp = torch.from_numpy(value).float()
+                final_sample['target_point_hist'] = tp[..., :2]
+                if tp.shape[-1] == 4:
+                    final_sample['target_point_next_hist'] = tp[..., 2:]
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
                 continue
@@ -503,18 +510,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         command_data = final_sample['command_hist']
         ego_status_components.append(command_data)  # (obs_horizon, 6)
 
-        # 4. target_point_hist — handle both (obs_horizon, 2) and (obs_horizon, 4) formats
-        target_point_raw = final_sample['target_point_hist']
-        if target_point_raw.shape[-1] == 4:
-            # Old HPC format: target_point(2) + target_point_next(2) concatenated
-            target_point_data = target_point_raw[..., :2]       # (obs_horizon, 2)
-            target_point_next_data = target_point_raw[..., 2:]  # (obs_horizon, 2)
-        else:
-            # Standard format: separate fields
-            target_point_data = target_point_raw                # (obs_horizon, 2)
-            target_point_next_data = final_sample.get(
-                'target_point_next_hist', torch.zeros_like(target_point_data))
-        ego_status_components.append(target_point_data)       # (obs_horizon, 2)
+        # 4. target_point_hist — already normalized to (obs_horizon, 2) during conversion
+        target_point_data = final_sample['target_point_hist']     # (obs_horizon, 2)
+        target_point_next_data = final_sample.get(
+            'target_point_next_hist', torch.zeros_like(target_point_data))
+        ego_status_components.append(target_point_data)           # (obs_horizon, 2)
         
         # 5. target_point_next_hist (obs_horizon, 2)
         ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
