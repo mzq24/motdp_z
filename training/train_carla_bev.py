@@ -34,42 +34,10 @@ def safe_wandb_log(data, use_wandb=True):
     if not use_wandb:
         return
     try:
-        cleaned_data = {}
-        for key, value in data.items():
-            if isinstance(value, torch.Tensor):
-                if value.numel() == 1:
-                    value = value.item()
-                else:
-                    continue
-            
-            if isinstance(value, np.ndarray):
-                if value.size == 1:
-                    value = value.item()
-                else:
-                    continue
-            
-            if isinstance(value, (np.integer, np.floating)):
-                value = value.item() 
-            
-            if isinstance(value, (int, float, np.integer, np.floating)):
-                if np.isnan(value):
-                    continue
-                elif np.isinf(value):
-                    value = 1e10 if value > 0 else -1e10
-            
-            if isinstance(value, np.generic):
-                value = value.item()
-            
-            cleaned_data[key] = value
-        
-        if not cleaned_data:
-            return
-
-        wandb.log(cleaned_data)
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+        wandb.log({k: v.item() if isinstance(v, (torch.Tensor, np.generic)) else v
+                   for k, v in data.items() if isinstance(v, (int, float, torch.Tensor, np.generic))})
+    except Exception:
+        pass
 
 
 def safe_wandb_finish(use_wandb=True):
@@ -131,18 +99,7 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     else:
         metrics['L2_avg'] = 0.0
     
-    safe_metrics = {}
-    for key, value in metrics.items():
-        if np.isnan(value):
-            print(f"Warning: Metric '{key}' is NaN, replacing with 0.0")
-            safe_metrics[key] = 0.0
-        elif np.isinf(value):
-            print(f"Warning: Metric '{key}' is Inf, replacing with large value")
-            safe_metrics[key] = 1e10 if value > 0 else -1e10
-        else:
-            safe_metrics[key] = value
-    
-    return safe_metrics
+    return metrics
 
 def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False):
     """
@@ -164,7 +121,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
             for batch_idx, batch in enumerate(pbar):
                 for key in batch:
                     if isinstance(batch[key], torch.Tensor):
-                        batch[key] = batch[key].to(device)
+                        batch[key] = batch[key].to(device, non_blocking=True)
 
                 with autocast('cuda', enabled=use_amp):
                     loss_dict = model_for_inference.compute_loss(batch)
@@ -228,19 +185,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
             pbar.close() 
     
         # Compute averaged metrics
-        averaged_metrics = {}
-        for key, values in val_metrics.items():
-            if values:  
-                mean_value = np.mean(values)
-                if np.isnan(mean_value):
-                    print(f"Warning: computed NaN for metric 'val_{key}'")
-                    averaged_metrics[f'val_{key}'] = 0.0  
-                elif np.isinf(mean_value):
-                    print(f"Warning: computed Inf for metric 'val_{key}'")
-                    averaged_metrics[f'val_{key}'] = 1e10 if mean_value > 0 else -1e10 
-                else:
-                    averaged_metrics[f'val_{key}'] = mean_value
-        
+        averaged_metrics = {f'val_{k}': np.mean(v) for k, v in val_metrics.items() if v}
         return averaged_metrics
     else:
         return {}
@@ -364,40 +309,17 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
     pin_memory = config.get('dataloader', {}).get('pin_memory', True)
     
-    # Custom collate: wraps default_collate with diagnostics for shape/type mismatches.
-    # Tensors are already cloned in dataset.__getitem__ to ensure resizable storage.
     def safe_collate(batch):
-        """Collate with diagnostic logging on failure (writes to /tmp for DDP visibility)."""
         try:
             return default_collate(batch)
-        except (RuntimeError, KeyError) as e:
-            import traceback as _tb
-            worker = torch.utils.data.get_worker_info()
-            worker_id = worker.id if worker else '?'
-            err_file = f"/tmp/collate_error_rank{os.environ.get('RANK', '?')}_w{worker_id}.txt"
-            with open(err_file, 'w') as f:
-                f.write(f"COLLATE ERROR: {e}\nBatch size: {len(batch)}\n\n")
-                keys = batch[0].keys()
-                for key in keys:
-                    vals = [b.get(key) for b in batch]
-                    missing = [i for i, v in enumerate(vals) if v is None]
-                    if missing:
-                        f.write(f"KEY '{key}': MISSING in samples {missing}\n")
-                        continue
-                    if all(isinstance(v, torch.Tensor) for v in vals):
-                        shapes = [v.shape for v in vals]
-                        unique = set(shapes)
-                        if len(unique) > 1:
-                            f.write(f"KEY '{key}': SHAPE MISMATCH {unique}\n")
-                            for i, s in enumerate(shapes):
-                                if s != shapes[0]:
-                                    f.write(f"  sample[{i}]: {s} (expected {shapes[0]})\n")
-                        dtypes = set(str(v.dtype) for v in vals)
-                        if len(dtypes) > 1:
-                            f.write(f"KEY '{key}': DTYPE MISMATCH {dtypes}\n")
-                f.write(f"\nTraceback:\n")
-                _tb.print_exc(file=f)
-            print(f"[COLLATE] Diagnostic info written to {err_file}", flush=True)
+        except RuntimeError as e:
+            # Print mismatched shapes for quick diagnosis
+            for key in batch[0]:
+                vals = [b[key] for b in batch if isinstance(b.get(key), torch.Tensor)]
+                if vals:
+                    shapes = set(v.shape for v in vals)
+                    if len(shapes) > 1:
+                        print(f"[COLLATE] shape mismatch '{key}': {shapes}", flush=True)
             raise
 
     # Use DistributedSampler for multi-GPU training
@@ -624,9 +546,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device)
+                    batch[key] = batch[key].to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             # Forward pass with AMP autocast
             with autocast('cuda', enabled=use_amp):
@@ -702,11 +624,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         avg_train_loss = np.mean(train_losses)
         if rank == 0:
             print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
-            # Print dataset missing-field stats (if any)
-            ds = train_dataset
-            if hasattr(ds, '_tp_next_missing_count') and ds._tp_next_missing_count > 0:
-                print(f"  [Dataset] target_point_next_hist missing: "
-                      f"{ds._tp_next_missing_count}/{ds._tp_next_total_count} samples (filled with target_point)")
         
         # Update learning rate scheduler after each epoch
         if scheduler is not None:
@@ -768,33 +685,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 continue
 
             if rank == 0:
-                log_dict = {
-                        "epoch": epoch,
-                        "train/loss": avg_train_loss,
-                    }
-            
-                if 'val_loss' in val_metrics:
-                    log_dict["val/loss"] = val_metrics['val_loss']
-            
+                log_dict = {"epoch": epoch, "train/loss": avg_train_loss}
                 for key, value in val_metrics.items():
-                    if key == 'val_loss':
-                        continue  
-                    elif key.startswith('val_'):
-                        # Remove 'val_' prefix
-                        metric_name = key.replace('val_', '')
-                        if 'L2' in metric_name:
-                            log_dict[f"val/driving_metrics/{metric_name}"] = value
-                        elif 'collision' in metric_name:
-                            log_dict[f"val/collision/{metric_name}"] = value
-                        else:
-                            log_dict[f"val/{metric_name}"] = value
-                    else:
-                        # Shouldn't happen, but handle it just in case
-                        if 'L2' in key:
-                            log_dict[f"val/driving_metrics/{key}"] = value
-                        else:
-                            log_dict[f"val/{key}"] = value
-            
+                    log_dict[f"val/{key.removeprefix('val_')}"] = value
                 safe_wandb_log(log_dict, use_wandb)
 
             

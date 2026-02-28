@@ -377,23 +377,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 final_sample[key] = value
 
-        # Ensure target_point_next_hist always exists (required for collate consistency).
-        # Missing samples use target_point_hist as fallback (closely related navigation waypoint).
+        # Ensure target_point_next_hist always exists (fallback to target_point_hist)
         if 'target_point_next_hist' not in final_sample:
-            if not hasattr(self, '_tp_next_missing_count'):
-                self._tp_next_missing_count = 0
-                self._tp_next_total_count = 0
-            self._tp_next_total_count += 1
-            self._tp_next_missing_count += 1
-            if self._tp_next_missing_count <= 3:
-                print(f"[Dataset] target_point_next_hist missing, using target_point_hist "
-                      f"(count={self._tp_next_missing_count})", flush=True)
             final_sample['target_point_next_hist'] = final_sample['target_point_hist'].clone()
-        else:
-            if not hasattr(self, '_tp_next_total_count'):
-                self._tp_next_total_count = 0
-                self._tp_next_missing_count = 0
-            self._tp_next_total_count += 1
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
