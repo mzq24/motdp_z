@@ -501,7 +501,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     ema_cfg = config.get('ema', {})
     model_for_ema = policy.module if world_size > 1 else policy
     ema_model = EMAModel(model_for_ema.parameters(), max_value=ema_cfg.get('max_value', 0.9999))
-    ema_model.to(device)
+    ema_model.to('cpu')  # Keep EMA on CPU to save GPU memory
+    ema_update_interval = ema_cfg.get('update_interval', 10)  # Update every N steps
     # Restore EMA state from checkpoint if available
     if checkpoint is not None and 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
         ema_model.load_state_dict(checkpoint['ema_state_dict'])
@@ -547,10 +548,22 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         return
 
     for epoch in range(start_epoch, num_epochs):
+        # Memory monitoring
+        if rank == 0:
+            import psutil
+            mem = psutil.virtual_memory()
+            print(f"\n[Epoch {epoch+1}] RAM: {mem.used/1e9:.1f}GB used / {mem.total/1e9:.1f}GB total "
+                  f"({mem.percent}%), available={mem.available/1e9:.1f}GB, "
+                  f"cached={getattr(mem, 'cached', 0)/1e9:.1f}GB")
+            for gi in range(torch.cuda.device_count()):
+                alloc = torch.cuda.memory_allocated(gi) / 1e9
+                reserved = torch.cuda.memory_reserved(gi) / 1e9
+                print(f"  GPU{gi}: {alloc:.2f}GB alloc / {reserved:.2f}GB reserved")
+
         # Update the seed depending on the epoch for distributed sampler
         if world_size > 1:
             sampler_train.set_epoch(epoch)
-        
+
         policy.train()
         train_losses = []
         
@@ -596,8 +609,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             scaler.step(optimizer)
             scaler.update()
 
-            # Update EMA after optimizer step
-            ema_model.step(model_for_ema.parameters())
+            # Update EMA every N steps (CPU-based, skip frequent updates to reduce overhead)
+            if batch_idx % ema_update_interval == 0:
+                ema_model.step(model_for_ema.parameters())
 
             train_losses.append(loss.item())
             
