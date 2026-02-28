@@ -78,9 +78,9 @@ policy:
   action_horizon: 6
 truncated_diffusion:
   num_train_timesteps: 1000
-  trunc_timesteps: 50
-  train_trunc_timesteps: 100
-  num_diffusion_steps: 5
+  trunc_timesteps: 10
+  train_trunc_timesteps: 20
+  num_diffusion_steps: 2
   eta: 0.0
   prediction_type: "sample"
   norm_x_offset: 16.0
