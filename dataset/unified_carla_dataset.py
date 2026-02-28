@@ -69,7 +69,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  semantic_behavior_cfg: dict = None,      # semantic behavior config
                  ):
 
-        self.image_data_root = image_data_root
+        self.image_data_root = os.path.realpath(image_data_root)
         self.dataset_path = dataset_path
         self.mode = mode
         # Feature loading: memmap (shared across DDP ranks, zero-copy) or LRU fallback
@@ -481,30 +481,40 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample['scene_buckets'] = torch.zeros(NUM_BUCKET_CATEGORIES, dtype=torch.float32)
 
         # Build ego_status: concatenate historical low-dimensional states
-        # Order: speed_hist, theta_hist, command_hist, waypoints_hist
+        # Total: 1 + 1 + 6 + 2 + 2 + 2 = 14 (must match bev_encoder.state_dim)
         ego_status_components = []
         
-        # 1. speed_hist
-        speed_data = final_sample['speed']
+        # 1. speed_hist (obs_horizon,) -> (obs_horizon, 1)
+        speed_data = final_sample.get('speed', final_sample.get('speed_hist'))
+        if speed_data is None:
+            raise KeyError("Neither 'speed' nor 'speed_hist' found in sample")
         ego_status_components.append(speed_data.unsqueeze(-1))  # (obs_horizon, 1)
         
-        # 2. theta_hist
+        # 2. theta_hist (obs_horizon,) -> (obs_horizon, 1)
         theta_data = final_sample['theta_hist']
         ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
         
-        # 5. command_hist (one-hot, shape: (obs_horizon, 6))
+        # 3. command_hist (obs_horizon, 6)
         command_data = final_sample['command_hist']
         ego_status_components.append(command_data)  # (obs_horizon, 6)
 
-        # 6. target point
-        target_point_data = final_sample['target_point_hist']
-        ego_status_components.append(target_point_data)  # (obs_horizon, 2)
+        # 4. target_point_hist — handle both (obs_horizon, 2) and (obs_horizon, 4) formats
+        target_point_raw = final_sample['target_point_hist']
+        if target_point_raw.shape[-1] == 4:
+            # Old HPC format: target_point(2) + target_point_next(2) concatenated
+            target_point_data = target_point_raw[..., :2]       # (obs_horizon, 2)
+            target_point_next_data = target_point_raw[..., 2:]  # (obs_horizon, 2)
+        else:
+            # Standard format: separate fields
+            target_point_data = target_point_raw                # (obs_horizon, 2)
+            target_point_next_data = final_sample.get(
+                'target_point_next_hist', torch.zeros_like(target_point_data))
+        ego_status_components.append(target_point_data)       # (obs_horizon, 2)
         
-        # 7. target point next (may be missing in older preprocessed data)
-        target_point_next_data = final_sample.get('target_point_next_hist', torch.zeros_like(target_point_data))
+        # 5. target_point_next_hist (obs_horizon, 2)
         ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
         
-        # 8. waypoints_hist (shape: (obs_horizon, 2))
+        # 6. waypoints_hist (obs_horizon, 2)
         waypoints_data = final_sample['waypoints_hist']
         ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
         
