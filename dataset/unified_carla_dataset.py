@@ -282,16 +282,21 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
-            frame_num = os.path.basename(bev_feature_path).replace('_feature.pt', '')
             packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
+            # Use frame_id as direct positional index into route_features.
+            # frame_id is the array index into sorted measurement files, and
+            # route_features.pt stores features in sorted lidar-file order.
+            # Since measurement and lidar files share the same naming, frame_id
+            # maps directly to the position in route_features.pt tensors.
+            frame_id = sample.get('frame_id')
 
             if self._feat_index is not None:
                 # Fast path: memmap (zero IO after pages are faulted in)
                 route_info = self._feat_index.get(packed_path)
                 if route_info is not None:
-                    fidx = route_info['frame_num_to_idx'].get(frame_num)
-                    if fidx is not None:
-                        abs_idx = route_info['offset'] + fidx
+                    n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
+                    if frame_id is not None and frame_id < n_frames:
+                        abs_idx = route_info['offset'] + frame_id
                         transfuser_bev_feature = torch.from_numpy(
                             self._feat_mmap[abs_idx].copy())        # (1512, 8, 8) float16
                         transfuser_bev_feature_upsample = torch.from_numpy(
@@ -299,7 +304,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     else:
                         import warnings
                         warnings.warn(
-                            f"[Dataset] frame_num '{frame_num}' not found in memmap index for {packed_path}",
+                            f"[Dataset] frame_id {frame_id} out of range "
+                            f"(n_frames={n_frames}) for {packed_path}",
                             stacklevel=2)
                 else:
                     import warnings
@@ -309,14 +315,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 # Slow fallback: LRU cache with disk IO
                 pack = self._get_route_pack_lru(packed_path)
-                fidx = pack['frame_num_to_idx'].get(frame_num)
-                if fidx is not None:
-                    transfuser_bev_feature = pack['bev_features'][fidx]
-                    transfuser_bev_feature_upsample = pack['bev_upsamples'][fidx]
+                n_frames = len(pack['bev_features'])
+                if frame_id is not None and frame_id < n_frames:
+                    transfuser_bev_feature = pack['bev_features'][frame_id]
+                    transfuser_bev_feature_upsample = pack['bev_upsamples'][frame_id]
                 else:
                     import warnings
                     warnings.warn(
-                        f"[Dataset] frame_num '{frame_num}' not found in route_features.pt: {packed_path}",
+                        f"[Dataset] frame_id {frame_id} out of range "
+                        f"(n_frames={n_frames}) for {packed_path}",
                         stacklevel=2)
         
         # # Load VQA feature from pt file

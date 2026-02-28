@@ -108,9 +108,7 @@ class DatasetPreprocessor:
             p = Path(route_path)
             if p.name.startswith('FAILED_'):
                 return None
-            if ((p / 'lidar').exists() and
-                    (p / 'rgb').exists() and
-                    (p / 'results.json.gz').exists()):
+            if (p / 'lidar').exists() and (p / 'rgb').exists():
                 return p
             return None
 
