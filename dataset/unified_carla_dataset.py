@@ -362,7 +362,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 tp = torch.from_numpy(value).float()
                 final_sample['target_point_hist'] = tp[..., :2]
                 if tp.shape[-1] == 4:
+                    # Old HPC format: split out target_point_next_hist from concatenated tensor
                     final_sample['target_point_next_hist'] = tp[..., 2:]
+                # else: standard format — target_point_next_hist is a separate key in the pkl,
+                # it will be handled by the generic np.ndarray branch below.
+            elif key == 'target_point_next_hist':
+                # Standard format: separate key for target_point_next_hist
+                final_sample['target_point_next_hist'] = torch.from_numpy(value).float()
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
                 continue
@@ -373,6 +379,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value
+
+        # Safety: ensure target_point_next_hist always exists for collate consistency
+        if 'target_point_next_hist' not in final_sample:
+            if not hasattr(self, '_tp_next_warn_count'):
+                self._tp_next_warn_count = 0
+            self._tp_next_warn_count += 1
+            if self._tp_next_warn_count <= 5:
+                import warnings
+                warnings.warn(
+                    f"[Dataset] Sample missing 'target_point_next_hist', filling zeros "
+                    f"(warning {self._tp_next_warn_count}/5, further suppressed)",
+                    stacklevel=2)
+            final_sample['target_point_next_hist'] = torch.zeros_like(
+                final_sample['target_point_hist'])
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
