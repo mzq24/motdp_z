@@ -12,6 +12,7 @@ from collections import defaultdict
 from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
@@ -298,9 +299,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     if frame_id is not None and frame_id < n_frames:
                         abs_idx = route_info['offset'] + frame_id
                         transfuser_bev_feature = torch.from_numpy(
-                            self._feat_mmap[abs_idx].copy())        # (1512, 8, 8) float16
-                        transfuser_bev_feature_upsample = torch.from_numpy(
-                            self._ups_mmap[abs_idx].copy())         # (64, 64, 64) float16
+                            self._feat_mmap[abs_idx].copy()).clone()  # (1512, 8, 8) float16
+                        # Stored as (64, 32, 32) after 2x downsample, interpolate back
+                        ups_ds = torch.from_numpy(
+                            self._ups_mmap[abs_idx].copy())           # (64, 32, 32) float16
+                        transfuser_bev_feature_upsample = F.interpolate(
+                            ups_ds.unsqueeze(0).float(), size=(64, 64),
+                            mode='bilinear', align_corners=False).squeeze(0).half()
                     else:
                         import warnings
                         warnings.warn(
