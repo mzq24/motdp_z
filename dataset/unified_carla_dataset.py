@@ -80,6 +80,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # LRU fallback (used when memmap cache not built yet)
         self._route_pack_cache = {}
         self._route_pack_cache_maxsize = 32
+        self._ram_features = None    # dict: abs_idx -> (feat_tensor, ups_tensor), set by preload_to_ram()
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -259,6 +260,42 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sample_files)
 
+    def preload_to_ram(self):
+        """Pre-load all sample features from memmap into RAM dict, then close memmap.
+        Used for val dataset to avoid polluting training page cache during validation."""
+        if self._feat_mmap is None or self._feat_index is None:
+            print("[Dataset] preload_to_ram: no memmap loaded, skipping.")
+            return
+        ram = {}
+        for idx in range(len(self.sample_files)):
+            sample = self._sample_cache[idx]
+            if 'transfuser_bev_feature' not in sample:
+                continue
+            bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
+            packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
+            frame_id = sample.get('frame_id')
+            route_info = self._feat_index.get(packed_path)
+            if route_info is None or frame_id is None:
+                continue
+            n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
+            if frame_id >= n_frames:
+                continue
+            abs_idx = route_info['offset'] + frame_id
+            if abs_idx not in ram:
+                feat = torch.from_numpy(self._feat_mmap[abs_idx].copy()).clone()
+                ups = torch.from_numpy(self._ups_mmap[abs_idx].copy()).clone()
+                ram[abs_idx] = (feat, ups)
+            # Map sample idx -> abs_idx for fast lookup in __getitem__
+            ram[('sidx', idx)] = abs_idx
+        self._ram_features = ram
+        # Close memmap to avoid page cache pollution
+        self._feat_mmap = None
+        self._ups_mmap = None
+        # Keep _feat_index = None so __getitem__ takes the RAM path
+        self._feat_index = None
+        mem_mb = sum(f.nbytes + u.nbytes for f, u in ram.values() if isinstance(f, torch.Tensor)) / 1e6
+        print(f"[Dataset] preload_to_ram: {len([k for k in ram if not isinstance(k, tuple)])} frames loaded into RAM ({mem_mb:.0f} MB)")
+
     def _get_route_pack_lru(self, packed_path: str) -> dict:
         """Fallback: load route_features.pt into LRU cache (used when memmap not available)."""
         if packed_path not in self._route_pack_cache:
@@ -291,7 +328,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             # maps directly to the position in route_features.pt tensors.
             frame_id = sample.get('frame_id')
 
-            if self._feat_index is not None:
+            if self._ram_features is not None:
+                # RAM pre-loaded path (val dataset): pure memory lookup, zero disk IO
+                abs_idx = self._ram_features.get(('sidx', idx))
+                if abs_idx is not None:
+                    cached = self._ram_features.get(abs_idx)
+                    if cached is not None:
+                        transfuser_bev_feature = cached[0].clone()
+                        ups_ds = cached[1]
+                        transfuser_bev_feature_upsample = F.interpolate(
+                            ups_ds.unsqueeze(0).float(), size=(64, 64),
+                            mode='bilinear', align_corners=False).squeeze(0).half()
+            elif self._feat_index is not None:
                 # Fast path: memmap (zero IO after pages are faulted in)
                 route_info = self._feat_index.get(packed_path)
                 if route_info is not None:

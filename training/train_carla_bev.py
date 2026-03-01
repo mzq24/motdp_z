@@ -299,6 +299,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     image_data_root = config.get('training', {}).get('image_data_root')
     train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
     val_dataset_orig = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
+    # Pre-load val features into RAM so validation doesn't touch memmap page cache
+    val_dataset_orig.preload_to_ram()
     if val_only:
         val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
     else:
