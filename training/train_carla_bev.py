@@ -382,7 +382,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             num_workers=num_workers,
             pin_memory=False,
             drop_last=True,
-            collate_fn=debug_collate,
         )
     else:
         # Single GPU: use full validation dataset
