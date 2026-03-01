@@ -298,9 +298,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     val_dataset_path = os.path.join(dataset_path_root, 'val')
     image_data_root = config.get('training', {}).get('image_data_root')
     train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
-    val_dataset_orig = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
-    # Pre-load val features into RAM so validation doesn't touch memmap page cache
-    val_dataset_orig.preload_to_ram()
+    # Val dataset: skip memmap, will inject RAM features after config is parsed
+    val_dataset_orig = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root, skip_memmap=True)
     if val_only:
         val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
     else:
@@ -341,7 +340,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         val_max_batches = int(raw_val_max_batches)
         if val_max_batches <= 0:
             val_max_batches = None
-    
+
+    # Inject val features from train's memmap into RAM (only this rank's samples)
+    _max_val_per_rank = val_max_batches * val_batch_size if val_max_batches else None
+    val_dataset_orig.inject_ram_features(train_dataset, rank=rank, world_size=world_size, max_val_samples=_max_val_per_rank)
+
     def safe_collate(batch):
         try:
             return default_collate(batch)
