@@ -183,13 +183,12 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                     print(f"Warning: Error in action prediction during validation: {e}")
                     continue
         
-            pbar.close() 
-    
-        # Compute averaged metrics
-        averaged_metrics = {f'val_{k}': np.mean(v) for k, v in val_metrics.items() if v}
-        return averaged_metrics
-    else:
-        return {}
+        if rank == 0:
+            pbar.close()
+
+    # Compute averaged metrics
+    averaged_metrics = {f'val_{k}': np.mean(v) for k, v in val_metrics.items() if v}
+    return averaged_metrics
 
 @record  # Records error and tracebacks in case of failure
 def train_pdm_policy(config_path, resume_path=None, val_only=False):
