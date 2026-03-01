@@ -102,24 +102,31 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return metrics
 
-def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False, amp_dtype=torch.float16):
+def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False, amp_dtype=torch.float16, max_batches=None):
     """
     Validation function for distributed training
     Only rank 0 will compute and log metrics
+    max_batches: limit number of val batches to avoid evicting training page cache
+                 None or <=0 means full validation.
     """
     policy.eval()
-    
+
     # Get the actual model (unwrap DDP if needed)
     model_for_inference = policy.module if world_size > 1 else policy
-    
+
     val_metrics = defaultdict(list)
-    
+
     # All ranks perform validation to avoid NCCL timeout
     # (rank 0 logs metrics, others just run forward to stay in sync)
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Validating", leave=False) if rank == 0 else val_loader
+        if max_batches is not None and max_batches <= 0:
+            max_batches = None
+        total_batches = min(len(val_loader), max_batches) if max_batches is not None else len(val_loader)
+        pbar = tqdm(val_loader, desc="Validating", leave=False, total=total_batches) if rank == 0 else val_loader
 
         for batch_idx, batch in enumerate(pbar):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
@@ -303,11 +310,35 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
 
     
-    batch_size = config.get('dataloader', {}).get('batch_size', 32)
-    num_workers = config.get('dataloader', {}).get('num_workers', 4)
-    persistent_workers = config.get('dataloader', {}).get('persistent_workers', True)
-    prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
-    pin_memory = config.get('dataloader', {}).get('pin_memory', True)
+    dataloader_cfg = config.get('dataloader', {})
+    training_cfg = config.get('training', {})
+    validation_cfg = config.get('validation', {})
+
+    train_batch_size = dataloader_cfg.get('batch_size', 32)
+    val_batch_size = dataloader_cfg.get('val_batch_size', train_batch_size)
+
+    base_num_workers = dataloader_cfg.get('num_workers', 4)
+    base_persistent_workers = dataloader_cfg.get('persistent_workers', True)
+    base_prefetch_factor = dataloader_cfg.get('prefetch_factor', 2)
+    base_pin_memory = dataloader_cfg.get('pin_memory', True)
+
+    train_num_workers = dataloader_cfg.get('train_num_workers', base_num_workers)
+    val_num_workers = dataloader_cfg.get('val_num_workers', base_num_workers)
+    train_persistent_workers = dataloader_cfg.get('train_persistent_workers', base_persistent_workers)
+    val_persistent_workers = dataloader_cfg.get('val_persistent_workers', False)
+    train_prefetch_factor = dataloader_cfg.get('train_prefetch_factor', base_prefetch_factor)
+    val_prefetch_factor = dataloader_cfg.get('val_prefetch_factor', 1)
+    train_pin_memory = dataloader_cfg.get('train_pin_memory', base_pin_memory)
+    val_pin_memory = dataloader_cfg.get('val_pin_memory', False)
+
+    validation_freq = int(validation_cfg.get('freq', training_cfg.get('validation_freq', 1)))
+    raw_val_max_batches = validation_cfg.get('max_batches', 16)
+    if raw_val_max_batches in (None, 0, "0"):
+        val_max_batches = None
+    else:
+        val_max_batches = int(raw_val_max_batches)
+        if val_max_batches <= 0:
+            val_max_batches = None
     
     def safe_collate(batch):
         try:
@@ -336,12 +367,12 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         sampler_val = None
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=train_batch_size,
             sampler=sampler_train,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers if num_workers > 0 else False,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            num_workers=train_num_workers,
+            pin_memory=train_pin_memory,
+            persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+            prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
             drop_last=True,
             collate_fn=safe_collate,
         )
@@ -351,15 +382,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # Route-grouped batching: samples in the same batch come from the same route(s),
         # so route_features.pt pack cache hits are maximized (1-2 loads per batch vs ~batch_size)
         train_batch_sampler = train_dataset.get_route_batch_sampler(
-            batch_size=batch_size, shuffle=True, drop_last=True)
+            batch_size=train_batch_size, shuffle=True, drop_last=True)
 
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers if num_workers > 0 else False,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            num_workers=train_num_workers,
+            pin_memory=train_pin_memory,
+            persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+            prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
             collate_fn=safe_collate,
         )
     
@@ -376,26 +407,43 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=val_batch_size,
             sampler=val_sampler,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=False,
+            num_workers=val_num_workers,
+            pin_memory=val_pin_memory,
+            persistent_workers=val_persistent_workers if val_num_workers > 0 else False,
+            prefetch_factor=val_prefetch_factor if val_num_workers > 0 else None,
             drop_last=True,
+            collate_fn=safe_collate,
         )
     else:
         # Single GPU: use full validation dataset
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=val_batch_size,
             sampler=sampler_val,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers if num_workers > 0 else False,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            drop_last=True
+            num_workers=val_num_workers,
+            pin_memory=val_pin_memory,
+            persistent_workers=val_persistent_workers if val_num_workers > 0 else False,
+            prefetch_factor=val_prefetch_factor if val_num_workers > 0 else None,
+            drop_last=True,
+            collate_fn=safe_collate,
         )
+
+    if rank == 0:
+        print("DataLoader config:")
+        print(f"  train: batch={train_batch_size}, workers={train_num_workers}, "
+              f"prefetch={train_prefetch_factor if train_num_workers > 0 else None}, "
+              f"persistent={train_persistent_workers if train_num_workers > 0 else False}, "
+              f"pin_memory={train_pin_memory}")
+        print(f"  val:   batch={val_batch_size}, workers={val_num_workers}, "
+              f"prefetch={val_prefetch_factor if val_num_workers > 0 else None}, "
+              f"persistent={val_persistent_workers if val_num_workers > 0 else False}, "
+              f"pin_memory={val_pin_memory}")
+        print(f"Validation config: freq={validation_freq}, "
+              f"max_batches={val_max_batches if val_max_batches is not None else 'ALL'}")
     
     if rank == 0:
         print("Initializing policy model...")
@@ -530,7 +578,10 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print("Running validation only (--val_only mode)")
             print("=" * 60)
         try:
-            val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp, amp_dtype=amp_dtype)
+            val_metrics = validate_model(
+                policy, val_loader, device, rank=rank, world_size=world_size,
+                use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches
+            )
             if rank == 0:
                 print(f"\n✓ Validation completed")
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
@@ -706,23 +757,41 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 "train/samples_processed": (epoch + 1) * len(train_dataset)
             }, use_wandb)
 
-        validation_freq = config.get('training', {}).get('validation_freq', 1)
         if (epoch + 1) % validation_freq == 0:
             # Apply EMA weights for validation
             ema_model.store(model_for_ema.parameters())
             ema_model.copy_to(model_for_ema.parameters())
 
             if rank == 0:
+                import psutil
+                mem_before_val = psutil.virtual_memory()
                 print(f"Validating with EMA weights (Epoch {epoch+1}/{num_epochs})...")
+                print(f"[Validation Start] max_batches={val_max_batches if val_max_batches is not None else 'ALL'}, "
+                      f"val_batch={val_batch_size}, val_workers={val_num_workers}, "
+                      f"val_prefetch={val_prefetch_factor if val_num_workers > 0 else None}, "
+                      f"val_persistent={val_persistent_workers if val_num_workers > 0 else False}")
+                print(f"[Validation Start] RAM available={mem_before_val.available/1e9:.1f}GB, "
+                      f"cached={getattr(mem_before_val, 'cached', 0)/1e9:.1f}GB")
             try:
-                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size, use_amp=use_amp, amp_dtype=amp_dtype)
+                val_metrics = validate_model(
+                    policy, val_loader, device, rank=rank, world_size=world_size,
+                    use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches
+                )
             except Exception as e:
                 if rank == 0:
                     print(f"✗ Error during validation: {e}")
                     import traceback
                     traceback.print_exc()
                 ema_model.restore(model_for_ema.parameters())
+                torch.cuda.empty_cache()
                 continue
+
+            # Free GPU memory allocated during diffusion sampling in validation
+            torch.cuda.empty_cache()
+            if rank == 0:
+                mem_after_val = psutil.virtual_memory()
+                print(f"[Validation End] RAM available={mem_after_val.available/1e9:.1f}GB, "
+                      f"cached={getattr(mem_after_val, 'cached', 0)/1e9:.1f}GB")
 
             if rank == 0:
                 log_dict = {"epoch": epoch, "train/loss": avg_train_loss}
