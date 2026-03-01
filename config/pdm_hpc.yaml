@@ -111,7 +111,7 @@ training:
   image_data_root: /home/users/ntu/wh.huang/scratch/z_projects/dataset/pdm_lite
   sample_interval: 1
   lr_final: 1e-7
-  validation_freq: 5
+  validation_freq: 10
   save_freq: 5
   early_stopping_patience: 10
   checkpoint_dir: /home/users/ntu/wh.huang/scratch/z_projects/code/motdp_z/checkpoints/hpc_run

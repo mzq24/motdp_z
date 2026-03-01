@@ -114,21 +114,21 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
     
     val_metrics = defaultdict(list)
     
-    # Only rank 0 performs validation
-    if rank == 0:
-        with torch.no_grad():
-            pbar = tqdm(val_loader, desc="Validating", leave=False)
-            
-            for batch_idx, batch in enumerate(pbar):
-                for key in batch:
-                    if isinstance(batch[key], torch.Tensor):
-                        batch[key] = batch[key].to(device, non_blocking=True)
+    # All ranks perform validation to avoid NCCL timeout
+    # (rank 0 logs metrics, others just run forward to stay in sync)
+    with torch.no_grad():
+        pbar = tqdm(val_loader, desc="Validating", leave=False) if rank == 0 else val_loader
 
-                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    loss_dict = model_for_inference.compute_loss(batch)
-                    loss = loss_dict['total_loss']
+        for batch_idx, batch in enumerate(pbar):
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device, non_blocking=True)
+
+            with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                loss_dict = model_for_inference.compute_loss(batch)
+                loss = loss_dict['total_loss']
+            if rank == 0:
                 val_metrics['loss'].append(loss.item())
-                # Track individual losses
                 val_metrics['cls_loss'].append(loss_dict['cls_loss'].item())
                 val_metrics['reg_loss'].append(loss_dict['reg_loss'].item())
                 val_metrics['route_loss'].append(loss_dict['route_loss'].item())
@@ -366,25 +366,27 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     # Validation loader: only create meaningful loader for rank 0
     # Other ranks get an empty loader since they don't validate
-    if world_size > 1 and rank != 0:
-        # Create empty validation loader for non-rank 0 processes
+    if world_size > 1:
+        # All ranks participate in validation to avoid NCCL timeout
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset,
+            shuffle=False,
+            num_replicas=world_size,
+            rank=rank,
+            drop_last=True
+        )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            sampler=torch.utils.data.distributed.DistributedSampler(
-                val_dataset,
-                shuffle=False,
-                num_replicas=world_size,
-                rank=rank,
-                drop_last=True
-            ),
+            sampler=val_sampler,
             shuffle=False,
-            num_workers=0,  # No workers needed for empty validation
+            num_workers=num_workers,
             pin_memory=False,
-            drop_last=True
+            drop_last=True,
+            collate_fn=debug_collate,
         )
     else:
-        # Rank 0 or single GPU: use full validation dataset
+        # Single GPU: use full validation dataset
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
