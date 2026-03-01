@@ -34,8 +34,9 @@ echo "Log:     ${LOG_FILE}"     | tee -a ${LOG_FILE}
 echo "Start:   $(date)"         | tee -a ${LOG_FILE}
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export OMP_NUM_THREADS=8
+export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
 torchrun \
     --nnodes=1 \
