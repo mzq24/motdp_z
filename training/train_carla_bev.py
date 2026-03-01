@@ -433,19 +433,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         )
 
     if rank == 0:
-        print("DataLoader config:")
-        print(f"  train: batch={train_batch_size}, workers={train_num_workers}, "
-              f"prefetch={train_prefetch_factor if train_num_workers > 0 else None}, "
-              f"persistent={train_persistent_workers if train_num_workers > 0 else False}, "
-              f"pin_memory={train_pin_memory}")
-        print(f"  val:   batch={val_batch_size}, workers={val_num_workers}, "
-              f"prefetch={val_prefetch_factor if val_num_workers > 0 else None}, "
-              f"persistent={val_persistent_workers if val_num_workers > 0 else False}, "
-              f"pin_memory={val_pin_memory}")
-        print(f"Validation config: freq={validation_freq}, "
-              f"max_batches={val_max_batches if val_max_batches is not None else 'ALL'}")
-    
-    if rank == 0:
         print("Initializing policy model...")
     policy = DiffusionDiTCarlaPolicy(config).to(device)
 
@@ -763,15 +750,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             ema_model.copy_to(model_for_ema.parameters())
 
             if rank == 0:
-                import psutil
-                mem_before_val = psutil.virtual_memory()
                 print(f"Validating with EMA weights (Epoch {epoch+1}/{num_epochs})...")
-                print(f"[Validation Start] max_batches={val_max_batches if val_max_batches is not None else 'ALL'}, "
-                      f"val_batch={val_batch_size}, val_workers={val_num_workers}, "
-                      f"val_prefetch={val_prefetch_factor if val_num_workers > 0 else None}, "
-                      f"val_persistent={val_persistent_workers if val_num_workers > 0 else False}")
-                print(f"[Validation Start] RAM available={mem_before_val.available/1e9:.1f}GB, "
-                      f"cached={getattr(mem_before_val, 'cached', 0)/1e9:.1f}GB")
             try:
                 val_metrics = validate_model(
                     policy, val_loader, device, rank=rank, world_size=world_size,
@@ -788,10 +767,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
             # Free GPU memory allocated during diffusion sampling in validation
             torch.cuda.empty_cache()
-            if rank == 0:
-                mem_after_val = psutil.virtual_memory()
-                print(f"[Validation End] RAM available={mem_after_val.available/1e9:.1f}GB, "
-                      f"cached={getattr(mem_after_val, 'cached', 0)/1e9:.1f}GB")
 
             if rank == 0:
                 log_dict = {"epoch": epoch, "train/loss": avg_train_loss}

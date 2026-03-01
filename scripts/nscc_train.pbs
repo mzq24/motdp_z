@@ -4,7 +4,7 @@
 ### Submit: qsub scripts/nscc_train.pbs
 
 #PBS -l select=1:ngpus=4:ncpus=32:mem=440G
-#PBS -l walltime=48:00:00
+#PBS -l walltime=20:00:00
 #PBS -P personal-wh.huang
 #PBS -N mot_train
 #PBS -j oe
