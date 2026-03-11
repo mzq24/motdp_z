@@ -100,6 +100,10 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1,
 
             if rank == 0:
                 val_metrics['loss'].append(loss.item())
+                # Log per-component losses
+                for k, v in loss_dict.items():
+                    if k != 'total_loss' and isinstance(v, torch.Tensor):
+                        val_metrics[k].append(v.item())
 
                 obs_dict = {
                     'transfuser_bev_feature': batch['transfuser_bev_feature'],
@@ -109,13 +113,31 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1,
                 target_actions = batch['agent_pos']
 
                 try:
-                    result = model_for_inference.predict_action(obs_dict)
+                    num_poses = model_for_inference.dd_config.num_poses
+                    targets = {'trajectory': batch['agent_pos'][:, :num_poses]}
+                    result = model_for_inference.predict_action(obs_dict, targets=targets)
                     predicted_actions = torch.from_numpy(result['action']).to(device)
-                    target_actions = target_actions[:, :predicted_actions.shape[1]]
+                    target_actions_eval = target_actions[:, :predicted_actions.shape[1]]
 
-                    driving_metrics = compute_driving_metrics(predicted_actions, target_actions)
+                    driving_metrics = compute_driving_metrics(predicted_actions, target_actions_eval)
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
+
+                    # Also log 1-step DDIM metrics for comparison
+                    traj_head = model_for_inference.model.trajectory_head
+                    original_steps = traj_head.num_diffusion_steps
+                    if original_steps > 1:
+                        try:
+                            traj_head.num_diffusion_steps = 1
+                            result_1step = model_for_inference.predict_action(obs_dict, targets=targets)
+                            pred_1step = torch.from_numpy(result_1step['action']).to(device)
+                            target_1step = target_actions[:, :pred_1step.shape[1]]
+
+                            metrics_1step = compute_driving_metrics(pred_1step, target_1step)
+                            for key, value in metrics_1step.items():
+                                val_metrics[f'{key}_1step'].append(value)
+                        finally:
+                            traj_head.num_diffusion_steps = original_steps
 
                     if rank == 0 and hasattr(pbar, 'set_postfix'):
                         postfix = {'val_loss': f'{loss.item():.4f}'}
@@ -123,7 +145,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1,
                             postfix['L2_avg'] = f'{driving_metrics["L2_avg"]:.3f}'
                         pbar.set_postfix(postfix)
                 except Exception as e:
-                    print(f"Warning: Error in prediction during validation: {e}")
+                    # print(f"Warning: Error in prediction during validation: {e}")  # debug
                     continue
 
         if rank == 0 and hasattr(pbar, 'close'):
@@ -173,7 +195,7 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
             wandb.init(
                 project=logging_cfg.get('wandb_project', "dd-baseline"),
                 name=logging_cfg.get('run_name', "dd_baseline_train"),
-                mode=os.environ.get('WANDB_MODE', 'offline'),
+                mode=os.environ.get('WANDB_MODE', 'online'),
                 resume='allow',
                 config=config,
             )
@@ -222,7 +244,8 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
                 if vals:
                     shapes = set(v.shape for v in vals)
                     if len(shapes) > 1:
-                        print(f"[COLLATE] shape mismatch '{key}': {shapes}", flush=True)
+                        # print(f"[COLLATE] shape mismatch '{key}': {shapes}", flush=True)  # debug
+                        pass
             raise
 
     if world_size > 1:
@@ -269,6 +292,30 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
             print(f"Loading checkpoint from {resume_path}...")
         checkpoint = torch.load(resume_path, map_location=device)
         policy.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Override config with the one from checkpoint BUT keep some overrides
+        if 'config' in checkpoint and val_only:
+            loaded_config = checkpoint['config']
+            # We want to keep dataloader and validation config from the file
+            loaded_config['validation'] = config.get('validation', {})
+            loaded_config['dataloader']['val_batch_size'] = config.get('dataloader', {}).get('val_batch_size', 32)
+            
+            # Allow overriding diffusion inference steps from yaml
+            if 'dd_baseline' in loaded_config and 'dd_baseline' in config:
+                if 'num_diffusion_steps' in config['dd_baseline']:
+                    loaded_config['dd_baseline']['num_diffusion_steps'] = config['dd_baseline']['num_diffusion_steps']
+                if 'trunc_timesteps' in config['dd_baseline']:
+                    loaded_config['dd_baseline']['trunc_timesteps'] = config['dd_baseline']['trunc_timesteps']
+            
+            config = loaded_config
+            
+            # Re-initialize the policy so it uses the new num_diffusion_steps logic correctly
+            # (since policy was instantiated before loading this overridden config)
+            if hasattr(policy, 'module'):
+                policy.module.update_inference_config(config)
+            else:
+                policy.update_inference_config(config)
+            
         start_epoch = checkpoint.get('epoch', 0) + 1
         if rank == 0:
             print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
@@ -307,6 +354,8 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
     ema_model = EMAModel(model_for_ema.parameters(), max_value=ema_cfg.get('max_value', 0.9999))
     ema_model.to(device)
     ema_update_interval = ema_cfg.get('update_interval', 10)
+    if checkpoint is not None and 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
 
     # Checkpoint dir
     checkpoint_dir = training_cfg.get('checkpoint_dir', os.path.join(project_root, 'checkpoints', 'dd_baseline'))
@@ -317,6 +366,39 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
     best_l2_avg = float('inf')
     val_loss = None
     val_metrics = {}
+
+    # ========== Val Only Mode ==========
+    if val_only:
+        if rank == 0:
+            print("\n" + "="*50)
+            print(f"Running Validation Only on {resume_path}")
+            print("="*50)
+
+        ema_model.store(model_for_ema.parameters())
+        ema_model.copy_to(model_for_ema.parameters())
+
+        try:
+            val_metrics = validate_model(
+                policy, val_loader, device, rank=rank, world_size=world_size,
+                use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches)
+        except Exception as e:
+            if rank == 0:
+                print(f"Error during validation: {e}")
+                # import traceback
+                # traceback.print_exc()  # debug
+
+        if rank == 0:
+            print("\nValidation Results:")
+            for key, value in val_metrics.items():
+                print(f"  {key}: {value:.4f}")
+            safe_wandb_log(val_metrics, use_wandb)
+
+        ema_model.restore(model_for_ema.parameters())
+        if use_wandb:
+            wandb.finish(quiet=True)
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
+        return
 
     # Training loop
     for epoch in range(start_epoch, num_epochs):
@@ -371,12 +453,16 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
 
             log_freq = config.get('logging', {}).get('log_freq', 50)
             if batch_idx % log_freq == 0 and rank == 0:
-                safe_wandb_log({
+                log_data = {
                     "train/loss_step": loss.item(),
                     "train/epoch": epoch,
                     "train/lr": optimizer.param_groups[0]['lr'],
                     "train/grad_norm": grad_norm.item(),
-                }, use_wandb)
+                }
+                for k, v in loss_dict.items():
+                    if k != 'total_loss':
+                        log_data[f"train/{k}"] = v.item() if isinstance(v, torch.Tensor) else v
+                safe_wandb_log(log_data, use_wandb)
 
         if rank == 0 and hasattr(pbar, 'close'):
             pbar.close()
@@ -384,6 +470,11 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
         avg_train_loss = np.mean(train_losses) if train_losses else 0
         if rank == 0:
             print(f"Epoch {epoch+1}/{num_epochs} - Avg loss: {avg_train_loss:.4f}")
+            safe_wandb_log({
+                "train/loss_epoch": avg_train_loss,
+                "train/epoch": epoch,
+                "train/lr": optimizer.param_groups[0]['lr'],
+            }, use_wandb)
 
         if scheduler is not None:
             scheduler.step()
@@ -426,8 +517,8 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
             except Exception as e:
                 if rank == 0:
                     print(f"Error during validation: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    # import traceback
+                    # traceback.print_exc()  # debug
                 ema_model.restore(model_for_ema.parameters())
                 continue
 
@@ -436,7 +527,11 @@ def train_dd_baseline(config_path, resume_path=None, val_only=False):
             if rank == 0:
                 for key, value in val_metrics.items():
                     print(f"  {key}: {value:.4f}")
-                safe_wandb_log(val_metrics, use_wandb)
+                # Log with val/ prefix for wandb (matching main project structure)
+                log_dict = {"train/epoch": epoch}
+                for key, value in val_metrics.items():
+                    log_dict[f"val/{key.removeprefix('val_')}"] = value
+                safe_wandb_log(log_dict, use_wandb)
 
                 val_loss = val_metrics.get('val_loss', float('inf'))
                 l2_avg = val_metrics.get('val_L2_avg', float('inf'))

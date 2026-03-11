@@ -1,0 +1,122 @@
+# DD Baseline Configuration
+# DiffusionDrive reproduction on MoT-DP framework
+
+# ========== Observation & Action Horizon ==========
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+
+# ========== DD Baseline Model Config ==========
+dd_baseline:
+  # BEV feature dimensions (from Transfuser backbone)
+  bev_feature_dim: 1512
+  bev_feature_upsample_dim: 64
+  bev_spatial_size: 64
+
+  # Transformer architecture
+  tf_d_model: 256
+  tf_d_ffn: 1024
+  tf_num_head: 8
+  tf_num_layers: 3          # standard transformer decoder layers
+  tf_dropout: 0.0
+
+  # Trajectory head
+  num_poses: 6              # waypoints per trajectory
+  ego_fut_mode: 20          # number of anchor modes
+  num_decoder_layers: 2     # stacked diffusion decoder layers
+  plan_anchor_path: /media/z/data/mzq/others/MoT-DP/dd_baseline/anchors/carla_kmeans_20.npy
+
+  # BEV physical range (meters)
+  lidar_max_x: 32.0
+  lidar_max_y: 32.0
+
+  # Diffusion
+  num_train_timesteps: 1000
+  trunc_timesteps: 50       # training noise range [0, 50)
+  num_diffusion_steps: 10   # DDIM inference steps (full diffusion needs more steps)
+
+  # Status encoding
+  status_dim: 14
+
+  # Loss weights
+  trajectory_cls_weight: 10.0
+  trajectory_reg_weight: 8.0
+
+  # Learnable agent queries (replacing agent detection head)
+  num_agent_queries: 16
+
+  # Delta prediction mode: predict per-step displacement instead of absolute trajectory
+  # delta[0] = pos[0], delta[i] = pos[i] - pos[i-1], cumsum(delta) = abs_traj
+  # Diffusion operates in Z-score normalized delta space; BEV grid_sample uses fixed anchor locations
+  predict_delta: true
+  delta_dynamic_bev: true
+
+  # Full diffusion: noise GT (not anchor), train with t ∈ [0, 1000)
+  # Inference starts from pure noise, DDIM skip-step denoising
+  # BEV always at anchor positions (anchor provides spatial prior)
+  use_full_diffusion: true
+
+  # Normalized forward mode (abs branch only, ignored when predict_delta=true):
+  # Model forward stays in normalized [-1,1] space, BEV grid_sample receives normalized coords
+  # instead of physical coords, decoupling spatial dependency
+  use_normalized_forward: false
+
+# ========== Normalization (shared with truncated_diffusion) ==========
+truncated_diffusion:
+  norm_x_offset: 5.0
+  norm_x_range: 80.0 
+  norm_y_offset: 25.0
+  norm_y_range: 55.0
+
+# ========== Dataset ==========
+dataset:
+  use_per_frame: true       # Local SSD: read individual .pt files (fast, low memory)
+                             # Set false on HPC to use memmap/packed mode
+
+# ========== Dataloader ==========
+dataloader:
+  batch_size: 128
+  val_batch_size: 128
+  num_workers: 4
+
+# ========== Optimizer ==========
+optimizer:
+  lr: 1.0e-04
+  weight_decay: 1.0e-04
+  scale_lr: true
+
+# ========== EMA ==========
+ema:
+  max_value: 0.9999
+  update_interval: 10
+
+# ========== Training ==========
+training:
+  num_epochs: 200
+  max_grad_norm: 1.0
+  warmup_epochs: 5
+  use_lr_scheduler: true
+  lr_final: 1.0e-07
+  validation_freq: 5
+  save_freq: 5
+  max_keep_ckpts: 5
+  dataset_path: /media/z/data/dataset/pdm_lite_mini
+  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/dd_baseline_white_noise_delta_dynamic_bev/
+
+# ========== Validation ==========
+validation:
+  freq: 5
+  max_batches: 16
+
+# ========== Mixed Precision ==========
+model_optimization:
+  use_mixed_precision: true
+
+# ========== Logging ==========
+logging:
+  use_wandb: true
+  wandb_project: debug_abs_traj_32
+  run_name: dd_baseline_white_noise_delta_dynamic_bev
+  log_freq: 50

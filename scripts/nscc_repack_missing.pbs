@@ -1,0 +1,55 @@
+#!/bin/bash
+
+### Repack ONLY routes that are missing route_source.pt and/or route_features.pt.
+### This is a fixup job for routes that were skipped or failed in the original run.
+###
+### Usage:
+###   1. Run debug script first to generate missing_routes.txt:
+###        python scripts/debug_dataset_paths.py
+###   2. Submit this job:
+###        qsub scripts/nscc_repack_missing.pbs
+###
+### The script re-runs pack_source (Phase 1) + extract (Phase 2) on missing routes only.
+
+#PBS -l select=1:ncpus=16:ngpus=1:mem=64G
+#PBS -l walltime=4:00:00
+#PBS -P personal-wh.huang
+#PBS -N mot_repack_missing
+#PBS -j oe
+#PBS -o out.repack_missing.txt
+#PBS -M m240117@e.ntu.edu.sg
+#PBS -m abe
+
+# ---- User config ----
+SCRATCH=/home/users/ntu/wh.huang/scratch
+DATASET_PATH=${SCRATCH}/z_projects/dataset/pdm_lite
+CONFIG_PATH=${SCRATCH}/z_projects/models/transfuser/pretrained_models/all_towns
+MODEL_PATH=${CONFIG_PATH}/model_0030_1.pth
+CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
+CONDA_ENV=dpautomotive
+LOG_FILE=${CODE_DIR}/logs/mot_repack_missing_${PBS_JOBID}.log
+# ---------------------
+
+source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
+conda activate ${CONDA_ENV}
+
+cd ${CODE_DIR}
+mkdir -p ${CODE_DIR}/logs
+
+echo "=== Repack Missing Routes ===" | tee ${LOG_FILE}
+echo "Dataset: ${DATASET_PATH}"      | tee -a ${LOG_FILE}
+echo "Start:   $(date)"              | tee -a ${LOG_FILE}
+
+# Step 1: Re-generate list of missing routes
+python -u scripts/debug_dataset_paths.py 2>&1 | tee -a ${LOG_FILE}
+
+# Step 2: Repack + extract missing routes
+python -u scripts/repack_missing_routes.py \
+  --dataset_path ${DATASET_PATH} \
+  --config_path  ${CONFIG_PATH} \
+  --model_path   ${MODEL_PATH} \
+  --device       cuda:0 \
+  --batch_size   16 \
+  2>&1 | tee -a ${LOG_FILE}
+
+echo "Done: $(date)" | tee -a ${LOG_FILE}

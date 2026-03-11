@@ -1,0 +1,73 @@
+#!/bin/bash
+
+### Quick diagnostic: check node-local NVMe / tmpdir availability
+### Usage: qsub scripts/nscc_check_local_storage.pbs
+
+#PBS -l select=1:ngpus=1:ncpus=4:mem=16G
+#PBS -l walltime=00:10:00
+#PBS -P personal-wh.huang
+#PBS -N check_storage
+#PBS -j oe
+#PBS -o out.check_storage.txt
+#PBS -M m240117@e.ntu.edu.sg
+
+echo "==================== Node Info ===================="
+hostname
+uname -a
+
+echo ""
+echo "==================== PBS Environment Variables ===================="
+echo "PBS_JOBID:   ${PBS_JOBID}"
+echo "PBS_TMPDIR:  ${PBS_TMPDIR:-not set}"
+echo "TMPDIR:      ${TMPDIR:-not set}"
+echo "PBS_JOBFS:   ${PBS_JOBFS:-not set}"
+echo "PBS_NODEFILE: $(cat ${PBS_NODEFILE} 2>/dev/null || echo 'not set')"
+
+echo ""
+echo "==================== /var/tmp contents ===================="
+ls -la /var/tmp/ 2>/dev/null | head -20
+echo ""
+echo "--- PBS job tmp dir ---"
+ls -la /var/tmp/pbs.${PBS_JOBID}*/ 2>/dev/null || echo "No /var/tmp/pbs.${PBS_JOBID}* found"
+
+echo ""
+echo "==================== Disk Space ===================="
+echo "--- df -h /var/tmp/ ---"
+df -h /var/tmp/ 2>/dev/null
+echo ""
+echo "--- df -h /tmp/ ---"
+df -h /tmp/ 2>/dev/null
+echo ""
+echo "--- df -h (all) ---"
+df -h 2>/dev/null | grep -E 'nvme|tmp|scratch|Filesystem'
+
+echo ""
+echo "==================== Block Devices (NVMe) ===================="
+lsblk 2>/dev/null | grep -E 'NAME|nvme' || echo "lsblk not available or no nvme"
+
+echo ""
+echo "==================== Mount Points ===================="
+mount | grep -E 'nvme|tmp|scratch' || echo "No nvme/tmp/scratch mounts found"
+
+echo ""
+echo "==================== IO Benchmark (if tmpdir available) ===================="
+TESTDIR="${PBS_TMPDIR:-${TMPDIR:-/var/tmp}}"
+echo "Testing write speed to: ${TESTDIR}"
+dd if=/dev/zero of=${TESTDIR}/io_test_${PBS_JOBID}.tmp bs=1M count=1024 oflag=direct 2>&1 || echo "dd write test failed"
+echo ""
+echo "Testing read speed from: ${TESTDIR}"
+dd if=${TESTDIR}/io_test_${PBS_JOBID}.tmp of=/dev/null bs=1M count=1024 iflag=direct 2>&1 || echo "dd read test failed"
+rm -f ${TESTDIR}/io_test_${PBS_JOBID}.tmp
+
+echo ""
+echo "==================== Lustre Scratch Benchmark ===================="
+SCRATCH=/home/users/ntu/wh.huang/scratch
+echo "Testing write speed to: ${SCRATCH}"
+dd if=/dev/zero of=${SCRATCH}/io_test_${PBS_JOBID}.tmp bs=1M count=1024 oflag=direct 2>&1 || echo "dd write test failed"
+echo ""
+echo "Testing read speed from: ${SCRATCH}"
+dd if=${SCRATCH}/io_test_${PBS_JOBID}.tmp of=/dev/null bs=1M count=1024 iflag=direct 2>&1 || echo "dd read test failed"
+rm -f ${SCRATCH}/io_test_${PBS_JOBID}.tmp
+
+echo ""
+echo "==================== Done ===================="

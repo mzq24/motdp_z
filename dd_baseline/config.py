@@ -46,3 +46,34 @@ class DDBaselineConfig:
     norm_x_range: float = 92.0
     norm_y_offset: float = 45.0
     norm_y_range: float = 88.0
+
+    # Delta prediction mode: predict per-step displacement instead of absolute trajectory
+    # delta[0] = pos[0], delta[i] = pos[i] - pos[i-1], cumsum(delta) = abs_traj
+    # When True, BEV grid_sample always uses anchor locations (fixed)
+    predict_delta: bool = False
+
+    # Per-step delta Z-score normalization (from data statistics)
+    norm_delta_x_mean: float = 1.84
+    norm_delta_x_std: float = 2.37
+    norm_delta_y_mean: float = -0.07
+    norm_delta_y_std: float = 0.90
+
+    # Normalized forward mode (abs branch only): run model forward entirely in normalized [-1,1] space
+    # BEV grid_sample receives normalized coords instead of physical coords, decoupling spatial dependency
+    use_normalized_forward: bool = False
+
+    # Ablation: fix BEV grid_sample at anchor positions (abs mode only)
+    # When True, BEV always samples at clean anchor locations instead of predicted trajectory
+    # Used to test if BEV's dynamic spatial feedback is the key factor for multi-step DDIM stability
+    fix_bev_at_anchor: bool = False
+
+    # Experiment 4b: dynamic BEV in delta mode
+    # When True + predict_delta, decoder converts delta predictions to abs (cumsum)
+    # and uses them for BEV sampling between layers (like abs mode does)
+    delta_dynamic_bev: bool = False
+
+    # Full diffusion: noise GT (not anchor), train with t ∈ [0, num_train_timesteps)
+    # Inference starts from pure noise, DDIM skip-step denoising
+    # BEV always at anchor positions (anchor provides spatial prior)
+    # Works with both abs and delta modes
+    use_full_diffusion: bool = False

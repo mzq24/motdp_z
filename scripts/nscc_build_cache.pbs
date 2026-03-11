@@ -1,0 +1,35 @@
+#!/bin/bash
+
+### Build flat fp16 memmap cache from all route_features.pt files.
+### No GPU needed, just CPU + disk IO.
+###
+### Usage:  qsub scripts/nscc_build_cache.pbs
+
+#PBS -l select=1:ncpus=8:mem=64G
+#PBS -l walltime=12:00:00
+#PBS -P personal-wh.huang
+#PBS -N mot_build_cache
+#PBS -j oe
+#PBS -o out.build_cache.txt
+#PBS -M m240117@e.ntu.edu.sg
+#PBS -m abe
+
+SCRATCH=/home/users/ntu/wh.huang/scratch
+DATASET_ROOT=${SCRATCH}/z_projects/dataset/pdm_lite
+CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
+CONDA_ENV=dpautomotive
+
+source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
+conda activate ${CONDA_ENV}
+
+cd ${CODE_DIR}
+mkdir -p logs
+LOG_FILE=logs/build_cache_${PBS_JOBID}.log
+
+echo "=== Build Feature Cache (fp16 memmap) ===" | tee ${LOG_FILE}
+echo "Dataset: ${DATASET_ROOT}"                  | tee -a ${LOG_FILE}
+echo "Start:   $(date)"                          | tee -a ${LOG_FILE}
+
+python -u scripts/build_feature_cache_fp16.py --dataset_root ${DATASET_ROOT} 2>&1 | tee -a ${LOG_FILE}
+
+echo "Done: $(date)" | tee -a ${LOG_FILE}

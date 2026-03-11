@@ -2,15 +2,14 @@ device:
   gpu_ids:
   - 0
 dataset:
-  use_per_frame: false
+  use_per_frame: true
 dataloader:
   batch_size: 256
-  num_workers: 8
+  num_workers: 4
   persistent_workers: false
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 2
   shuffle: true
-  use_route_group_sampler: false
 obs_horizon: 4
 pred_horizon: 10
 action_horizon: 6
@@ -66,7 +65,7 @@ policy:
   n_obs_steps: 4
   cond_dim: 256
   obs_as_global_cond: true
-  n_layer: 4
+  n_layer: 8
   n_head: 8
   n_emb: 512
   p_drop_emb: 0.1
@@ -76,12 +75,11 @@ policy:
   obs_as_cond: true
   n_cond_layers: 6
   action_horizon: 6
-  traj_can_attend_route: false
 truncated_diffusion:
   num_train_timesteps: 1000
   trunc_timesteps: 20
   train_trunc_timesteps: 20
-  num_diffusion_steps: 5
+  num_diffusion_steps: 2
   eta: 0.0
   prediction_type: "sample"
   # Absolute coord normalization: maps x to [-1,1] and y to [-1,1]
@@ -91,14 +89,10 @@ truncated_diffusion:
   norm_y_offset: 25.0
   norm_y_range: 55.0    # maps [-25, 30] -> [-1, 1]
   route_loss_weight: 0.6
-  # Normalized forward: model forward in normalized [-1,1] space
-  # BEV grid_sample receives normalized coords, decoupling spatial dependency
-  use_normalized_forward: true
 
 # ========== Multimodal Anchor Configuration ==========
 anchor_path: /media/z/data/mzq/others/MoT-DP/dd_baseline/anchors/carla_kmeans_32.npy
 num_modes: 32
-use_vqa_anchor: True  # true: add VLM-predicted anchor as 33rd mode
 cls_loss_weight: 10.0
 reg_loss_weight: 8.0
 
@@ -114,12 +108,12 @@ training:
   validation_freq: 5
   save_freq: 5
   early_stopping_patience: 10
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/base_plus_mot_anchor_norm/
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit/
 logging:
   use_wandb: true
-  wandb_project: debug_abs_traj_32
-  run_name: base_plus_mot_anchor_norm
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/base_plus_mot_anchor_norm/
+  wandb_project: carla-diffusion-policy
+  run_name: carla_dit_pdm_local
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit/
   save_every: 5
   log_freq: 50  # Log to wandb every 50 batches to reduce overhead
   wandb_entity: m240117_z

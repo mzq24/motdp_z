@@ -57,17 +57,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # ========== Load Anchor Centers from wp_tokens.pkl ==========
         anchor_path = config.get('anchor_path', 'wp_tokens.pkl')
         self.num_modes = config.get('num_modes', 32)  # Number of anchor modes
-        self.use_vqa_anchor = config.get('use_vqa_anchor', False)
         self._load_anchor_centers(anchor_path)
 
-        obs_feature_dim = 256
-
-        # Semantic behavior configuration
-        sem_cfg = config.get('semantic_behavior', {})
-        self.semantic_behavior_enabled = sem_cfg.get('enabled', False)
-        self.num_behaviors = sem_cfg.get('num_behaviors', 11) if self.semantic_behavior_enabled else 0
-        self.allowed_loss_weight = sem_cfg.get('allowed_loss_weight', 0.5)
-        self.behavior_loss_weight = sem_cfg.get('behavior_loss_weight', 0.1)
+        obs_feature_dim = 256  
 
         # Get status_dim from config
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
@@ -102,17 +94,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             transfuser_bev_upsample_dim=self.bev_feature_upsample_dim,
             num_waypoints=num_waypoints,  # Number of route waypoints
             num_modes=self.num_modes,  # Number of anchor modes for multimodal prediction
-            num_behaviors=self.num_behaviors,  # Semantic behavior categories
-            traj_can_attend_route=policy_cfg.get('traj_can_attend_route', True),
         )
 
         self.model = model
-
-        # Behavior prediction heads (auxiliary tasks)
-        n_emb = policy_cfg.get('n_emb', 512)
-        if self.semantic_behavior_enabled:
-            self.allowed_pred_head = nn.Linear(n_emb, 1)
-            self.behavior_pred_head = nn.Linear(n_emb, self.num_behaviors)
         
         # ========== Truncated Diffusion Configuration (DiffusionDriveV2 style) ==========
         diffusion_cfg = config.get('truncated_diffusion', {})
@@ -123,19 +107,20 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.diffusion_eta = diffusion_cfg.get('eta', 0.0)
         self.prediction_type = diffusion_cfg.get('prediction_type', 'sample')  # "sample" or "epsilon"
         
-        # Absolute coordinate normalization to [-1, 1] (DiffusionDrive v1 style)
-        self.norm_x_offset = diffusion_cfg.get('norm_x_offset', 2.0)
+        # Normalization parameters for DELTA (per-step displacement)
+        # Based on anchor statistics: dx [-0.31, 11.13], dy [-9.84, 7.88]
+        # Formula: 2*(x + offset)/range - 1
+        self.norm_delta_x_offset = diffusion_cfg.get('norm_delta_x_offset', 1.0)   # maps [-1, 13] to [-1, 1]
+        self.norm_delta_x_range = diffusion_cfg.get('norm_delta_x_range', 14.0)
+        self.norm_delta_y_offset = diffusion_cfg.get('norm_delta_y_offset', 10.0)  # maps [-10, 10] to [-1, 1]
+        self.norm_delta_y_range = diffusion_cfg.get('norm_delta_y_range', 20.0)
+
+        # Keep old params for absolute coords (used for anchor matching)
+        self.norm_x_offset = diffusion_cfg.get('norm_x_offset', 2.0)  # x range: [-2, 78]
         self.norm_x_range = diffusion_cfg.get('norm_x_range', 80.0)
-        self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)
+        self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)  # y range: [-20, 36]
         self.norm_y_range = diffusion_cfg.get('norm_y_range', 56.0)
         
-        # Normalized forward mode: model forward in normalized [-1,1] space
-        # BEV grid_sample receives normalized coords, decoupling spatial dependency
-        self.use_normalized_forward = diffusion_cfg.get('use_normalized_forward', False)
-
-        # Ablation: fix BEV grid_sample at clean anchor positions (disable dynamic spatial feedback)
-        self.fix_bev_at_anchor = diffusion_cfg.get('fix_bev_at_anchor', False)
-
         # Route prediction auxiliary loss weight (横向控制重要性)
         self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
         
@@ -156,6 +141,74 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
 
+        # ========== Optional: TransFuser backbone for on-the-fly feature extraction ==========
+        self.transfuser_backbone = None
+        transfuser_config_path = config.get('scene_dataset', {}).get('transfuser_config_path', None)
+        if transfuser_config_path is not None and config.get('scene_dataset', {}).get('enabled', False):
+            try:
+                import sys as _sys
+                _sys.path.insert(0, os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    'model', 'transfuser_extractor'))
+                from backbone_extractor import TransFuserBackboneExtractor
+                self.transfuser_backbone = TransFuserBackboneExtractor(
+                    config_path=transfuser_config_path,
+                    device='cpu',  # Will be moved with the model
+                )
+                print("[Policy] TransFuser backbone loaded for on-the-fly feature extraction")
+            except Exception as e:
+                print(f"[Policy] WARNING: Failed to load TransFuser backbone: {e}")
+                self.transfuser_backbone = None
+
+    @torch.no_grad()
+    def _extract_bev_features(self, batch, device, model_dtype):
+        """Extract transfuser BEV features from batch.
+
+        Supports two modes:
+        1. Pre-extracted: batch contains 'transfuser_bev_feature' tensors
+        2. On-the-fly: batch contains 'rgb_raw' + 'lidar_bev', run backbone
+
+        Returns:
+            (transfuser_bev_feature, transfuser_bev_feature_upsample)
+        """
+        if 'transfuser_bev_feature' in batch:
+            # Mode 1: pre-extracted features
+            bev_feat = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+            bev_feat_up = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+            return bev_feat, bev_feat_up
+
+        if self.transfuser_backbone is not None and 'rgb_raw' in batch:
+            # Mode 2: on-the-fly extraction
+            rgb = batch['rgb_raw']       # (B, 3, H, W) float32 [0,255]
+            lidar = batch['lidar_bev']   # (B, C, H, W) float32
+
+            # Move entire backbone module to same device if needed
+            if next(self.transfuser_backbone.parameters()).device != device:
+                self.transfuser_backbone.to(device)
+
+            # backbone.forward will auto-move inputs to the correct device
+            out = self.transfuser_backbone(rgb, lidar)
+            bev_feat = out['bev_feature'].to(dtype=model_dtype)
+            bev_feat_up = out['bev_feature_upscale'].to(dtype=model_dtype)
+            return bev_feat, bev_feat_up
+
+        raise ValueError(
+            "Batch must contain either 'transfuser_bev_feature' (pre-extracted) "
+            "or 'rgb_raw'+'lidar_bev' (on-the-fly) with transfuser_backbone configured"
+        )
+
+    def _cumulate_trajectory(self, traj_deltas: torch.Tensor) -> torch.Tensor:
+        """
+        Convert per-step (dx, dy) deltas into absolute trajectory by cumulative sum.
+
+        Args:
+            traj_deltas: (..., T, 2) trajectory deltas
+
+        Returns:
+            (..., T, 2) cumulative trajectory
+        """
+        return torch.cumsum(traj_deltas, dim=-2)
+    
     # ========== Normalization Functions ==========
     def norm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
         """
@@ -189,42 +242,87 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         return torch.cat([odo_info_fut_x, odo_info_fut_y], dim=-1)
 
+    def norm_delta(self, delta: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize per-step delta (displacement) to [-1, 1] range.
+        Based on anchor statistics: dx [-0.31, 11.13], dy [-9.84, 7.88]
+        """
+        delta_x = delta[..., 0:1]
+        delta_y = delta[..., 1:2]
+
+        # Linear mapping to [-1, 1]
+        delta_x = 2 * (delta_x + self.norm_delta_x_offset) / self.norm_delta_x_range - 1
+        delta_y = 2 * (delta_y + self.norm_delta_y_offset) / self.norm_delta_y_range - 1
+
+        return torch.cat([delta_x, delta_y], dim=-1)
+
+    def denorm_delta(self, delta_normed: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize delta from [-1, 1] back to original scale.
+        """
+        delta_x = delta_normed[..., 0:1]
+        delta_y = delta_normed[..., 1:2]
+
+        # Inverse linear mapping from [-1, 1]
+        delta_x = (delta_x + 1) / 2 * self.norm_delta_x_range - self.norm_delta_x_offset
+        delta_y = (delta_y + 1) / 2 * self.norm_delta_y_range - self.norm_delta_y_offset
+
+        return torch.cat([delta_x, delta_y], dim=-1)
+
+    def _traj_to_delta(self, trajectory: torch.Tensor) -> torch.Tensor:
+        """
+        Convert absolute trajectory to per-step deltas.
+        delta[0] = pos[0], delta[i] = pos[i] - pos[i-1]
+        """
+        delta = torch.zeros_like(trajectory)
+        delta[..., 0, :] = trajectory[..., 0, :]  # First point is absolute (from origin)
+        delta[..., 1:, :] = trajectory[..., 1:, :] - trajectory[..., :-1, :]
+        return delta
+
     def _load_anchor_centers(self, anchor_path: str):
         """
-        Load anchor centers (absolute coordinates) from .npy or .pkl file.
+        Load anchor centers from wp_tokens.pkl file.
 
-        Stores anchor_centers as absolute (x, y) coordinates for:
-        - BEV grid_sample spatial attention (needs real positions)
-        - Diffusion noise addition (in normalized space via norm_odo)
-        - Residual prediction (model predicts offset from anchor)
+        The file contains:
+        - centers: (num_modes, num_points, 2) - cluster centers as trajectories
+        - labels: (N,) - cluster labels for each sample
+        - centers_flat: (num_modes, num_points*2) - flattened centers
+
+        We store two versions:
+        - anchor_centers: per-step deltas (for model input, cumsum to get trajectory)
+        - anchor_centers_abs: absolute coordinates (for anchor matching with GT)
         """
         if os.path.exists(anchor_path):
-            if anchor_path.endswith('.npy'):
-                centers = np.load(anchor_path)  # (M, T, 2) absolute coords
-            else:
-                with open(anchor_path, 'rb') as f:
-                    data = pickle.load(f)
-                centers = data['centers']  # (M, T, 2) absolute coords
+            with open(anchor_path, 'rb') as f:
+                data = pickle.load(f)
 
-            self.anchor_num_points = centers.shape[1]
+            centers = data['centers']  # (32, 5, 2) - absolute coordinates
+            self.anchor_num_points = centers.shape[1]  # 5 waypoints per anchor
+
+            # Convert to per-step deltas: delta[0] = pos[0], delta[i] = pos[i] - pos[i-1]
             centers_tensor = torch.from_numpy(centers).float()
+            centers_delta = torch.zeros_like(centers_tensor)
+            centers_delta[:, 0, :] = centers_tensor[:, 0, :]  # First point is absolute
+            centers_delta[:, 1:, :] = centers_tensor[:, 1:, :] - centers_tensor[:, :-1, :]  # Subsequent are deltas
 
-            # Single buffer: absolute coordinates throughout
-            self.register_buffer('anchor_centers', centers_tensor)
+            # Register as buffers (not trainable, but moves with model)
+            self.register_buffer('anchor_centers', centers_delta)  # Per-step deltas for model input
+            self.register_buffer('anchor_centers_abs', centers_tensor)  # Absolute coords for matching
 
             print(f"[DiffusionDiTCarlaPolicy] Loaded {self.num_modes} anchor centers from {anchor_path}")
             print(f"  - Shape: {centers.shape} (num_modes, num_points, 2)")
-            print(f"  - x range: [{centers[...,0].min():.2f}, {centers[...,0].max():.2f}]")
-            print(f"  - y range: [{centers[...,1].min():.2f}, {centers[...,1].max():.2f}]")
+            print(f"  - Converted to per-step deltas for model input")
         else:
             print(f"[Warning] Anchor file not found: {anchor_path}, using default initialization")
-            self.anchor_num_points = 6
+            # Initialize with zeros - should be loaded later
+            self.anchor_num_points = 5
             self.register_buffer('anchor_centers', torch.zeros(self.num_modes, self.anchor_num_points, 2))
+            self.register_buffer('anchor_centers_abs', torch.zeros(self.num_modes, self.anchor_num_points, 2))
     
     def get_best_anchor_idx(self, trajectory: torch.Tensor) -> torch.Tensor:
         """
         Find the closest anchor center for each trajectory in the batch.
-        Uses anchor_centers (absolute coordinates) for distance computation.
+        Uses anchor_centers_abs (absolute coordinates) for distance computation.
 
         Args:
             trajectory: (B, T, 2) - ground truth trajectory (absolute coordinates)
@@ -236,7 +334,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         T = trajectory.shape[1]
 
         # Sample trajectory at anchor waypoint positions
-        # anchor_centers: (num_modes, 5, 2), trajectory: (B, T, 2)
+        # anchor_centers_abs: (num_modes, 5, 2), trajectory: (B, T, 2)
         # We need to interpolate trajectory to match anchor's 5 points
         if T != self.anchor_num_points:
             # Linearly interpolate trajectory to anchor_num_points
@@ -246,10 +344,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             traj_sampled = trajectory
 
         # Compute L2 distance between trajectory and each anchor (use absolute coords)
-        # traj_sampled: (B, 5, 2), anchor_centers: (32, 5, 2)
+        # traj_sampled: (B, 5, 2), anchor_centers_abs: (32, 5, 2)
         # Expand for broadcasting: (B, 1, 5, 2) - (1, 32, 5, 2) -> (B, 32, 5, 2)
         traj_expanded = traj_sampled.unsqueeze(1)  # (B, 1, 5, 2)
-        anchor_expanded = self.anchor_centers.unsqueeze(0)  # (1, 32, 5, 2)
+        anchor_expanded = self.anchor_centers_abs.unsqueeze(0)  # (1, 32, 5, 2)
 
         # L2 distance per point, then mean over points
         dist = torch.norm(traj_expanded - anchor_expanded, dim=-1)  # (B, 32, 5)
@@ -501,21 +599,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
-        # Load transfuser features (single frame, no temporal)
-        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        
+        # Load transfuser features (pre-extracted or on-the-fly)
+        transfuser_bev_feature, transfuser_bev_feature_upsample = \
+            self._extract_bev_features(batch, device, model_dtype)
+
         # Get ego_status
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
-
-        # VQA anchor for 33rd mode experiment
-        vqa_anchor = None
-        if self.use_vqa_anchor and 'vqa_anchor' in batch:
-            vqa_anchor = batch['vqa_anchor'].to(device=device, dtype=model_dtype)  # (B, 6, 2)
-
-        # Extract behavior labels (if available)
-        behavior_labels = batch.get('behavior_labels', None)
-        allowed_flags = batch.get('allowed_flags', None)
 
         # ========== Compute Multimodal Loss (DiffusionDrive style) ==========
         loss_dict = self._compute_multimodal_loss(
@@ -525,10 +614,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             ego_status=ego_status,
             route_gt=route_gt,
             device=device,
-            model_dtype=model_dtype,
-            vqa_anchor=vqa_anchor,
-            behavior_labels=behavior_labels,
-            allowed_flags=allowed_flags,
+            model_dtype=model_dtype
         )
 
         return loss_dict
@@ -541,22 +627,23 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         ego_status: torch.Tensor,
         device: torch.device,
         model_dtype: torch.dtype,
-        route_gt: Optional[torch.Tensor] = None,
-        vqa_anchor: Optional[torch.Tensor] = None,
-        behavior_labels: Optional[torch.Tensor] = None,
-        allowed_flags: Optional[torch.Tensor] = None,
+        route_gt: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute DiffusionDrive-style multimodal loss with truncated diffusion.
 
-        Absolute trajectory version:
+        Truncated Diffusion Training Flow (DDIM additive noise):
         1. Sample timestep from truncated range [0, train_trunc_timesteps)
-        2. Normalize abs anchors to [-1,1], add DDIM noise, clamp, denormalize back
-        3. Model receives noisy abs anchors → BEV grid_sample at real positions
-        4. Model predicts clean abs trajectory (normalized space), denorm for L1 loss
+        2. Normalize anchors, add DDIM additive noise (scheduler.add_noise), then denormalize
+        3. Model predicts in ORIGINAL delta scale (not normalized!)
+        4. Loss = focal_cls (select best mode) + L1_reg (in original delta scale)
+
+        Key insight: Normalization is ONLY for noise addition (to ensure proper noise scale).
+        Model predicts and loss is computed in original delta scale to match route loss scale.
+        DDIM additive noise enables multi-step denoising at inference via scheduler.step().
 
         Args:
-            trajectory: (B, horizon, 2) - ground truth absolute trajectory
+            trajectory: (B, horizon, 2) - ground truth trajectory (clean)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
             ego_status: (B, To, status_dim) - ego vehicle status
@@ -567,105 +654,122 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         batch_size = trajectory.shape[0]
         horizon = trajectory.shape[1]
 
-        assert horizon == self.anchor_num_points, \
-            f"horizon ({horizon}) must equal anchor_num_points ({self.anchor_num_points})."
+        # ========== Convert GT trajectory to delta (original scale, NOT normalized) ==========
+        # Model predicts in original delta scale for proper loss weighting
+        trajectory_delta = self._traj_to_delta(trajectory)  # (B, horizon, 2) delta in original scale
 
         # ========== Sample timestep ==========
+        # Truncated range [0, train_trunc_timesteps) instead of [0, 1000)
         timesteps = torch.randint(
             0, self.train_trunc_timesteps,
             (batch_size,), device=device
         ).long()
 
-        # ========== Prepare anchors (absolute) and add noise in normalized space ==========
-        all_anchors = self.anchor_centers.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        all_anchors = all_anchors.to(device=device, dtype=model_dtype)  # (B, M, T, 2)
+        # ========== Prepare anchors (delta) and add noise ==========
+        # anchor_centers is already in delta form (original scale)
+        all_anchors_delta = self.anchor_centers.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)
 
-        # Concatenate VLM anchor as extra mode if enabled
-        if vqa_anchor is not None:
-            vqa_anchor_4d = vqa_anchor.unsqueeze(1)  # (B, 1, T, 2)
-            all_anchors = torch.cat([all_anchors, vqa_anchor_4d], dim=1)  # (B, M+1, T, 2)
+        # Normalize delta to [-1, 1] for noise addition only
+        all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T_anchor, 2)
 
-        # Normalize to [-1, 1] for noise addition
-        all_anchors_normed = self.norm_odo(all_anchors)  # (B, M, T, 2)
-
-        B, M, T_anchor, D = all_anchors_normed.shape
-        anchors_flat = all_anchors_normed.contiguous().view(B * M, T_anchor, D)
+        # ========== Add DDIM additive noise to normalized delta anchors ==========
+        # DDIM forward: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
+        B, M, T_anchor, D = all_anchors_delta_normed.shape
+        anchors_flat = all_anchors_delta_normed.contiguous().view(B * M, T_anchor, D)
 
         # Expand timesteps for all modes: (B,) -> (B*M,)
         timesteps_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B * M)
 
-        # DDIM additive noise
-        noise = torch.randn(anchors_flat.shape, dtype=torch.float32, device=device)
+        # DDIM additive Gaussian noise
+        noise = torch.randn_like(anchors_flat)
         noisy_anchors_flat = self.diffusion_scheduler.add_noise(
             original_samples=anchors_flat,
             noise=noise,
             timesteps=timesteps_expanded
         )
 
-        # Reshape back and clamp to valid normalized range
-        noisy_anchors_normed = noisy_anchors_flat.view(B, M, T_anchor, D)
-        noisy_anchors_normed = torch.clamp(noisy_anchors_normed, -1, 1)
-        noise = noise.view(B, M, T_anchor, D)
+        # Reshape back to (B, M, T_anchor, 2)
+        noisy_anchors_delta_normed = noisy_anchors_flat.view(B, M, T_anchor, D)
+        noise = noise.view(B, M, T_anchor, D)  # keep noise for epsilon loss
 
-        if self.use_normalized_forward:
-            # Normalized forward: model operates in normalized space
-            # BEV grid_sample receives normalized coords (decouples spatial dependency)
-            noisy_anchors_abs = noisy_anchors_normed  # pass normalized as "abs"
-        else:
-            # Denormalize back to absolute coords for model input (BEV sampling needs real positions)
-            noisy_anchors_abs = self.denorm_odo(noisy_anchors_normed)  # (B, M, T, 2)
+        # Denormalize for model input (model operates in original delta scale)
+        noisy_anchors_delta = self.denorm_delta(noisy_anchors_delta_normed)  # (B, M, T_anchor, 2)
 
         # ========== Forward pass ==========
-        # Model receives noisy anchors; BEV grid_sample and trajectory regression
-        # use anchors_abs (physical space normally, normalized space if use_normalized_forward).
-        # Ablation: fix BEV at clean anchor positions for training consistency
-        bev_abs = all_anchors if self.fix_bev_at_anchor else noisy_anchors_abs
-        poses_reg_out, poses_cls, route_pred, mode_out = self.model(
-            anchors=noisy_anchors_normed,
-            anchors_abs=bev_abs,
+        # Model receives noisy anchors (original delta scale) and predicts clean delta
+        poses_reg, poses_cls, route_pred = self.model(
+            anchors=noisy_anchors_delta,
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            behavior_labels=behavior_labels,
-            allowed_flags=allowed_flags,
+            ego_status=ego_status
         )
-        # Denorm model output if in normalized forward mode
-        if self.use_normalized_forward:
-            poses_reg_abs = self.denorm_odo(poses_reg_out)
-        else:
-            poses_reg_abs = poses_reg_out
-        # poses_reg_abs: (B, num_modes, horizon, 2) in absolute coords
+        # poses_reg: (B, num_modes, horizon, 2) in original delta scale
 
         # ========== Find best matching anchor (in absolute space) ==========
+        # Use anchor_centers_abs (absolute coordinates) for distance computation
+        # Ensure anchor_num_points == horizon (no interpolation for delta prediction)
+        assert horizon == self.anchor_num_points, \
+            f"horizon ({horizon}) must equal anchor_num_points ({self.anchor_num_points}). " \
+            f"Interpolating deltas is incorrect - ensure config aligns these values."
+
+        all_anchors_abs = self.anchor_centers_abs.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        all_anchors_abs = all_anchors_abs.to(device=device, dtype=model_dtype)
+
+        # Compute L2 distance in absolute space: (B, num_modes)
+        # Use absolute trajectory for anchor matching (more intuitive)
         traj_expanded = trajectory.unsqueeze(1)  # (B, 1, horizon, 2)
-        dist = torch.norm(traj_expanded - all_anchors, dim=-1)  # (B, num_modes, horizon)
+        dist = torch.norm(traj_expanded - all_anchors_abs, dim=-1)  # (B, num_modes, horizon)
         dist = dist.mean(dim=-1)  # (B, num_modes)
+
+        # Best mode index
         mode_idx = torch.argmin(dist, dim=-1)  # (B,)
 
         # ========== Classification Loss (Focal Loss) ==========
-        target_onehot = torch.zeros(batch_size, M, device=device, dtype=model_dtype)
+        # Create one-hot target
+        target_onehot = torch.zeros(batch_size, self.num_modes, device=device, dtype=model_dtype)
         target_onehot.scatter_(1, mode_idx.unsqueeze(1), 1)
+
+        # Focal loss
         loss_cls = self._focal_loss(poses_cls, target_onehot)
 
         # ========== Regression Loss ==========
         mode_idx_expanded = mode_idx.view(batch_size, 1, 1, 1).expand(-1, 1, horizon, 2)
 
         if self.prediction_type == "sample":
-            # Model predicts clean x_0 directly in absolute space
-            best_reg_abs = torch.gather(poses_reg_abs, 1, mode_idx_expanded).squeeze(1)
-            loss_reg = F.l1_loss(best_reg_abs, trajectory, reduction='mean')
+            # Model predicts clean x_0 → L1 loss in original delta scale
+            best_reg = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
+            loss_reg = F.l1_loss(best_reg, trajectory_delta, reduction='mean')
         else:
             # prediction_type == "epsilon"
+            # Model still outputs original delta scale, convert to predicted noise in normalized space
+            # pred_noise = (x_t - sqrt(α_t) * norm(poses_reg)) / sqrt(1-α_t)
+            # But simpler: directly compare model output to GT in original scale,
+            # then the model learns to predict x_0 regardless. The prediction_type
+            # only affects how DDIM step interprets the output during inference.
+            #
+            # Alternative: compute noise-space loss for true epsilon training.
+            # We use the GT delta to compute target noise:
+            # x_t = sqrt(α_t) * x_0 + sqrt(1-α_t) * ε → ε = (x_t - sqrt(α_t) * x_0) / sqrt(1-α_t)
             alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device)
-            alpha_t = alphas_cumprod[timesteps].view(batch_size, 1, 1, 1)
+            alpha_t = alphas_cumprod[timesteps]  # (B,)
+            alpha_t = alpha_t.view(batch_size, 1, 1, 1)  # broadcast to (B, 1, 1, 1)
 
-            best_noise = torch.gather(noise, 1, mode_idx_expanded).squeeze(1)
-            best_reg_abs = torch.gather(poses_reg_abs, 1, mode_idx_expanded).squeeze(1)
-            best_reg_normed = self.norm_odo(best_reg_abs)
-            best_noisy_normed = torch.gather(noisy_anchors_normed, 1, mode_idx_expanded).squeeze(1)
+            # Best mode noise target (in normalized space)
+            best_noise = torch.gather(noise, 1, mode_idx_expanded).squeeze(1)  # (B, horizon, 2)
 
-            pred_eps = (best_noisy_normed - alpha_t.squeeze(1).sqrt() * best_reg_normed) / (1 - alpha_t.squeeze(1)).sqrt()
+            # Model's predicted noise: convert poses_reg to normalized, then derive epsilon
+            best_reg = torch.gather(poses_reg, 1, mode_idx_expanded).squeeze(1)
+            best_reg_normed = self.norm_delta(best_reg)  # (B, horizon, 2)
+
+            # Best mode's noisy input in normalized space
+            best_noisy_normed = torch.gather(noisy_anchors_delta_normed, 1, mode_idx_expanded).squeeze(1)
+
+            # Predicted epsilon: ε_pred = (x_t - sqrt(α_t) * pred_x0) / sqrt(1-α_t)
+            alpha_t_sq = alpha_t.squeeze(1)  # (B, 1, 1)
+            pred_eps = (best_noisy_normed - alpha_t_sq.sqrt() * best_reg_normed) / (1 - alpha_t_sq).sqrt()
+
             loss_reg = F.mse_loss(pred_eps, best_noise, reduction='mean')
 
         # ========== Route Loss (Optional) ==========
@@ -676,34 +780,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
             total_loss = total_loss + self.route_loss_weight * route_loss
 
-        # ========== Semantic Behavior Loss (Optional) ==========
-        behavior_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        allowed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        if self.semantic_behavior_enabled and behavior_labels is not None and allowed_flags is not None:
-            behavior_labels_dev = behavior_labels.to(device=device)
-            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype)
-
-            # Allowed prediction: binary classification per anchor
-            pred_allowed = self.allowed_pred_head(mode_out).squeeze(-1)  # (B, num_modes)
-            allowed_loss = F.binary_cross_entropy_with_logits(pred_allowed, allowed_flags_dev)
-
-            # Behavior prediction: multi-class classification per anchor
-            pred_behavior = self.behavior_pred_head(mode_out)  # (B, num_modes, num_behaviors)
-            behavior_loss = F.cross_entropy(
-                pred_behavior.reshape(-1, self.num_behaviors),
-                behavior_labels_dev.reshape(-1),
-            )
-
-            total_loss = total_loss + self.allowed_loss_weight * allowed_loss + \
-                         self.behavior_loss_weight * behavior_loss
-
+        # Return dict with all losses for logging
         loss_dict = {
             'total_loss': total_loss,
             'cls_loss': loss_cls,
             'reg_loss': loss_reg,
             'route_loss': route_loss,
-            'behavior_loss': behavior_loss,
-            'allowed_loss': allowed_loss,
+            # Weighted losses (for debugging loss scale)
             'cls_loss_weighted': self.cls_loss_weight * loss_cls,
             'reg_loss_weighted': self.reg_loss_weight * loss_reg,
             'route_loss_weighted': self.route_loss_weight * route_loss,
@@ -764,7 +847,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Reshape back
         return noisy_anchors_flat.view(B, M, T_anchor, D)
 
-
     def conditional_sample(self,
             transfuser_bev_feature: torch.Tensor,
             transfuser_bev_feature_upsample: torch.Tensor,
@@ -774,9 +856,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             generator=None,
             num_denoise_steps: Optional[int] = None,
             no_noise: bool = False,
-            use_server_style: bool = False,
-            server_noise_type: str = "additive",
-            gt_trajectory: Optional[torch.Tensor] = None,
             **kwargs
             ):
         """
@@ -799,201 +878,106 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             ego_status: (B, To, status_dim) - ego status history
             num_denoise_steps: number of DDIM denoising steps (default: self.num_diffusion_steps)
             no_noise: if True, skip noise addition (for debugging model capability)
-            use_server_style: if True, run server-style iterative forward (no DDIM step)
-            server_noise_type: noise type for server-style path ('additive' or 'multiplicative')
 
         Returns:
             (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
         """
         bs = transfuser_bev_feature.shape[0]
         num_steps = num_denoise_steps or self.num_diffusion_steps
-        horizon = self.anchor_centers.shape[1]
-        poses_cls = None
-        route_pred = None
 
-        # Get all anchors in absolute coords
-        all_anchors = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
-        all_anchors = all_anchors.to(device=device, dtype=model_dtype)  # (B, M, T, 2)
-
-        # Concatenate VLM anchor as extra mode if enabled
-        vqa_anchor = kwargs.get('vqa_anchor', None)
-        if vqa_anchor is not None:
-            vqa_anchor_4d = vqa_anchor.unsqueeze(1)  # (B, 1, T, 2)
-            all_anchors = torch.cat([all_anchors, vqa_anchor_4d], dim=1)  # (B, M+1, T, 2)
-
-        num_modes_effective = all_anchors.shape[1]
-
-        # Normalize to [-1, 1] for diffusion
-        all_anchors_normed = self.norm_odo(all_anchors)  # (B, M, T, 2)
-
-        # Inference behavior conditioning: follow_road(0) + allowed(1)
-        infer_behavior = None
-        infer_allowed = None
-        if self.semantic_behavior_enabled:
-            M = all_anchors.shape[1]
-            infer_behavior = torch.zeros((bs, M), dtype=torch.long, device=device)  # follow_road
-            infer_allowed = torch.ones((bs, M), dtype=torch.long, device=device)    # allowed
+        # Get all anchor centers (per-step deltas) in original scale
+        all_anchors_delta = self.anchor_centers.unsqueeze(0).expand(bs, -1, -1, -1)
+        all_anchors_delta = all_anchors_delta.to(device=device, dtype=model_dtype)  # (B, M, T, 2)
 
         if no_noise:
-            # Debug mode: single forward pass with clean anchors
+            # Debug mode: single forward pass with clean anchors, no denoising loop
             timesteps = torch.zeros((bs,), dtype=torch.long, device=device)
-            anchors_abs_input = all_anchors_normed if self.use_normalized_forward else all_anchors
-            poses_reg_out, poses_cls, route_pred, mode_out = self.model(
-                anchors=all_anchors_normed,
-                anchors_abs=anchors_abs_input,
+            poses_reg, poses_cls, route_pred = self.model(
+                anchors=all_anchors_delta,
                 timestep=timesteps,
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                ego_status=ego_status,
-                behavior_labels=infer_behavior,
-                allowed_flags=infer_allowed,
+                ego_status=ego_status
             )
-            if self.use_normalized_forward:
-                final_abs = self.denorm_odo(poses_reg_out)
-            else:
-                final_abs = poses_reg_out  # (B, M, T, 2)
+            final_delta = poses_reg  # (B, M, T, 2) in original delta scale
         else:
             # ========== Standard DDIM Multi-step Denoising ==========
-            noise = torch.randn(all_anchors_normed.shape, dtype=torch.float32, device=device)
-            trunc_ts = torch.full((bs,), self.trunc_timesteps - 1, dtype=torch.long, device=device)
+            # Normalize delta to [-1, 1] for diffusion operations
+            all_anchors_delta_normed = self.norm_delta(all_anchors_delta)  # (B, M, T, 2)
+
+            # Add DDIM additive noise at truncated timestep
+            noise = torch.randn_like(all_anchors_delta_normed)
+            trunc_ts = torch.full((bs,), self.trunc_timesteps, dtype=torch.long, device=device)
             x_t = self.diffusion_scheduler.add_noise(
-                original_samples=all_anchors_normed,
+                original_samples=all_anchors_delta_normed,
                 noise=noise,
                 timesteps=trunc_ts
             )
 
-            step_ratio = self.trunc_timesteps / num_steps
-            roll_timesteps = (np.arange(0, num_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-            roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+            # roll_timesteps: num_steps+1 points from trunc_timesteps to 0
+            # e.g. trunc=100, steps=2 → [100, 50, 0], loop runs 2 iterations
+            roll_timesteps = np.linspace(
+                self.trunc_timesteps, 0, num_steps + 1
+            ).round().astype(np.int64)
 
+            # Precompute alphas_cumprod
             alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device)
 
-            # Prepare GT in normed space for diagnostic
-            gt_normed = None
-            if gt_trajectory is not None:
-                gt_normed = self.norm_odo(gt_trajectory.to(device=device, dtype=x_t.dtype))
+            # DDIM denoising loop
+            route_pred = None
+            poses_cls = None
 
-            prev_best_idx = None
-            # _debug_first_batch = not getattr(self, '_test_debug_printed', False)
-            _debug_first_batch = True
-            poses_reg_abs = None
-
-            for step_i, k in enumerate(roll_timesteps):
-                t_cur = k.item()
-                t_next = roll_timesteps[step_i + 1].item() if step_i + 1 < len(roll_timesteps) else 0
-
-                # Clamp and prepare model input
-                x_clamped = torch.clamp(x_t, -1, 1)
-                if self.use_normalized_forward:
-                    x_abs = x_clamped  # Stay in normalized space
-                else:
-                    x_abs = self.denorm_odo(x_clamped)  # (B, M, T, 2) absolute coords
-
-                # Ablation: fix BEV at clean anchor positions (disable dynamic spatial feedback)
-                bev_abs = all_anchors if self.fix_bev_at_anchor else x_abs
-
+            for i in range(len(roll_timesteps) - 1):
+                t_cur = int(roll_timesteps[i])
+                t_next = int(roll_timesteps[i + 1])
                 t_tensor = torch.full((bs,), t_cur, dtype=torch.long, device=device)
-                poses_reg_out, poses_cls, route_pred, mode_out = self.model(
-                    anchors=x_clamped,
-                    anchors_abs=bev_abs,
+
+                # Clamp & denormalize → original delta scale for model
+                x_clamped = torch.clamp(x_t, min=-1, max=1)
+                input_delta = self.denorm_delta(x_clamped)  # (B, M, T, 2)
+
+                # Model forward: always predicts clean delta (original scale)
+                poses_reg, poses_cls, route_pred = self.model(
+                    anchors=input_delta,
                     timestep=t_tensor,
                     transfuser_bev_feature=transfuser_bev_feature,
                     transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                    ego_status=ego_status,
-                    behavior_labels=infer_behavior,
-                    allowed_flags=infer_allowed,
+                    ego_status=ego_status
                 )
+                # poses_reg: (B, M, T, 2) in original delta scale
 
-                if self.use_normalized_forward:
-                    # Normalized forward: model output is already in normalized space
-                    pred_x0_normed = poses_reg_out
-                    poses_reg_abs = self.denorm_odo(poses_reg_out)  # for debug logging
-                else:
-                    poses_reg_abs = poses_reg_out
-                    pred_x0_normed = self.norm_odo(poses_reg_abs)
+                # Convert model output to (pred_x0, pred_eps) in normalized space
+                pred_x0_normed = self.norm_delta(poses_reg)  # (B, M, T, 2)
+
                 alpha_t = alphas_cumprod[t_cur]
                 alpha_next = alphas_cumprod[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
-                pred_eps = (x_t - alpha_t.sqrt() * pred_x0_normed) / (1 - alpha_t).sqrt().clamp(min=1e-8)
 
-                if _debug_first_batch:
-                    best_idx = torch.argmax(poses_cls, dim=-1)
-                    print(f"\n  [DDIM step {step_i}] t={t_cur}->{t_next}, sqrt(1-alpha_t)={(1-alpha_t).sqrt().item():.4f}")
-                    for b in range(min(bs, 1)):
-                        bi = best_idx[b].item()
-                        print(f"    batch {b}: best_mode={bi}, cls_top3={torch.topk(poses_cls[b], 3).indices.tolist()}")
+                # Estimate noise from prediction
+                # pred_eps = (x_t - sqrt(α_t) * pred_x0) / sqrt(1 - α_t)
+                pred_eps = (x_t - alpha_t.sqrt() * pred_x0_normed) / (1 - alpha_t).sqrt()
 
-                        if gt_normed is not None:
-                            gt_n = gt_normed[b]  # (T, 2)
-                            anchor_gt_dist = (all_anchors_normed[b] - gt_n.unsqueeze(0)).abs().mean(dim=(-2, -1))
-                            pred_error_per_mode = (pred_x0_normed[b] - gt_n.unsqueeze(0)).abs().mean(dim=(-2, -1))
-                            x_t_anchor_dist = (x_t[b] - all_anchors_normed[b]).abs().mean(dim=(-2, -1))
-                            # Physical L2
-                            pred_x0_abs = poses_reg_abs[b]
-                            gt_abs = gt_trajectory[b].to(device=device, dtype=x_t.dtype)
-                            l2_per_mode = (pred_x0_abs - gt_abs.unsqueeze(0)).norm(dim=-1).mean(dim=-1)
-                            print(f"      anchor vs GT (normed MAE):  best={anchor_gt_dist[bi]:.4f}, "
-                                  f"others_mean={anchor_gt_dist.sum().sub(anchor_gt_dist[bi]).div(num_modes_effective-1):.4f}")
-                            print(f"      pred_x0 vs GT (normed MAE): best={pred_error_per_mode[bi]:.4f}, "
-                                  f"others_mean={pred_error_per_mode.sum().sub(pred_error_per_mode[bi]).div(num_modes_effective-1):.4f}")
-                            print(f"      pred_x0 vs GT (L2 meters):  best={l2_per_mode[bi]:.4f}, "
-                                  f"others_mean={l2_per_mode.sum().sub(l2_per_mode[bi]).div(num_modes_effective-1):.4f}")
-                            print(f"      x_t vs anchor (normed MAE): best={x_t_anchor_dist[bi]:.4f}, "
-                                  f"others_mean={x_t_anchor_dist.sum().sub(x_t_anchor_dist[bi]).div(num_modes_effective-1):.4f}"
-                                  f"  <- {'~noise level' if step_i == 0 else 'OOD if >> noise level'}")
-
-                        pred_eps_mag = pred_eps[b].abs().mean(dim=(-2, -1))
-                        print(f"      pred_eps_mag (should~1.0): best={pred_eps_mag[bi]:.4f}, "
-                              f"others_mean={pred_eps_mag.sum().sub(pred_eps_mag[bi]).div(num_modes_effective-1):.4f}, "
-                              f"others_max={pred_eps_mag.clone().scatter_(0, best_idx[b:b+1], 0).max():.4f}")
-
-                        if prev_best_idx is not None:
-                            print(f"      mode_changed: {bi != prev_best_idx[b].item()} (was {prev_best_idx[b].item()})")
-
-                    prev_best_idx = best_idx
-
-                # DDIM step
+                # DDIM step (eta=0, deterministic):
+                # x_{t_next} = sqrt(α_{t_next}) * pred_x0 + sqrt(1 - α_{t_next}) * pred_eps
                 x_t = alpha_next.sqrt() * pred_x0_normed + (1 - alpha_next).sqrt() * pred_eps
 
-            if _debug_first_batch:
-                self._test_debug_printed = True
+            # Final output: denormalize the denoised result
+            final_delta_normed = torch.clamp(x_t, -1, 1)
+            final_delta = self.denorm_delta(final_delta_normed)  # (B, M, T, 2)
 
-            # dd_baseline-style: use model's last clean prediction in absolute space.
-            if poses_reg_abs is not None:
-                final_abs = poses_reg_abs
-            elif self.use_normalized_forward:
-                final_abs = self.denorm_odo(torch.clamp(x_t, -1, 1))
-            else:
-                final_abs = self.denorm_odo(x_t)
+        # Select best mode based on classification scores from last forward pass
+        best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
 
-        # Select best mode, filtered by allowed prediction (Energy Shielding)
-        if self.semantic_behavior_enabled and mode_out is not None:
-            pred_allowed_logits = self.allowed_pred_head(mode_out).squeeze(-1)  # (B, M)
-            pred_allowed_prob = torch.sigmoid(pred_allowed_logits)
-            # Mask forbidden modes by setting their cls scores to -inf
-            forbidden_mask = pred_allowed_prob < 0.5
-            masked_cls = poses_cls.clone()
-            masked_cls[forbidden_mask] = float('-inf')
-            # Fallback: if all modes are forbidden, use original scores
-            all_forbidden = forbidden_mask.all(dim=-1)  # (B,)
-            if all_forbidden.any():
-                masked_cls[all_forbidden] = poses_cls[all_forbidden]
-            best_mode_idx = torch.argmax(masked_cls, dim=-1)  # (B,)
-        else:
-            best_mode_idx = torch.argmax(poses_cls, dim=-1)  # (B,)
-        horizon = final_abs.shape[2]
+        # Gather best mode trajectory (in original delta scale)
+        horizon = final_delta.shape[2]
         mode_idx_expanded = best_mode_idx.view(bs, 1, 1, 1).expand(-1, 1, horizon, 2)
-        best_trajectory = torch.gather(final_abs, 1, mode_idx_expanded).squeeze(1)  # (B, T, 2)
+        best_delta = torch.gather(final_delta, 1, mode_idx_expanded).squeeze(1)  # (B, T, 2)
+
+        # Cumsum to get absolute trajectory
+        best_trajectory = self._cumulate_trajectory(best_delta)  # (B, T, 2)
 
         return best_trajectory, route_pred
 
-    def predict_action(
-        self,
-        obs_dict: Dict[str, torch.Tensor],
-        no_noise: bool = False,
-        use_server_style: bool = False,
-        server_noise_type: str = "additive",
-        gt_trajectory: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], no_noise: bool = False) -> Dict[str, torch.Tensor]:
         """
         Predict action from observation.
 
@@ -1012,18 +996,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         B = value.shape[0]
         Da = self.action_dim
 
-        # Load transfuser features (single frame, no temporal)
-        transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        # Load transfuser features (pre-extracted or on-the-fly)
+        transfuser_bev_feature, transfuser_bev_feature_upsample = \
+            self._extract_bev_features(nobs, device, model_dtype)
 
         # Get ego_status
         ego_status = nobs['ego_status']
         ego_status = ego_status.to(dtype=model_dtype)
-
-        # VQA anchor for 33rd mode experiment
-        vqa_anchor = None
-        if self.use_vqa_anchor and 'vqa_anchor' in nobs:
-            vqa_anchor = nobs['vqa_anchor'].to(device=device, dtype=model_dtype)
 
         # Generate samples using multimodal prediction
         nsample, route_pred = self.conditional_sample(
@@ -1033,10 +1012,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             ego_status=ego_status,
             device=device,
             model_dtype=model_dtype,
-            use_server_style=use_server_style,
-            server_noise_type=server_noise_type,
-            gt_trajectory=gt_trajectory,
-            vqa_anchor=vqa_anchor,
         )
         
         naction_pred = nsample[...,:Da]

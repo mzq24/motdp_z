@@ -69,6 +69,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  anchor_centers_abs: np.ndarray = None,  # (num_modes, num_points, 2)
                  semantic_behavior_cfg: dict = None,      # semantic behavior config
                  skip_memmap: bool = False,   # True for val: skip memmap, use inject_ram_features() later
+                 use_per_frame: bool = False, # True for local SSD: load individual .pt files directly (no pack/memmap)
+                 use_vqa_anchor: bool = False, # True to load VLM-predicted anchor from dp_vl_feature/*.pt
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -82,6 +84,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._route_pack_cache = {}
         self._route_pack_cache_maxsize = 32
         self._ram_features = None    # dict: abs_idx -> (feat_tensor, ups_tensor), set by preload_to_ram()
+        self._use_per_frame = use_per_frame  # Local SSD mode: read individual .pt files
+        self._use_vqa_anchor = use_vqa_anchor  # Load VLM anchor from dp_vl_feature
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -255,6 +259,26 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
                   f"Using LRU fallback (slow). Run: python scripts/build_feature_cache_fp16.py")
 
+        # ===== Pre-load VQA anchors into RAM (tiny: ~48 bytes each) =====
+        self._vqa_anchor_cache = {}  # sample_idx -> tensor (6, 2)
+        if self._use_vqa_anchor:
+            loaded = 0
+            for i, s in enumerate(tqdm(self._sample_cache, desc="Loading VQA anchors", disable=(rank != 0))):
+                feat_rel = s.get('transfuser_bev_feature', '')
+                if not feat_rel:
+                    continue
+                base_dir = os.path.dirname(os.path.dirname(feat_rel))
+                frame_str = os.path.basename(feat_rel).replace('_feature.pt', '')
+                vqa_path = os.path.join(image_data_root, base_dir, 'dp_vl_feature', f'{frame_str}.pt')
+                if os.path.exists(vqa_path):
+                    vf = torch.load(vqa_path, weights_only=True)
+                    if 'pred_traj' in vf:
+                        anchor = vf['pred_traj']
+                        if anchor.dim() == 3:
+                            anchor = anchor.squeeze(0)
+                        self._vqa_anchor_cache[i] = anchor[:6].float()
+                        loaded += 1
+            print(f"[Rank {rank}] Pre-loaded {loaded}/{len(self._sample_cache)} VQA anchors into RAM.")
 
     def get_route_batch_sampler(self, batch_size, shuffle=True, drop_last=False):
         """Return a RouteBatchSampler for this dataset."""
@@ -344,14 +368,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
             packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
-            # Use frame_id as direct positional index into route_features.
-            # frame_id is the array index into sorted measurement files, and
-            # route_features.pt stores features in sorted lidar-file order.
-            # Since measurement and lidar files share the same naming, frame_id
-            # maps directly to the position in route_features.pt tensors.
             frame_id = sample.get('frame_id')
 
-            if self._ram_features is not None:
+            if self._use_per_frame:
+                # Local SSD mode: load individual per-frame .pt files directly
+                # e.g. "0010_feature.pt" -> (1, 1512, 8, 8), "0010_feature_upsample.pt" -> (1, 64, 64, 64)
+                feat_path = bev_feature_path  # already points to {frame_id}_feature.pt
+                ups_path = bev_feature_path.replace('_feature.pt', '_feature_upsample.pt')
+                if os.path.exists(feat_path):
+                    transfuser_bev_feature = torch.load(feat_path, weights_only=True).squeeze(0).half()
+                if os.path.exists(ups_path):
+                    transfuser_bev_feature_upsample = torch.load(ups_path, weights_only=True).squeeze(0).half()
+            elif self._ram_features is not None:
                 # RAM pre-loaded path (val dataset): pure memory lookup, zero disk IO
                 abs_idx = self._ram_features.get(('sidx', idx))
                 if abs_idx is not None:
@@ -402,13 +430,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                         f"(n_frames={n_frames}) for {packed_path}",
                         stacklevel=2)
         
-        # # Load VQA feature from pt file
-        # vqa_path = sample.get('vqa', None)
-        # vqa_feature = {}
-        # full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-        # vqa_feature = torch.load(full_vqa_path, weights_only=True)
-  
-        
+        # Load VQA anchor from pre-loaded RAM cache (zero IO)
+        vqa_anchor_cached = None
+        if self._use_vqa_anchor:
+            vqa_anchor_cached = self._vqa_anchor_cache.get(idx)  # (6, 2) or None
+
         # Convert sample data
         final_sample = dict()
         for key, value in sample.items():
@@ -421,7 +447,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 ego_waypoints = torch.from_numpy(sample['ego_waypoints'][1:]).float()
                 final_sample['agent_pos'] = ego_waypoints
             elif key == 'vqa':
-                # Skip VQA field - we no longer use it
+                if self._use_vqa_anchor and vqa_anchor_cached is not None:
+                    final_sample['vqa_anchor'] = vqa_anchor_cached.clone()
                 continue
             elif key == 'route':
                 # Load route waypoints (expected shape: (20, 2))
@@ -451,6 +478,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Ensure target_point_next_hist always exists (fallback to target_point_hist)
         if 'target_point_next_hist' not in final_sample:
             final_sample['target_point_next_hist'] = final_sample['target_point_hist'].clone()
+
+        # Set vqa_anchor from RAM cache (or fallback to zeros)
+        if self._use_vqa_anchor:
+            if vqa_anchor_cached is not None:
+                final_sample['vqa_anchor'] = vqa_anchor_cached.clone()
+            elif 'vqa_anchor' not in final_sample:
+                final_sample['vqa_anchor'] = torch.zeros(6, 2)
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
@@ -925,5 +959,4 @@ def test_pdm():
 if __name__ == "__main__":
     test_pdm()
     
-
 

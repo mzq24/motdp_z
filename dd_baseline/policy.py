@@ -79,11 +79,12 @@ class DDBaselinePolicy(nn.Module):
         return loss_dict
 
     @torch.no_grad()
-    def predict_action(self, obs_dict, **kwargs):
+    def predict_action(self, obs_dict, targets=None, **kwargs):
         """Inference: predict trajectory from observations.
 
         Args:
             obs_dict: dict with BEV features and ego_status
+            targets: optional dict with 'trajectory' for debug GT comparison
         Returns:
             dict with 'action': (B, T, 2) numpy array
         """
@@ -93,7 +94,16 @@ class DDBaselinePolicy(nn.Module):
             'transfuser_bev_feature_upsample': obs_dict['transfuser_bev_feature_upsample'].float(),
             'ego_status': obs_dict['ego_status'].float(),
         }
-        output = self.model(features, targets=None)
+        output = self.model(features, targets=targets)
         trajectory = output['trajectory']  # (B, T, 2)
 
         return {'action': trajectory.cpu().numpy()}
+
+    def update_inference_config(self, modified_config):
+        """Update inference parameters from a modified config dictionary."""
+        dd_cfg = modified_config.get('dd_baseline', {})
+        # Update the properties in trajectory_head used during forward_test
+        if 'trunc_timesteps' in dd_cfg:
+            self.model.trajectory_head.trunc_timesteps = dd_cfg['trunc_timesteps']
+        if 'num_diffusion_steps' in dd_cfg:
+            self.model.trajectory_head.num_diffusion_steps = dd_cfg['num_diffusion_steps']
