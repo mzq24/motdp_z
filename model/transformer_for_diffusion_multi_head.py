@@ -32,6 +32,40 @@ import math
 logger = logging.getLogger(__name__)
 
 
+def gen_sineembed_for_position(pos_tensor: torch.Tensor, hidden_dim: int = 64) -> torch.Tensor:
+    """Sinusoidal position embedding for 2D points.
+
+    Args:
+        pos_tensor: (..., 2) tensor of (x, y) coordinates.
+        hidden_dim: embedding dimension per point (must be divisible by 2).
+
+    Returns:
+        (..., hidden_dim) sinusoidal embedding.
+    """
+    if hidden_dim % 2 != 0:
+        raise ValueError(f"hidden_dim must be even, got {hidden_dim}")
+
+    orig_dtype = pos_tensor.dtype
+    pos = pos_tensor.float()
+
+    half_hidden_dim = hidden_dim // 2
+    scale = 2 * math.pi
+    dim_t = torch.arange(half_hidden_dim, dtype=torch.float32, device=pos.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / half_hidden_dim)
+
+    x_embed = pos[..., 0] * scale
+    y_embed = pos[..., 1] * scale
+
+    pos_x = x_embed[..., None] / dim_t
+    pos_y = y_embed[..., None] / dim_t
+
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_emb = torch.cat((pos_y, pos_x), dim=-1)
+
+    return pos_emb.to(dtype=orig_dtype)
+
+
 # =============================================================================
 # Basic Components
 # =============================================================================
@@ -275,16 +309,12 @@ class GridSampleCrossBEVAttention(nn.Module):
         value = self.value_proj(bev_feature)  # (B, embed_dims, H, W)
         
         # Grid for sampling: (B, num_queries, num_points, 2)
+        # grid_sample treats dim1 as H_out, dim2 as W_out
         grid = normalized_trajectory.view(bs, num_queries, num_points, 2)
-        
-        # Sample features at trajectory points
-        # Reshape grid for grid_sample: (B, num_queries * num_points, 1, 2) -> requires (B, H_out, W_out, 2)
-        # We treat num_queries as H_out and num_points as W_out
-        grid_for_sample = grid.view(bs, num_queries, num_points, 2)
-        
+
         sampled_features = F.grid_sample(
             value,
-            grid_for_sample,
+            grid,
             mode='bilinear',
             padding_mode='zeros',
             align_corners=False
@@ -944,12 +974,14 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         horizon: int = 8,
         num_waypoints: int = 20,
         max_seq_len: int = 64,  # Max length for unified position encoding
+        traj_can_attend_route: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
         self.horizon = horizon
         self.num_waypoints = num_waypoints
+        self.traj_can_attend_route = traj_can_attend_route
         
         # ========== Transfuser Feature Projections (following DiffusionDriveV2) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, d_model)
@@ -1054,40 +1086,48 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
     
     def _create_block_diagonal_mask(self, T_traj: int, T_route: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Create a unidirectional block self-attention mask.
-        
-        This ensures:
-        - Trajectory queries can attend to: trajectory + route (full visibility)
-        - Route queries can only attend to: route (isolated from trajectory)
-        
-        Rationale:
-        - Trajectory prediction benefits from knowing the planned route
-        - Route planning should be independent of specific trajectory details
-        
+        Create a self-attention mask with anchor isolation.
+
+        This enforces:
+        - Trajectory(anchor) queries cannot attend to other anchors
+          (only self-anchor attention is allowed).
+        - Trajectory(anchor) queries optionally attend route queries
+          (controlled by self.traj_can_attend_route).
+        - Route queries cannot attend to trajectory(anchor) queries.
+        - Route queries can attend to route queries.
+
         Attention pattern (0 = allowed, -inf = blocked):
-        
+
                     | Trajectory | Route |
         ------------------------------------
-        Trajectory  |     0      |   0   |  <- can see both
-        Route       |   -inf     |   0   |  <- can only see route
-        
+        Trajectory  | diagonal 0 |  0/-inf |
+        Route       |   -inf     |   0   |
+
         Args:
-            T_traj: Number of trajectory queries
+            T_traj: Number of trajectory(anchor) queries
             T_route: Number of route queries
             device: Device for the mask tensor
             dtype: Data type for the mask tensor
-            
+
         Returns:
             mask: (T_total, T_total) mask where -inf blocks attention
         """
         T_total = T_traj + T_route
-        # Start with all allowed
         mask = torch.zeros((T_total, T_total), device=device, dtype=dtype)
-        
-        # Block route-to-trajectory attention (lower-left block)
-        # Route queries (rows T_traj:) cannot attend to trajectory keys (cols :T_traj)
+
+        # Block anchor-to-anchor interactions (off-diagonal only).
+        if T_traj > 1:
+            traj_block = torch.full((T_traj, T_traj), float('-inf'), device=device, dtype=dtype)
+            traj_block.fill_diagonal_(0)
+            mask[:T_traj, :T_traj] = traj_block
+
+        # Optional dd-style strict isolation: anchors cannot attend route tokens.
+        if not self.traj_can_attend_route:
+            mask[:T_traj, T_traj:] = float('-inf')
+
+        # Block route-to-anchor attention (route rows, trajectory cols).
         mask[T_traj:, :T_traj] = float('-inf')
-        
+
         return mask
     
     def forward(
@@ -1102,9 +1142,10 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         """
         Forward pass with unified queries and multi-source attention (DiffusionDriveV2 style).
         
-        Uses unidirectional self-attention mask:
-        - Trajectory queries can see: trajectory + route (route guides trajectory)
-        - Route queries can only see: route (independent planning)
+        Uses anchor-isolated self-attention mask:
+        - Each trajectory(anchor) query can only see itself
+          (or itself + route if traj_can_attend_route=True)
+        - Route queries can only see route queries
         - Both can attend to all cross-attention sources (BEV features, reasoning)
         
         Transfuser Feature Processing (following DiffusionDriveV2):
@@ -1145,7 +1186,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Concatenate queries: [trajectory | route]
         x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
         
-        # Create unidirectional self-attention mask
+        # Create anchor-isolated self-attention mask
         self_attn_mask = self._create_block_diagonal_mask(
             T_traj, T_route, device=x.device, dtype=x.dtype
         )
@@ -1241,9 +1282,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         transfuser_bev_upsample_dim: int = 64,  # bev_feature_upsample channel dim
         num_waypoints: int = 20,
         num_modes: int = 32,  # Number of anchor modes
+        num_behaviors: int = 0,  # Number of behavior categories (0 = disabled)
+        traj_can_attend_route: bool = True,
+        anchor_free: bool = False,  # Route B: no anchor residual, predict absolute trajectory
+        energy_heads: bool = False,  # Route B: energy evaluator heads for gradient guidance
     ) -> None:
         super().__init__()
-        
+
+        self.anchor_free = anchor_free
+        self.energy_heads_enabled = energy_heads
+
         if n_obs_steps is None:
             n_obs_steps = horizon
         
@@ -1258,15 +1306,26 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.output_dim = output_dim
         
         # ========== Anchor Embedding ==========
-        # Embed anchor trajectories: (B, num_modes, anchor_points, 2) -> (B, num_modes, n_emb)
+        # Encode full noisy trajectory shape per mode (not just mean point) to preserve
+        # mode identity under multi-step denoising.
+        self.anchor_pos_hidden_dim = 64
+        self.anchor_embed_dim = horizon * self.anchor_pos_hidden_dim
         self.anchor_emb = nn.Sequential(
-            nn.Linear(input_dim, n_emb),
+            nn.Linear(self.anchor_embed_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
 
         # Learnable mode queries for each anchor
         self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
+        # Extra learnable query for VLM anchor (33rd mode), used when use_vqa_anchor=True
+        self.vqa_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
+
+        # Semantic behavior conditioning (optional)
+        self.num_behaviors = num_behaviors
+        if num_behaviors > 0:
+            self.behavior_emb = nn.Embedding(num_behaviors, n_emb)
+            self.allowed_emb = nn.Embedding(2, n_emb)  # 0=forbidden, 1=allowed
 
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
@@ -1296,6 +1355,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             transfuser_bev_upsample_dim=transfuser_bev_upsample_dim,
             horizon=horizon,        # used for GridSampleCrossBEVAttention.num_points
             num_waypoints=num_waypoints,
+            traj_can_attend_route=traj_can_attend_route,
         )
 
         # ========== Output Heads ==========
@@ -1314,6 +1374,21 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb // 2, 1),
         )
+
+        # Energy evaluator heads (Route B: for classifier guidance)
+        if energy_heads:
+            self.energy_collision_head = nn.Sequential(
+                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, 1), nn.Sigmoid(),
+            )
+            self.energy_offroad_head = nn.Sequential(
+                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, 1), nn.Sigmoid(),
+            )
+            self.energy_target_head = nn.Sequential(
+                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, 1),
+            )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -1418,30 +1493,42 @@ class TransformerForDiffusion(ModuleAttrMixin):
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
         ego_status: torch.Tensor,
+        anchors_abs: Optional[torch.Tensor] = None,
+        behavior_labels: torch.Tensor = None,
+        allowed_flags: torch.Tensor = None,
         **kwargs
     ):
         """
         Multimodal forward pass for trajectory prediction.
-        
+
         Args:
-            anchors: (B, num_modes, anchor_num_points, 2) - all anchor trajectories
+            anchors: (B, num_modes, anchor_num_points, 2) - anchors in normalized space
+                     (kept for diffusion state compatibility)
             timestep: diffusion timestep (for conditioning, can be 0 at inference)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature from transfuser
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upsampled BEV for spatial attention
             ego_status: (B, T_obs, status_dim) - ego status history
-            
+            anchors_abs: (B, num_modes, anchor_num_points, 2) - anchors in absolute coords for BEV grid_sample.
+                         If None, uses `anchors` directly (backward compatible).
+
         Returns:
-            poses_reg: (B, num_modes, horizon, 2) - trajectory predictions for each mode
+            poses_reg: (B, num_modes, horizon, 2) - trajectory predictions for each mode.
+                      Output space follows residual base:
+                      - absolute space if anchors_abs is provided
+                      - normalized space otherwise (backward compatibility)
             poses_cls: (B, num_modes) - classification logits for mode selection
             route_pred: (B, num_waypoints, 2) - route prediction
         """
         model_dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
-        
+
         anchors = anchors.contiguous().to(device=device, dtype=model_dtype)
         transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
         ego_status = ego_status.to(device=device, dtype=model_dtype)
+
+        # BEV sampling uses absolute coords; fallback to anchors for backward compat
+        bev_traj_points = anchors_abs.contiguous().to(device=device, dtype=model_dtype) if anchors_abs is not None else anchors
         
         B = anchors.shape[0]
         num_modes = anchors.shape[1]
@@ -1469,16 +1556,32 @@ class TransformerForDiffusion(ModuleAttrMixin):
         conditioning = time_emb + status_emb + hist_global_emb  # (B, n_emb)
         
         # ========== Anchor Embedding ==========
-        # anchors: (B, num_modes, anchor_num_points, 2)
-        # Embed using average anchor position -> (B, num_modes, n_emb)
-        anchors_flat = anchors.mean(dim=2)  # (B, num_modes, 2) - average anchor position
-        anchor_emb = self.anchor_emb(anchors_flat)  # (B, num_modes, n_emb)
+        # Encode full trajectory geometry for each mode:
+        # (B, M, T, 2) -> sine embed (B, M, T, 64) -> flatten (B, M, T*64) -> (B, M, n_emb)
+        anchor_pos_embed = gen_sineembed_for_position(
+            bev_traj_points, hidden_dim=self.anchor_pos_hidden_dim
+        )
+        anchor_pos_embed = anchor_pos_embed.flatten(-2)  # (B, M, T * 64)
+        anchor_emb = self.anchor_emb(anchor_pos_embed.to(dtype=model_dtype))
 
-        # Add learnable mode queries
-        mode_queries = self.mode_queries.expand(B, -1, -1)  # (B, num_modes, n_emb)
+        # Add learnable mode queries (dynamically extend if VLM anchor is present)
+        M = anchor_emb.shape[1]
+        if M > self.mode_queries.shape[1]:
+            # VLM anchor added: concatenate vqa_mode_query for the extra mode
+            mode_queries = torch.cat([self.mode_queries, self.vqa_mode_query], dim=1)
+        else:
+            mode_queries = self.mode_queries
+        mode_queries = mode_queries.expand(B, -1, -1)  # (B, M, n_emb)
 
         # Combine: anchor embedding + mode queries + conditioning
         mode_emb = anchor_emb + mode_queries + conditioning.unsqueeze(1)  # (B, num_modes, n_emb)
+
+        # Add semantic behavior conditioning (if available)
+        if self.num_behaviors > 0 and behavior_labels is not None:
+            behavior_emb = self.behavior_emb(behavior_labels.to(device))  # (B, num_modes, n_emb)
+            allowed_emb = self.allowed_emb(allowed_flags.long().to(device))  # (B, num_modes, n_emb)
+            mode_emb = mode_emb + behavior_emb + allowed_emb
+
         mode_emb = self.drop(mode_emb)
         mode_emb = self.pre_decoder_norm(mode_emb)
 
@@ -1494,7 +1597,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
             conditioning=conditioning,
-            traj_points=anchors,  # (B, num_modes, horizon, 2)
+            traj_points=bev_traj_points,  # (B, num_modes, horizon, 2) absolute coords for grid_sample
             route_conditioning=route_conditioning,
         )
         # mode_out: (B, num_modes, n_emb), route_out: (B, num_waypoints, n_emb)
@@ -1504,21 +1607,30 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_flat = self.trajectory_head(mode_out, conditioning, route_features=route_out)  # (B, num_modes, horizon * output_dim)
         poses_reg = traj_flat.view(B, num_modes, self.horizon, self.output_dim)  # (B, num_modes, horizon, 2)
         
-        # Add anchor as residual (predict refinement)
-        # Anchor num_points must match horizon (no interpolation for delta prediction)
         assert anchor_num_points == self.horizon, \
-            f"anchor_num_points ({anchor_num_points}) must equal horizon ({self.horizon}). " \
-            f"Interpolating deltas is incorrect - ensure config aligns these values."
+            f"anchor_num_points ({anchor_num_points}) must equal horizon ({self.horizon})."
 
-        poses_reg = poses_reg + anchors  # Residual prediction
+        # Add anchor as residual (skip in anchor-free mode where model predicts absolute)
+        if not self.anchor_free:
+            residual_base = bev_traj_points
+            poses_reg = poses_reg + residual_base
         
         # 2. Classification: (B, num_modes, n_emb) -> (B, num_modes, 1) -> (B, num_modes)
         poses_cls = self.cls_head(mode_out).squeeze(-1)  # (B, num_modes)
-        
+
         # 3. Route prediction from unified decoder output
         route_pred = self.route_head(route_out, conditioning, current_status)  # (B, num_waypoints, 2)
-        
-        return poses_reg, poses_cls, route_pred
+
+        # 4. Energy scores (Route B: for classifier guidance)
+        if self.energy_heads_enabled:
+            energy_scores = {
+                'collision': self.energy_collision_head(mode_out).squeeze(-1),  # (B, M)
+                'offroad': self.energy_offroad_head(mode_out).squeeze(-1),      # (B, M)
+                'target': self.energy_target_head(mode_out).squeeze(-1),        # (B, M)
+            }
+            return poses_reg, poses_cls, route_pred, mode_out, energy_scores
+
+        return poses_reg, poses_cls, route_pred, mode_out
 
 
 # =============================================================================
@@ -1561,7 +1673,7 @@ def test():
     ego_status = torch.randn((B, 4, 14))  # 4 frames of history with updated dim
     
     print("\nTest 1: Basic forward pass (multimodal)")
-    poses_reg, poses_cls, route_pred = transformer(
+    poses_reg, poses_cls, route_pred, mode_out = transformer(
         anchors=anchors, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,

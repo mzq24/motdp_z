@@ -1,0 +1,181 @@
+# Route B: Annealed Energy Guidance (anchor-free, pure diffusion from N(0,I))
+# Based on pdm_local.yaml with Route B specific changes
+
+policy_type: anchor_free  # Use AnnealedEnergyGuidancePolicy
+
+device:
+  gpu_ids:
+  - 0
+dataset:
+  use_per_frame: false
+dataloader:
+  batch_size: 128  # Smaller batch due to gradient computation in energy guidance
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  prefetch_factor: 4
+  shuffle: true
+  use_route_group_sampler: false
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 5.0e-05  # Slightly lower LR for stability with energy heads
+  weight_decay: 1.0e-04
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+enable_action_normalization: true
+bev_encoder:
+  state_dim: 14
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  n_obs_steps: 4
+  cond_dim: 256
+  obs_as_global_cond: true
+  n_layer: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 6
+  action_horizon: 6
+  traj_can_attend_route: false
+
+# ========== Route B: Annealed Energy Guidance ==========
+route_b:
+  num_samples: 32          # Number of noise trajectory candidates
+  num_inference_steps: 10  # 10-step DDIM (5x of Route A's 2-step)
+  guidance_scale: 0.1      # Global energy gradient scale (start small, tune up)
+  energy_collision_weight: 1.0
+  energy_offroad_weight: 1.0
+  energy_target_weight: 1.0
+  energy_loss_weight: 1.0  # Weight of energy loss in total training loss
+  train_max_timesteps: 100 # Train with timesteps in [0, 100)
+
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 100     # Used as default for train_max_timesteps
+  train_trunc_timesteps: 100
+  num_diffusion_steps: 10  # 10-step DDIM
+  eta: 0.0
+  prediction_type: "sample"
+  norm_x_offset: 5.0
+  norm_x_range: 80.0
+  norm_y_offset: 25.0
+  norm_y_range: 55.0
+  route_loss_weight: 0.6
+  use_normalized_forward: true
+
+# No anchors needed for Route B, but keep num_modes for sample count
+num_modes: 32
+cls_loss_weight: 5.0
+reg_loss_weight: 8.0
+
+training:
+  num_epochs: 500
+  max_grad_norm: 1.0
+  warmup_epochs: 10  # Longer warmup for stability with energy guidance
+  use_lr_scheduler: true
+  dataset_path: /media/z/data/dataset/pdm_lite_mini
+  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  sample_interval: 1
+  lr_final: 1e-7
+  validation_freq: 5
+  save_freq: 5
+  early_stopping_patience: 15
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy/
+logging:
+  use_wandb: true
+  wandb_project: route_b_annealed_energy
+  run_name: route_b_v1
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy/
+  save_every: 5
+  log_freq: 50
+  wandb_entity: m240117_z
+  wandb_api_key: bddb5a05a0820c1157702750c9f0ce60bcac2bba
+eval:
+  num_episodes: 10
+  max_steps: 500
+  success_threshold: 0.1
+  eval_freq: 10
+data_augmentation:
+  enable: true
+  image_noise_std: 0.02
+  action_noise_std: 0.01
+  random_crop: false
+model_optimization:
+  use_mixed_precision: true
+  gradient_accumulation_steps: 2
+  warmup_steps: 500
+  lr_scheduler: cosine
+action_stats:
+  min:
+  - -14.108696937561035
+  - -43.720863342285156
+  max:
+  - 74.04539489746094
+  - 41.13515090942383
+  mean:
+  - 8.067095756530762
+  - -0.013612879440188408
+  std:
+  - 11.3925199508667
+  - 2.4904565811157227
+controller:
+  turn_KP: 0.75
+  turn_KI: 0.75
+  turn_KD: 0.3
+  turn_n: 40
+  speed_KP: 5.0
+  speed_KI: 0.5
+  speed_KD: 1.0
+  speed_n: 40
+  aim_dist: 4.0
+  angle_thresh: 0.3
+  dist_thresh: 10.0
+  brake_speed: 0.4
+  brake_ratio: 1.1
+  clip_delta: 0.25
+  max_throttle: 0.75

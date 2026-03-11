@@ -12,6 +12,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from collections import defaultdict
 import argparse
+import pickle
 import datetime
 from torch.distributed.elastic.multiprocessing.errors import record
 from diffusers.training_utils import EMAModel
@@ -21,6 +22,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
+from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
 
 def load_config(config_path=None):
     if config_path is None:
@@ -145,29 +147,58 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                 obs_dict = {
                     'transfuser_bev_feature': batch['transfuser_bev_feature'],
                     'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
-                    'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
+                    'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],
                 }
-                target_actions = batch['agent_pos']  
+                if model_for_inference.use_vqa_anchor and 'vqa_anchor' in batch:
+                    obs_dict['vqa_anchor'] = batch['vqa_anchor']
+                target_actions = batch['agent_pos']
                 
                 try:
                     # Model always returns route prediction
-                    result = model_for_inference.predict_action(obs_dict, no_noise=False)
+                    result = model_for_inference.predict_action(obs_dict, no_noise=False,use_server_style=False, gt_trajectory=target_actions)
                     predicted_actions = torch.from_numpy(result['action']).to(device)
-                    
-                    if target_actions.dim() == 3:  # (B, T, 2)
-                        target_actions = target_actions[:, :predicted_actions.shape[1]]
-                    elif target_actions.dim() == 2:  # (B, 2) 
-                        target_actions = target_actions.unsqueeze(1)  # (B, 1, 2)
-                    
+
+                    target_actions_eval = target_actions
+                    if target_actions_eval.dim() == 3:  # (B, T, 2)
+                        target_actions_eval = target_actions_eval[:, :predicted_actions.shape[1]]
+                    elif target_actions_eval.dim() == 2:  # (B, 2)
+                        target_actions_eval = target_actions_eval.unsqueeze(1)  # (B, 1, 2)
+
                     fut_obstacles = batch.get('fut_obstacles', None)
 
                     driving_metrics = compute_driving_metrics(
-                        predicted_actions, 
-                        target_actions, 
-                        fut_obstacles=fut_obstacles 
+                        predicted_actions,
+                        target_actions_eval,
+                        fut_obstacles=fut_obstacles
                     )
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
+
+                    # Also log 1-step DDIM L2 metrics for direct comparison
+                    if hasattr(model_for_inference, 'num_diffusion_steps'):
+                        original_num_steps = model_for_inference.num_diffusion_steps
+                        try:
+                            model_for_inference.num_diffusion_steps = 1
+                            result_1step = model_for_inference.predict_action(
+                                obs_dict, no_noise=False, use_server_style=False, gt_trajectory=target_actions
+                            )
+                            predicted_actions_1step = torch.from_numpy(result_1step['action']).to(device)
+
+                            target_actions_1step = target_actions
+                            if target_actions_1step.dim() == 3:
+                                target_actions_1step = target_actions_1step[:, :predicted_actions_1step.shape[1]]
+                            elif target_actions_1step.dim() == 2:
+                                target_actions_1step = target_actions_1step.unsqueeze(1)
+
+                            driving_metrics_1step = compute_driving_metrics(
+                                predicted_actions_1step,
+                                target_actions_1step,
+                                fut_obstacles=fut_obstacles
+                            )
+                            for key, value in driving_metrics_1step.items():
+                                val_metrics[f'{key}_1step'].append(value)
+                        finally:
+                            model_for_inference.num_diffusion_steps = original_num_steps
                     
                     # Compute route prediction metrics if route ground truth is available
                     if 'route' in batch and batch['route'] is not None and 'route_pred' in result:
@@ -297,13 +328,41 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     train_dataset_path = os.path.join(dataset_path_root, 'train')
     val_dataset_path = os.path.join(dataset_path_root, 'val')
     image_data_root = config.get('training', {}).get('image_data_root')
-    train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
+    
+    use_per_frame = config.get('dataset', {}).get('use_per_frame', False)
+    use_vqa_anchor = config.get('use_vqa_anchor', False)
+
+    # Load anchor_centers_abs for semantic behavior labeling
+    semantic_behavior_cfg = config.get('semantic_behavior', {})
+    anchor_centers_abs = None
+    if semantic_behavior_cfg.get('enabled', False):
+        anchor_path = config.get('anchor_path', 'wp_tokens.pkl')
+        if os.path.exists(anchor_path):
+            with open(anchor_path, 'rb') as f:
+                anchor_data = pickle.load(f)
+            anchor_centers_abs = anchor_data['centers']  # (num_modes, num_points, 2)
+            if rank == 0:
+                print(f"[Semantic Behavior] Loaded anchor centers: {anchor_centers_abs.shape}")
+        else:
+            if rank == 0:
+                print(f"[Semantic Behavior] WARNING: anchor file not found: {anchor_path}, disabling")
+            semantic_behavior_cfg = {}
+
+    train_dataset = CARLAImageDataset(
+        dataset_path=train_dataset_path, image_data_root=image_data_root,
+        use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
+        anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+    )
     # Val dataset: skip memmap, will inject RAM features after config is parsed
-    val_dataset_orig = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root, skip_memmap=True)
-    if val_only:
-        val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
-    else:
-        val_dataset = val_dataset_orig
+    val_dataset_orig = CARLAImageDataset(
+        dataset_path=val_dataset_path, image_data_root=image_data_root,
+        skip_memmap=True, use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
+        anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+    )
+    # if val_only:
+    #     val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
+    # else:
+    val_dataset = val_dataset_orig
 
     if rank == 0:
         print(f"\nTraining samples: {len(train_dataset)}")
@@ -331,6 +390,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     val_prefetch_factor = dataloader_cfg.get('val_prefetch_factor', 1)
     train_pin_memory = dataloader_cfg.get('train_pin_memory', base_pin_memory)
     val_pin_memory = dataloader_cfg.get('val_pin_memory', False)
+    use_route_group_sampler = dataloader_cfg.get('use_route_group_sampler', False)
 
     validation_freq = int(validation_cfg.get('freq', training_cfg.get('validation_freq', 1)))
     raw_val_max_batches = validation_cfg.get('max_batches', 16)
@@ -343,7 +403,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     # Inject val features from train's memmap into RAM (only this rank's samples)
     _max_val_per_rank = val_max_batches * val_batch_size if val_max_batches else None
-    val_dataset_orig.inject_ram_features(train_dataset, rank=rank, world_size=world_size, max_val_samples=_max_val_per_rank)
+    if not use_per_frame:
+        val_dataset_orig.inject_ram_features(train_dataset, rank=rank, world_size=world_size, max_val_samples=_max_val_per_rank)
 
     def safe_collate(batch):
         try:
@@ -384,20 +445,35 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     else:
         sampler_train = None
         sampler_val = None
-        # Route-grouped batching: samples in the same batch come from the same route(s),
-        # so route_features.pt pack cache hits are maximized (1-2 loads per batch vs ~batch_size)
-        train_batch_sampler = train_dataset.get_route_batch_sampler(
-            batch_size=train_batch_size, shuffle=True, drop_last=True)
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=train_batch_sampler,
-            num_workers=train_num_workers,
-            pin_memory=train_pin_memory,
-            persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
-            prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
-            collate_fn=safe_collate,
-        )
+        if use_route_group_sampler:
+            # Route-grouped batching: samples in the same batch come from the same/adjacent routes.
+            train_batch_sampler = train_dataset.get_route_batch_sampler(
+                batch_size=train_batch_size, shuffle=True, drop_last=True)
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=train_batch_sampler,
+                num_workers=train_num_workers,
+                pin_memory=train_pin_memory,
+                persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+                prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
+                collate_fn=safe_collate,
+            )
+            if rank == 0:
+                print("Using route-grouped batch sampler (single GPU)")
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=train_batch_size,
+                shuffle=True,
+                num_workers=train_num_workers,
+                pin_memory=train_pin_memory,
+                persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+                prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
+                drop_last=True,
+                collate_fn=safe_collate,
+            )
+            if rank == 0:
+                print("Using random shuffle sampler (single GPU)")
     
     # Validation loader: only create meaningful loader for rank 0
     # Other ranks get an empty loader since they don't validate
@@ -437,9 +513,24 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             collate_fn=safe_collate,
         )
 
+    # Mixed precision (AMP) setup — prefer BF16 on supported hardware
+    use_amp = config.get('model_optimization', {}).get('use_mixed_precision', True)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    if rank == 0:
+        print(f"✓ Mixed precision (AMP): {'enabled' if use_amp else 'disabled'} (dtype={amp_dtype})")
+
     if rank == 0:
         print("Initializing policy model...")
-    policy = DiffusionDiTCarlaPolicy(config).to(device)
+    policy_type = config.get('policy_type', 'anchor')  # 'anchor' (Route A) or 'anchor_free' (Route B)
+    if policy_type == 'anchor_free':
+        policy = AnnealedEnergyGuidancePolicy(config).to(device)
+        if rank == 0:
+            print(f"  Policy: AnnealedEnergyGuidancePolicy (Route B - anchor-free)")
+    else:
+        policy = DiffusionDiTCarlaPolicy(config).to(device)
+        if rank == 0:
+            print(f"  Policy: DiffusionDiTCarlaPolicy (Route A - anchor-based)")
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -529,13 +620,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         scheduler = None
         if rank == 0:
             print("✓ No learning rate scheduler used")
-
-    # Mixed precision (AMP) setup — prefer BF16 on supported hardware
-    use_amp = config.get('model_optimization', {}).get('use_mixed_precision', True)
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))  # BF16 doesn't need scaler
-    if rank == 0:
-        print(f"✓ Mixed precision (AMP): {'enabled' if use_amp else 'disabled'} (dtype={amp_dtype})")
 
     # EMA (Exponential Moving Average) for stable inference
     ema_cfg = config.get('ema', {})
@@ -663,13 +747,16 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             was_clipped = grad_norm_value > max_grad_norm
             
             if rank == 0:
-                pbar.set_postfix({
+                postfix = {
                     'loss': f'{loss.item():.4f}',
                     'cls': f'{loss_dict["cls_loss"].item():.3f}',
                     'reg': f'{loss_dict["reg_loss"].item():.3f}',
                     'route': f'{loss_dict["route_loss"].item():.3f}',
-                    'grad': f'{grad_norm_value:.2f}{"✂" if was_clipped else ""}'
-                })
+                    'grad': f'{grad_norm_value:.2f}{"✂" if was_clipped else ""}',
+                }
+                if 'energy_loss' in loss_dict:
+                    postfix['energy'] = f'{loss_dict["energy_loss"].item():.3f}'
+                pbar.set_postfix(postfix)
             
             # Log to wandb less frequently to reduce overhead
             log_freq = config.get('logging', {}).get('log_freq', 50)
@@ -688,11 +775,18 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     "train/cls_loss": loss_dict['cls_loss'].item(),
                     "train/reg_loss": loss_dict['reg_loss'].item(),
                     "train/route_loss": loss_dict['route_loss'].item(),
-                    # Weighted losses (for debugging loss scale)
-                    "train/cls_loss_weighted": loss_dict['cls_loss_weighted'].item(),
-                    "train/reg_loss_weighted": loss_dict['reg_loss_weighted'].item(),
-                    "train/route_loss_weighted": loss_dict['route_loss_weighted'].item(),
                 }
+                # Weighted losses (Route A only — Route B doesn't split weighted)
+                for wk in ('cls_loss_weighted', 'reg_loss_weighted', 'route_loss_weighted'):
+                    if wk in loss_dict:
+                        log_data[f"train/{wk}"] = loss_dict[wk].item()
+                # Semantic behavior losses (if available)
+                if 'behavior_loss' in loss_dict:
+                    log_data["train/behavior_loss"] = loss_dict['behavior_loss'].item()
+                    log_data["train/allowed_loss"] = loss_dict['allowed_loss'].item()
+                # Energy losses (Route B)
+                if 'energy_loss' in loss_dict:
+                    log_data["train/energy_loss"] = loss_dict['energy_loss'].item()
                 safe_wandb_log(log_data, use_wandb)
         
         if rank == 0:
