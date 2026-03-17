@@ -193,8 +193,9 @@ def train_bridge_baseline(config_path, resume_path=None, val_only=False):
     image_data_root = config.get('training', {}).get('image_data_root')
 
     use_per_frame = config.get('dataset', {}).get('use_per_frame', False)
+    cache_dir = config.get('dataset', {}).get('cache_dir', None)  # e.g. /tmp/tmp_data for tmpfs
     train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root,
-                                       use_per_frame=use_per_frame)
+                                       use_per_frame=use_per_frame, cache_dir=cache_dir)
     val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root,
                                      skip_memmap=True, use_per_frame=use_per_frame)
 

@@ -71,6 +71,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  skip_memmap: bool = False,   # True for val: skip memmap, use inject_ram_features() later
                  use_per_frame: bool = False, # True for local SSD: load individual .pt files directly (no pack/memmap)
                  use_vqa_anchor: bool = False, # True to load VLM-predicted anchor from dp_vl_feature/*.pt
+                 cache_dir: str = None,       # Override memmap cache dir (e.g. /tmp/tmp_data for tmpfs)
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -238,7 +239,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         print(f"Grouped into {len(self._route_groups)} routes for batch sampling.")
 
         # ===== Load feature cache (memmap, shared across DDP ranks) =====
-        cache_dir = os.path.join(image_data_root, 'tmp_data')
+        if cache_dir is None:
+            cache_dir = os.path.join(image_data_root, 'tmp_data')
         index_path = os.path.join(cache_dir, 'feature_index.pkl')
         feat_bin = os.path.join(cache_dir, 'bev_features_fp16.bin')
         ups_bin = os.path.join(cache_dir, 'bev_upsamples_fp16.bin')
@@ -257,7 +259,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                   f"{cache_meta['total_frames']} frames (shared across ranks).")
         else:
             print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
-                  f"Using LRU fallback (slow). Run: python scripts/build_feature_cache_fp16.py")
+                  f"Using LRU fallback (slow). Run: python scripts/data_tools/build_feature_cache_fp16.py")
 
         # ===== Pre-load VQA anchors into RAM (tiny: ~48 bytes each) =====
         self._vqa_anchor_cache = {}  # sample_idx -> tensor (6, 2)
