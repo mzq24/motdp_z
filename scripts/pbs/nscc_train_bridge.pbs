@@ -15,12 +15,15 @@
 # ---- User config ----
 SCRATCH=/home/users/ntu/wh.huang/scratch
 CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
-DATASET_ROOT=${SCRATCH}/z_projects/dataset/pdm_lite
-CONFIG_PATH=${CODE_DIR}/bridge_baseline/bd_config.yaml
+DATA_ROOT=${SCRATCH}/z_projects/dataset/pdm_lite
+CONFIG_PATH=${CODE_DIR}/bridge_baseline/bd_config_hpc.yaml
 CONDA_ENV=dpautomotive
 LOG_FILE=${CODE_DIR}/logs/bridge_train_${PBS_JOBID}.log
 USE_TMPFS=true   # true: copy BEV cache to /tmp for faster IO
 # ---------------------
+
+# Derived paths
+CACHE_DIR=${DATA_ROOT}/tmp_data
 
 source /home/users/ntu/wh.huang/miniconda3/etc/profile.d/conda.sh
 conda activate ${CONDA_ENV}
@@ -30,7 +33,7 @@ mkdir -p ${CODE_DIR}/logs
 
 echo "=== Bridge Baseline Training ===" | tee ${LOG_FILE}
 echo "Config:  ${CONFIG_PATH}"  | tee -a ${LOG_FILE}
-echo "Dataset: ${DATASET_ROOT}" | tee -a ${LOG_FILE}
+echo "Dataset: ${DATA_ROOT}"    | tee -a ${LOG_FILE}
 echo "GPUs:    $(nvidia-smi --query-gpu=name --format=csv,noheader)" | tee -a ${LOG_FILE}
 echo "Start:   $(date)"         | tee -a ${LOG_FILE}
 
@@ -38,9 +41,9 @@ echo "Start:   $(date)"         | tee -a ${LOG_FILE}
 if [ "${USE_TMPFS}" = true ]; then
     echo "Copying BEV cache to /tmp/tmp_data ..." | tee -a ${LOG_FILE}
     mkdir -p /tmp/tmp_data
-    rsync --progress ${DATASET_ROOT}/train/tmp_data/feature_index.pkl /tmp/tmp_data/
-    rsync --progress ${DATASET_ROOT}/train/tmp_data/bev_features_fp16.bin /tmp/tmp_data/
-    rsync --progress ${DATASET_ROOT}/train/tmp_data/bev_upsamples_fp16.bin /tmp/tmp_data/
+    rsync --progress ${CACHE_DIR}/feature_index.pkl /tmp/tmp_data/
+    rsync --progress ${CACHE_DIR}/bev_features_fp16.bin /tmp/tmp_data/
+    rsync --progress ${CACHE_DIR}/bev_upsamples_fp16.bin /tmp/tmp_data/
     echo "BEV cache copied: $(du -sh /tmp/tmp_data/)" | tee -a ${LOG_FILE}
 fi
 
@@ -48,7 +51,7 @@ fi
 if [ ! -f "${CODE_DIR}/.bridge_stats_done" ]; then
     echo "Computing route + traj norm stats ..." | tee -a ${LOG_FILE}
     python bridge_baseline/scripts/compute_route_stats.py \
-        --dataset_path ${DATASET_ROOT}/train \
+        --dataset_path ${DATA_ROOT}/tmp_data/train \
         --key all --fast \
         --output_yaml ${CONFIG_PATH} \
         2>&1 | tee -a ${LOG_FILE}

@@ -9,11 +9,15 @@ set -e
 # ---- User config (和 pbs 保持一致) ----
 SCRATCH=/home/users/ntu/wh.huang/scratch
 CODE_DIR=${SCRATCH}/z_projects/code/motdp_z
-DATASET_ROOT=${SCRATCH}/z_projects/dataset/pdm_lite
-CONFIG_PATH=${CODE_DIR}/bridge_baseline/bd_config.yaml
+DATA_ROOT=${SCRATCH}/z_projects/dataset/pdm_lite
+CONFIG_PATH=${CODE_DIR}/bridge_baseline/bd_config_hpc.yaml
 CONDA_ENV=dpautomotive
 USE_TMPFS=true
 # ---------------------
+
+# Derived paths (match HPC dataset structure)
+DATASET_PATH=${DATA_ROOT}/tmp_data          # train/ val/ under here
+CACHE_DIR=${DATA_ROOT}/tmp_data             # feature_index.pkl + .bin here
 
 echo "=========================================="
 echo "  Bridge Baseline — Dry Run Check"
@@ -22,7 +26,7 @@ echo "=========================================="
 # 1. 检查关键目录
 echo ""
 echo "[1] 检查目录..."
-for d in "${CODE_DIR}" "${DATASET_ROOT}" "${DATASET_ROOT}/train" "${DATASET_ROOT}/val"; do
+for d in "${CODE_DIR}" "${DATA_ROOT}" "${DATASET_PATH}/train" "${DATASET_PATH}/val"; do
     if [ -d "$d" ]; then
         echo "  OK: $d"
     else
@@ -35,22 +39,17 @@ echo ""
 echo "[2] 检查 config..."
 if [ -f "${CONFIG_PATH}" ]; then
     echo "  OK: ${CONFIG_PATH}"
-    echo "  --- dataset section ---"
-    grep -A5 'dataset:' "${CONFIG_PATH}" | head -8
-    echo "  --- bridge_baseline.predict_traj ---"
-    grep 'predict_traj' "${CONFIG_PATH}" || echo "  (not found)"
-    echo "  --- dataset.cache_dir ---"
-    grep 'cache_dir' "${CONFIG_PATH}" || echo "  (not found, will use default)"
+    echo "  --- key settings ---"
+    grep -E 'dataset_path|image_data_root|cache_dir|use_per_frame|predict_traj|plan_anchor|traj_anchor' "${CONFIG_PATH}" | sed 's/^/  /'
 else
     echo "  MISSING: ${CONFIG_PATH}"
 fi
 
 # 3. 检查 memmap cache
 echo ""
-echo "[3] 检查 memmap cache..."
-TRAIN_CACHE="${DATASET_ROOT}/train/tmp_data"
+echo "[3] 检查 memmap cache (${CACHE_DIR})..."
 for f in feature_index.pkl bev_features_fp16.bin bev_upsamples_fp16.bin; do
-    fpath="${TRAIN_CACHE}/$f"
+    fpath="${CACHE_DIR}/$f"
     if [ -f "$fpath" ]; then
         echo "  OK: $f ($(du -h "$fpath" | cut -f1))"
     else
@@ -62,7 +61,7 @@ done
 echo ""
 echo "[4] 检查 samples_packed.pkl..."
 for split in train val; do
-    fpath="${DATASET_ROOT}/${split}/samples_packed.pkl"
+    fpath="${DATASET_PATH}/${split}/samples_packed.pkl"
     if [ -f "$fpath" ]; then
         echo "  OK: ${split}/samples_packed.pkl ($(du -h "$fpath" | cut -f1))"
     else
@@ -70,17 +69,18 @@ for split in train val; do
     fi
 done
 
-# 5. 检查 anchor 文件
+# 5. 检查 anchor 文件 (相对路径，基于 CODE_DIR)
 echo ""
 echo "[5] 检查 anchor 文件..."
+cd ${CODE_DIR}
 for anchor_key in plan_anchor_path traj_anchor_path; do
     anchor_path=$(grep "${anchor_key}" "${CONFIG_PATH}" 2>/dev/null | head -1 | awk '{print $2}')
-    if [ -n "$anchor_path" ] && [ -f "$anchor_path" ]; then
-        echo "  OK: ${anchor_key} -> $anchor_path"
-    elif [ -n "$anchor_path" ]; then
-        echo "  MISSING: ${anchor_key} -> $anchor_path"
-    else
+    if [ -z "$anchor_path" ]; then
         echo "  NOT SET: ${anchor_key}"
+    elif [ -f "$anchor_path" ]; then
+        echo "  OK: ${anchor_key} -> $anchor_path"
+    else
+        echo "  MISSING: ${anchor_key} -> $anchor_path (cwd: $(pwd))"
     fi
 done
 
@@ -91,7 +91,7 @@ if [ "${USE_TMPFS}" = true ]; then
     tmp_total=$(df -h /tmp | tail -1 | awk '{print $2}')
     tmp_avail=$(df -h /tmp | tail -1 | awk '{print $4}')
     echo "  tmpfs total: ${tmp_total}, available: ${tmp_avail}"
-    cache_size=$(du -sh "${TRAIN_CACHE}" 2>/dev/null | cut -f1 || echo "unknown")
+    cache_size=$(du -sh "${CACHE_DIR}" 2>/dev/null | cut -f1 || echo "unknown")
     echo "  BEV cache size: ${cache_size}"
     echo "  USE_TMPFS=true -> will copy to /tmp/tmp_data"
 else
