@@ -31,22 +31,88 @@ sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
 
 
-def compute_stats(dataset_path, image_data_root, keys_and_poses):
-    """Compute per-waypoint stats for one or more keys in a single dataset pass.
+def _finalize(accum, keys_and_poses):
+    """Compute mean/std from accumulators and print results."""
+    results = {}
+    for key, _ in keys_and_poses:
+        a = accum[key]
+        np_ = a['num_poses']
+        x_mean = [float(np.mean(a['all_x'][t])) for t in range(np_)]
+        x_std  = [float(np.std(a['all_x'][t]))  for t in range(np_)]
+        y_mean = [float(np.mean(a['all_y'][t])) for t in range(np_)]
+        y_std  = [float(np.std(a['all_y'][t]))  for t in range(np_)]
+        x_std = [max(s, 1e-3) for s in x_std]
+        y_std = [max(s, 1e-3) for s in y_std]
 
-    Args:
-        keys_and_poses: list of (key, num_poses), e.g. [('route', 10), ('agent_pos', 6)]
+        print(f"\n[{key}] Per-waypoint statistics ({np_} poses):")
+        print(f"  x_mean: {[f'{v:.4f}' for v in x_mean]}")
+        print(f"  x_std:  {[f'{v:.4f}' for v in x_std]}")
+        print(f"  y_mean: {[f'{v:.4f}' for v in y_mean]}")
+        print(f"  y_std:  {[f'{v:.4f}' for v in y_std]}")
 
-    Returns:
-        dict: {key: (x_mean, x_std, y_mean, y_std)}
+        results[key] = (x_mean, x_std, y_mean, y_std)
+    return results
+
+
+# pkl key mapping: pkl uses raw keys, dataset.__getitem__ renames them
+_PKL_KEY_MAP = {'route': 'route', 'agent_pos': 'ego_waypoints'}
+
+
+def compute_stats_fast(dataset_path, keys_and_poses):
+    """Fast path: read samples_packed.pkl directly, skip CARLAImageDataset entirely.
+
+    No BEV loading, no tensor conversion — pure numpy on raw pkl dicts.
     """
+    import pickle, time
+
+    packed_path = os.path.join(dataset_path, 'samples_packed.pkl')
+    if not os.path.exists(packed_path):
+        raise FileNotFoundError(
+            f"samples_packed.pkl not found at {packed_path}. "
+            "Run training once to generate it, or use --no-fast.")
+
+    print(f"[fast] Loading {packed_path} ...")
+    t0 = time.time()
+    with open(packed_path, 'rb') as f:
+        all_samples = pickle.load(f)
+    print(f"[fast] Loaded {len(all_samples)} samples in {time.time()-t0:.1f}s")
+
+    accum = {}
+    for key, num_poses in keys_and_poses:
+        accum[key] = {
+            'num_poses': num_poses,
+            'all_x': [[] for _ in range(num_poses)],
+            'all_y': [[] for _ in range(num_poses)],
+        }
+
+    keys_str = ', '.join(f'{k}[:{n}]' for k, n in keys_and_poses)
+    print(f"[fast] Computing stats for {keys_str} ...")
+
+    for sample in tqdm(all_samples):
+        for key, num_poses in keys_and_poses:
+            pkl_key = _PKL_KEY_MAP.get(key, key)
+            traj = sample.get(pkl_key)
+            if traj is None:
+                continue
+            # ego_waypoints -> agent_pos: skip first row (current pos)
+            if pkl_key == 'ego_waypoints':
+                traj = traj[1:]
+            if traj.shape[0] >= num_poses:
+                for t in range(num_poses):
+                    accum[key]['all_x'][t].append(float(traj[t, 0]))
+                    accum[key]['all_y'][t].append(float(traj[t, 1]))
+
+    return _finalize(accum, keys_and_poses)
+
+
+def compute_stats(dataset_path, image_data_root, keys_and_poses):
+    """Original path: uses CARLAImageDataset.__getitem__ (slower due to BEV loading)."""
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
         image_data_root=image_data_root,
         skip_memmap=True,
     )
 
-    # Accumulators per key
     accum = {}
     for key, num_poses in keys_and_poses:
         accum[key] = {
@@ -71,26 +137,7 @@ def compute_stats(dataset_path, image_data_root, keys_and_poses):
                     accum[key]['all_x'][t].append(float(traj_np[t, 0]))
                     accum[key]['all_y'][t].append(float(traj_np[t, 1]))
 
-    results = {}
-    for key, num_poses in keys_and_poses:
-        a = accum[key]
-        np_ = a['num_poses']
-        x_mean = [float(np.mean(a['all_x'][t])) for t in range(np_)]
-        x_std  = [float(np.std(a['all_x'][t]))  for t in range(np_)]
-        y_mean = [float(np.mean(a['all_y'][t])) for t in range(np_)]
-        y_std  = [float(np.std(a['all_y'][t]))  for t in range(np_)]
-        x_std = [max(s, 1e-3) for s in x_std]
-        y_std = [max(s, 1e-3) for s in y_std]
-
-        print(f"\n[{key}] Per-waypoint statistics ({np_} poses):")
-        print(f"  x_mean: {[f'{v:.4f}' for v in x_mean]}")
-        print(f"  x_std:  {[f'{v:.4f}' for v in x_std]}")
-        print(f"  y_mean: {[f'{v:.4f}' for v in y_mean]}")
-        print(f"  y_std:  {[f'{v:.4f}' for v in y_std]}")
-
-        results[key] = (x_mean, x_std, y_mean, y_std)
-
-    return results
+    return _finalize(accum, keys_and_poses)
 
 
 def update_yaml(yaml_path, x_mean, x_std, y_mean, y_std, key='route'):
@@ -128,6 +175,8 @@ def main():
                         help='all: compute both route(10) and agent_pos(6) in one pass')
     parser.add_argument('--output_yaml', type=str,
                         default=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bd_config.yaml'))
+    parser.add_argument('--fast', action='store_true',
+                        help='Read samples_packed.pkl directly, skip BEV loading (much faster)')
     args = parser.parse_args()
 
     if args.image_data_root is None:
@@ -138,7 +187,10 @@ def main():
     else:
         keys_and_poses = [(args.key, args.num_poses)]
 
-    results = compute_stats(args.dataset_path, args.image_data_root, keys_and_poses)
+    if args.fast:
+        results = compute_stats_fast(args.dataset_path, keys_and_poses)
+    else:
+        results = compute_stats(args.dataset_path, args.image_data_root, keys_and_poses)
 
     if os.path.exists(args.output_yaml):
         for key, (x_mean, x_std, y_mean, y_std) in results.items():
