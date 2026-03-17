@@ -47,6 +47,22 @@ if [ "${USE_TMPFS}" = true ]; then
     echo "BEV cache copied: $(du -sh /tmp/tmp_data/)" | tee -a ${LOG_FILE}
 fi
 
+# ---- Generate anchors (one-time, fast mode) ----
+if [ ! -f "${CODE_DIR}/.bridge_anchors_done" ]; then
+    echo "Generating route + traj anchors ..." | tee -a ${LOG_FILE}
+    python bridge_baseline/scripts/generate_anchors.py \
+        --dataset_path ${DATA_ROOT}/tmp_data/train \
+        --key route --num_poses 10 --num_modes 20 --fast \
+        --output bridge_baseline/anchors/carla_kmeans_20_route10.npy \
+        2>&1 | tee -a ${LOG_FILE}
+    python bridge_baseline/scripts/generate_anchors.py \
+        --dataset_path ${DATA_ROOT}/tmp_data/train \
+        --key agent_pos --num_poses 6 --num_modes 20 --fast \
+        --output dd_baseline/anchors/carla_kmeans_20.npy \
+        2>&1 | tee -a ${LOG_FILE}
+    touch "${CODE_DIR}/.bridge_anchors_done"
+fi
+
 # ---- Compute norm stats (one-time, fast mode) ----
 if [ ! -f "${CODE_DIR}/.bridge_stats_done" ]; then
     echo "Computing route + traj norm stats ..." | tee -a ${LOG_FILE}
