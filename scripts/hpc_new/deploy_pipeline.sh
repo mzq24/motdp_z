@@ -10,10 +10,10 @@
 # Usage:
 #   bash scripts/hpc_new/deploy_pipeline.sh [step]
 #
-# Steps:
+# Steps (must run in order):
 #   all           - run everything (default)
-#   preprocess    - Step 1: raw data -> sample pkl
-#   transfuser    - Step 2: extract BEV features (GPU)
+#   transfuser    - Step 1: extract BEV features (GPU, must run FIRST)
+#   preprocess    - Step 2: raw data -> sample pkl (depends on transfuser_feature/)
 #   build_cache   - Step 3: pack route_features.pt -> memmap .bin
 #   anchors       - Step 4: generate anchor files
 #   stats         - Step 5: compute norm statistics
@@ -44,10 +44,11 @@ echo "  Code: ${CODE_DIR}"
 echo "  Data: ${DATA_RAW}"
 echo "========================================"
 
-# ---- Step 1: Preprocess raw data -> sample-level pkl ----
+# ---- Step 2: Preprocess raw data -> sample-level pkl ----
+# NOTE: Must run AFTER transfuser, because preprocess reads transfuser_feature/ paths
 run_preprocess() {
     echo ""
-    echo "==== Step 1: Preprocess raw data -> sample pkl ===="
+    echo "==== Step 2: Preprocess raw data -> sample pkl ===="
     python dataset/preprocess_pdm_lite.py \
         --data-root "${DATA_RAW}" \
         --out-dir "${PROCESSED_DIR}" \
@@ -58,16 +59,17 @@ run_preprocess() {
         --hz-interval 2 \
         --workers 4 \
         --save-mode frame
-    echo "Step 1 done. Output: ${PROCESSED_DIR}/train/ and ${PROCESSED_DIR}/val/"
+    echo "Step 2 done. Output: ${PROCESSED_DIR}/train/ and ${PROCESSED_DIR}/val/"
     echo "Checking counts:"
     echo "  train: $(ls ${PROCESSED_DIR}/train/*.pkl 2>/dev/null | wc -l) pkl files"
     echo "  val:   $(ls ${PROCESSED_DIR}/val/*.pkl 2>/dev/null | wc -l) pkl files"
 }
 
-# ---- Step 2: TransFuser BEV feature extraction (GPU) ----
+# ---- Step 1: TransFuser BEV feature extraction (GPU) ----
+# NOTE: Must run FIRST — preprocess depends on transfuser_feature/ existing
 run_transfuser() {
     echo ""
-    echo "==== Step 2: TransFuser BEV feature extraction ===="
+    echo "==== Step 1: TransFuser BEV feature extraction ===="
     if [ ! -d "${MODEL_DIR}" ]; then
         echo "ERROR: MODEL_DIR not found: ${MODEL_DIR}"
         echo "Please update MODEL_DIR to the TransFuser pretrained weights directory."
@@ -90,7 +92,7 @@ run_transfuser() {
         --batch_size 128 \
         --device cuda:0 \
         --mode pack_and_extract
-    echo "Step 2 done. route_features.pt generated per route."
+    echo "Step 1 done. route_features.pt generated per route."
 }
 
 # ---- Step 3: Build memmap cache (.bin) ----
@@ -210,8 +212,8 @@ run_dryrun() {
 # ---- Dispatch ----
 case "${STEP}" in
     all)
-        run_preprocess
         run_transfuser
+        run_preprocess
         run_build_cache
         run_anchors
         run_stats
