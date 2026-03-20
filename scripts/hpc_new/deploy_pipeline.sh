@@ -25,7 +25,7 @@ set -euo pipefail
 # ============ Path Configuration ============
 DATA_RAW=/workspace1/z_project/dataset/pdm_lite
 CODE_DIR=/workspace1/z_project/code/motdp_z
-MODEL_DIR=/workspace1/z_project/models/pretrain   # <- update to actual path when ready
+MODEL_DIR=/workspace1/z_project/models/pretrained_models/all_towns   # <- update to actual path when ready
 CONDA_ENV=z_dpauto
 
 # Derived paths
