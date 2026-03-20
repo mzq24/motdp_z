@@ -764,8 +764,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             sampler_train.set_epoch(epoch)
 
         policy.train()
+        policy_unwrapped = policy.module if world_size > 1 else policy
+        if hasattr(policy_unwrapped, '_current_epoch'):
+            policy_unwrapped._current_epoch = epoch
         train_losses = []
-        
+
         if rank == 0:
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
         else:

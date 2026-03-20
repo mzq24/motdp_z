@@ -116,6 +116,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.num_gt_augmentations = route_b_cfg.get('num_gt_augmentations', 4)
         self.use_safe_anchors = route_b_cfg.get('use_safe_anchors', False)
         self.energy_noisy_training = route_b_cfg.get('energy_noisy_training', False)
+        self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
+        self._current_epoch = 0
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -452,7 +454,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # ========== Alignment Loss ==========
         # Encourage decoder to generate low-energy (safe) trajectories
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        if self.alignment_loss_weight > 0 and energy_scores is not None:
+        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
+        if self.alignment_loss_weight > 0 and energy_scores is not None and alignment_active:
             alignment_loss = (
                 self.energy_collision_weight * energy_scores['collision'].mean()
                 + self.energy_offroad_weight * energy_scores['offroad'].mean()

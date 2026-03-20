@@ -100,6 +100,7 @@ route_b:
   num_gt_augmentations: 4      # First K anchor slots replaced with speed-scaled GT
   use_safe_anchors: false      # Trust allowed anchor labels as positive samples
   energy_noisy_training: false # Train energy heads on clean (t=0) or noisy (random t)
+  alignment_warmup_epochs: 50  # Let energy heads stabilize before alignment
   energy_grad_clip_norm: 1.0   # Per-element gradient clipping during inference
 
 truncated_diffusion:
