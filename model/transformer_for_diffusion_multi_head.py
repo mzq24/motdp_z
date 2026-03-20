@@ -1379,11 +1379,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if energy_heads:
             self.energy_collision_head = nn.Sequential(
                 nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1), nn.Sigmoid(),
+                nn.Linear(n_emb // 2, 1),
             )
             self.energy_offroad_head = nn.Sequential(
                 nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1), nn.Sigmoid(),
+                nn.Linear(n_emb // 2, 1),
             )
             self.energy_target_head = nn.Sequential(
                 nn.Linear(n_emb, n_emb // 2), nn.SiLU(),

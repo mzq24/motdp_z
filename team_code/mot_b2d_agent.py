@@ -32,7 +32,8 @@ sys.path = [str(p) for p in sys.path]
 
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
-from team_code.simlingo.nav_planner import RoutePlanner, LateralPIDController  
+from team_code.simlingo.nav_planner import RoutePlanner, LateralPIDController, get_throttle
+from team_code.simlingo.birds_eye_view.run_stop_sign import RunStopSign
 from agents.navigation.local_planner import RoadOption
 import team_code.simlingo.transfuser_utils as t_u  
 from team_code.render import render, render_self_car, render_waypoints
@@ -191,7 +192,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Load diffusion policy first (smaller model)
 		print("Loading diffusion policy...")
-		self.config = create_carla_config()
+		self.config = create_carla_config(self.config_path)
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/add_noise_multi_infer_trunc20")
 		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best.pt")
@@ -443,6 +444,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_command = -1
 		self.last_command_tmp = -1
 		
+		# Stop sign post-processor (CARLA API-based, no model needed)
+		world = CarlaDataProvider.get_world()
+		self.stop_sign_criteria = RunStopSign(world)
+
 		self.initialized = True
 		self.metric_info = {}
 		# self._hic = DisplayInterface()
@@ -1054,12 +1059,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# max_desired_speed_ms = 35.0 / 3.6  # 35 km/h in m/s
 		# desired_speed = min(desired_speed, max_desired_speed_ms)
 
-		brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
-		
-		delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
-		throttle = self.speed_controller.step(delta)
-		throttle = np.clip(throttle, 0.0, self.clip_throttle)
-		throttle = throttle if not brake else 0.0
+		# OLD PID throttle (kept for reference):
+		# brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
+		# delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
+		# throttle = self.speed_controller.step(delta)
+		# throttle = np.clip(throttle, 0.0, self.clip_throttle)
+		# throttle = throttle if not brake else 0.0
+
+		# BridgeDrive post-processing: learned polynomial throttle
+		brake = (desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio)
+		throttle, brake = get_throttle(brake, desired_speed, speed)
 		
 
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
@@ -1297,7 +1306,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			# print(f"stuck_detector: {self.stuck_detector}")
 
-			
+			# ---- BridgeDrive-style post-processing ----
+
+			# Traffic light: stop on red/yellow (CARLA API, no model needed)
+			vehicle = CarlaDataProvider.get_hero_actor()
+			if vehicle.is_at_traffic_light():
+				tl = vehicle.get_traffic_light()
+				tl_state = tl.get_state()
+				if tl_state == carla.TrafficLightState.Red or tl_state == carla.TrafficLightState.Yellow:
+					throttle = 0.0
+					brake = 1.0
+					self.stuck_detector = 0  # Waiting at TL is not stuck
+
+			# Stop sign: brake to a full stop, then continue
+			self.stop_sign_criteria.tick(vehicle)
+			if self.stop_sign_criteria.target_stop_sign is not None and not self.stop_sign_criteria.stop_completed:
+				throttle = 0.0
+				brake = 1.0
+				self.stuck_detector = 0  # Waiting at stop sign is not stuck
+
 			control = carla.VehicleControl()
 			control.steer = float(steer)
 			control.throttle = float(throttle)

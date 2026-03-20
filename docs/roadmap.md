@@ -104,7 +104,7 @@ best_idx = safe_logits.argmax(dim=-1)
 
 ## 路线 B：终极浪漫 (Annealed Energy Guidance)
 
-### 状态：Future Work（已验证白噪声去噪可行，效果更好且收敛更快）
+### 状态：代码框架已完成 ✅（分支 `annealed-energy-guidance`）
 
 ### 已知问题
 - 推理需要 **10 步 DDIM**，是当前 2-step 的 **5 倍推理时间**
@@ -133,59 +133,39 @@ t=30 → 0 (小噪声期)
   完成车道级几何打磨
 ```
 
-### 需要修改的代码
+### 已完成的代码（分支 `annealed-energy-guidance`）
 
 #### 1. 模型层 (`model/transformer_for_diffusion_multi_head.py`)
 
-- 移除 Anchor Embedding，改为直接编码噪声轨迹
-- 保留 trajectory_head 和 route_head
-- 添加独立的 Energy Evaluator 网络 (或复用主网络 + gradient)
+- ✅ `anchor_free=True`：跳过 anchor residual，模型直接预测绝对轨迹
+- ✅ `energy_heads=True`：添加 E_collision / E_offroad / E_target 能量头
+- ✅ 向后兼容：`energy_heads=False` 时返回 4 值，`True` 时返回 5 值
 
-#### 2. 策略层 (`policy/diffusion_dit_carla_policy.py`)
+#### 2. 策略层 (`policy/annealed_energy_guidance_policy.py`) — 新文件
 
-推理循环改为带梯度引导的 DDIM：
+- ✅ 训练：GT 轨迹加噪 → 模型预测 clean x_0 + 能量头用 behavior label 监督
+- ✅ 推理：10-step DDIM 从 N(0,I) + 每步能量梯度引导
+- ✅ 时间尺度权重调度 `get_energy_weights(t, T)`
+- ✅ 推理最终选择：energy shielding + cls_logits 联合排序
+- ✅ 采用方案一：复用主网络 decoder 输出 + 能量头（无需独立评估网络）
 
-```python
-# 从白噪声开始
-x_t = torch.randn(B, num_samples, horizon, 2)  # N(0, I)
+#### 3. 训练脚本 (`training/train_carla_bev.py`)
 
-for t in ddim_timesteps:  # 10 steps
-    # 1. 标准 DDIM 去噪
-    x_t.requires_grad_(True)
-    noise_pred = model(x_t, t, bev_features, ego_status)
-    x_denoised = ddim_step(x_t, noise_pred, t)
+- ✅ `policy_type: anchor_free` 配置切换 Route B policy
+- ✅ wandb logging 兼容 energy_loss
 
-    # 2. 计算能量梯度 (需要评估网络)
-    E_col = energy_evaluator.collision(x_denoised, bev_features)
-    E_off = energy_evaluator.offroad(x_denoised, bev_features)
-    E_nav = energy_evaluator.navigation(x_denoised, route)
+#### 4. 配置 (`config/pdm_local_route_b.yaml`)
 
-    # 3. 注入梯度引导 (权重随 t 变化)
-    grad = torch.autograd.grad(
-        w_nav(t) * E_nav + w_col(t) * E_col + w_off(t) * E_off,
-        x_t
-    )[0]
-    x_t = x_denoised - grad
-```
+- ✅ Route B 专用配置（`policy_type: anchor_free`）
 
-#### 3. Energy Evaluator 训练
-
-需要一个独立的或共享的评估网络，输入为 `(轨迹, BEV 特征)`，输出各能量分数。
-
-**方案一 (简单)**：复用主网络的 decoder 输出 + 能量头 (同路线 A)
-**方案二 (独立)**：轻量级 MLP，输入 trajectory + BEV feature，专门训练
-
-### 时间尺度权重调度
+### 时间尺度权重调度（已实现）
 
 ```python
 def get_energy_weights(t, T=100):
-    """不同噪声阶段的能量权重"""
     progress = 1 - t / T  # 0→1 随去噪推进
-
-    w_nav = 1.0  # 全程生效
-    w_col = max(0, (progress - 0.3) / 0.4)  # t<70 开始生效
-    w_off = max(0, (progress - 0.7) / 0.3)  # t<30 开始生效
-
+    w_nav = 1.0                              # 全程生效
+    w_col = max(0, (progress - 0.3) / 0.4)   # 30% 进度后生效
+    w_off = max(0, (progress - 0.7) / 0.3)   # 70% 进度后生效
     return w_nav, w_col, w_off
 ```
 
@@ -224,6 +204,8 @@ def get_energy_weights(t, T=100):
 
 - [x] 白噪声去噪验证通过：效果更好，收敛更快
 - [x] 代价：10-step 推理 (vs 2-step)，5 倍时间
+- [x] 路线 B 代码框架完成（分支 `annealed-energy-guidance`）
 - [ ] 能量头训练效果待验证
-- [ ] Energy Shielding 超参数待调优
-- [ ] 梯度引导稳定性待验证
+- [ ] Energy Shielding 超参数待调优（路线 A）
+- [ ] 梯度引导稳定性待验证（路线 B）
+- [ ] `guidance_scale` 超参数待调优（路线 B）
