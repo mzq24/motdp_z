@@ -5,8 +5,8 @@
 # Runs generate_scenario_videos.py on the full pdm_lite dataset.
 # Output goes to /workspace1/z_project/scenario_videos/
 #
-# Usage:
-#   nohup bash scripts/hpc_new/generate_videos.sh > logs/generate_videos.log 2>&1 &
+# Usage (in tmux):
+#   bash scripts/hpc_new/generate_videos.sh
 ###############################################################################
 
 set -euo pipefail
