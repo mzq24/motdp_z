@@ -874,8 +874,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 gt_normed = self.norm_odo(gt_trajectory.to(device=device, dtype=x_t.dtype))
 
             prev_best_idx = None
-            # _debug_first_batch = not getattr(self, '_test_debug_printed', False)
-            _debug_first_batch = True
+            _debug_first_batch = False
             poses_reg_abs = None
 
             for step_i, k in enumerate(roll_timesteps):
