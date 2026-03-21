@@ -11,13 +11,14 @@
 #   bash scripts/hpc_new/deploy_pipeline.sh [step]
 #
 # Steps (must run in order):
-#   all           - run everything (default)
-#   transfuser    - Step 1: extract BEV features (GPU, must run FIRST)
-#   preprocess    - Step 2: raw data -> sample pkl (depends on transfuser_feature/)
-#   build_cache   - Step 3: pack route_features.pt -> memmap .bin
-#   anchors       - Step 4: generate anchor files
-#   stats         - Step 5: compute norm statistics
-#   dryrun        - Step 6: verify everything
+#   all              - run everything (default)
+#   transfuser       - Step 1: extract BEV features (GPU, must run FIRST)
+#   preprocess       - Step 2: raw data -> sample pkl (depends on transfuser_feature/)
+#   build_cache      - Step 3: pack route_features.pt -> memmap .bin
+#   anchors          - Step 4: generate anchor files
+#   semantic_labels  - Step 5: pre-compute semantic behavior labels (needs bev_semantics/)
+#   stats            - Step 6: compute norm statistics
+#   dryrun           - Step 7: verify everything
 ###############################################################################
 
 set -euo pipefail
@@ -178,10 +179,36 @@ print(f'Loaded {len(ds)} val samples.')
     ls -lh bridge_baseline/anchors/*.npy dd_baseline/anchors/*.npy 2>/dev/null
 }
 
-# ---- Step 5: Compute norm statistics ----
+# ---- Step 5: Pre-compute semantic behavior labels ----
+run_semantic_labels() {
+    echo ""
+    echo "==== Step 5: Pre-compute semantic behavior labels ===="
+
+    ANCHOR_PATH=dd_baseline/anchors/carla_kmeans_32.npy
+    if [ ! -f "${ANCHOR_PATH}" ]; then
+        echo "ERROR: Anchor file not found: ${ANCHOR_PATH}. Run 'anchors' step first."
+        exit 1
+    fi
+
+    echo "Labeling train split..."
+    python scripts/data_tools/precompute_semantic_labels.py \
+        --dataset_path "${PROCESSED_DIR}/train" \
+        --image_data_root "${DATA_RAW}" \
+        --anchor_path "${ANCHOR_PATH}"
+
+    echo "Labeling val split..."
+    python scripts/data_tools/precompute_semantic_labels.py \
+        --dataset_path "${PROCESSED_DIR}/val" \
+        --image_data_root "${DATA_RAW}" \
+        --anchor_path "${ANCHOR_PATH}"
+
+    echo "Step 5 done. behavior_labels injected into samples_packed.pkl"
+}
+
+# ---- Step 6: Compute norm statistics ----
 run_stats() {
     echo ""
-    echo "==== Step 5: Compute norm statistics ===="
+    echo "==== Step 6: Compute norm statistics ===="
 
     # 5a: Bridge baseline per-waypoint stats
     echo "Computing bridge norm stats..."
@@ -197,15 +224,15 @@ run_stats() {
         --image_data_root "${DATA_RAW}" \
         --config_path config/pdm_local.yaml
 
-    echo "Step 5 done."
+    echo "Step 6 done."
     echo "IMPORTANT: Copy the norm stats from bd_config.yaml -> bd_config_hpc_new.yaml"
     echo "IMPORTANT: Copy action_stats from pdm_local.yaml -> pdm_hpc_new.yaml / pdm_local_route_b.yaml"
 }
 
-# ---- Step 6: Dry-run verification ----
+# ---- Step 7: Dry-run verification ----
 run_dryrun() {
     echo ""
-    echo "==== Step 6: Dry-run verification ===="
+    echo "==== Step 7: Dry-run verification ===="
     bash scripts/hpc_new/dryrun.sh
 }
 
@@ -216,18 +243,20 @@ case "${STEP}" in
         run_preprocess
         run_build_cache
         run_anchors
+        run_semantic_labels
         run_stats
         run_dryrun
         ;;
-    preprocess)   run_preprocess ;;
-    transfuser)   run_transfuser ;;
-    build_cache)  run_build_cache ;;
-    anchors)      run_anchors ;;
-    stats)        run_stats ;;
-    dryrun)       run_dryrun ;;
+    preprocess)        run_preprocess ;;
+    transfuser)        run_transfuser ;;
+    build_cache)       run_build_cache ;;
+    anchors)           run_anchors ;;
+    semantic_labels)   run_semantic_labels ;;
+    stats)             run_stats ;;
+    dryrun)            run_dryrun ;;
     *)
         echo "Unknown step: ${STEP}"
-        echo "Usage: $0 {all|preprocess|transfuser|build_cache|anchors|stats|dryrun}"
+        echo "Usage: $0 {all|preprocess|transfuser|build_cache|anchors|semantic_labels|stats|dryrun}"
         exit 1
         ;;
 esac

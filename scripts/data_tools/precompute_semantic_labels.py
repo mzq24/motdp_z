@@ -79,19 +79,26 @@ def precompute(dataset_path, image_data_root, anchor_path, bev_ppm=2.0, bev_size
             continue
 
         feature_rel = sample.get('transfuser_bev_feature', '')
-        if not feature_rel:
-            # No feature path — fallback
+        frame_id = sample.get('frame_id', None)
+        if not feature_rel or frame_id is None:
+            # No feature path or frame_id — fallback
             sample['behavior_labels'] = np.zeros(num_modes, dtype=np.int64)
             sample['allowed_flags'] = np.ones(num_modes, dtype=np.float32)
             sample['scene_buckets'] = np.zeros(NUM_BUCKET_CATEGORIES, dtype=np.float32)
             fallback += 1
             continue
 
-        base_dir = os.path.dirname(os.path.dirname(feature_rel))
-        frame_str = os.path.basename(feature_rel).replace('_feature.pt', '')
+        # Derive base_dir and frame_str from feature_rel + frame_id
+        # Supports both per-frame (XXXX_feature.pt) and route-level (route_features.pt) formats
+        if 'route_features.pt' in feature_rel:
+            base_dir = os.path.dirname(os.path.dirname(feature_rel))
+            frame_str = f"{frame_id:04d}"
+        else:
+            base_dir = os.path.dirname(os.path.dirname(feature_rel))
+            frame_str = os.path.basename(feature_rel).replace('_feature.pt', '')
 
         # Load BEV semantic
-        bev_rel = feature_rel.replace('transfuser_feature/', 'bev_semantics/').replace('_feature.pt', '.png')
+        bev_rel = os.path.join(base_dir, 'bev_semantics', f'{frame_str}.png')
         bev_path = os.path.join(image_data_root, bev_rel)
 
         if not os.path.exists(bev_path):
@@ -105,7 +112,7 @@ def precompute(dataset_path, image_data_root, anchor_path, bev_ppm=2.0, bev_size
 
         # Load boxes
         boxes = None
-        boxes_rel = feature_rel.replace('transfuser_feature/', 'boxes/').replace('_feature.pt', '.json.gz')
+        boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
         boxes_path = os.path.join(image_data_root, boxes_rel)
         if os.path.exists(boxes_path):
             try:
@@ -116,7 +123,7 @@ def precompute(dataset_path, image_data_root, anchor_path, bev_ppm=2.0, bev_size
 
         # Load measurements
         measurements = None
-        meas_rel = feature_rel.replace('transfuser_feature/', 'measurements/').replace('_feature.pt', '.json.gz')
+        meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
         meas_path = os.path.join(image_data_root, meas_rel)
         if os.path.exists(meas_path):
             try:
