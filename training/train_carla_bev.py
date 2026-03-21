@@ -213,12 +213,11 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                             
                             val_metrics['route_L2'].append(route_l2_mean)
                             val_metrics['route_L2_final'].append(route_l2_final)
-                        except Exception as e:
-                            print(f"Warning: Error in route metrics computation: {e}")
-                        
+                        except Exception:
+                            pass
+
                     pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
-                except Exception as e:
-                    print(f"Warning: Error in action prediction during validation: {e}")
+                except Exception:
                     continue
         
         if rank == 0:
@@ -1010,12 +1009,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 safe_wandb_log(log_dict, use_wandb)
 
             
-                print(f"Validation metrics: (total {len(val_metrics)} metrics)")
-                if len(val_metrics) == 0:
-                    print("  Warning: No validation metrics were computed!")
-                for key, value in val_metrics.items():
-                    print(f"  {key}: {value:.4f}")
-        
                 val_loss = val_metrics.get('val_loss', float('inf'))
                 l2_avg = val_metrics.get('val_L2_avg', float('inf'))
                 

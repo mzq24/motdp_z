@@ -125,7 +125,7 @@ training:
   early_stopping_patience: 10
   checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/hpc_new/
 validation:
-  max_batches: 16
+  max_batches: 0
 logging:
   use_wandb: true
   wandb_project: B2D_transfuser
