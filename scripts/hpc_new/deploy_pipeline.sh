@@ -52,7 +52,7 @@ run_preprocess() {
     python dataset/preprocess_pdm_lite.py \
         --data-root "${DATA_RAW}" \
         --out-dir "${PROCESSED_DIR}" \
-        --tmp-dir data \
+        --tmp-dir . \
         --obs-horizon 4 \
         --action-horizon 6 \
         --sample-interval 1 \
