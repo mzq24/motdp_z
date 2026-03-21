@@ -555,46 +555,40 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['rgb_hist_jpg'] = rgb_hist
             
             # --- Transfuser Features (single frame, no temporal) ---
-            # Load four features: bev_feature, bev_feature_upsample, fused_features, image_feature_grid
+            # Supports two formats:
+            #   1. Per-frame: transfuser_feature/XXXX_feature.pt (legacy)
+            #   2. Route-level: transfuser_feature/route_features.pt (packed by preprocess_dataset.py)
             transfuser_feature_dir = join(folder_path, 'transfuser_feature')
-            
+
             if os.path.exists(transfuser_feature_dir):
-                # Check if both required feature files exist for current frame
-                # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
+                # Try per-frame format first
                 bev_feature_file = join(transfuser_feature_dir, f"{ii:04d}_feature.pt")
                 bev_feature_upsample_file = join(transfuser_feature_dir, f"{ii:04d}_feature_upsample.pt")
-                
+
                 if all(os.path.exists(f) for f in [bev_feature_file, bev_feature_upsample_file]):
-                    # Store relative paths for lazy loading
                     frame_data['transfuser_bev_feature'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_feature.pt")
                     frame_data['transfuser_bev_feature_upsample'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_feature_upsample.pt")
+                elif os.path.exists(join(transfuser_feature_dir, 'route_features.pt')):
+                    # Route-level packed format: store route path + frame_id for memmap/LRU loading
+                    frame_data['transfuser_bev_feature'] = join(folder_name, 'transfuser_feature', 'route_features.pt')
+                    frame_data['transfuser_bev_feature_upsample'] = join(folder_name, 'transfuser_feature', 'route_features.pt')
                 else:
-                    # Skip this sample if any transfuser feature is missing
                     continue
             else:
-                # Skip this sample if transfuser_feature directory doesn't exist
                 print(f"Warning: transfuser_feature directory not found in {folder_name}, skipping frame {ii}...")
                 continue
 
-            # --- VQA Features (dp_vl_feature) ---
+            # --- VQA Features (dp_vl_feature) --- optional
             # Load only the current frame's corresponding .pt file (no history)
             # VQA features start from frame 0004
             dp_vl_feature_dir = join(folder_path, 'dp_vl_feature')
             vqa_path = None
-            
+
             if ii >= 4 and os.path.exists(dp_vl_feature_dir):
-                # Load the exact frame index for current frame
                 vqa_file = join(dp_vl_feature_dir, f"{ii:04d}.pt")
-                
                 if os.path.exists(vqa_file):
                     vqa_path = join(folder_name, 'dp_vl_feature', f"{ii:04d}.pt")
-                else:
-                    # Skip this sample if VQA feature is missing (no padding allowed)
-                    continue
-            elif ii >= 4:
-                print(f"Warning: VQA feature directory not found in {folder_name}, skipping frame {ii}...")
-                continue
-            
+
             frame_data['vqa'] = vqa_path
 
             scene_data.append(frame_data)
