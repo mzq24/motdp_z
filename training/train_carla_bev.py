@@ -1008,9 +1008,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     log_dict[f"val/{key.removeprefix('val_')}"] = value
                 safe_wandb_log(log_dict, use_wandb)
 
-            
                 val_loss = val_metrics.get('val_loss', float('inf'))
                 l2_avg = val_metrics.get('val_L2_avg', float('inf'))
+                print(f"[Epoch {epoch}] val_loss: {val_loss:.4f}, L2_avg: {l2_avg:.4f}")
                 
                 # Save best model based on L2_avg (average L2 error across all timesteps)
                 if l2_avg < best_l2_avg:
