@@ -23,7 +23,7 @@ MODEL=${1:-""}
 
 case "${MODEL}" in
     route_b)
-        CONFIG=config/pdm_hpc_new.yaml
+        CONFIG=config/pdm_hpc_route_b.yaml
         SCRIPT=training/train_carla_bev.py
         ;;
     bridge)
