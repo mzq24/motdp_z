@@ -1316,8 +1316,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(n_emb, n_emb),
         )
 
-        # Learnable mode queries for each anchor
+        # Learnable mode queries for each anchor (energy training uses all num_modes)
         self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
+        # Dedicated diffusion mode query (single-mode denoising in Route B)
+        self.diff_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
         # Extra learnable query for VLM anchor (33rd mode), used when use_vqa_anchor=True
         self.vqa_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
 
@@ -1564,13 +1566,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         anchor_pos_embed = anchor_pos_embed.flatten(-2)  # (B, M, T * 64)
         anchor_emb = self.anchor_emb(anchor_pos_embed.to(dtype=model_dtype))
 
-        # Add learnable mode queries (dynamically extend if VLM anchor is present)
+        # Add learnable mode queries (select based on input M)
         M = anchor_emb.shape[1]
-        if M > self.mode_queries.shape[1]:
+        if M == 1 and self.anchor_free:
+            # Single-mode diffusion denoising: use dedicated diff_mode_query
+            mode_queries = self.diff_mode_query
+        elif M > self.mode_queries.shape[1]:
             # VLM anchor added: concatenate vqa_mode_query for the extra mode
             mode_queries = torch.cat([self.mode_queries, self.vqa_mode_query], dim=1)
         else:
-            mode_queries = self.mode_queries
+            mode_queries = self.mode_queries[:, :M, :]
         mode_queries = mode_queries.expand(B, -1, -1)  # (B, M, n_emb)
 
         # Combine: anchor embedding + mode queries + conditioning

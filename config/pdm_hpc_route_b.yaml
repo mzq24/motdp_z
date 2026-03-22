@@ -1,23 +1,29 @@
-# Route B+: Compositional Energy-Guided Diffusion (anchor-free, pure diffusion from N(0,I))
-# Dual-optimizer training (GAN-style): energy heads + diffusion decoder
-# Based on pdm_local.yaml with Route B+ specific changes
+# Route B+: Compositional Energy-Guided Diffusion (anchor-free, single-mode denoising)
+# Based on pdm_hpc_new.yaml with Route B+ specific changes
 
 policy_type: anchor_free  # Use AnnealedEnergyGuidancePolicy
-anchor_path: dd_baseline/anchors/carla_kmeans_32.npy  # K-means anchor trajectories (32, 6, 2)
+anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
 
 device:
   gpu_ids:
   - 0
-dataset:
-  use_per_frame: false
+  - 1
+  - 2
+  - 3
 dataloader:
-  batch_size: 128  # Smaller batch due to gradient computation in energy guidance
-  num_workers: 8
+  batch_size: 128
+  num_workers: 4
   persistent_workers: false
-  pin_memory: true
-  prefetch_factor: 4
+  pin_memory: false
+  prefetch_factor: 2
+  train_num_workers: 4
+  val_num_workers: 1
+  train_persistent_workers: false
+  val_persistent_workers: false
+  train_prefetch_factor: 2
+  val_prefetch_factor: 1
+  val_batch_size: 128
   shuffle: true
-  use_route_group_sampler: false
 obs_horizon: 4
 pred_horizon: 10
 action_horizon: 6
@@ -28,13 +34,14 @@ ema:
   min_value: 0.0
   power: 0.75
   update_after_step: 0
+  update_interval: 10
 optimizer:
   _target_: torch.optim.AdamW
   betas:
   - 0.9
   - 0.999
   eps: 1.0e-08
-  lr: 5.0e-05  # Slightly lower LR for stability with energy heads
+  lr: 5.0e-05
   weight_decay: 1.0e-04
 shape_meta:
   action:
@@ -73,9 +80,9 @@ policy:
   n_obs_steps: 4
   cond_dim: 256
   obs_as_global_cond: true
-  n_layer: 4
-  n_head: 8
-  n_emb: 512
+  n_layer: 8
+  n_head: 16
+  n_emb: 1024
   p_drop_emb: 0.1
   p_drop_attn: 0.1
   causal_attn: true
@@ -87,64 +94,69 @@ policy:
 
 # ========== Route B+: Compositional Energy Guidance ==========
 route_b:
-  num_samples: 1           # Diffusion denoising: single mode (no multi-candidate selection)
-  num_energy_modes: 32     # Energy head training: use all anchors for diverse pos/neg samples
-  num_inference_steps: 10  # 10-step DDIM (5x of Route A's 2-step)
-  guidance_scale: 0.1      # Global energy gradient scale (start small, tune up)
+  num_samples: 1           # Diffusion denoising: single mode
+  num_energy_modes: 32     # Energy head training: use all anchors
+  num_inference_steps: 10  # 10-step DDIM
+  guidance_scale: 0.1
   energy_collision_weight: 1.0
   energy_offroad_weight: 1.0
   energy_target_weight: 1.0
-  energy_loss_weight: 1.0  # Weight of energy loss in total training loss
-  train_max_timesteps: 100 # Train with timesteps in [0, 100)
-  # Route B+ additions
-  alignment_loss_weight: 0.1   # β — alignment loss (decoder → low energy)
-  num_gt_augmentations: 0      # GT augmentation disabled for now
-  use_safe_anchors: false      # Trust allowed anchor labels as positive samples
-  energy_noisy_training: false # Train energy heads on clean (t=0) or noisy (random t)
-  alignment_warmup_epochs: 50  # Let energy heads stabilize before alignment
-  energy_grad_clip_norm: 1.0   # Per-element gradient clipping during inference
+  energy_loss_weight: 1.0
+  train_max_timesteps: 100
+  alignment_loss_weight: 0.1
+  num_gt_augmentations: 0
+  use_safe_anchors: false
+  energy_noisy_training: false
+  alignment_warmup_epochs: 50
+  energy_grad_clip_norm: 1.0
 
 truncated_diffusion:
   num_train_timesteps: 1000
-  trunc_timesteps: 100     # Used as default for train_max_timesteps
+  trunc_timesteps: 100
   train_trunc_timesteps: 100
-  num_diffusion_steps: 10  # 10-step DDIM
+  num_diffusion_steps: 10
   eta: 0.0
   prediction_type: "sample"
-  norm_x_offset: 5.0
-  norm_x_range: 80.0
-  norm_y_offset: 25.0
-  norm_y_range: 55.0
+  norm_x_offset: 16.0
+  norm_x_range: 92.0
+  norm_y_offset: 45.0
+  norm_y_range: 88.0
+  norm_delta_x_mean: 1.84
+  norm_delta_x_std: 2.37
+  norm_delta_y_mean: -0.07
+  norm_delta_y_std: 0.90
   route_loss_weight: 0.6
-  use_normalized_forward: true
 
-# No anchors needed for Route B, but keep num_modes for sample count
 num_modes: 32
 cls_loss_weight: 0.0  # M=1: no multi-mode classification needed
 reg_loss_weight: 8.0
 
+dataset:
+  use_per_frame: false
+  cache_dir: null
+
 training:
   num_epochs: 500
   max_grad_norm: 1.0
-  warmup_epochs: 10  # Longer warmup for stability with energy guidance
+  warmup_epochs: 10
   use_lr_scheduler: true
-  dataset_path: /media/z/data/dataset/pdm_lite_mini
-  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data
+  image_data_root: /workspace1/z_project/dataset/pdm_lite
   sample_interval: 1
   lr_final: 1e-7
-  validation_freq: 5
+  validation_freq: 10
   save_freq: 5
   early_stopping_patience: 15
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy/
+  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_annealed_energy/
+validation:
+  max_batches: 0
 logging:
   use_wandb: true
   wandb_project: route_b_annealed_energy
-  run_name: route_b_v1
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy/
+  run_name: route_b_hpc_v1
+  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_annealed_energy/
   save_every: 5
   log_freq: 50
-  wandb_entity: m240117_z
-  wandb_api_key: bddb5a05a0820c1157702750c9f0ce60bcac2bba
 eval:
   num_episodes: 10
   max_steps: 500

@@ -103,7 +103,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Route B specific config
         route_b_cfg = config.get('route_b', {})
-        self.num_samples = route_b_cfg.get('num_samples', 32)  # number of noise candidates
+        self.num_samples = route_b_cfg.get('num_samples', 1)  # diffusion denoising: single mode
+        self.num_energy_modes = route_b_cfg.get('num_energy_modes', 32)  # energy training: multi-anchor
         self.num_inference_steps = route_b_cfg.get('num_inference_steps', 10)
         self.guidance_scale = route_b_cfg.get('guidance_scale', 1.0)  # global energy guidance multiplier
         self.energy_collision_weight = route_b_cfg.get('energy_collision_weight', 1.0)
@@ -145,7 +146,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             transfuser_bev_dim=self.bev_feature_dim,
             transfuser_bev_upsample_dim=self.bev_feature_upsample_dim,
             num_waypoints=num_waypoints,
-            num_modes=self.num_samples,
+            num_modes=self.num_energy_modes,
             traj_can_attend_route=policy_cfg.get('traj_can_attend_route', True),
             anchor_free=True,
             energy_heads=True,
@@ -268,7 +269,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
         B, T, D = trajectory.shape
-        M = self.num_samples
+        M = self.num_energy_modes  # use full anchor count for energy training
 
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
@@ -377,14 +378,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
     # ========== Phase 2: Diffusion Training + Alignment ==========
     def compute_diffusion_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Standard diffusion training + alignment loss.
+        Single-mode diffusion training + alignment loss.
 
         Training procedure:
-        1. Replicate GT trajectory across num_samples slots
+        1. GT trajectory as single mode (M=1), no replication needed
         2. Sample random timestep, add noise to GT
         3. Model predicts clean x_0 from noisy input
-        4. Losses: regression (L1), classification (focal), route (L1)
-        5. Alignment: encourage decoder to produce low-energy trajectories
+        4. Losses: regression (L1), route (L1), alignment (energy)
         """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
@@ -400,24 +400,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)
 
-        # ========== Prepare noisy trajectories ==========
+        # ========== Prepare noisy trajectory (M=1) ==========
         traj_normed = self.norm_odo(trajectory)  # (B, T, 2)
-        M = self.num_samples
-        traj_normed_expanded = traj_normed.unsqueeze(1).expand(-1, M, -1, -1)
+        traj_normed = traj_normed.unsqueeze(1)   # (B, 1, T, 2)
 
         timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
 
-        B_M = B * M
-        traj_flat = traj_normed_expanded.contiguous().view(B_M, T, D)
-        timesteps_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B_M)
-
-        noise = torch.randn(traj_flat.shape, dtype=torch.float32, device=device)
-        noisy_traj_flat = self.diffusion_scheduler.add_noise(
+        noise = torch.randn(B, 1, T, D, dtype=torch.float32, device=device)
+        traj_flat = traj_normed.view(B, T, D)
+        noisy_flat = self.diffusion_scheduler.add_noise(
             original_samples=traj_flat,
-            noise=noise,
-            timesteps=timesteps_expanded,
+            noise=noise.view(B, T, D),
+            timesteps=timesteps,
         )
-        noisy_traj = noisy_traj_flat.view(B, M, T, D)
+        noisy_traj = noisy_flat.view(B, 1, T, D)
         noisy_traj = torch.clamp(noisy_traj, -1, 1)
 
         # ========== Forward pass ==========
@@ -433,18 +429,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
 
         # Denorm predictions to absolute space
-        poses_reg_abs = self.denorm_odo(poses_reg)  # (B, M, T, 2)
+        poses_reg_abs = self.denorm_odo(poses_reg)  # (B, 1, T, 2)
 
         # ========== Regression Loss ==========
-        traj_expanded = trajectory.unsqueeze(1).expand(-1, M, -1, -1)
-        loss_reg = F.l1_loss(poses_reg_abs, traj_expanded, reduction='mean')
-
-        # ========== Classification Loss ==========
-        dist_per_sample = (poses_reg_abs - traj_expanded).norm(dim=-1).mean(dim=-1)  # (B, M)
-        best_idx = dist_per_sample.argmin(dim=-1)  # (B,)
-        target_onehot = torch.zeros(B, M, device=device, dtype=model_dtype)
-        target_onehot.scatter_(1, best_idx.unsqueeze(1), 1)
-        loss_cls = self._focal_loss(poses_cls, target_onehot)
+        traj_target = trajectory.unsqueeze(1)  # (B, 1, T, 2)
+        loss_reg = F.l1_loss(poses_reg_abs, traj_target, reduction='mean')
 
         # ========== Route Loss ==========
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -452,7 +441,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
 
         # ========== Alignment Loss ==========
-        # Encourage decoder to generate low-energy (safe) trajectories
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
         if self.alignment_loss_weight > 0 and energy_scores is not None and alignment_active:
@@ -465,7 +453,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # ========== Total Loss ==========
         total_loss = (
             self.reg_loss_weight * loss_reg
-            + self.cls_loss_weight * loss_cls
             + self.route_loss_weight * route_loss
             + self.alignment_loss_weight * alignment_loss
         )
@@ -473,7 +460,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_dict = {
             'total_loss': total_loss,
             'reg_loss': loss_reg,
-            'cls_loss': loss_cls,
+            'cls_loss': torch.tensor(0.0, device=device),
             'route_loss': route_loss,
             'alignment_loss': alignment_loss,
         }
@@ -605,34 +592,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             # Inject energy gradient guidance (subtract gradient to minimize energy)
             x_t = x_t - self.guidance_scale * grad
 
-        # ========== Select best trajectory ==========
-        final_abs = self.denorm_odo(torch.clamp(pred_x0_normed, -1, 1))  # (B, M, T, 2)
+        # ========== Output trajectory ==========
+        final_abs = self.denorm_odo(torch.clamp(pred_x0_normed, -1, 1))  # (B, 1, T, 2)
+        best_trajectory = final_abs.squeeze(1)  # (B, T, 2)
 
-        # Energy shielding: penalize high-energy candidates
-        if energy_scores is not None:
-            safe_logits = (
-                poses_cls
-                - w_col_cfg * energy_scores['collision']
-                - w_off_cfg * energy_scores['offroad']
-                - w_tgt_cfg * energy_scores['target']
-            )
-            best_idx = safe_logits.argmax(dim=-1)  # (B,)
-        else:
-            safe_logits = poses_cls
-            best_idx = poses_cls.argmax(dim=-1)  # (B,)
-
-        mode_idx_expanded = best_idx.view(B, 1, 1, 1).expand(-1, 1, T, 2)
-        best_trajectory = torch.gather(final_abs, 1, mode_idx_expanded).squeeze(1)  # (B, T, 2)
-
-        # Return rich output for visualization
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
             'route_pred': route_pred,                 # (B, 20, 2)
-            'all_trajectories': final_abs,            # (B, M, T, 2)
-            'energy_scores': energy_scores,           # dict of (B, M)
-            'poses_cls': poses_cls,                   # (B, M)
-            'safe_logits': safe_logits,               # (B, M)
-            'best_idx': best_idx,                     # (B,)
+            'all_trajectories': final_abs,            # (B, 1, T, 2)
+            'energy_scores': energy_scores,           # dict of (B, 1)
+            'poses_cls': poses_cls,                   # (B, 1)
+            'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
         }
 
     # ========== Predict Action (standard interface) ==========
