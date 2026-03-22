@@ -142,7 +142,7 @@ training:
   max_keep_ckpts: 5
   dataset_path: /media/z/data/dataset/pdm_lite_mini
   image_data_root: /media/z/data/dataset/pdm_lite_mini
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/bridge_traj_diffsped_20/
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/bd_hpc/
 validation:
   freq: 5
   max_batches: 16

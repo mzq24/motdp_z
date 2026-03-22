@@ -23,9 +23,9 @@ dd_baseline:
 
   # Trajectory head
   num_poses: 6              # waypoints per trajectory
-  ego_fut_mode: 20          # number of anchor modes
+  ego_fut_mode: 32          # number of anchor modes
   num_decoder_layers: 2     # stacked diffusion decoder layers
-  plan_anchor_path: /media/z/data/mzq/others/MoT-DP/dd_baseline/anchors/carla_kmeans_20.npy
+  plan_anchor_path: /media/z/data/mzq/others/MoT-DP/dd_baseline/anchors/carla_kmeans_32.npy
 
   # BEV physical range (meters)
   lidar_max_x: 32.0
@@ -103,7 +103,7 @@ training:
   max_keep_ckpts: 5
   dataset_path: /media/z/data/dataset/pdm_lite_mini
   image_data_root: /media/z/data/dataset/pdm_lite_mini
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/dd_baseline_white_noise_delta_dynamic_bev/
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/dd_baseline_white_noise_delta_dynamic_bev_32/
 
 # ========== Validation ==========
 validation:
@@ -118,5 +118,5 @@ model_optimization:
 logging:
   use_wandb: true
   wandb_project: debug_abs_traj_32
-  run_name: dd_baseline_white_noise_delta_dynamic_bev
+  run_name: dd_baseline_white_noise_delta_dynamic_bev_32
   log_freq: 50
