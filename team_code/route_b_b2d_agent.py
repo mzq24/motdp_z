@@ -136,40 +136,22 @@ def load_best_model(checkpoint_path, config, device):
     if not hasattr(np, '_core'):
         sys.modules['numpy._core'] = np.core
         sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
-    
-    # Load checkpoint to CPU first to save GPU memory
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    policy = AnnealedEnergyGuidancePolicy(config)
-    policy.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Print info before deleting checkpoint
-    epoch = checkpoint.get('epoch', 'N/A')
-    val_loss = checkpoint.get('val_loss', 'N/A')
-    train_loss = checkpoint.get('train_loss', 'N/A')
-    val_metrics = checkpoint.get('val_metrics', None)
-    
-    # Free checkpoint memory immediately
-    del checkpoint
+    policy, ckpt = AnnealedEnergyGuidancePolicy.load_checkpoint(checkpoint_path, config, device)
+
+    epoch = ckpt.get('epoch', 'N/A')
+    val_loss = ckpt.get('val_loss', 'N/A')
+    train_loss = ckpt.get('train_loss', 'N/A')
+
+    del ckpt
     import gc
     gc.collect()
-    
-    # Now move to device
-    policy = policy.to(device)
-    policy.eval()
-    
-    print(f"✓ Model loaded successfully!")
-    print(f"  - Epoch: {epoch}")
+
+    print(f"✓ Model loaded: epoch={epoch}")
     if isinstance(val_loss, float):
         print(f"  - Validation Loss: {val_loss:.4f}")
     if isinstance(train_loss, float):
         print(f"  - Training Loss: {train_loss:.4f}")
-    
-    if val_metrics:
-        print(f"  - Validation Metrics:")
-        for key, value in val_metrics.items():
-            if isinstance(value, (int, float)):
-                print(f"    {key}: {value:.4f}")
 
     return policy
 

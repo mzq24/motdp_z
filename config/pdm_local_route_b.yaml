@@ -4,6 +4,9 @@
 
 policy_type: anchor_free  # Use AnnealedEnergyGuidancePolicy
 anchor_path: dd_baseline/anchors/carla_kmeans_32.npy  # K-means anchor trajectories (32, 6, 2)
+# global_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/global_abs_stats.npz
+# abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats.npz  # per-step abs, for ablation
+delta_stats_path: /media/z/data/dataset/pdm_lite_mini/delta_stats.npz  # delta, for ablation
 
 device:
   gpu_ids:
@@ -34,7 +37,7 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
-  lr: 5.0e-05  # Slightly lower LR for stability with energy heads
+  lr: 5.0e-05  # Higher LR for Route B (pure diffusion from N(0,I) needs faster convergence)
   weight_decay: 1.0e-04
 shape_meta:
   action:
@@ -95,7 +98,7 @@ route_b:
   energy_offroad_weight: 1.0
   energy_target_weight: 1.0
   energy_loss_weight: 1.0  # Weight of energy loss in total training loss
-  train_max_timesteps: 100 # Train with timesteps in [0, 100)
+  train_max_timesteps: 1000 # Full range for pure N(0,I) diffusion (must match num_train_timesteps)
   # Route B+ additions
   alignment_loss_weight: 0.1   # β — alignment loss (decoder → low energy)
   num_gt_augmentations: 0      # GT augmentation disabled for now
@@ -106,17 +109,14 @@ route_b:
 
 truncated_diffusion:
   num_train_timesteps: 1000
-  trunc_timesteps: 100     # Used as default for train_max_timesteps
-  train_trunc_timesteps: 100
+  trunc_timesteps: 1000    # Full range for Route B (pure N(0,I) diffusion)
+  train_trunc_timesteps: 1000
   num_diffusion_steps: 10  # 10-step DDIM
   eta: 0.0
   prediction_type: "sample"
-  norm_x_offset: 5.0
-  norm_x_range: 80.0
-  norm_y_offset: 25.0
-  norm_y_range: 55.0
   route_loss_weight: 0.6
-  use_normalized_forward: true
+  # Normalization: delta z-score (per-step mean/std from delta_stats_path)
+  # Old norm_x_offset/range/y_offset/range removed — no longer used
 
 # No anchors needed for Route B, but keep num_modes for sample count
 num_modes: 32
@@ -124,7 +124,7 @@ cls_loss_weight: 0.0  # M=1: no multi-mode classification needed
 reg_loss_weight: 8.0
 
 training:
-  num_epochs: 500
+  num_epochs: 300
   max_grad_norm: 1.0
   warmup_epochs: 10  # Longer warmup for stability with energy guidance
   use_lr_scheduler: true

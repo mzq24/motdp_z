@@ -3,6 +3,7 @@
 
 policy_type: anchor_free  # Use AnnealedEnergyGuidancePolicy
 anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
+global_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/global_abs_stats.npz
 
 device:
   gpu_ids:
@@ -117,15 +118,9 @@ truncated_diffusion:
   num_diffusion_steps: 10
   eta: 0.0
   prediction_type: "sample"
-  norm_x_offset: 16.0
-  norm_x_range: 92.0
-  norm_y_offset: 45.0
-  norm_y_range: 88.0
-  norm_delta_x_mean: 1.84
-  norm_delta_x_std: 2.37
-  norm_delta_y_mean: -0.07
-  norm_delta_y_std: 0.90
   route_loss_weight: 0.6
+  # Normalization: delta z-score (per-step mean/std from delta_stats_path)
+  # Old norm params removed — no longer used
 
 num_modes: 32
 cls_loss_weight: 0.0  # M=1: no multi-mode classification needed

@@ -1320,6 +1320,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
         # Dedicated diffusion mode query (single-mode denoising in Route B)
         self.diff_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
+        # Dedicated GT mode query (unified training: GT slot in energy evaluation)
+        self.gt_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
         # Extra learnable query for VLM anchor (33rd mode), used when use_vqa_anchor=True
         self.vqa_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
 
@@ -1377,18 +1379,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(n_emb // 2, 1),
         )
 
-        # Energy evaluator heads (Route B: for classifier guidance)
+        # Energy evaluator heads (Route B: evaluate pred_x0 + scene context)
+        # Input: concat(pred_x0_flat, mode_out) = (B, M, horizon*output_dim + n_emb)
+        #   - pred_x0_flat: trajectory being evaluated (gradient flows back for guidance)
+        #   - mode_out: scene context from BEV attention + ego status (provides scene understanding)
         if energy_heads:
+            energy_in_dim = self.horizon * self.output_dim + n_emb  # T*2 + n_emb
             self.energy_collision_head = nn.Sequential(
-                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
                 nn.Linear(n_emb // 2, 1),
             )
             self.energy_offroad_head = nn.Sequential(
-                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
                 nn.Linear(n_emb // 2, 1),
             )
             self.energy_target_head = nn.Sequential(
-                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
                 nn.Linear(n_emb // 2, 1),
             )
 
@@ -1490,33 +1496,37 @@ class TransformerForDiffusion(ModuleAttrMixin):
     
     def forward(
         self,
-        anchors: torch.Tensor,
+        x_t: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
         ego_status: torch.Tensor,
-        anchors_abs: Optional[torch.Tensor] = None,
+        x_t_abs: Optional[torch.Tensor] = None,
         behavior_labels: torch.Tensor = None,
         allowed_flags: torch.Tensor = None,
+        traj_for_energy: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """
         Multimodal forward pass for trajectory prediction.
 
         Args:
-            anchors: (B, num_modes, anchor_num_points, 2) - anchors in normalized space
-                     (kept for diffusion state compatibility)
+            x_t: (B, num_modes, anchor_num_points, 2) - current denoising trajectory in normalized space
             timestep: diffusion timestep (for conditioning, can be 0 at inference)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature from transfuser
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upsampled BEV for spatial attention
             ego_status: (B, T_obs, status_dim) - ego status history
-            anchors_abs: (B, num_modes, anchor_num_points, 2) - anchors in absolute coords for BEV grid_sample.
-                         If None, uses `anchors` directly (backward compatible).
+            x_t_abs: (B, num_modes, anchor_num_points, 2) - current denoising trajectory in absolute coords for BEV grid_sample.
+                     If None, uses `x_t` directly (backward compatible).
+            traj_for_energy: (B, M, T, 2) optional - trajectory for energy head evaluation.
+                     Training: original anchor coords (labels match these, not model output).
+                     Inference: pred_x0 from first forward pass (gradient flows back for guidance).
+                     If None, uses poses_reg (model output).
 
         Returns:
             poses_reg: (B, num_modes, horizon, 2) - trajectory predictions for each mode.
                       Output space follows residual base:
-                      - absolute space if anchors_abs is provided
+                      - absolute space if x_t_abs is provided
                       - normalized space otherwise (backward compatibility)
             poses_cls: (B, num_modes) - classification logits for mode selection
             route_pred: (B, num_waypoints, 2) - route prediction
@@ -1524,17 +1534,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
         model_dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
 
-        anchors = anchors.contiguous().to(device=device, dtype=model_dtype)
+        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
         transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
         ego_status = ego_status.to(device=device, dtype=model_dtype)
 
-        # BEV sampling uses absolute coords; fallback to anchors for backward compat
-        bev_traj_points = anchors_abs.contiguous().to(device=device, dtype=model_dtype) if anchors_abs is not None else anchors
-        
-        B = anchors.shape[0]
-        num_modes = anchors.shape[1]
-        anchor_num_points = anchors.shape[2]
+        # BEV sampling uses absolute coords; fallback to x_t for backward compat
+        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
+
+        B = x_t.shape[0]
+        num_modes = x_t.shape[1]
+        anchor_num_points = x_t.shape[2]
         
         # ========== Timestep handling ==========
         if not torch.is_tensor(timestep):
@@ -1568,10 +1578,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         # Add learnable mode queries (select based on input M)
         M = anchor_emb.shape[1]
+        M_anchor = self.mode_queries.shape[1]  # num_energy_modes (e.g. 32)
         if M == 1 and self.anchor_free:
             # Single-mode diffusion denoising: use dedicated diff_mode_query
             mode_queries = self.diff_mode_query
-        elif M > self.mode_queries.shape[1]:
+        elif self.anchor_free and M > M_anchor:
+            # Unified training: M = 1 (x_t) + M_anchor (32) + 1 (GT) = 34
+            # - Slot  [0]:            x_t — diff_mode_query (matches M=1 inference position)
+            # - Slots [1, M_anchor+1): anchor mode_queries
+            # - Slot  [M_anchor+1]:    GT — dedicated gt_mode_query
+            mode_queries = torch.cat([self.diff_mode_query, self.mode_queries, self.gt_mode_query], dim=1)  # (1, 34, n_emb)
+        elif M > M_anchor:
             # VLM anchor added: concatenate vqa_mode_query for the extra mode
             mode_queries = torch.cat([self.mode_queries, self.vqa_mode_query], dim=1)
         else:
@@ -1595,7 +1612,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         # ========== UnifiedDecoderOnlyTransformer ==========
         # traj_emb = mode_emb (B, num_modes, n_emb) - each mode is one "trajectory query"
-        # traj_points = anchors (B, num_modes, horizon, 2) - each mode samples BEV at its anchor waypoints
+        # traj_points = bev_traj_points (B, num_modes, horizon, 2) - each mode samples BEV at its waypoints
         # The decoder internally builds route_queries and returns (mode_out, route_out)
         mode_out, route_out = self.decoder(
             traj_emb=mode_emb,
@@ -1626,12 +1643,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # 3. Route prediction from unified decoder output
         route_pred = self.route_head(route_out, conditioning, current_status)  # (B, num_waypoints, 2)
 
-        # 4. Energy scores (Route B: for classifier guidance)
+        # 4. Energy scores (Route B: evaluate trajectory + scene context)
+        #    traj_for_energy: the trajectory to evaluate (anchor coords for training, pred_x0 for inference)
+        #    mode_out: scene context from BEV attention (computed from the evaluated trajectory's path)
+        #    At inference, gradient of energy w.r.t. traj_for_energy flows back for guidance.
         if self.energy_heads_enabled:
+            # Use external trajectory if provided (training: original anchors), else model output (inference)
+            eval_traj = traj_for_energy if traj_for_energy is not None else poses_reg
+            eval_traj_flat = eval_traj.flatten(-2)  # (B, M, horizon * 2)
+            energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)  # (B, M, T*2 + n_emb)
             energy_scores = {
-                'collision': self.energy_collision_head(mode_out).squeeze(-1),  # (B, M)
-                'offroad': self.energy_offroad_head(mode_out).squeeze(-1),      # (B, M)
-                'target': self.energy_target_head(mode_out).squeeze(-1),        # (B, M)
+                'collision': self.energy_collision_head(energy_input).squeeze(-1),  # (B, M)
+                'offroad': self.energy_offroad_head(energy_input).squeeze(-1),      # (B, M)
+                'target': self.energy_target_head(energy_input).squeeze(-1),        # (B, M)
             }
             return poses_reg, poses_cls, route_pred, mode_out, energy_scores
 
@@ -1669,17 +1693,17 @@ def test():
     
     B = 4
     timestep = torch.tensor(0)
-    anchors = torch.randn((B, 32, 8, 2))  # (B, num_modes, anchor_num_points=horizon, 2)
-    
+    x_t = torch.randn((B, 32, 8, 2))  # (B, num_modes, anchor_num_points=horizon, 2)
+
     # Transfuser features (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
     transfuser_bev_feature = torch.randn((B, 1512, 8, 8))
     transfuser_bev_feature_upsample = torch.randn((B, 64, 64, 64))
-    
+
     ego_status = torch.randn((B, 4, 14))  # 4 frames of history with updated dim
-    
+
     print("\nTest 1: Basic forward pass (multimodal)")
     poses_reg, poses_cls, route_pred, mode_out = transformer(
-        anchors=anchors, timestep=timestep,
+        x_t=x_t, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
         ego_status=ego_status,
@@ -1690,11 +1714,11 @@ def test():
     assert poses_reg.shape == (B, 32, 8, 2), f"Expected (B, 32, 8, 2), got {poses_reg.shape}"
     assert poses_cls.shape == (B, 32), f"Expected (B, 32), got {poses_cls.shape}"
     assert route_pred.shape == (B, 20, 2), f"Expected (B, 20, 2), got {route_pred.shape}"
-    
+
     print("\nTest 2: Different BEV features affect output")
     transfuser_bev_feature2 = torch.randn((B, 1512, 8, 8))
     poses_reg2, _, _ = transformer(
-        anchors=anchors, timestep=timestep,
+        x_t=x_t, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature2,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
         ego_status=ego_status,
@@ -1702,18 +1726,18 @@ def test():
     diff = torch.abs(poses_reg - poses_reg2).mean()
     print(f"  Difference: {diff:.6f}")
     assert diff > 0, "BEV features should affect output"
-    
-    print("\nTest 3: Different anchors affect output")
-    anchors2 = torch.randn((B, 32, 8, 2))
+
+    print("\nTest 3: Different x_t affect output")
+    x_t2 = torch.randn((B, 32, 8, 2))
     poses_reg3, _, _ = transformer(
-        anchors=anchors2, timestep=timestep,
+        x_t=x_t2, timestep=timestep,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
         ego_status=ego_status,
     )
-    diff_anchors = torch.abs(poses_reg - poses_reg3).mean()
-    print(f"  Difference: {diff_anchors:.6f}")
-    assert diff_anchors > 0, "Anchors should affect output"
+    diff_x_t = torch.abs(poses_reg - poses_reg3).mean()
+    print(f"  Difference: {diff_x_t:.6f}")
+    assert diff_x_t > 0, "x_t should affect output"
     
     print("\nTest 4: Optimizer")
     opt = transformer.configure_optimizers()
@@ -1723,7 +1747,7 @@ def test():
     print("✓ All tests passed!")
     print("=" * 60)
     print("\nArchitecture (Multimodal DiffusionDrive style):")
-    print("  1. Input: anchors (B, num_modes, anchor_points, 2)")
+    print("  1. Input: x_t (B, num_modes, anchor_points, 2)")
     print("  2. Output: ")
     print("     - poses_reg: (B, num_modes, horizon, 2) - trajectory predictions")
     print("     - poses_cls: (B, num_modes) - mode classification logits")

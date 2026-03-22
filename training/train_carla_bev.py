@@ -134,13 +134,21 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                     batch[key] = batch[key].to(device, non_blocking=True)
 
             with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                loss_dict = model_for_inference.compute_loss(batch)
+                # Use unified forward for Route B+ to match training (position encoding consistency)
+                if hasattr(model_for_inference, 'compute_unified_loss') and \
+                   getattr(model_for_inference, 'anchor_centers_abs', None) is not None:
+                    loss_dict = model_for_inference(batch, return_loss_dict=True, phase='unified')
+                else:
+                    loss_dict = model_for_inference.compute_loss(batch)
                 loss = loss_dict['total_loss']
             if rank == 0:
                 val_metrics['loss'].append(loss.item())
                 val_metrics['cls_loss'].append(loss_dict['cls_loss'].item())
                 val_metrics['reg_loss'].append(loss_dict['reg_loss'].item())
                 val_metrics['route_loss'].append(loss_dict['route_loss'].item())
+                if 'energy_loss' in loss_dict:
+                    val_metrics['energy_loss'].append(loss_dict['energy_loss'].item())
+                    val_metrics['alignment_loss'].append(loss_dict['alignment_loss'].item())
                 
                 # Multimodal model: only needs bev_feature, bev_feature_upsample, ego_status
                 # No more reasoning_query_tokens or anchor needed (anchor is loaded from wp_tokens.pkl)
@@ -175,10 +183,16 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                         val_metrics[key].append(value)
 
                     # Also log 1-step DDIM L2 metrics for direct comparison
+                    # Support both Route A (num_diffusion_steps) and Route B (num_inference_steps)
+                    steps_attr = None
                     if hasattr(model_for_inference, 'num_diffusion_steps'):
-                        original_num_steps = model_for_inference.num_diffusion_steps
+                        steps_attr = 'num_diffusion_steps'
+                    elif hasattr(model_for_inference, 'num_inference_steps'):
+                        steps_attr = 'num_inference_steps'
+                    if steps_attr is not None:
+                        original_num_steps = getattr(model_for_inference, steps_attr)
                         try:
-                            model_for_inference.num_diffusion_steps = 1
+                            setattr(model_for_inference, steps_attr, 1)
                             result_1step = model_for_inference.predict_action(
                                 obs_dict, no_noise=False, use_server_style=False, gt_trajectory=target_actions
                             )
@@ -198,7 +212,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                             for key, value in driving_metrics_1step.items():
                                 val_metrics[f'{key}_1step'].append(value)
                         finally:
-                            model_for_inference.num_diffusion_steps = original_num_steps
+                            setattr(model_for_inference, steps_attr, original_num_steps)
                     
                     # Compute route prediction metrics if route ground truth is available
                     if 'route' in batch and batch['route'] is not None and 'route_pred' in result:
@@ -217,7 +231,11 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                             pass
 
                     pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
-                except Exception:
+                except Exception as e:
+                    if batch_idx == 0:
+                        import traceback
+                        print(f"\n[Val] predict_action failed: {e}")
+                        traceback.print_exc()
                     continue
         
         if rank == 0:
@@ -539,6 +557,29 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         policy = AnnealedEnergyGuidancePolicy(config).to(device)
         if rank == 0:
             print(f"  Policy: AnnealedEnergyGuidancePolicy (Route B+ - anchor-free)")
+        # Register normalization stats (before DDP wrapping)
+        # Priority: global_abs > per-step abs > delta (legacy)
+        global_abs_stats_path = config.get('global_abs_stats_path', None)
+        abs_stats_path = config.get('abs_stats_path', None)
+        delta_stats_path = config.get('delta_stats_path', None)
+        if global_abs_stats_path:
+            gdata = np.load(global_abs_stats_path)
+            policy.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
+            if rank == 0:
+                print(f"  ✓ Global abs stats registered: mean={gdata['global_abs_mean']}, std={gdata['global_abs_std']}")
+        elif abs_stats_path:
+            abs_data = np.load(abs_stats_path)
+            policy.register_abs_stats(abs_data['abs_mean'], abs_data['abs_std'])
+            if rank == 0:
+                print(f"  ✓ Per-step abs stats registered: mean={abs_data['abs_mean'].shape}, std={abs_data['abs_std'].shape}")
+        elif delta_stats_path:
+            delta_data = np.load(delta_stats_path)
+            policy.register_delta_stats(delta_data['delta_mean'], delta_data['delta_std'])
+            if rank == 0:
+                print(f"  ✓ Delta stats registered (legacy): mean={delta_data['delta_mean'].shape}, std={delta_data['delta_std'].shape}")
+        else:
+            if rank == 0:
+                print(f"  ⚠ No normalization stats configured — will fail!")
         # Register anchor trajectories for energy head training (before DDP wrapping)
         anchor_path = config.get('anchor_path', None)
         if anchor_path:
@@ -732,8 +773,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             if rank == 0:
                 print(f"\n✓ Validation completed")
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
+                l2_keys = ['val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
+                            'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
+                for key in l2_keys:
+                    if key in val_metrics:
+                        tag = " (1-step)" if "_1step" in key else ""
+                        print(f"  >>> {key}: {val_metrics[key]:.4f}{tag}")
                 for key, value in val_metrics.items():
-                    print(f"  {key}: {value:.4f}")
+                    if key not in l2_keys:
+                        print(f"  {key}: {value:.4f}")
         except Exception as e:
             if rank == 0:
                 print(f"✗ Error during validation: {e}")
@@ -781,33 +829,30 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
 
             if policy_type == 'anchor_free' and optimizer_energy is not None:
-                # ===== Route B+: Two-phase training (GAN-style) =====
+                # ===== Route B+: Unified single-forward training =====
+                # One forward pass with 34 modes (32 anchor + 1 GT + 1 x_t),
+                # then separate backward for energy heads vs diffusion decoder.
 
-                # --- Phase 1: Train energy heads (考官学打分) ---
                 optimizer_energy.zero_grad(set_to_none=True)
-                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    energy_dict = policy(batch, return_loss_dict=True, phase='energy')
-                    energy_loss = energy_dict['total_loss']
-
-                if not (torch.isnan(energy_loss) or torch.isinf(energy_loss)):
-                    scaler.scale(energy_loss).backward()
-                    scaler.unscale_(optimizer_energy)
-                    torch.nn.utils.clip_grad_norm_(energy_params, max_norm=max_grad_norm)
-                    scaler.step(optimizer_energy)
-                    scaler.update()
-
-                # --- Phase 2: Train diffusion decoder (学先验 + alignment) ---
                 optimizer.zero_grad(set_to_none=True)
-                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    diff_dict = policy(batch, return_loss_dict=True, phase='diffusion')
-                    diff_loss = diff_dict['total_loss']
 
-                if torch.isnan(diff_loss) or torch.isinf(diff_loss):
+                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                    loss_dict = policy(batch, return_loss_dict=True, phase='unified')
+                    total_loss = loss_dict['total_loss']
+
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
                     if rank == 0:
-                        print(f"Warning: NaN/Inf diff_loss at batch {batch_idx}, skipping")
+                        print(f"Warning: NaN/Inf total_loss at batch {batch_idx}, skipping")
                     continue
 
-                scaler.scale(diff_loss).backward()
+                scaler.scale(total_loss).backward()
+
+                # Clip and step energy optimizer
+                scaler.unscale_(optimizer_energy)
+                torch.nn.utils.clip_grad_norm_(energy_params, max_norm=max_grad_norm)
+                scaler.step(optimizer_energy)
+
+                # Clip and step diffusion optimizer
                 scaler.unscale_(optimizer)
                 diff_params_for_clip = [p for p in (policy.module if world_size > 1 else policy).parameters()
                                         if id(p) not in energy_param_ids]
@@ -817,18 +862,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     if rank == 0:
                         print(f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping")
                     optimizer.zero_grad()
+                    optimizer_energy.zero_grad()
+                    scaler.update()
                     continue
 
                 scaler.step(optimizer)
                 scaler.update()
 
-                # Combine for logging
-                loss = diff_loss
-                loss_dict = diff_dict
-                loss_dict['energy_loss'] = energy_dict.get('energy_loss', torch.tensor(0.0))
-                loss_dict['energy_col_loss'] = energy_dict.get('energy_col_loss', torch.tensor(0.0))
-                loss_dict['energy_off_loss'] = energy_dict.get('energy_off_loss', torch.tensor(0.0))
-                loss_dict['energy_tgt_loss'] = energy_dict.get('energy_tgt_loss', torch.tensor(0.0))
+                loss = total_loss
             else:
                 # ===== Route A: Single-phase training (unchanged) =====
                 optimizer.zero_grad(set_to_none=True)
@@ -1009,8 +1050,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 safe_wandb_log(log_dict, use_wandb)
 
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
+                l2_keys = ['val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
+                            'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
+                for key in l2_keys:
+                    if key in val_metrics:
+                        tag = " (1-step)" if "_1step" in key else ""
+                        print(f"  >>> {key}: {val_metrics[key]:.4f}{tag}")
                 for key, value in val_metrics.items():
-                    print(f"  {key}: {value:.4f}")
+                    if key not in l2_keys:
+                        print(f"  {key}: {value:.4f}")
 
                 val_loss = val_metrics.get('val_loss', float('inf'))
                 l2_avg = val_metrics.get('val_L2_avg', float('inf'))

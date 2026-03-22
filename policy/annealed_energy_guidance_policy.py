@@ -161,11 +161,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                                                     diffusion_cfg.get('trunc_timesteps', 100))
         self.prediction_type = diffusion_cfg.get('prediction_type', 'sample')
 
-        # Coordinate normalization to [-1, 1]
-        self.norm_x_offset = diffusion_cfg.get('norm_x_offset', 2.0)
-        self.norm_x_range = diffusion_cfg.get('norm_x_range', 80.0)
-        self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)
-        self.norm_y_range = diffusion_cfg.get('norm_y_range', 56.0)
+        # Delta z-score normalization buffers (legacy, for ablation)
+        self.register_buffer('delta_mean', None)  # (T, 2)
+        self.register_buffer('delta_std', None)   # (T, 2)
+        # Per-timestep abs z-score normalization buffers (ablation)
+        self.register_buffer('abs_mean', None)  # (T, 2)
+        self.register_buffer('abs_std', None)   # (T, 2)
+        # Global abs z-score normalization buffers
+        self.register_buffer('global_abs_mean', None)  # (2,)
+        self.register_buffer('global_abs_std', None)   # (2,)
 
         # Loss weights
         self.cls_loss_weight = config.get('cls_loss_weight', 0.5)
@@ -212,20 +216,129 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             aug[:, k, 1:] = aug[:, k, :1] + displacements * scale
         return aug  # (B, K, T, 2)
 
-    # ========== Normalization ==========
-    def norm_odo(self, odo: torch.Tensor) -> torch.Tensor:
-        x = odo[..., 0:1]
-        y = odo[..., 1:2]
-        x = 2 * (x + self.norm_x_offset) / self.norm_x_range - 1
-        y = 2 * (y + self.norm_y_offset) / self.norm_y_range - 1
-        return torch.cat([x, y], dim=-1)
+    # ========== Delta Stats Registration ==========
+    def register_delta_stats(self, delta_mean, delta_std):
+        """Register per-step delta mean/std for z-score normalization.
+        Must be called before DDP wrapping.
 
-    def denorm_odo(self, odo: torch.Tensor) -> torch.Tensor:
-        x = odo[..., 0:1]
-        y = odo[..., 1:2]
-        x = (x + 1) / 2 * self.norm_x_range - self.norm_x_offset
-        y = (y + 1) / 2 * self.norm_y_range - self.norm_y_offset
-        return torch.cat([x, y], dim=-1)
+        Args:
+            delta_mean: (T, 2) per-step delta mean
+            delta_std: (T, 2) per-step delta std
+        """
+        if isinstance(delta_mean, np.ndarray):
+            delta_mean = torch.from_numpy(delta_mean).float()
+        if isinstance(delta_std, np.ndarray):
+            delta_std = torch.from_numpy(delta_std).float()
+        device = next(self.parameters()).device
+        self.register_buffer('delta_mean', delta_mean.to(device))
+        self.register_buffer('delta_std', delta_std.to(device))
+
+    # ========== Normalization: Delta Z-Score ==========
+    @staticmethod
+    def abs_to_delta(abs_traj: torch.Tensor) -> torch.Tensor:
+        """Convert absolute trajectory to delta: [p0, p1-p0, p2-p1, ...]"""
+        delta = abs_traj.clone()
+        delta[..., 1:, :] = abs_traj[..., 1:, :] - abs_traj[..., :-1, :]
+        return delta
+
+    @staticmethod
+    def delta_to_abs(delta: torch.Tensor) -> torch.Tensor:
+        """Convert delta to absolute trajectory via cumulative sum."""
+        return delta.cumsum(dim=-2)
+
+    def z_norm(self, delta: torch.Tensor) -> torch.Tensor:
+        """Z-score normalize delta using per-step mean/std.
+        delta: (..., T, 2)  ->  z: (..., T, 2)
+        """
+        mean = self.delta_mean.to(delta.device)  # (T, 2)
+        std = self.delta_std.to(delta.device)     # (T, 2)
+        return (delta - mean) / std.clamp(min=1e-6)
+
+    def z_denorm(self, z: torch.Tensor) -> torch.Tensor:
+        """Inverse z-score: z -> delta.
+        z: (..., T, 2)  ->  delta: (..., T, 2)
+        """
+        mean = self.delta_mean.to(z.device)  # (T, 2)
+        std = self.delta_std.to(z.device)    # (T, 2)
+        return z * std + mean
+
+    def norm_to_abs(self, z: torch.Tensor) -> torch.Tensor:
+        """Inverse: z-normed -> absolute trajectory.
+        Priority: global_abs > per-step abs > delta (legacy).
+        """
+        if self.global_abs_mean is not None:
+            return self.global_abs_z_denorm(z)
+        if self.abs_mean is not None:
+            return self.abs_z_denorm(z)
+        return self.delta_to_abs(self.z_denorm(z))
+
+    def abs_to_norm(self, abs_traj: torch.Tensor) -> torch.Tensor:
+        """Forward: absolute trajectory -> z-normed.
+        Priority: global_abs > per-step abs > delta (legacy).
+        """
+        if self.global_abs_mean is not None:
+            return self.global_abs_z_norm(abs_traj)
+        if self.abs_mean is not None:
+            return self.abs_z_norm(abs_traj)
+        return self.z_norm(self.abs_to_delta(abs_traj))
+
+    # ========== Normalization: Per-Timestep Abs Z-Score ==========
+    def register_abs_stats(self, abs_mean, abs_std):
+        """Register per-step abs mean/std for z-score normalization.
+        Must be called before DDP wrapping.
+        """
+        if isinstance(abs_mean, np.ndarray):
+            abs_mean = torch.from_numpy(abs_mean).float()
+        if isinstance(abs_std, np.ndarray):
+            abs_std = torch.from_numpy(abs_std).float()
+        device = next(self.parameters()).device
+        self.register_buffer('abs_mean', abs_mean.to(device))
+        self.register_buffer('abs_std', abs_std.to(device))
+
+    def abs_z_norm(self, abs_traj: torch.Tensor) -> torch.Tensor:
+        """Per-timestep z-score on absolute coordinates.
+        abs_traj: (..., T, 2)  ->  z: (..., T, 2)
+        """
+        mean = self.abs_mean.to(abs_traj.device)  # (T, 2)
+        std = self.abs_std.to(abs_traj.device)     # (T, 2)
+        return (abs_traj - mean) / std.clamp(min=1e-6)
+
+    def abs_z_denorm(self, z: torch.Tensor) -> torch.Tensor:
+        """Inverse per-timestep z-score -> absolute coordinates.
+        z: (..., T, 2)  ->  abs_traj: (..., T, 2)
+        """
+        mean = self.abs_mean.to(z.device)  # (T, 2)
+        std = self.abs_std.to(z.device)    # (T, 2)
+        return z * std + mean
+
+    # ========== Normalization: Global Abs Z-Score ==========
+    def register_global_abs_stats(self, global_abs_mean, global_abs_std):
+        """Register global abs mean/std for z-score normalization.
+        All timesteps share the same (2,) mean/std — preserves temporal structure.
+        """
+        if isinstance(global_abs_mean, np.ndarray):
+            global_abs_mean = torch.from_numpy(global_abs_mean).float()
+        if isinstance(global_abs_std, np.ndarray):
+            global_abs_std = torch.from_numpy(global_abs_std).float()
+        device = next(self.parameters()).device
+        self.register_buffer('global_abs_mean', global_abs_mean.to(device))
+        self.register_buffer('global_abs_std', global_abs_std.to(device))
+
+    def global_abs_z_norm(self, abs_traj: torch.Tensor) -> torch.Tensor:
+        """Global z-score: all timesteps share same mean/std.
+        abs_traj: (..., T, 2)  ->  z: (..., T, 2)
+        """
+        mean = self.global_abs_mean.to(abs_traj.device)  # (2,)
+        std = self.global_abs_std.to(abs_traj.device)     # (2,)
+        return (abs_traj - mean) / std.clamp(min=1e-6)
+
+    def global_abs_z_denorm(self, z: torch.Tensor) -> torch.Tensor:
+        """Inverse global z-score -> absolute coordinates.
+        z: (..., T, 2)  ->  abs_traj: (..., T, 2)
+        """
+        mean = self.global_abs_mean.to(z.device)  # (2,)
+        std = self.global_abs_std.to(z.device)    # (2,)
+        return z * std + mean
 
     # ========== Focal Loss (same as Route A) ==========
     def _focal_loss(self, logits, targets, gamma=2.0, alpha=0.25):
@@ -235,16 +348,31 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         focal_weight = alpha * (1 - p_t) ** gamma
         return (focal_weight * bce).mean()
 
+    # ========== Energy Head Eval with Detached Weights ==========
+    @staticmethod
+    def _eval_energy_head_detached(head: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate an energy head using detached weights.
+        Gradients flow back to input x, but NOT to head parameters.
+        head: nn.Sequential(Linear, SiLU, Linear)
+        """
+        x = F.linear(x, head[0].weight.detach(), head[0].bias.detach())
+        x = F.silu(x)
+        x = F.linear(x, head[2].weight.detach(), head[2].bias.detach())
+        return x
+
     # ========== Forward (DDP-compatible) ==========
     def forward(self, batch: Dict[str, torch.Tensor],
                 return_loss_dict: bool = False,
-                phase: str = 'diffusion'):
+                phase: str = 'unified'):
         """
-        DDP-compatible forward. Use `phase` to select training phase:
-          - 'energy': Phase 1 — train energy heads on anchors + GT augmentation
-          - 'diffusion': Phase 2 — train decoder (diffusion loss + alignment)
+        DDP-compatible forward.
+          - 'unified': Single forward pass for both energy + diffusion training (default)
+          - 'energy': Phase 1 only — train energy heads (legacy, for ablation)
+          - 'diffusion': Phase 2 only — train decoder (legacy, for ablation)
         """
-        if phase == 'energy':
+        if phase == 'unified':
+            loss_dict = self.compute_unified_loss(batch)
+        elif phase == 'energy':
             loss_dict = self.compute_energy_loss(batch)
         else:
             loss_dict = self.compute_diffusion_loss(batch)
@@ -254,7 +382,245 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         else:
             return loss_dict['total_loss']
 
-    # ========== Phase 1: Energy Head Training ==========
+    # ========== Unified Training: Single Forward Pass ==========
+    def compute_unified_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Unified single-forward training for both energy heads and diffusion decoder.
+
+        Constructs M_total = M_anchor + 1 (GT) + 1 (x_t) modes in one forward pass:
+          - Slots [0, M_anchor): anchor trajectories (with behavior labels from dataset)
+          - Slot [M_anchor]: GT trajectory (clean, labeled safe)
+          - Slot [M_anchor+1]: noisy GT trajectory (x_t for diffusion denoising)
+
+        Mode queries:
+          - Slots [0, M_anchor+1): use mode_queries (anchor + GT share anchor query space)
+          - Slot [M_anchor+1]: uses diff_mode_query (dedicated diffusion query)
+
+        Energy head evaluates original anchor/GT coords via traj_for_energy (not model output).
+        Diffusion loss computed only on the last slot's poses_reg.
+
+        Anchor isolation in decoder self-attention ensures no information leak between modes.
+        """
+        device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
+
+        trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
+        B, T, D = trajectory.shape
+        M_anchor = self.num_energy_modes  # 32
+
+        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
+
+        route_gt = batch.get('route', None)
+        if route_gt is not None:
+            route_gt = route_gt.to(device=device, dtype=model_dtype)
+
+        behavior_labels = batch.get('behavior_labels', None)  # (B, M_anchor) or None
+        allowed_flags = batch.get('allowed_flags', None)      # (B, M_anchor) or None
+
+        has_energy = (self.anchor_centers_abs is not None
+                      and behavior_labels is not None
+                      and allowed_flags is not None)
+
+        # ========== Build anchor slots (32) ==========
+        if has_energy:
+            anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1).clone()  # (B, M_anchor, T, 2)
+            behavior_labels_dev = behavior_labels.to(device=device).clone()
+            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype).clone()
+
+            # Replace first K slots with GT augmentation
+            K = min(self.num_gt_augmentations, M_anchor)
+            if K > 0:
+                gt_aug = self._augment_gt(trajectory, K)  # (B, K, T, 2)
+                anchor_abs[:, :K] = gt_aug
+                behavior_labels_dev[:, :K] = 0
+                allowed_flags_dev[:, :K] = 1.0
+
+        # ========== Build GT slot (1) ==========
+        gt_abs = trajectory.unsqueeze(1)  # (B, 1, T, 2)
+
+        # ========== Build x_t slot (1): noisy GT for diffusion ==========
+        traj_normed = self.abs_to_norm(trajectory)  # (B, T, 2)
+        diff_timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
+
+        noise = torch.randn(B, T, D, dtype=torch.float32, device=device)
+        noisy_flat = self.diffusion_scheduler.add_noise(
+            original_samples=traj_normed,
+            noise=noise,
+            timesteps=diff_timesteps,
+        )
+        noisy_traj = noisy_flat.unsqueeze(1)  # (B, 1, T, D)
+
+        # ========== Concatenate all slots into unified input ==========
+        # IMPORTANT: x_t (diffusion) is at position 0 to match M=1 inference (predict_action).
+        # Order: [x_t(0), anchors(1-32), GT(33)]
+        if has_energy:
+            # Energy anchor input: normalize anchors
+            anchor_normed = self.abs_to_norm(anchor_abs)  # (B, M_anchor, T, 2)
+            gt_normed = self.abs_to_norm(gt_abs)           # (B, 1, T, 2)
+
+            # Unified: [x_t (1), anchors (32), GT (1)] = 34 modes
+            x_t_unified = torch.cat([noisy_traj, anchor_normed, gt_normed], dim=1)  # (B, 34, T, 2)
+
+            # Abs coords for BEV grid_sample
+            noisy_traj_abs = self.norm_to_abs(noisy_traj)
+            x_t_abs_unified = torch.cat([noisy_traj_abs, anchor_abs, gt_abs], dim=1)  # (B, 34, T, 2)
+
+            # traj_for_energy: original anchor/GT abs coords for energy head (slots 1-33)
+            # Energy evaluates spatial properties (collision/offroad/target) — abs space is natural.
+            # Slot 0 (x_t) uses GT abs as placeholder (energy loss is NOT computed on this slot,
+            # alignment loss is computed separately below with the actual diffusion prediction).
+            energy_traj_padded = torch.cat([
+                gt_abs,       # (B, 1, T, 2) placeholder for x_t slot (not used for energy_loss)
+                anchor_abs,   # (B, 32, T, 2) abs
+                gt_abs,       # (B, 1, T, 2) abs
+            ], dim=1)  # (B, 34, T, 2) abs coords
+        else:
+            # No anchors: just x_t + GT (2 modes), no energy training
+            gt_normed = self.abs_to_norm(gt_abs)
+            x_t_unified = torch.cat([noisy_traj, gt_normed], dim=1)  # (B, 2, T, 2)
+            noisy_traj_abs = self.norm_to_abs(noisy_traj)
+            x_t_abs_unified = torch.cat([noisy_traj_abs, gt_abs], dim=1)
+            energy_traj_padded = None
+
+        # ========== Single forward pass ==========
+        poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
+            x_t=x_t_unified,
+            x_t_abs=x_t_abs_unified,
+            timestep=diff_timesteps,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            traj_for_energy=energy_traj_padded,
+        )
+
+        # ========== Split outputs ==========
+        # Layout: [x_t(0), anchors(1..M_anchor), GT(M_anchor+1)]
+        if has_energy:
+            M_energy = M_anchor + 1  # anchors + GT = 33 energy slots
+
+            # Energy scores for slots 1-33 (anchors + GT), skip slot 0 (x_t)
+            energy_scores_energy = {k: v[:, 1:1+M_energy] for k, v in energy_scores.items()}
+
+            # Diffusion output from first slot (position 0)
+            poses_reg_diff = poses_reg[:, :1, :, :]  # (B, 1, T, 2)
+        else:
+            M_energy = 0
+            energy_scores_energy = None
+            poses_reg_diff = poses_reg[:, :1, :, :]
+
+        # ========== Energy Loss (on slots 1-33: anchors + GT) ==========
+        energy_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        loss_col = torch.tensor(0.0, device=device, dtype=model_dtype)
+        loss_off = torch.tensor(0.0, device=device, dtype=model_dtype)
+        loss_tgt = torch.tensor(0.0, device=device, dtype=model_dtype)
+
+        if has_energy and energy_scores_energy is not None:
+            # Build targets: anchors (32) + GT (1)
+            # GT slot is safe
+            gt_behavior = torch.zeros(B, 1, device=device, dtype=behavior_labels_dev.dtype)
+            gt_allowed = torch.ones(B, 1, device=device, dtype=allowed_flags_dev.dtype)
+            behavior_all = torch.cat([behavior_labels_dev, gt_behavior], dim=1)  # (B, 33)
+            allowed_all = torch.cat([allowed_flags_dev, gt_allowed], dim=1)      # (B, 33)
+
+            collision_target = ((behavior_all >= 1) & (behavior_all <= 4)).float()
+            offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
+            target_proxy = 1.0 - allowed_all
+
+            if not self.use_safe_anchors:
+                active_mask = torch.ones(B, M_energy, device=device, dtype=torch.bool)
+                allowed_flags_original = torch.cat([
+                    allowed_flags.to(device=device),
+                    torch.ones(B, 1, device=device),  # GT always active
+                ], dim=1)
+                K = min(self.num_gt_augmentations, M_anchor)
+                active_mask[:, K:M_anchor] = (allowed_flags_original[:, K:M_anchor] < 0.5)
+                # GT slot (index M_anchor) always active
+                active_mask[:, M_anchor] = True
+
+                n_active = active_mask.sum()
+                if n_active > 0:
+                    loss_col = F.smooth_l1_loss(
+                        energy_scores_energy['collision'][active_mask],
+                        collision_target[active_mask],
+                    )
+                    loss_off = F.smooth_l1_loss(
+                        energy_scores_energy['offroad'][active_mask],
+                        offroad_target[active_mask],
+                    )
+                    loss_tgt = F.smooth_l1_loss(
+                        energy_scores_energy['target'][active_mask],
+                        target_proxy[active_mask],
+                    )
+            else:
+                loss_col = F.smooth_l1_loss(energy_scores_energy['collision'], collision_target)
+                loss_off = F.smooth_l1_loss(energy_scores_energy['offroad'], offroad_target)
+                loss_tgt = F.smooth_l1_loss(energy_scores_energy['target'], target_proxy)
+
+            energy_loss = loss_col + loss_off + loss_tgt
+
+        # ========== Diffusion Loss (on slot 0: x_t) ==========
+        poses_reg_diff_abs = self.norm_to_abs(poses_reg_diff)  # (B, 1, T, 2)
+        traj_target = trajectory.unsqueeze(1)  # (B, 1, T, 2)
+        loss_reg = F.l1_loss(poses_reg_diff_abs, traj_target, reduction='mean')
+
+        # Route loss
+        route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        if route_gt is not None and route_pred is not None:
+            route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+
+        # Alignment loss: evaluate diffusion prediction with FROZEN energy heads
+        # Goal: push diffusion decoder to generate trajectories that energy heads rate as safe.
+        # - Use actual prediction (poses_reg_diff_abs), not noisy input or zero placeholder
+        # - Gradient flows back to decoder (poses_reg_diff_abs, mode_out are NOT detached)
+        # - Energy head weights are detached via _eval_energy_head_detached, so
+        #   optimizer_energy sees NO alignment gradient — only energy_loss trains the heads
+        # - Sigmoid bounds scores to [0,1], preventing loss → -∞
+        alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
+        if self.alignment_loss_weight > 0 and has_energy and alignment_active:
+            # Keep grad: alignment loss trains the decoder via poses_reg_diff_abs and mode_out
+            diff_mode_out = mode_out[:, :1, :]           # (B, 1, n_emb) — slot 0 is diffusion
+            diff_traj_flat = poses_reg_diff_abs.flatten(-2)  # (B, 1, T*2)
+            align_input = torch.cat([diff_traj_flat, diff_mode_out], dim=-1)
+
+            # Detached-weight evaluation: grad → decoder, NOT → energy heads
+            align_col = self._eval_energy_head_detached(
+                self.model.energy_collision_head, align_input).squeeze(-1)  # (B, 1)
+            align_off = self._eval_energy_head_detached(
+                self.model.energy_offroad_head, align_input).squeeze(-1)
+            align_tgt = self._eval_energy_head_detached(
+                self.model.energy_target_head, align_input).squeeze(-1)
+
+            # Sigmoid to bound scores to [0,1], then mean over batch
+            alignment_loss = (
+                self.energy_collision_weight * torch.sigmoid(align_col).mean()
+                + self.energy_offroad_weight * torch.sigmoid(align_off).mean()
+                + self.energy_target_weight * torch.sigmoid(align_tgt).mean()
+            )
+
+        # ========== Total Loss ==========
+        total_loss = (
+            self.energy_loss_weight * energy_loss
+            + self.reg_loss_weight * loss_reg
+            + self.route_loss_weight * route_loss
+            + self.alignment_loss_weight * alignment_loss
+        )
+
+        return {
+            'total_loss': total_loss,
+            'energy_loss': energy_loss,
+            'energy_col_loss': loss_col,
+            'energy_off_loss': loss_off,
+            'energy_tgt_loss': loss_tgt,
+            'reg_loss': loss_reg,
+            'cls_loss': torch.tensor(0.0, device=device),
+            'route_loss': route_loss,
+            'alignment_loss': alignment_loss,
+        }
+
+    # ========== Phase 1: Energy Head Training (legacy) ==========
     def compute_energy_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Train energy heads on anchor trajectories + GT augmentation.
@@ -305,27 +671,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # --- Timestep: clean (t=0) or noisy (random t) ---
         if self.energy_noisy_training:
             timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
-            anchor_normed = self.norm_odo(anchor_abs)
+            anchor_normed = self.abs_to_norm(anchor_abs)  # (B, M, T, 2) z-scored delta
             anchor_flat = anchor_normed.contiguous().view(B * M, T, D)
             t_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B * M)
             noise = torch.randn_like(anchor_flat)
             noisy_anchor = self.diffusion_scheduler.add_noise(anchor_flat, noise, t_expanded)
-            noisy_anchor = noisy_anchor.view(B, M, T, D).clamp(-1, 1)
+            noisy_anchor = noisy_anchor.view(B, M, T, D)
             anchor_input = noisy_anchor
-            anchor_abs_input = self.denorm_odo(anchor_input)
+            anchor_abs_input = self.norm_to_abs(anchor_input)
         else:
             timesteps = torch.zeros(B, device=device, dtype=torch.long)
-            anchor_input = self.norm_odo(anchor_abs)
+            anchor_input = self.abs_to_norm(anchor_abs)
             anchor_abs_input = anchor_abs
 
         # --- Forward pass WITH gradients ---
+        # Pass original anchor abs coords as traj_for_energy so energy head evaluates
+        # spatial properties (collision/offroad) in abs space, consistent with inference.
         _, _, _, _, energy_scores = self.model(
-            anchors=anchor_input,
-            anchors_abs=anchor_abs_input,
+            x_t=anchor_input,
+            x_t_abs=anchor_abs_input,
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
             ego_status=ego_status,
+            traj_for_energy=anchor_abs_input,
         )
 
         # --- Build supervision targets ---
@@ -375,7 +744,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'energy_tgt_loss': loss_tgt,
         }
 
-    # ========== Phase 2: Diffusion Training + Alignment ==========
+    # ========== Phase 2: Diffusion Training + Alignment (legacy) ==========
     def compute_diffusion_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Single-mode diffusion training + alignment loss.
@@ -401,8 +770,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_gt = route_gt.to(device=device, dtype=model_dtype)
 
         # ========== Prepare noisy trajectory (M=1) ==========
-        traj_normed = self.norm_odo(trajectory)  # (B, T, 2)
-        traj_normed = traj_normed.unsqueeze(1)   # (B, 1, T, 2)
+        traj_normed = self.abs_to_norm(trajectory)  # (B, T, 2) z-scored delta
+        traj_normed = traj_normed.unsqueeze(1)      # (B, 1, T, 2)
 
         timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
 
@@ -414,22 +783,21 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             timesteps=timesteps,
         )
         noisy_traj = noisy_flat.view(B, 1, T, D)
-        noisy_traj = torch.clamp(noisy_traj, -1, 1)
 
         # ========== Forward pass ==========
-        noisy_traj_abs = self.denorm_odo(noisy_traj)
+        noisy_traj_abs = self.norm_to_abs(noisy_traj)
 
         poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
-            anchors=noisy_traj,
-            anchors_abs=noisy_traj_abs,
+            x_t=noisy_traj,
+            x_t_abs=noisy_traj_abs,
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
             ego_status=ego_status,
         )
 
-        # Denorm predictions to absolute space
-        poses_reg_abs = self.denorm_odo(poses_reg)  # (B, 1, T, 2)
+        # Denorm predictions to absolute space: z-normed delta -> delta -> abs
+        poses_reg_abs = self.norm_to_abs(poses_reg)  # (B, 1, T, 2)
 
         # ========== Regression Loss ==========
         traj_target = trajectory.unsqueeze(1)  # (B, 1, T, 2)
@@ -471,6 +839,68 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         """Backward compatible: calls compute_diffusion_loss."""
         return self.compute_diffusion_loss(batch)
 
+    # ========== Checkpoint Loading ==========
+    @classmethod
+    def load_checkpoint(cls, checkpoint_path, config, device='cuda'):
+        """Load checkpoint with proper buffer restoration.
+
+        Handles:
+        - register_buffer(None) buffers that don't enter state_dict
+        - Normalization stats registration from config before loading
+        - Best checkpoint already has EMA weights applied (no separate EMA load needed)
+        """
+        import numpy as np
+
+        policy = cls(config)
+
+        # Register norm stats from config FIRST (makes buffers non-None so load_state_dict can find them)
+        global_abs_stats_path = config.get('global_abs_stats_path')
+        abs_stats_path = config.get('abs_stats_path')
+        delta_stats_path = config.get('delta_stats_path')
+        if global_abs_stats_path:
+            gdata = np.load(global_abs_stats_path)
+            policy.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
+        elif abs_stats_path:
+            adata = np.load(abs_stats_path)
+            policy.register_abs_stats(adata['abs_mean'], adata['abs_std'])
+        elif delta_stats_path:
+            ddata = np.load(delta_stats_path)
+            policy.register_delta_stats(ddata['delta_mean'], ddata['delta_std'])
+
+        # Register anchor centers
+        anchor_path = config.get('anchor_path')
+        if anchor_path:
+            if anchor_path.endswith('.npy'):
+                ac = np.load(anchor_path)
+            else:
+                import pickle
+                with open(anchor_path, 'rb') as f:
+                    ac = pickle.load(f)['centers']
+            policy.register_anchor_centers(ac)
+
+        # Load checkpoint
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        sd = ckpt.get('model_state_dict', ckpt)
+
+        # Load state dict — buffers are now non-None so they can be matched
+        missing, unexpected = policy.load_state_dict(sd, strict=False)
+
+        # Restore any buffers still unexpected (config didn't have stats but checkpoint does)
+        _BUFFER_NAMES = ['delta_mean', 'delta_std', 'abs_mean', 'abs_std',
+                         'global_abs_mean', 'global_abs_std', 'anchor_centers_abs']
+        for buf_name in _BUFFER_NAMES:
+            if buf_name in sd and sd[buf_name] is not None and getattr(policy, buf_name, None) is None:
+                policy.register_buffer(buf_name, sd[buf_name])
+
+        if missing:
+            print(f"  [load_checkpoint] Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        if unexpected:
+            print(f"  [load_checkpoint] Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+        policy = policy.to(device)
+        policy.eval()
+        return policy, ckpt
+
     # ========== Inference with Energy Guidance ==========
     @torch.no_grad()
     def conditional_sample(
@@ -502,9 +932,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         w_off_cfg = energy_weights.get('offroad', self.energy_offroad_weight) if energy_weights else self.energy_offroad_weight
         w_tgt_cfg = energy_weights.get('target', self.energy_target_weight) if energy_weights else self.energy_target_weight
 
-        # Start from pure Gaussian noise in normalized space
+        # Start from pure Gaussian noise in z-scored delta space
         x_t = torch.randn(B, M, T, 2, device=device, dtype=torch.float32)
-        x_t = torch.clamp(x_t, -1, 1)
 
         # Set up DDIM timestep schedule
         num_steps = self.num_inference_steps
@@ -525,75 +954,89 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             # Get annealed energy weights for current noise level
             w_nav, w_col, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
 
-            # ========== Forward pass (with gradients for energy guidance) ==========
-            x_clamped = torch.clamp(x_t, -1, 1).to(dtype=model_dtype)
-            x_abs = self.denorm_odo(x_clamped)
+            # ========== Forward pass 1: denoise x_t → pred_x0 ==========
+            x_input = x_t.to(dtype=model_dtype)
+            x_t_abs = self.norm_to_abs(x_input)
 
-            # Enable gradients for energy guidance
-            if self.guidance_scale > 0 and (w_nav + w_col + w_off) > 0:
-                x_for_grad = x_clamped.detach().requires_grad_(True)
-                x_abs_grad = self.denorm_odo(x_for_grad)
+            t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
 
-                t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
-                poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
-                    anchors=x_for_grad,
-                    anchors_abs=x_abs_grad,
-                    timestep=t_tensor,
-                    transfuser_bev_feature=transfuser_bev_feature,
-                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                    ego_status=ego_status,
-                )
+            use_guidance = self.guidance_scale > 0 and (w_nav + w_col + w_off) > 0
 
-                # Compute total energy for gradient
-                total_energy = torch.zeros(1, device=device)
-                if energy_scores is not None:
-                    total_energy = (
-                        w_tgt_cfg * w_nav * energy_scores['target'].sum()
-                        + w_col_cfg * w_col * energy_scores['collision'].sum()
-                        + w_off_cfg * w_off * energy_scores['offroad'].sum()
-                    )
-
-                # Compute gradient with clipping
-                if total_energy.requires_grad:
-                    grad = torch.autograd.grad(total_energy, x_for_grad)[0]
-                    grad = grad.detach().to(dtype=torch.float32)
-                    # Per-element gradient clipping
-                    grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                    max_norm = self.energy_grad_clip_norm
-                    grad = grad * torch.clamp(max_norm / grad_norm, max=1.0)
-                else:
-                    grad = torch.zeros_like(x_t)
-
-                # Detach outputs for DDIM step
-                poses_reg = poses_reg.detach()
-                poses_cls = poses_cls.detach()
-            else:
-                t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
+            if use_guidance:
+                # Pass 1: get pred_x0 from denoising (no energy eval yet)
                 with torch.no_grad():
-                    poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
-                        anchors=x_clamped,
-                        anchors_abs=x_abs,
+                    poses_reg, poses_cls, route_pred, _, _ = self.model(
+                        x_t=x_input,
+                        x_t_abs=x_t_abs,
                         timestep=t_tensor,
                         transfuser_bev_feature=transfuser_bev_feature,
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                         ego_status=ego_status,
                     )
-                grad = torch.zeros_like(x_t)
+                    pred_x0 = poses_reg.detach()  # (B, M, T, 2) z-normed delta
 
-            # ========== DDIM Step ==========
-            pred_x0_normed = poses_reg.float()  # (B, M, T, 2) in normalized space
+                # Pass 2: feed pred_x0 as input to get mode_out along pred_x0's path,
+                # then energy head evaluates pred_x0 in abs space (spatial properties).
+                # Gradient flows: energy → abs → z_denorm+cumsum → pred_x0 (z-normed delta).
+                pred_x0_for_grad = pred_x0.clone().requires_grad_(True)
 
+                with torch.enable_grad():
+                    pred_x0_abs = self.norm_to_abs(pred_x0_for_grad)  # differentiable: z-denorm + cumsum
+                    _, _, _, _, energy_scores = self.model(
+                        x_t=pred_x0_for_grad,
+                        x_t_abs=pred_x0_abs,
+                        timestep=torch.zeros(B, dtype=torch.long, device=device),  # t=0 for clean pred_x0
+                        transfuser_bev_feature=transfuser_bev_feature,
+                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                        ego_status=ego_status,
+                        traj_for_energy=pred_x0_abs,  # abs space for spatial energy evaluation
+                    )
+
+                    # Compute total energy
+                    total_energy = torch.zeros(1, device=device)
+                    if energy_scores is not None:
+                        total_energy = (
+                            w_tgt_cfg * w_nav * energy_scores['target'].sum()
+                            + w_col_cfg * w_col * energy_scores['collision'].sum()
+                            + w_off_cfg * w_off * energy_scores['offroad'].sum()
+                        )
+
+                    # Gradient w.r.t. pred_x0 with clipping
+                    if total_energy.requires_grad and pred_x0_for_grad.requires_grad:
+                        grad = torch.autograd.grad(total_energy, pred_x0_for_grad, allow_unused=True)[0]
+                        if grad is None:
+                            grad = torch.zeros_like(pred_x0_for_grad)
+                        grad = grad.detach().to(dtype=torch.float32)
+                        grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                        max_norm = self.energy_grad_clip_norm
+                        grad = grad * torch.clamp(max_norm / grad_norm, max=1.0)
+                    else:
+                        grad = torch.zeros_like(x_t)
+
+                # Correct pred_x0, then DDIM step
+                pred_x0_corrected = pred_x0.float() - self.guidance_scale * grad
+                poses_cls = poses_cls.detach()
+            else:
+                with torch.no_grad():
+                    poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
+                        x_t=x_input,
+                        x_t_abs=x_t_abs,
+                        timestep=t_tensor,
+                        transfuser_bev_feature=transfuser_bev_feature,
+                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                        ego_status=ego_status,
+                    )
+                pred_x0_corrected = poses_reg.float()
+
+            # ========== DDIM Step with corrected pred_x0 ==========
             alpha_t = alphas_cumprod[t_cur]
             alpha_next = alphas_cumprod[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
 
-            pred_eps = (x_t - alpha_t.sqrt() * pred_x0_normed) / (1 - alpha_t).sqrt().clamp(min=1e-8)
-            x_t = alpha_next.sqrt() * pred_x0_normed + (1 - alpha_next).sqrt() * pred_eps
-
-            # Inject energy gradient guidance (subtract gradient to minimize energy)
-            x_t = x_t - self.guidance_scale * grad
+            pred_eps = (x_t - alpha_t.sqrt() * pred_x0_corrected) / (1 - alpha_t).sqrt().clamp(min=1e-8)
+            x_t = alpha_next.sqrt() * pred_x0_corrected + (1 - alpha_next).sqrt() * pred_eps
 
         # ========== Output trajectory ==========
-        final_abs = self.denorm_odo(torch.clamp(pred_x0_normed, -1, 1))  # (B, 1, T, 2)
+        final_abs = self.norm_to_abs(pred_x0_corrected)  # (B, 1, T, 2)
         best_trajectory = final_abs.squeeze(1)  # (B, T, 2)
 
         return {

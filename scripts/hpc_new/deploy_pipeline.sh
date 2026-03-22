@@ -224,9 +224,29 @@ run_stats() {
         --image_data_root "${DATA_RAW}" \
         --config_path config/pdm_local.yaml
 
+    # 5c: Route B+ norm stats (all three variants for ablation)
+    echo "Computing global abs stats for Route B+..."
+    python dataset/compute_action_stats.py \
+        --mode global_abs \
+        --dataset_path "${PROCESSED_DIR}" \
+        --output_path "${PROCESSED_DIR}/global_abs_stats.npz"
+
+    echo "Computing per-step abs stats for Route B+..."
+    python dataset/compute_action_stats.py \
+        --mode abs \
+        --dataset_path "${PROCESSED_DIR}" \
+        --output_path "${PROCESSED_DIR}/abs_stats.npz"
+
+    echo "Computing per-step delta stats for Route B+..."
+    python dataset/compute_action_stats.py \
+        --mode delta \
+        --dataset_path "${PROCESSED_DIR}" \
+        --output_path "${PROCESSED_DIR}/delta_stats.npz"
+
     echo "Step 6 done."
     echo "IMPORTANT: Copy the norm stats from bd_config.yaml -> bd_config_hpc_new.yaml"
     echo "IMPORTANT: Copy action_stats from pdm_local.yaml -> pdm_hpc_new.yaml / pdm_local_route_b.yaml"
+    echo "Route B+ global_abs_stats.npz saved to: ${PROCESSED_DIR}/global_abs_stats.npz"
 }
 
 # ---- Step 7: Dry-run verification ----

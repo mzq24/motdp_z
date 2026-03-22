@@ -621,8 +621,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Ablation: fix BEV at clean anchor positions for training consistency
         bev_abs = all_anchors if self.fix_bev_at_anchor else noisy_anchors_abs
         poses_reg_out, poses_cls, route_pred, mode_out = self.model(
-            anchors=noisy_anchors_normed,
-            anchors_abs=bev_abs,
+            x_t=noisy_anchors_normed,
+            x_t_abs=bev_abs,
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -839,8 +839,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             timesteps = torch.zeros((bs,), dtype=torch.long, device=device)
             anchors_abs_input = all_anchors_normed if self.use_normalized_forward else all_anchors
             poses_reg_out, poses_cls, route_pred, mode_out = self.model(
-                anchors=all_anchors_normed,
-                anchors_abs=anchors_abs_input,
+                x_t=all_anchors_normed,
+                x_t_abs=anchors_abs_input,
                 timestep=timesteps,
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -893,8 +893,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
                 t_tensor = torch.full((bs,), t_cur, dtype=torch.long, device=device)
                 poses_reg_out, poses_cls, route_pred, mode_out = self.model(
-                    anchors=x_clamped,
-                    anchors_abs=bev_abs,
+                    x_t=x_clamped,
+                    x_t_abs=bev_abs,
                     timestep=t_tensor,
                     transfuser_bev_feature=transfuser_bev_feature,
                     transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,

@@ -76,7 +76,7 @@ done
 # 5. Config files
 echo ""
 echo "[5] HPC config files..."
-for cfg in bridge_baseline/bd_config_hpc_new.yaml config/pdm_hpc_new.yaml config/pdm_local_route_b.yaml; do
+for cfg in bridge_baseline/bd_config_hpc_new.yaml config/pdm_hpc_new.yaml config/pdm_hpc_route_b.yaml; do
     if [ -f "$cfg" ]; then
         echo "  OK: $cfg"
         # Show key paths
@@ -96,6 +96,17 @@ if [ -f bridge_baseline/bd_config_hpc_new.yaml ]; then
     else
         echo "  OK: norm stats appear populated"
     fi
+fi
+
+# 6b. Route B+ global abs stats
+echo ""
+echo "[6b] Route B+ global_abs_stats..."
+GLOBAL_ABS="${PROCESSED_DIR}/global_abs_stats.npz"
+if [ -f "${GLOBAL_ABS}" ]; then
+    echo "  OK: global_abs_stats.npz ($(du -h "${GLOBAL_ABS}" | cut -f1))"
+else
+    echo "  MISSING: ${GLOBAL_ABS} — run: python dataset/compute_action_stats.py --mode global_abs --dataset_path ${PROCESSED_DIR}"
+    FAIL=1
 fi
 
 # 7. Conda
@@ -131,6 +142,8 @@ from dataset.unified_carla_dataset import CARLAImageDataset
 print('  CARLAImageDataset: OK')
 from bridge_baseline.policy import BDBaselinePolicyV2
 print('  BDBaselinePolicyV2: OK')
+from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
+print('  AnnealedEnergyGuidancePolicy: OK')
 " 2>&1 || echo "  IMPORT FAILED"
 
 # 10. Memory

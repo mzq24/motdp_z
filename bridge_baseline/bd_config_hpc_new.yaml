@@ -25,14 +25,37 @@ bridge_baseline:
   tp_norm:
   - 200.0
   - 50.0
-  predict_traj: true
+  predict_traj: false
   traj_anchor_path: dd_baseline/anchors/carla_kmeans_20.npy
-  # traj norm stats: run compute_route_stats.py --fast --key all to populate
-  traj_norm_x_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  traj_norm_x_std:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-  traj_norm_y_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  traj_norm_y_std:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-  predict_target_speed: false
+  traj_norm_x_mean:
+  - 2.841766
+  - 5.673671
+  - 8.50435
+  - 11.340415
+  - 14.192013
+  - 17.054647
+  traj_norm_x_std:
+  - 3.112278
+  - 6.16986
+  - 9.161222
+  - 12.085596
+  - 14.945809
+  - 17.738104
+  traj_norm_y_mean:
+  - 0.012546
+  - 0.057323
+  - 0.126686
+  - 0.205144
+  - 0.294363
+  - 0.397652
+  traj_norm_y_std:
+  - 0.391954
+  - 1.038979
+  - 1.778695
+  - 2.580671
+  - 3.374823
+  - 4.16221
+  predict_target_speed: true
   target_speed_classes:
   - 0.0
   - 4.0
@@ -43,7 +66,7 @@ bridge_baseline:
   - 17.78
   - 20.0
   speed_loss_weight: 1.0
-  diffusion_speed: true
+  diffusion_speed: false
   diffusion_speed_anchor: 8.0
   diffusion_speed_mean: 8.0
   diffusion_speed_std: 5.0
@@ -51,14 +74,53 @@ bridge_baseline:
   trajectory_cls_weight: 10.0
   trajectory_reg_weight: 8.0
   num_agent_queries: 16
-  # route norm stats: run compute_route_stats.py --fast --key all to populate
-  norm_x_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  norm_x_std:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-  norm_y_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  norm_y_std:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  norm_x_mean:
+  - 2.490868595127002
+  - 3.481156543917186
+  - 4.464454848382859
+  - 5.441355354234655
+  - 6.415066909825394
+  - 7.387900003104902
+  - 8.359328053513595
+  - 9.327316075722655
+  - 10.290424566869847
+  - 11.247967869978408
+  norm_x_std:
+  - 0.08869524498127068
+  - 0.11285663272498085
+  - 0.1441065214135421
+  - 0.1931662097428255
+  - 0.2527258929766773
+  - 0.3145910978556985
+  - 0.38050558536760937
+  - 0.456217660900088
+  - 0.5447450516202552
+  - 0.646182474287767
+  norm_y_mean:
+  - -0.012665788951539188
+  - -0.024444082488842975
+  - -0.047354389746646575
+  - -0.07508421073500589
+  - -0.10298006960418869
+  - -0.1273045562122212
+  - -0.14644950739563206
+  - -0.16248700086691703
+  - -0.17780588942014083
+  - -0.19377927505995685
+  norm_y_std:
+  - 0.19376886519246483
+  - 0.29851686549571804
+  - 0.43366409659231814
+  - 0.6016148827569083
+  - 0.7882027369161408
+  - 0.978601353702765
+  - 1.1677537291437756
+  - 1.3619226368298625
+  - 1.56701254770298
+  - 1.7858588878228894
 dataset:
   use_per_frame: false
-  cache_dir: null     # null = use default {image_data_root}/tmp_data; set /tmp/tmp_data for tmpfs
+  cache_dir: null
 dataloader:
   batch_size: 128
   val_batch_size: 128
@@ -84,11 +146,12 @@ training:
   checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/bridge_hpc_new/
 validation:
   freq: 5
-  max_batches: 16
+  max_batches: 0
 model_optimization:
   use_mixed_precision: true
 logging:
   use_wandb: true
+  wandb_api_key: null
   wandb_project: bridge_baseline
-  run_name: bridge_hpc_new
+  run_name: bridge_hpc_new_route_speed
   log_freq: 50

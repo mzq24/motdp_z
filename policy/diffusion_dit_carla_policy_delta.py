@@ -623,7 +623,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # ========== Forward pass ==========
         # Model receives noisy anchors in normalized space and predicts clean normalized delta
         poses_reg_normed, poses_cls, route_pred = self.model(
-            anchors=noisy_anchors_delta_normed,
+            x_t=noisy_anchors_delta_normed,
             timestep=timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -819,7 +819,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             # Model operates in normalized space
             all_anchors_delta_normed = self.norm_delta(all_anchors_delta)
             poses_reg_normed, poses_cls, route_pred = self.model(
-                anchors=all_anchors_delta_normed,
+                x_t=all_anchors_delta_normed,
                 timestep=timesteps,
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -864,7 +864,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     t_tensor = torch.full((bs,), t_cur, dtype=torch.long, device=device)
 
                     poses_reg_normed, poses_cls, route_pred = self.model(
-                        anchors=x_t,
+                        x_t=x_t,
                         timestep=t_tensor,
                         transfuser_bev_feature=transfuser_bev_feature,
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -979,7 +979,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     t_tensor = torch.full((bs,), t_cur, dtype=torch.long, device=device)
 
                     poses_reg_normed, poses_cls, route_pred = self.model(
-                        anchors=x_t,
+                        x_t=x_t,
                         timestep=t_tensor,
                         transfuser_bev_feature=transfuser_bev_feature,
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
