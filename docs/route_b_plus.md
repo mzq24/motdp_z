@@ -7,6 +7,7 @@
 - **基座**：纯 Diffusion，从 N(0,I) 白噪声出发，10-step DDIM 去噪
 - **能量引导**：Multi-head Energy Decomposition，显式附加语义独立的能量头
 - **单 mode 去噪**：diffusion 训练/推理 M=1，energy 训练用 M=32 anchor 提供正负样本多样性
+- **Delta z-score 归一化**：扩散空间为 per-step delta z-score，非 abs min-max
 
 ### 组合能量公式
 
@@ -91,15 +92,26 @@ for batch in dataloader:
 ## 6. 推理：10-step DDIM + 能量梯度引导
 
 ```
-x_0 ~ N(0,I)，shape (B, 1, T, 2)
+x_T ~ N(0,I)，shape (B, 1, T, 2) [z-normed delta space]
 for each DDIM step t:
+    x_t_abs = z_denorm(x_t) → cumsum → abs
     w_nav, w_col, w_off = get_energy_weights(t)
-    开梯度 forward → energy_scores
-    grad = autograd.grad(total_energy, x_t)
+    开梯度 forward → pred_x0, energy_scores
+    grad = autograd.grad(total_energy, pred_x0)   # 对 clean 预测求梯度
     grad = clip(grad, max_norm)
-    x_{t-1} = DDIM_step(x_t) - guidance_scale * grad
-output = denorm(x_0)  # 单条轨迹
+    pred_x0_corrected = pred_x0 - guidance_scale * grad
+    x_{t-1} = DDIM_step(x_t, pred_x0_corrected)  # 用修正后的 pred_x0 做 DDIM
+output = z_denorm(pred_x0_corrected) → cumsum → abs  # 单条轨迹
 ```
+
+### 关键设计决策：energy gradient 作用在 pred_x0 上而非 x_t_next
+
+**问题**：如果将 energy gradient 注入到 DDIM step 后的 x_t_next，会造成 diffusion model OOD——
+model 训练时只见过 `pred_x0 + scheduled noise` 形式的 x_t，`x_t_next + energy_grad` 不在这个分布里。
+
+**解决**：energy gradient 作用在 pred_x0（clean 预测）上，然后用修正后的 pred_x0 做 DDIM step。
+这样 x_t_next 仍然是"某个 clean trajectory + scheduled noise"的形式，diffusion model 不 OOD。
+同时 energy head 评估的也是 clean 预测，与其训练分布（clean anchor）一致。
 
 M=1 不需要 energy shielding 选择，纯靠梯度引导生成最优轨迹。
 
@@ -119,33 +131,90 @@ M=1 不需要 energy shielding 选择，纯靠梯度引导生成最优轨迹。
 
 ---
 
-## 8. 后续规划
+## 8. 命名规范
 
-### 8.1 MOA 改造（下一步）
+避免 anchor/residual/delta 混淆：
+
+| 术语 | 含义 |
+|------|------|
+| `x_t` | 当前去噪轨迹（normalized delta z-score 空间） |
+| `x_t_abs` | 当前去噪轨迹（绝对坐标，用于 BEV grid_sample） |
+| `pred_x0` | model 预测的 clean 轨迹（normalized delta 空间） |
+| `anchor_centers` | 32 个 k-means 聚类中心（abs 坐标），仅 energy Phase 1 训练用 |
+| `delta` | 时间增量：`[p0, p1-p0, p2-p1, ...]`，p0 是相对 ego 的位移 |
+| `residual` | 模型输出相对 anchor 的偏移（Route A 概念，Route B 不使用） |
+
+Model forward 参数：`anchors` → `x_t`，`anchors_abs` → `x_t_abs`
+
+---
+
+## 9. 归一化：Delta Z-Score
+
+### 9.1 数据流
+
+```
+训练:
+  GT abs (B, T, 2) → abs_to_delta → z_norm → add noise → x_t
+  传给 model: x_t (z-normed delta), x_t_abs (denorm → cumsum → abs)
+  model 输出 pred_x0 → denorm → cumsum → abs → L1 loss with GT
+
+推理:
+  x_T ~ N(0, I) → DDIM denoise → pred_x0 → denorm → cumsum → abs
+```
+
+### 9.2 per-step z-score
+
+每个 timestep 独立统计 mean/std：
+```
+delta_mean: (T, 2)  # 每步 delta 的均值
+delta_std:  (T, 2)  # 每步 delta 的标准差
+```
+
+归一化：`z = (delta - mean[t]) / std[t]`
+反归一化：`delta = z * std[t] + mean[t]`
+
+### 9.3 abs ↔ delta 转换
+
+```python
+def abs_to_delta(abs_traj):
+    # abs_traj: (B, T, 2), p0 已经是相对 ego
+    delta = abs_traj.clone()
+    delta[:, 1:] = abs_traj[:, 1:] - abs_traj[:, :-1]
+    return delta  # [p0, p1-p0, p2-p1, ...]
+
+def delta_to_abs(delta):
+    return delta.cumsum(dim=-2)  # [p0, p0+(p1-p0), ...]
+```
+
+---
+
+## 10. 后续规划
+
+### 10.1 MOA 改造（下一步）
 将 MultiSourceAttentionBlock 从"合并 softmax"改为"分离式 cross-attention"：
 - 各 KV 源独立 softmax、独立输出
 - Self KV → traj head，BEV KV → scene understanding head
 - Route 从拼接序列改为独立 KV 源
 
-### 8.2 Text-Conditioned BEV Query（远期）
+### 10.2 Text-Conditioned BEV Query（远期）
 文本指令作为"语义透镜"query BEV grid，渐进注入任务特定空间条件：
 - 固定 6 指令词表（3 正 + 3 负）
 - TextConditionedBEVQuery 模块 cross-attend BEV
 - 对比学习（Phase 3 独立训练）
 - 渐进指令调度与 energy annealing 三段式对齐
 
-### 8.3 GT 增广改进（待设计）
+### 10.3 GT 增广改进（待设计）
 等间距上采样方案：轨迹上采样到高密度点后取不同子集，比速度缩放更物理合理。
 需考虑并线窗口期等 edge case。
 
-### 8.4 其他
+### 10.4 其他
 - 连续 risk score 标签（替代二元 behavior label）
 - 能量头拆分：forward_collision + pedestrian_collision
 - Safe anchor 质量提升后开启 `use_safe_anchors: true`
 
 ---
 
-## 9. 验证清单
+## 11. 验证清单
 
 - [ ] energy_loss 有意义：forbidden anchor → 高能量
 - [ ] alignment_loss 下降：decoder 逐渐生成低能量轨迹
