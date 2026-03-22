@@ -103,7 +103,7 @@ route_b:
   energy_offroad_weight: 1.0
   energy_target_weight: 1.0
   energy_loss_weight: 1.0
-  train_max_timesteps: 100
+  train_max_timesteps: 1000
   alignment_loss_weight: 0.1
   num_gt_augmentations: 0
   use_safe_anchors: false

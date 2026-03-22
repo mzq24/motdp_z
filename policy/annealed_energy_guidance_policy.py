@@ -199,7 +199,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         """
         if isinstance(anchor_centers_abs, np.ndarray):
             anchor_centers_abs = torch.from_numpy(anchor_centers_abs).float()
-        self.register_buffer('anchor_centers_abs', anchor_centers_abs)
+        device = next(self.parameters()).device
+        self.register_buffer('anchor_centers_abs', anchor_centers_abs.to(device))
 
     # ========== GT Augmentation ==========
     def _augment_gt(self, trajectory, K):
