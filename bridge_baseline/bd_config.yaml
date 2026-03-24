@@ -25,7 +25,7 @@ bridge_baseline:
   tp_norm:
   - 200.0
   - 50.0
-  predict_traj: true
+  predict_traj: false
   traj_anchor_path: /media/z/data/mzq/others/MoT-DP/dd_baseline/anchors/carla_kmeans_20.npy
   traj_norm_x_mean:
   - 2.841766
@@ -55,7 +55,7 @@ bridge_baseline:
   - 2.580671
   - 3.374823
   - 4.16221
-  predict_target_speed: false
+  predict_target_speed: true
   target_speed_classes:
   - 0.0
   - 4.0
@@ -66,7 +66,7 @@ bridge_baseline:
   - 17.78
   - 20.0
   speed_loss_weight: 1.0
-  diffusion_speed: true
+  diffusion_speed: false
   diffusion_speed_anchor: 8.0
   diffusion_speed_mean: 8.0
   diffusion_speed_std: 5.0
@@ -142,7 +142,7 @@ training:
   max_keep_ckpts: 5
   dataset_path: /media/z/data/dataset/pdm_lite_mini
   image_data_root: /media/z/data/dataset/pdm_lite_mini
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/bd_hpc/
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/bridge_route_20/
 validation:
   freq: 5
   max_batches: 16

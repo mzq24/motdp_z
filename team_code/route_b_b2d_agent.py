@@ -128,6 +128,38 @@ def create_carla_config(config_path=None):
         config_path = "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
+    config_path = os.path.abspath(config_path)
+    config_dir = os.path.dirname(config_path)
+    mot_dp_root = os.path.dirname(config_dir)
+
+    def _resolve_path(path_value):
+        if not path_value or os.path.isabs(path_value):
+            return path_value
+
+        candidate_from_config = os.path.abspath(os.path.join(config_dir, path_value))
+        if os.path.exists(candidate_from_config):
+            return candidate_from_config
+
+        candidate_from_project = os.path.abspath(os.path.join(mot_dp_root, path_value))
+        return candidate_from_project
+
+    for key in ['anchor_path', 'abs_stats_path', 'delta_stats_path', 'global_abs_stats_path']:
+        if key in config:
+            config[key] = _resolve_path(config.get(key))
+
+    training_cfg = config.get('training', {})
+    if 'checkpoint_dir' in training_cfg:
+        training_cfg['checkpoint_dir'] = _resolve_path(training_cfg.get('checkpoint_dir'))
+    if 'checkpoint_path' in training_cfg:
+        training_cfg['checkpoint_path'] = _resolve_path(training_cfg.get('checkpoint_path'))
+
+    logging_cfg = config.get('logging', {})
+    if 'checkpoint_dir' in logging_cfg:
+        logging_cfg['checkpoint_dir'] = _resolve_path(logging_cfg.get('checkpoint_dir'))
+    if 'checkpoint_path' in logging_cfg:
+        logging_cfg['checkpoint_path'] = _resolve_path(logging_cfg.get('checkpoint_path'))
+
     return config
 
 def load_best_model(checkpoint_path, config, device):
@@ -157,6 +189,28 @@ def load_best_model(checkpoint_path, config, device):
 
 
 class MOTAgent(autonomous_agent.AutonomousAgent):
+	def get_default_config_path(self):
+		return "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
+
+	def get_checkpoint_filename(self):
+		return "dit_policy_best.pt"
+
+	def resolve_checkpoint_path(self):
+		training_cfg = self.config.get('training', {})
+		logging_cfg = self.config.get('logging', {})
+		checkpoint_path = training_cfg.get('checkpoint_path') or logging_cfg.get('checkpoint_path')
+		if checkpoint_path:
+			return checkpoint_path
+
+		checkpoint_base_path = training_cfg.get(
+			'checkpoint_dir',
+			"/media/z/data/mzq/others/MoT-DP/checkpoints/add_noise_multi_infer_trunc20"
+		)
+		return os.path.join(checkpoint_base_path, self.get_checkpoint_filename())
+
+	def _predict_dp_action(self, dp_obs_dict):
+		return self.net.predict_action(dp_obs_dict, no_noise=True)
+
 	def setup(self, path_to_conf_file):
 		self.track = autonomous_agent.Track.SENSORS
 		if IS_BENCH2DRIVE:
@@ -176,8 +230,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		print("Loading diffusion policy...")
 		self.config = create_carla_config(self.config_path)
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/add_noise_multi_infer_trunc20")
-		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best.pt")
+		checkpoint_path = self.resolve_checkpoint_path()
 		self.net = load_best_model(checkpoint_path, self.config, device)
 		print("✓ Diffusion policy loaded (float32).")
 		
@@ -333,6 +386,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		(self.save_path / 'meta').mkdir()
 		(self.save_path / 'bev').mkdir()
 		(self.save_path / 'lidar_bev').mkdir()
+		(self.save_path / 'debug_vis').mkdir()
 		
 		# Initialize lidar buffer for combining two frames
 		self.lidar_buffer = deque(maxlen=2)
@@ -361,6 +415,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_target_point = None  # Store the last target point (in ego frame)
 		self.last_next_target_point = None  # Store the last next target point (in ego frame)
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
+		self.last_energy_debug = {}
 
 	def _init(self):
 		# Use _global_plan_world_coord directly (already in CARLA coordinates)
@@ -1231,7 +1286,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
 				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
 			}
-			dp_pred_traj = self.net.predict_action(dp_obs_dict, no_noise=True)
+			dp_pred_traj = self._predict_dp_action(dp_obs_dict)
 			# self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			# if self.step % 20 == 0:
 			# 	bev_f = transfuser_bev_feature.float()
@@ -1245,6 +1300,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() # - use DP prediction
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
+			self.last_energy_debug = {}
+			for energy_key in ['energy_collision', 'energy_offroad', 'energy_target']:
+				energy_value = dp_pred_traj.get(energy_key)
+				if energy_value is None:
+					continue
+				energy_array = np.asarray(energy_value).reshape(-1)
+				if energy_array.size > 0:
+					self.last_energy_debug[energy_key] = float(energy_array[0])
 			
 			# route_pred is 20 waypoints with equal intervals for lateral control
 			route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
@@ -1434,6 +1497,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			                                        self.last_next_target_point, self.last_dp_pred_traj, self.last_route_pred)
 		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
+		debug_img = self._compose_debug_visualization(tick_data['rgb_front'], bev_img)
+		Image.fromarray(debug_img).save(self.save_path / 'debug_vis' / ('%04d.png' % frame))
 		
 		if 'lidar_bev' in tick_data:
 			lidar_bev_tensor = tick_data['lidar_bev']
@@ -1450,6 +1515,70 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		outfile = open(self.save_path / 'metric_info.json', 'w')
 		json.dump(self.metric_info, outfile, indent=4)
 		outfile.close()
+
+	def _compose_debug_visualization(self, rgb_img, bev_img):
+		left = cv2.resize(rgb_img, (800, 600))
+		right = cv2.resize(bev_img, (800, 600))
+
+		overlay = right.copy()
+		panel_top = 350
+		cv2.rectangle(overlay, (20, panel_top), (780, 580), (20, 20, 20), -1)
+		right = cv2.addWeighted(overlay, 0.45, right, 0.55, 0.0)
+
+		status_lines = [
+			f"frame: {self.step}",
+			f"speed_kmh: {float(self.pid_metadata.get('speed', 0.0)) * 3.6:.2f}",
+			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
+			f"throttle: {float(self.pid_metadata.get('throttle', 0.0)):.3f}",
+			f"brake: {float(self.pid_metadata.get('brake', 0.0)):.3f}",
+			f"command: {self.pid_metadata.get('command', 'N/A')}",
+		]
+
+		if self.last_target_point is not None:
+			status_lines.append(
+				f"target_point: [{self.last_target_point[0]:.2f}, {self.last_target_point[1]:.2f}]"
+			)
+		if self.last_next_target_point is not None:
+			status_lines.append(
+				f"next_target_point: [{self.last_next_target_point[0]:.2f}, {self.last_next_target_point[1]:.2f}]"
+			)
+
+		status_lines.extend([
+			f"energy_collision: {self.last_energy_debug.get('energy_collision', float('nan')):.4f}",
+			f"energy_offroad: {self.last_energy_debug.get('energy_offroad', float('nan')):.4f}",
+			f"energy_target: {self.last_energy_debug.get('energy_target', float('nan')):.4f}",
+		])
+
+		for idx, line in enumerate(status_lines):
+			y = panel_top + 30 + idx * 22
+			cv2.putText(
+				right, line, (35, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+				(255, 255, 255), 1, cv2.LINE_AA
+			)
+
+		legend_items = [
+			("traj", (0, 255, 0)),
+			("dp_traj", (255, 0, 0)),
+			("route", (0, 0, 255)),
+			("target", (0, 255, 255)),
+			("next_target", (255, 0, 255)),
+		]
+		legend_x = 35
+		legend_y = 330
+		for label, color in legend_items:
+			cv2.circle(right, (legend_x, legend_y), 7, color, -1)
+			cv2.putText(
+				right, label, (legend_x + 18, legend_y + 5),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA
+			)
+			legend_x += 145
+
+		canvas = np.zeros((600, 1600, 3), dtype=np.uint8)
+		canvas[:, :800] = left
+		canvas[:, 800:] = right
+		cv2.putText(canvas, "RGB", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+		cv2.putText(canvas, "BEV + Status", (820, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+		return canvas
 
 	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, next_target_point=None, dp_traj=None, route_pred=None):
 		"""
@@ -1607,11 +1736,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		y = scale * EARTH_RADIUS_EQUA * math.log(math.tan((90.0 + self.lat_ref) * math.pi / 360.0)) - my
 		x = mx - scale * self.lon_ref * math.pi * EARTH_RADIUS_EQUA / 180.0
 		return np.array([x, y])
-
-
-
-
-
 
 
 
