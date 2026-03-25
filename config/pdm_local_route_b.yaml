@@ -94,9 +94,16 @@ route_b:
   num_energy_modes: 32     # Energy head training: use all anchors for diverse pos/neg samples
   num_inference_steps: 10  # 10-step DDIM (5x of Route A's 2-step)
   guidance_scale: 0.1      # Global energy gradient scale (start small, tune up)
-  energy_collision_weight: 1.0
+  # Per-head energy weights (6 heads: front/left/right/pedestrian/offroad/route)
+  energy_front_weight: 1.0
+  energy_left_weight: 1.0
+  energy_right_weight: 1.0
+  energy_pedestrian_weight: 1.0
   energy_offroad_weight: 1.0
-  energy_target_weight: 1.0
+  energy_route_weight: 1.0
+  # Route energy target parameters
+  route_energy_margin: 1.0   # corridor half-width (m): within 1m of route/GT = deviation 0
+  route_energy_norm: 5.0     # normalization factor (m): 5m outside corridor = target 1.0
   energy_loss_weight: 1.0  # Weight of energy loss in total training loss
   train_max_timesteps: 1000 # Full range for pure N(0,I) diffusion (must match num_train_timesteps)
   # Route B+ additions

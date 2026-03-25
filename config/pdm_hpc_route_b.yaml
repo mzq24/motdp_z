@@ -99,9 +99,16 @@ route_b:
   num_energy_modes: 32     # Energy head training: use all anchors
   num_inference_steps: 10  # 10-step DDIM
   guidance_scale: 0.1
-  energy_collision_weight: 1.0
+  # Per-head energy weights (6 heads: front/left/right/pedestrian/offroad/route)
+  energy_front_weight: 1.0
+  energy_left_weight: 1.0
+  energy_right_weight: 1.0
+  energy_pedestrian_weight: 1.0
   energy_offroad_weight: 1.0
-  energy_target_weight: 1.0
+  energy_route_weight: 1.0
+  # Route energy target parameters
+  route_energy_margin: 1.0
+  route_energy_norm: 5.0
   energy_loss_weight: 1.0
   train_max_timesteps: 1000
   alignment_loss_weight: 0.1

@@ -50,20 +50,26 @@ def get_energy_weights(t: int, T: int = 100):
     """
     Annealed energy weights: different energies activate at different noise levels.
 
+    Schedule (hardcoded; LLM Router can override per-head weights at runtime):
+      t=T→0.7T  (high noise):   E_route activates (macro navigation direction)
+      t=0.7T→0.3T (mid noise):  E_vehicle (front/left/right) + E_pedestrian activate
+      t=0.3T→0    (low noise):  E_offroad activates (lane-level polish)
+
     Args:
         t: current timestep (higher = more noise)
         T: total timesteps
 
     Returns:
-        (w_nav, w_col, w_off) weight tuple
+        (w_route, w_veh, w_off) weight tuple
+        w_veh applies to all 4 collision heads (front/left/right/pedestrian)
     """
     progress = 1.0 - t / T  # 0 -> 1 as denoising progresses
 
-    w_nav = 1.0                                       # always active
-    w_col = max(0.0, (progress - 0.3) / 0.4)          # activates after t < 0.7*T
-    w_off = max(0.0, (progress - 0.7) / 0.3)          # activates after t < 0.3*T
+    w_route = 1.0                                      # always active (navigation)
+    w_veh   = max(0.0, (progress - 0.3) / 0.4)        # activates after t < 0.7*T
+    w_off   = max(0.0, (progress - 0.7) / 0.3)        # activates after t < 0.3*T
 
-    return w_nav, w_col, w_off
+    return w_route, w_veh, w_off
 
 
 # =============================================================================
@@ -107,9 +113,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.num_energy_modes = route_b_cfg.get('num_energy_modes', 32)  # energy training: multi-anchor
         self.num_inference_steps = route_b_cfg.get('num_inference_steps', 10)
         self.guidance_scale = route_b_cfg.get('guidance_scale', 1.0)  # global energy guidance multiplier
-        self.energy_collision_weight = route_b_cfg.get('energy_collision_weight', 1.0)
-        self.energy_offroad_weight = route_b_cfg.get('energy_offroad_weight', 1.0)
-        self.energy_target_weight = route_b_cfg.get('energy_target_weight', 1.0)
+        # Per-head energy weights (used in alignment loss and guidance)
+        self.energy_front_weight      = route_b_cfg.get('energy_front_weight', 1.0)
+        self.energy_left_weight       = route_b_cfg.get('energy_left_weight', 1.0)
+        self.energy_right_weight      = route_b_cfg.get('energy_right_weight', 1.0)
+        self.energy_pedestrian_weight = route_b_cfg.get('energy_pedestrian_weight', 1.0)
+        self.energy_offroad_weight    = route_b_cfg.get('energy_offroad_weight', 1.0)
+        self.energy_route_weight      = route_b_cfg.get('energy_route_weight', 1.0)
+        # Route target params
+        self.route_energy_margin = route_b_cfg.get('route_energy_margin', 1.0)   # corridor half-width (m)
+        self.route_energy_norm   = route_b_cfg.get('route_energy_norm', 5.0)     # normalization factor (m)
 
         # Route B+ config
         self.energy_grad_clip_norm = route_b_cfg.get('energy_grad_clip_norm', 1.0)
@@ -512,22 +525,34 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             poses_reg_diff = poses_reg[:, :1, :, :]
 
         # ========== Energy Loss (on slots 1-33: anchors + GT) ==========
-        energy_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        loss_col = torch.tensor(0.0, device=device, dtype=model_dtype)
-        loss_off = torch.tensor(0.0, device=device, dtype=model_dtype)
-        loss_tgt = torch.tensor(0.0, device=device, dtype=model_dtype)
+        zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
+        energy_loss = zero_t
+        loss_front = loss_left = loss_right = loss_ped = loss_off = loss_route = zero_t
 
         if has_energy and energy_scores_energy is not None:
             # Build targets: anchors (32) + GT (1)
-            # GT slot is safe
+            # GT slot is safe (all collision/offroad = 0)
             gt_behavior = torch.zeros(B, 1, device=device, dtype=behavior_labels_dev.dtype)
-            gt_allowed = torch.ones(B, 1, device=device, dtype=allowed_flags_dev.dtype)
             behavior_all = torch.cat([behavior_labels_dev, gt_behavior], dim=1)  # (B, 33)
-            allowed_all = torch.cat([allowed_flags_dev, gt_allowed], dim=1)      # (B, 33)
 
-            collision_target = ((behavior_all >= 1) & (behavior_all <= 4)).float()
+            front_target  = (behavior_all == 1).float()
+            left_target   = (behavior_all == 2).float()
+            right_target  = (behavior_all == 3).float()
+            ped_target    = (behavior_all == 4).float()
             offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
-            target_proxy = 1.0 - allowed_all
+
+            # Route deviation target for anchors+GT: (B, 33)
+            # anchor_abs_for_energy contains anchors+GT in abs coords
+            if route_gt is not None:
+                # Reconstruct abs traj for energy slots from x_t_abs_unified slots 1-34
+                anchor_abs_energy = x_t_abs_unified[:, 1:1+M_energy, :, :]  # (B, 33, T, 2)
+                route_target_all = self.compute_route_target(
+                    anchor_abs_energy, route_gt, trajectory)   # (B, 33)
+            else:
+                route_target_all = torch.zeros(B, M_energy, device=device, dtype=model_dtype)
+
+            def _sl1e(pred, tgt, mask=None):
+                return F.smooth_l1_loss(pred[mask], tgt[mask]) if mask is not None else F.smooth_l1_loss(pred, tgt)
 
             if not self.use_safe_anchors:
                 active_mask = torch.ones(B, M_energy, device=device, dtype=torch.bool)
@@ -537,29 +562,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 ], dim=1)
                 K = min(self.num_gt_augmentations, M_anchor)
                 active_mask[:, K:M_anchor] = (allowed_flags_original[:, K:M_anchor] < 0.5)
-                # GT slot (index M_anchor) always active
-                active_mask[:, M_anchor] = True
+                active_mask[:, M_anchor] = True  # GT slot always active
 
                 n_active = active_mask.sum()
                 if n_active > 0:
-                    loss_col = F.smooth_l1_loss(
-                        energy_scores_energy['collision'][active_mask],
-                        collision_target[active_mask],
-                    )
-                    loss_off = F.smooth_l1_loss(
-                        energy_scores_energy['offroad'][active_mask],
-                        offroad_target[active_mask],
-                    )
-                    loss_tgt = F.smooth_l1_loss(
-                        energy_scores_energy['target'][active_mask],
-                        target_proxy[active_mask],
-                    )
+                    loss_front = _sl1e(energy_scores_energy['front'],  front_target,  active_mask)
+                    loss_left  = _sl1e(energy_scores_energy['left'],   left_target,   active_mask)
+                    loss_right = _sl1e(energy_scores_energy['right'],  right_target,  active_mask)
+                    loss_ped   = _sl1e(energy_scores_energy['pedestrian'], ped_target, active_mask)
+                    loss_off   = _sl1e(energy_scores_energy['offroad'], offroad_target, active_mask)
+                # Route loss on ALL slots (continuous metric)
+                loss_route = _sl1e(energy_scores_energy['route'], route_target_all)
             else:
-                loss_col = F.smooth_l1_loss(energy_scores_energy['collision'], collision_target)
-                loss_off = F.smooth_l1_loss(energy_scores_energy['offroad'], offroad_target)
-                loss_tgt = F.smooth_l1_loss(energy_scores_energy['target'], target_proxy)
+                loss_front = _sl1e(energy_scores_energy['front'],  front_target)
+                loss_left  = _sl1e(energy_scores_energy['left'],   left_target)
+                loss_right = _sl1e(energy_scores_energy['right'],  right_target)
+                loss_ped   = _sl1e(energy_scores_energy['pedestrian'], ped_target)
+                loss_off   = _sl1e(energy_scores_energy['offroad'], offroad_target)
+                loss_route = _sl1e(energy_scores_energy['route'], route_target_all)
 
-            energy_loss = loss_col + loss_off + loss_tgt
+            energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off + loss_route
 
         # ========== Diffusion Loss (on slot 0: x_t) ==========
         poses_reg_diff_abs = self.norm_to_abs(poses_reg_diff)  # (B, 1, T, 2)
@@ -577,28 +599,29 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # - Gradient flows back to decoder (poses_reg_diff_abs, mode_out are NOT detached)
         # - Energy head weights are detached via _eval_energy_head_detached, so
         #   optimizer_energy sees NO alignment gradient — only energy_loss trains the heads
-        # - Sigmoid bounds scores to [0,1], preventing loss → -∞
+        # - Sigmoid bounds binary scores to [0,1]; route score left unbounded (already ≥ 0)
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
         if self.alignment_loss_weight > 0 and has_energy and alignment_active:
-            # Keep grad: alignment loss trains the decoder via poses_reg_diff_abs and mode_out
             diff_mode_out = mode_out[:, :1, :]           # (B, 1, n_emb) — slot 0 is diffusion
             diff_traj_flat = poses_reg_diff_abs.flatten(-2)  # (B, 1, T*2)
             align_input = torch.cat([diff_traj_flat, diff_mode_out], dim=-1)
 
             # Detached-weight evaluation: grad → decoder, NOT → energy heads
-            align_col = self._eval_energy_head_detached(
-                self.model.energy_collision_head, align_input).squeeze(-1)  # (B, 1)
-            align_off = self._eval_energy_head_detached(
-                self.model.energy_offroad_head, align_input).squeeze(-1)
-            align_tgt = self._eval_energy_head_detached(
-                self.model.energy_target_head, align_input).squeeze(-1)
+            a_front = self._eval_energy_head_detached(self.model.energy_front_head,      align_input).squeeze(-1)
+            a_left  = self._eval_energy_head_detached(self.model.energy_left_head,       align_input).squeeze(-1)
+            a_right = self._eval_energy_head_detached(self.model.energy_right_head,      align_input).squeeze(-1)
+            a_ped   = self._eval_energy_head_detached(self.model.energy_pedestrian_head, align_input).squeeze(-1)
+            a_off   = self._eval_energy_head_detached(self.model.energy_offroad_head,    align_input).squeeze(-1)
+            a_rte   = self._eval_energy_head_detached(self.model.energy_route_head,      align_input).squeeze(-1)
 
-            # Sigmoid to bound scores to [0,1], then mean over batch
             alignment_loss = (
-                self.energy_collision_weight * torch.sigmoid(align_col).mean()
-                + self.energy_offroad_weight * torch.sigmoid(align_off).mean()
-                + self.energy_target_weight * torch.sigmoid(align_tgt).mean()
+                self.energy_front_weight      * torch.sigmoid(a_front).mean()
+                + self.energy_left_weight     * torch.sigmoid(a_left).mean()
+                + self.energy_right_weight    * torch.sigmoid(a_right).mean()
+                + self.energy_pedestrian_weight * torch.sigmoid(a_ped).mean()
+                + self.energy_offroad_weight  * torch.sigmoid(a_off).mean()
+                + self.energy_route_weight    * a_rte.mean()  # already ≥ 0, no sigmoid needed
             )
 
         # ========== Total Loss ==========
@@ -612,14 +635,82 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         return {
             'total_loss': total_loss,
             'energy_loss': energy_loss,
-            'energy_col_loss': loss_col,
-            'energy_off_loss': loss_off,
-            'energy_tgt_loss': loss_tgt,
+            'energy_front_loss': loss_front,
+            'energy_left_loss':  loss_left,
+            'energy_right_loss': loss_right,
+            'energy_ped_loss':   loss_ped,
+            'energy_off_loss':   loss_off,
+            'energy_route_loss': loss_route,
             'reg_loss': loss_reg,
             'cls_loss': torch.tensor(0.0, device=device),
             'route_loss': route_loss,
             'alignment_loss': alignment_loss,
         }
+
+    # ========== Route Energy Target ==========
+    @staticmethod
+    def _point_to_polyline_dist(pts: torch.Tensor, seg_a: torch.Tensor, seg_b: torch.Tensor) -> torch.Tensor:
+        """
+        Compute mean-over-T minimum distance from trajectory points to a polyline.
+
+        Args:
+            pts:   (B, M, T, 2) — trajectory points to evaluate
+            seg_a: (B, N, 2)    — polyline segment start points
+            seg_b: (B, N, 2)    — polyline segment end points
+
+        Returns:
+            (B, M) — mean over T of min-over-N distance to polyline
+        """
+        # (B, M, T, 1, 2) vs (B, 1, 1, N, 2)
+        pts_e = pts.unsqueeze(3)
+        a_e = seg_a.unsqueeze(1).unsqueeze(2)
+        b_e = seg_b.unsqueeze(1).unsqueeze(2)
+        ab = b_e - a_e                                  # (B, 1, 1, N, 2)
+        ap = pts_e - a_e                                # (B, M, T, N, 2)
+        t = (ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-8)
+        t = t.clamp(0.0, 1.0)                           # project onto segment
+        closest = a_e + t.unsqueeze(-1) * ab            # (B, M, T, N, 2)
+        dist = (pts_e - closest).norm(dim=-1)           # (B, M, T, N)
+        return dist.min(dim=-1).values.mean(dim=-1)     # (B, M)
+
+    def compute_route_target(
+        self,
+        anchor_abs: torch.Tensor,
+        route: torch.Tensor,
+        gt_traj: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute continuous route-deviation target for energy heads.
+
+        Defines a "corridor" as the union of the route polyline and the GT traj polyline.
+        Trajectories within `route_energy_margin` meters of the corridor get target=0.
+        Outside the corridor: target = (dist - margin) / norm, clipped to [0, 2].
+
+        GT trajectory is inside its own corridor by construction → gt_route_target ≈ 0.
+
+        Args:
+            anchor_abs: (B, M, T, 2) — anchor/pred trajectories in abs ego-frame coords
+            route:      (B, 20, 2)   — route waypoints (ego frame)
+            gt_traj:    (B, T, 2)    — GT trajectory (abs ego-frame, used as corridor reference)
+
+        Returns:
+            (B, M) route deviation target ≥ 0
+        """
+        # Route polyline segments: (B, 19, 2)
+        route_seg_a = route[:, :-1, :]
+        route_seg_b = route[:, 1:, :]
+
+        # GT polyline segments: (B, T-1, 2)
+        gt_seg_a = gt_traj[:, :-1, :]
+        gt_seg_b = gt_traj[:, 1:, :]
+
+        # Corridor = route + GT polyline (B, 19+T-1, 2)
+        corridor_a = torch.cat([route_seg_a, gt_seg_a], dim=1)
+        corridor_b = torch.cat([route_seg_b, gt_seg_b], dim=1)
+
+        dist = self._point_to_polyline_dist(anchor_abs, corridor_a, corridor_b)  # (B, M)
+        target = F.relu(dist - self.route_energy_margin) / self.route_energy_norm
+        return target.clamp(max=2.0)
 
     # ========== Phase 1: Energy Head Training (legacy) ==========
     def compute_energy_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -651,9 +742,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             return {
                 'total_loss': zero,
                 'energy_loss': zero.detach(),
-                'energy_col_loss': zero.detach(),
+                'energy_front_loss': zero.detach(),
+                'energy_left_loss': zero.detach(),
+                'energy_right_loss': zero.detach(),
+                'energy_ped_loss': zero.detach(),
                 'energy_off_loss': zero.detach(),
-                'energy_tgt_loss': zero.detach(),
+                'energy_route_loss': zero.detach(),
             }
 
         # --- Build mixed input: GT augmentation + anchors ---
@@ -698,51 +792,67 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             traj_for_energy=anchor_abs_input,
         )
 
-        # --- Build supervision targets ---
-        collision_target = ((behavior_labels_dev >= 1) & (behavior_labels_dev <= 4)).float()
+        # --- Build supervision targets (derived from single-label behavior_labels) ---
+        # Vehicle collision direction (mutually exclusive per label priority)
+        front_target = (behavior_labels_dev == 1).float()
+        left_target  = (behavior_labels_dev == 2).float()
+        right_target = (behavior_labels_dev == 3).float()
+        ped_target   = (behavior_labels_dev == 4).float()
         offroad_target = ((behavior_labels_dev >= 5) & (behavior_labels_dev <= 6)).float()
-        target_proxy = 1.0 - allowed_flags_dev
+
+        # Route deviation target: continuous distance to route+GT corridor
+        route = batch.get('route', None)
+        if route is not None:
+            route_dev = route.to(device=device, dtype=model_dtype)  # (B, 20, 2)
+            trajectory_dev = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
+            route_target = self.compute_route_target(anchor_abs_input, route_dev, trajectory_dev)  # (B, M)
+        else:
+            route_target = torch.zeros(B, M, device=device, dtype=model_dtype)
 
         # --- Compute energy loss with optional masking ---
+        def _sl1(pred, tgt, mask=None):
+            if mask is not None:
+                return F.smooth_l1_loss(pred[mask], tgt[mask])
+            return F.smooth_l1_loss(pred, tgt)
+
+        zero = torch.tensor(0.0, device=device, dtype=model_dtype)
+
         if not self.use_safe_anchors:
-            # Only train on: GT augmentation (first K, safe) + forbidden anchors (rest)
-            # Skip allowed anchors (potentially unreliable)
+            # Binary heads: GT augmentation (first K, always safe) + forbidden anchors only
             active_mask = torch.ones(B, M, device=device, dtype=torch.bool)
             allowed_flags_original = allowed_flags.to(device=device)
-            active_mask[:, K:] = (allowed_flags_original[:, K:] < 0.5)  # keep forbidden only
+            active_mask[:, K:] = (allowed_flags_original[:, K:] < 0.5)
 
             n_active = active_mask.sum()
             if n_active > 0:
-                loss_col = F.smooth_l1_loss(
-                    energy_scores['collision'][active_mask],
-                    collision_target[active_mask],
-                )
-                loss_off = F.smooth_l1_loss(
-                    energy_scores['offroad'][active_mask],
-                    offroad_target[active_mask],
-                )
-                loss_tgt = F.smooth_l1_loss(
-                    energy_scores['target'][active_mask],
-                    target_proxy[active_mask],
-                )
+                loss_front = _sl1(energy_scores['front'], front_target, active_mask)
+                loss_left  = _sl1(energy_scores['left'],  left_target,  active_mask)
+                loss_right = _sl1(energy_scores['right'], right_target, active_mask)
+                loss_ped   = _sl1(energy_scores['pedestrian'], ped_target, active_mask)
+                loss_off   = _sl1(energy_scores['offroad'], offroad_target, active_mask)
             else:
-                loss_col = torch.tensor(0.0, device=device, dtype=model_dtype)
-                loss_off = torch.tensor(0.0, device=device, dtype=model_dtype)
-                loss_tgt = torch.tensor(0.0, device=device, dtype=model_dtype)
+                loss_front = loss_left = loss_right = loss_ped = loss_off = zero
+            # Route loss on ALL anchors (continuous metric, not safety-based masking)
+            loss_route = _sl1(energy_scores['route'], route_target)
         else:
-            # Trust all anchor labels (including safe ones)
-            loss_col = F.smooth_l1_loss(energy_scores['collision'], collision_target)
-            loss_off = F.smooth_l1_loss(energy_scores['offroad'], offroad_target)
-            loss_tgt = F.smooth_l1_loss(energy_scores['target'], target_proxy)
+            loss_front = _sl1(energy_scores['front'], front_target)
+            loss_left  = _sl1(energy_scores['left'],  left_target)
+            loss_right = _sl1(energy_scores['right'], right_target)
+            loss_ped   = _sl1(energy_scores['pedestrian'], ped_target)
+            loss_off   = _sl1(energy_scores['offroad'], offroad_target)
+            loss_route = _sl1(energy_scores['route'], route_target)
 
-        energy_loss = loss_col + loss_off + loss_tgt
+        energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off + loss_route
 
         return {
             'total_loss': self.energy_loss_weight * energy_loss,
             'energy_loss': energy_loss,
-            'energy_col_loss': loss_col,
+            'energy_front_loss': loss_front,
+            'energy_left_loss': loss_left,
+            'energy_right_loss': loss_right,
+            'energy_ped_loss': loss_ped,
             'energy_off_loss': loss_off,
-            'energy_tgt_loss': loss_tgt,
+            'energy_route_loss': loss_route,
         }
 
     # ========== Phase 2: Diffusion Training + Alignment (legacy) ==========
@@ -814,9 +924,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
         if self.alignment_loss_weight > 0 and energy_scores is not None and alignment_active:
             alignment_loss = (
-                self.energy_collision_weight * energy_scores['collision'].mean()
-                + self.energy_offroad_weight * energy_scores['offroad'].mean()
-                + self.energy_target_weight * energy_scores['target'].mean()
+                self.energy_front_weight      * torch.sigmoid(energy_scores['front']).mean()
+                + self.energy_left_weight     * torch.sigmoid(energy_scores['left']).mean()
+                + self.energy_right_weight    * torch.sigmoid(energy_scores['right']).mean()
+                + self.energy_pedestrian_weight * torch.sigmoid(energy_scores['pedestrian']).mean()
+                + self.energy_offroad_weight  * torch.sigmoid(energy_scores['offroad']).mean()
+                + self.energy_route_weight    * energy_scores['route'].mean()
             )
 
         # ========== Total Loss ==========
@@ -928,10 +1041,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         M = self.num_samples
         T = self.horizon
 
-        # Dynamic weight override (LLM Router interface)
-        w_col_cfg = energy_weights.get('collision', self.energy_collision_weight) if energy_weights else self.energy_collision_weight
-        w_off_cfg = energy_weights.get('offroad', self.energy_offroad_weight) if energy_weights else self.energy_offroad_weight
-        w_tgt_cfg = energy_weights.get('target', self.energy_target_weight) if energy_weights else self.energy_target_weight
+        # Dynamic weight override (LLM Router interface — runtime per-head weight control)
+        def _w(key, default):
+            return energy_weights.get(key, default) if energy_weights else default
+        w_front_cfg = _w('front',      self.energy_front_weight)
+        w_left_cfg  = _w('left',       self.energy_left_weight)
+        w_right_cfg = _w('right',      self.energy_right_weight)
+        w_ped_cfg   = _w('pedestrian', self.energy_pedestrian_weight)
+        w_off_cfg   = _w('offroad',    self.energy_offroad_weight)
+        w_rte_cfg   = _w('route',      self.energy_route_weight)
 
         # Start from pure Gaussian noise in z-scored delta space
         x_t = torch.randn(B, M, T, 2, device=device, dtype=torch.float32)
@@ -953,7 +1071,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             t_next = roll_timesteps[step_i + 1].item() if step_i + 1 < len(roll_timesteps) else 0
 
             # Get annealed energy weights for current noise level
-            w_nav, w_col, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
+            w_route, w_veh, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
 
             # ========== Forward pass 1: denoise x_t → pred_x0 ==========
             x_input = x_t.to(dtype=model_dtype)
@@ -961,7 +1079,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
             t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
 
-            use_guidance = self.guidance_scale > 0 and (w_nav + w_col + w_off) > 0
+            use_guidance = self.guidance_scale > 0 and (w_route + w_veh + w_off) > 0
 
             if use_guidance:
                 # Pass 1: get pred_x0 from denoising (no energy eval yet)
@@ -993,12 +1111,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         traj_for_energy=pred_x0_abs,  # abs space for spatial energy evaluation
                     )
 
+                    # Compute route deviation target for guidance (if route available)
+                    if route_for_guidance is not None:
+                        # pred_x0_abs: (B, M, T, 2) — use as anchor_abs for route target
+                        rte_target = self.compute_route_target(
+                            pred_x0_abs,
+                            route_for_guidance.to(device=device, dtype=model_dtype),
+                            pred_x0_abs[:, 0, :, :],  # placeholder gt (not needed for inference)
+                        )  # (B, M)
+                        # Route guidance: pull toward route (minimize route deviation)
+                        route_guidance_energy = w_rte_cfg * w_route * rte_target.sum()
+                    else:
+                        route_guidance_energy = w_rte_cfg * w_route * energy_scores['route'].sum()
+
                     # Compute total energy
                     total_energy = torch.zeros(1, device=device)
                     if energy_scores is not None:
                         total_energy = (
-                            w_tgt_cfg * w_nav * energy_scores['target'].sum()
-                            + w_col_cfg * w_col * energy_scores['collision'].sum()
+                            route_guidance_energy
+                            + w_veh * (
+                                w_front_cfg * energy_scores['front'].sum()
+                                + w_left_cfg  * energy_scores['left'].sum()
+                                + w_right_cfg * energy_scores['right'].sum()
+                                + w_ped_cfg   * energy_scores['pedestrian'].sum()
+                            )
                             + w_off_cfg * w_off * energy_scores['offroad'].sum()
                         )
 
@@ -1093,8 +1229,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Add energy scores if available
         if sample_result['energy_scores'] is not None:
-            result['energy_collision'] = sample_result['energy_scores']['collision'].detach().float().cpu().numpy()
-            result['energy_offroad'] = sample_result['energy_scores']['offroad'].detach().float().cpu().numpy()
-            result['energy_target'] = sample_result['energy_scores']['target'].detach().float().cpu().numpy()
+            es = sample_result['energy_scores']
+            for key in ('front', 'left', 'right', 'pedestrian', 'offroad', 'route'):
+                if key in es:
+                    result[f'energy_{key}'] = es[key].detach().float().cpu().numpy()
 
         return result

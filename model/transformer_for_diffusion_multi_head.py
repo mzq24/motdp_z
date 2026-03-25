@@ -1383,20 +1383,20 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Input: concat(pred_x0_flat, mode_out) = (B, M, horizon*output_dim + n_emb)
         #   - pred_x0_flat: trajectory being evaluated (gradient flows back for guidance)
         #   - mode_out: scene context from BEV attention + ego status (provides scene understanding)
+        # 6 heads: front/left/right (vehicle collision by direction), pedestrian, offroad, route
         if energy_heads:
             energy_in_dim = self.horizon * self.output_dim + n_emb  # T*2 + n_emb
-            self.energy_collision_head = nn.Sequential(
-                nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1),
-            )
-            self.energy_offroad_head = nn.Sequential(
-                nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1),
-            )
-            self.energy_target_head = nn.Sequential(
-                nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1),
-            )
+            def _make_energy_head():
+                return nn.Sequential(
+                    nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
+                    nn.Linear(n_emb // 2, 1),
+                )
+            self.energy_front_head      = _make_energy_head()  # vehicle collision front (label 1)
+            self.energy_left_head       = _make_energy_head()  # vehicle collision left  (label 2)
+            self.energy_right_head      = _make_energy_head()  # vehicle collision right (label 3)
+            self.energy_pedestrian_head = _make_energy_head()  # pedestrian collision    (label 4)
+            self.energy_offroad_head    = _make_energy_head()  # off_road/sidewalk       (label 5-6)
+            self.energy_route_head      = _make_energy_head()  # route deviation (continuous, computed in policy)
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -1653,9 +1653,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
             eval_traj_flat = eval_traj.flatten(-2)  # (B, M, horizon * 2)
             energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)  # (B, M, T*2 + n_emb)
             energy_scores = {
-                'collision': self.energy_collision_head(energy_input).squeeze(-1),  # (B, M)
-                'offroad': self.energy_offroad_head(energy_input).squeeze(-1),      # (B, M)
-                'target': self.energy_target_head(energy_input).squeeze(-1),        # (B, M)
+                'front':      self.energy_front_head(energy_input).squeeze(-1),      # (B, M) vehicle front
+                'left':       self.energy_left_head(energy_input).squeeze(-1),       # (B, M) vehicle left
+                'right':      self.energy_right_head(energy_input).squeeze(-1),      # (B, M) vehicle right
+                'pedestrian': self.energy_pedestrian_head(energy_input).squeeze(-1), # (B, M) pedestrian
+                'offroad':    self.energy_offroad_head(energy_input).squeeze(-1),    # (B, M) offroad
+                'route':      self.energy_route_head(energy_input).squeeze(-1),      # (B, M) route deviation
             }
             return poses_reg, poses_cls, route_pred, mode_out, energy_scores
 

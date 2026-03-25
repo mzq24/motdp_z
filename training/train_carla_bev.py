@@ -660,7 +660,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # Separate energy head params from decoder params
         energy_param_ids = set()
         energy_params = []
-        for head_name in ['energy_collision_head', 'energy_offroad_head', 'energy_target_head']:
+        for head_name in ['energy_front_head', 'energy_left_head', 'energy_right_head',
+                          'energy_pedestrian_head', 'energy_offroad_head', 'energy_route_head']:
             head = getattr(policy_for_params.model, head_name)
             for p in head.parameters():
                 energy_param_ids.add(id(p))
@@ -941,8 +942,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0,
                 }
                 # Individual losses
-                for lk in ('cls_loss', 'reg_loss', 'route_loss', 'energy_loss',
-                           'alignment_loss', 'energy_col_loss', 'energy_off_loss', 'energy_tgt_loss'):
+                for lk in ('cls_loss', 'reg_loss', 'route_loss', 'energy_loss', 'alignment_loss',
+                           'energy_front_loss', 'energy_left_loss', 'energy_right_loss',
+                           'energy_ped_loss', 'energy_off_loss', 'energy_route_loss'):
                     if lk in loss_dict:
                         val = loss_dict[lk]
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
