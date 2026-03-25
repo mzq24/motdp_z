@@ -85,7 +85,7 @@ class RouteBConstructedAgent(BaseRouteBAgent):
 			'route_pred': route_pred,
 		}
 		if last_energy_scores is not None:
-			result['energy_collision'] = last_energy_scores['collision'][:, 0].detach().float().cpu().numpy()
-			result['energy_offroad'] = last_energy_scores['offroad'][:, 0].detach().float().cpu().numpy()
-			result['energy_target'] = last_energy_scores['target'][:, 0].detach().float().cpu().numpy()
+			for key in ('front', 'left', 'right', 'pedestrian', 'offroad', 'route'):
+				if key in last_energy_scores:
+					result[f'energy_{key}'] = last_energy_scores[key][:, 0].detach().float().cpu().numpy()
 		return result

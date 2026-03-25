@@ -800,44 +800,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 
 		
-		if len(waypoint_route) > 2:
-			target_point, far_command = waypoint_route[1]
-			next_target_point, next_far_command = waypoint_route[2]
-		elif len(waypoint_route) > 1:
-			target_point, far_command = waypoint_route[1]
-			# Only target_point available, generate virtual next_target_point
-			# Extend 50m along the direction from ego to target_point (in world frame)
-			ego_pos = result['gps'][:2]
-			direction = target_point[:2] - ego_pos
-			dist = np.linalg.norm(direction)
-			if dist > 1e-3:
-				direction_normalized = direction / dist
-			else:
-				# If target_point is too close, use forward direction based on compass
-				direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
-			next_target_point = target_point[:2] + direction_normalized * 50.0
-			next_far_command = far_command
-		elif len(waypoint_route) > 0:
-			target_point, far_command = waypoint_route[0]
-			# Only one waypoint available, generate virtual next_target_point
-			# Extend 50m along the direction from ego to target_point (in world frame)
-			ego_pos = result['gps'][:2]
-			direction = target_point[:2] - ego_pos
-			dist = np.linalg.norm(direction)
-			if dist > 1e-3:
-				direction_normalized = direction / dist
-			else:
-				# If target_point is too close, use forward direction based on compass
-				direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
-			next_target_point = target_point[:2] + direction_normalized * 50.0
-			next_far_command = far_command
+		# Use the farthest waypoint (waypoint_route[-1]) as target_point for stability.
+		# Close waypoints (e.g. waypoint_route[1] at ~7.5m) are too sensitive to GPS noise,
+		# causing target_point angle to jitter. The farthest point (~50m) is much more stable.
+		# This follows the proven HPC agent convention.
+		if len(waypoint_route) > 0:
+			target_point, far_command = waypoint_route[-1]
+			next_target_point, next_far_command = waypoint_route[-1]
 		else:
-			# waypoint_route 为空的极端情况，使用当前位置
 			target_point, far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
-			# Generate virtual next_target_point 50m ahead in ego's forward direction
-			direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
-			next_target_point = result['gps'][:2] + direction_normalized * 50.0
-			next_far_command = RoadOption.LANEFOLLOW
+			next_target_point, next_far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
 
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp

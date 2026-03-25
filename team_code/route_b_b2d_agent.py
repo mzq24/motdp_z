@@ -117,6 +117,10 @@ IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 PLANNER_TYPE = os.environ.get('PLANNER_TYPE', None)
 EARTH_RADIUS_EQUA = 6378137.0
 USE_UKF = True  # Enable Unscented Kalman Filter for GPS/compass smoothing
+TARGET_POSE_SOURCE = os.environ.get('TARGET_POSE_SOURCE', 'filtered').lower()
+STEER_SIGN_SCALE = float(os.environ.get('STEER_SIGN_SCALE', '1.0'))
+TARGET_YAW_SIGN = float(os.environ.get('TARGET_YAW_SIGN', '1.0'))
+TARGET_GEOM_YAW_SIGN = float(os.environ.get('TARGET_GEOM_YAW_SIGN', '1.0'))
 
 # Entry point
 def get_entry_point():
@@ -414,8 +418,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_dp_pred_traj = None  # Store the last DP refined trajectory (in ego frame)
 		self.last_target_point = None  # Store the last target point (in ego frame)
 		self.last_next_target_point = None  # Store the last next target point (in ego frame)
+		self.last_waypoint_route = None  # Store the planner waypoint route (in ego frame)
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 		self.last_energy_debug = {}
+		self.prev_debug_planner_xy = None
+		self.prev_debug_filtered_xy = None
+		self.prev_debug_raw_xy = None
+		self.prev_debug_hero_xy = None
+		self.last_steer_debug = {}
 
 	def _init(self):
 		# Use _global_plan_world_coord directly (already in CARLA coordinates)
@@ -638,6 +648,35 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		return lidar_stacked, ego_status_stacked, rgb_stacked
 
+	def _resolve_target_pose(self, gps_raw, gps_filtered, compass_raw, compass_filtered):
+		"""Choose the pose source used by planner/target projection/model theta."""
+		if TARGET_POSE_SOURCE == 'hero':
+			try:
+				vehicle = CarlaDataProvider.get_hero_actor()
+				if vehicle is not None:
+					vehicle_transform = vehicle.get_transform()
+					hero_xy = np.array(
+						[vehicle_transform.location.x, vehicle_transform.location.y],
+						dtype=np.float32,
+					)
+					hero_yaw = t_u.normalize_angle(np.deg2rad(vehicle_transform.rotation.yaw))
+					return hero_xy, hero_yaw, 'hero'
+			except Exception:
+				pass
+
+		if TARGET_POSE_SOURCE == 'raw':
+			return (
+				np.asarray(gps_raw, dtype=np.float32),
+				float(t_u.normalize_angle(compass_raw)),
+				'raw',
+			)
+
+		return (
+			np.asarray(gps_filtered, dtype=np.float32),
+			float(t_u.normalize_angle(compass_filtered)),
+			'filtered',
+		)
+
 
 	def sensors(self):
 		sensors =  [
@@ -726,7 +765,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			gps_filtered = np.array([gps_pos[0], gps_pos[1]])
 			compass_filtered = compass
-		
+
+		gps_target_pose, compass_target_pose, target_pose_source = self._resolve_target_pose(
+			gps_raw=np.array([gps_pos[0], gps_pos[1]], dtype=np.float32),
+			gps_filtered=gps_filtered,
+			compass_raw=compass,
+			compass_filtered=compass_filtered,
+		)
+
 		# Combine two frames of lidar data using algin_lidar
 		# Use filtered GPS for lidar alignment
 		if self.last_lidar is not None and self.last_ego_transform is not None:
@@ -824,10 +870,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result = {
 				'rgb_front': rgb_front,
 				'lidar_bev': lidar_bev_tensor,
-				'gps': gps_filtered,  # Use UKF filtered CARLA coordinates
+				'gps': gps_target_pose,  # Pose used by planner/model target projection
+				'gps_raw': np.array([gps_pos[0], gps_pos[1]], dtype=np.float32),
 				'speed': speed,
-				'compass': compass_filtered,  # Use UKF filtered compass
+				'compass': compass_target_pose,  # Heading used by planner/model target projection
+				'compass_raw': compass,
 				'bev': bev,
+				'gps_filtered': gps_filtered,
+				'compass_filtered': compass_filtered,
+				'target_pose_source': target_pose_source,
 				# TransFuser processed data for DP
 				'transfuser_rgb': transfuser_rgb_tensor,  # (1, 3, H, W) on GPU
 				'transfuser_lidar_bev': transfuser_lidar_bev_tensor,  # (1, C, H, W) on GPU
@@ -837,41 +888,37 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 
 		
+		# Follow the newer hpc_agent_1 logic:
+		# - use the near-future route point as target_point
+		# - use the next route point as next_target_point when available
+		# - if route points are insufficient, synthesize a farther next_target_point in world frame
 		if len(waypoint_route) > 2:
 			target_point, far_command = waypoint_route[1]
 			next_target_point, next_far_command = waypoint_route[2]
 		elif len(waypoint_route) > 1:
 			target_point, far_command = waypoint_route[1]
-			# Only target_point available, generate virtual next_target_point
-			# Extend 50m along the direction from ego to target_point (in world frame)
 			ego_pos = result['gps'][:2]
 			direction = target_point[:2] - ego_pos
 			dist = np.linalg.norm(direction)
 			if dist > 1e-3:
 				direction_normalized = direction / dist
 			else:
-				# If target_point is too close, use forward direction based on compass
 				direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
 			next_target_point = target_point[:2] + direction_normalized * 50.0
 			next_far_command = far_command
 		elif len(waypoint_route) > 0:
 			target_point, far_command = waypoint_route[0]
-			# Only one waypoint available, generate virtual next_target_point
-			# Extend 50m along the direction from ego to target_point (in world frame)
 			ego_pos = result['gps'][:2]
 			direction = target_point[:2] - ego_pos
 			dist = np.linalg.norm(direction)
 			if dist > 1e-3:
 				direction_normalized = direction / dist
 			else:
-				# If target_point is too close, use forward direction based on compass
 				direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
 			next_target_point = target_point[:2] + direction_normalized * 50.0
 			next_far_command = far_command
 		else:
-			# waypoint_route 为空的极端情况，使用当前位置
 			target_point, far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
-			# Generate virtual next_target_point 50m ahead in ego's forward direction
 			direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
 			next_target_point = result['gps'][:2] + direction_normalized * 50.0
 			next_far_command = RoadOption.LANEFOLLOW
@@ -886,8 +933,38 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.commands.append(far_command.value)
 		
 		result['next_command'] = self.commands[-2]
-		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass']) #result['compass'])
-		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass']) #result['compass'])
+		ego_waypoint_route = []
+		for route_item in waypoint_route:
+			route_point = route_item[0]
+			ego_route_point = t_u.inverse_conversion_2d(route_point[:2], result['gps'], result['compass'])
+			ego_waypoint_route.append(ego_route_point)
+		if ego_waypoint_route:
+			self.last_waypoint_route = np.asarray(ego_waypoint_route, dtype=np.float32)
+		else:
+			self.last_waypoint_route = None
+
+		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])
+		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass'])
+
+		forward_vec_world = np.array([
+			np.cos(result['compass']),
+			np.sin(result['compass']),
+		], dtype=np.float32)
+		target_delta_world = np.asarray(target_point[:2], dtype=np.float32) - np.asarray(result['gps'][:2], dtype=np.float32)
+		next_target_delta_world = np.asarray(next_target_point[:2], dtype=np.float32) - np.asarray(result['gps'][:2], dtype=np.float32)
+
+		def _angle_and_dot(delta_world):
+			dist = float(np.linalg.norm(delta_world))
+			if dist < 1e-6:
+				return 0.0, 0.0, 0.0
+			dot = float(np.dot(forward_vec_world, delta_world))
+			cross = float(forward_vec_world[0] * delta_world[1] - forward_vec_world[1] * delta_world[0])
+			cos_val = float(np.clip(dot / dist, -1.0, 1.0))
+			angle_deg = float(np.rad2deg(np.arccos(cos_val)))
+			return angle_deg, dot, cross
+
+		target_angle_deg, target_dot_forward, target_cross_forward = _angle_and_dot(target_delta_world)
+		next_target_angle_deg, next_target_dot_forward, next_target_cross_forward = _angle_and_dot(next_target_delta_world)
 
 		# Debug: print target point transformation
 		# if self.step <= 5:
@@ -898,7 +975,28 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
 		result['next_target_point'] = ego_next_target_point  # numpy array (2,)
-		result['theta'] = compass_filtered  # Use UKF filtered compass
+		result['target_point_world'] = np.asarray(target_point[:2], dtype=np.float32)
+		result['next_target_point_world'] = np.asarray(next_target_point[:2], dtype=np.float32)
+		result['target_dot_forward'] = target_dot_forward
+		result['next_target_dot_forward'] = next_target_dot_forward
+		result['target_cross_forward'] = target_cross_forward
+		result['next_target_cross_forward'] = next_target_cross_forward
+		result['target_angle_deg'] = target_angle_deg
+		result['next_target_angle_deg'] = next_target_angle_deg
+		result['target_is_behind'] = bool(target_dot_forward < 0.0)
+		result['next_target_is_behind'] = bool(next_target_dot_forward < 0.0)
+		# Docs/data convention: ego frame uses [x_forward, y_lateral] with y > 0 = right.
+		result['target_is_right'] = bool(target_cross_forward > 0.0)
+		result['next_target_is_right'] = bool(next_target_cross_forward > 0.0)
+		result['target_is_left'] = bool(target_cross_forward < 0.0)
+		result['next_target_is_left'] = bool(next_target_cross_forward < 0.0)
+		if len(waypoint_route) > 0:
+			result['waypoint_route_world'] = np.asarray([route_item[0][:2] for route_item in waypoint_route], dtype=np.float32)
+			result['waypoint_route_ego'] = self.last_waypoint_route.copy() if self.last_waypoint_route is not None else None
+		else:
+			result['waypoint_route_world'] = None
+			result['waypoint_route_ego'] = None
+		result['theta'] = compass_filtered
 
 		return result
 
@@ -941,8 +1039,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		- This handles edge cases near the destination where target_point is very close
 		
 		Args:
-			route_waypoints_np: (N, 2) numpy array in ego frame [x_forward, y_left]
-			target_point_np: (2,) numpy array in ego frame [x_forward, y_left]
+			route_waypoints_np: (N, 2) numpy array in ego frame [x_forward, y_right]
+			target_point_np: (2,) numpy array in ego frame [x_forward, y_right]
 		
 		Returns:
 			truncated_route: (M, 2) numpy array, M <= N, the valid portion of route_pred
@@ -1061,10 +1159,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		Predicts vehicle control with a PID controller.
 		
 		Args:
-			route_waypoints: (1, N, 2) tensor in ego frame [x_forward, y_left]
+			route_waypoints: (1, N, 2) tensor in ego frame [x_forward, y_right]
 			velocity: float, current speed in m/s
 			speed_waypoints: (1, N, 2) tensor for speed calculation
-			target_point: (1, 2) tensor in ego frame [x_forward, y_left], used for route truncation
+			target_point: (1, 2) tensor in ego frame [x_forward, y_right], used for route truncation
 		"""
 		assert route_waypoints.size(0) == 1
 		route_waypoints_np = route_waypoints[0].data.cpu().numpy()  # (N, 2)
@@ -1111,7 +1209,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
 		
 		
-		steer = self.turn_controller.step(route_interp, speed)
+		steer = self._compute_lateral_steer(route_interp, speed)
 		steer = np.clip(steer, -1.0, 1.0)
 		steer = round(steer, 3)
 		
@@ -1123,7 +1221,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		Interpolate waypoints to be 0.1m apart
 		
 		Args:
-			waypoints: (N, 2) numpy array in ego frame [x_forward, y_left]
+			waypoints: (N, 2) numpy array in ego frame [x_forward, y_right]
 			
 		Returns:
 			interp_points: (M, 2) numpy array with points 0.1m apart
@@ -1148,6 +1246,70 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			interp_points = waypoints[None, -1]
 		
 		return interp_points
+
+	def _compute_lateral_steer(self, route_interp, current_speed):
+		"""Compute a smoother steering command from forward-valid route points."""
+		ctrl = self.turn_controller
+		speed_kmh = current_speed * 3.6
+
+		if ctrl.inference_mode:
+			requested_idx = np.clip(
+				ctrl.speed_scale * speed_kmh + ctrl.speed_offset,
+				ctrl.default_lookahead,
+				105,
+			) / 10.0
+			requested_idx = max(requested_idx - 2.0, 0.0)
+		else:
+			requested_idx = float(np.clip(
+				ctrl.speed_scale * speed_kmh + ctrl.speed_offset,
+				ctrl.default_lookahead,
+				105,
+			))
+
+		requested_idx = min(requested_idx, max(len(route_interp) - 1, 0))
+		target_idx = int(round(requested_idx))
+
+		# Ignore route points that are effectively behind the ego; these can flip
+		# the heading target during tight turns or route truncation.
+		forward_valid_idx = np.flatnonzero(route_interp[:, 0] > 0.5)
+		if forward_valid_idx.size > 0:
+			candidate_idx = forward_valid_idx[forward_valid_idx >= target_idx]
+			if candidate_idx.size > 0:
+				target_idx = int(candidate_idx[0])
+			else:
+				target_idx = int(forward_valid_idx[-1])
+
+		window_start = max(0, target_idx - 2)
+		window_end = min(len(route_interp), target_idx + 3)
+		desired_heading_vec = route_interp[window_start:window_end].mean(axis=0)
+
+		yaw_path = np.arctan2(desired_heading_vec[1], desired_heading_vec[0])
+		heading_error_rad = (yaw_path) % (2 * np.pi)
+		heading_error_rad = heading_error_rad if heading_error_rad < np.pi else heading_error_rad - 2 * np.pi
+		heading_error = heading_error_rad * 180.0 / np.pi / 90.0
+
+		ctrl._window.append(heading_error)
+		ctrl._window = ctrl._window[-ctrl.n:]
+
+		derivative = 0.0 if len(ctrl._window) == 1 else ctrl._window[-1] - ctrl._window[-2]
+		integral = float(np.mean(ctrl._window))
+		steering = np.clip(
+			ctrl.k_p * heading_error + ctrl.k_d * derivative + ctrl.k_i * integral,
+			-1.0,
+			1.0,
+		).item()
+
+		self.last_steer_debug = {
+			'requested_lookahead_idx': float(requested_idx),
+			'target_idx': int(target_idx),
+			'forward_valid_count': int(forward_valid_idx.size),
+			'desired_heading_vec': desired_heading_vec.tolist(),
+			'yaw_path_deg': float(np.rad2deg(yaw_path)),
+			'heading_error_norm': float(heading_error),
+			'heading_error_deg': float(np.rad2deg(heading_error_rad)),
+			'steer_raw': float(steering),
+		}
+		return steering
 	
 	@torch.no_grad()
 	def run_step(self, input_data, timestamp):
@@ -1301,7 +1463,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			self.last_energy_debug = {}
-			for energy_key in ['energy_collision', 'energy_offroad', 'energy_target']:
+			for energy_key in ['energy_front', 'energy_left', 'energy_right',
+								'energy_pedestrian', 'energy_offroad', 'energy_route']:
 				energy_value = dp_pred_traj.get(energy_key)
 				if energy_value is None:
 					continue
@@ -1370,8 +1533,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				brake = 1.0
 				self.stuck_detector = 0  # Waiting at stop sign is not stuck
 
+			applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
 			control = carla.VehicleControl()
-			control.steer = float(steer)
+			control.steer = applied_steer
 			control.throttle = float(throttle)
 			control.brake = float(brake)
 			
@@ -1386,11 +1550,106 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata = {
 				'agent': 'mot',
 				'steer': control.steer,
+				'steer_controller': float(steer),
+				'steer_sign_scale': STEER_SIGN_SCALE,
 				'throttle': control.throttle,
 				'brake': control.brake,
 				'speed': gt_velocity,
 				'command': command,
 			}
+			vehicle_transform = vehicle.get_transform()
+			hero_xy = np.array([
+				float(vehicle_transform.location.x),
+				float(vehicle_transform.location.y),
+			], dtype=np.float32)
+			planner_xy = np.asarray(tick_data.get('gps'), dtype=np.float32)
+			filtered_xy = np.asarray(tick_data.get('gps_filtered'), dtype=np.float32)
+			raw_xy = np.asarray(tick_data.get('gps_raw'), dtype=np.float32)
+			expected_step_distance = float(gt_velocity) * self.carla_frame_rate
+
+			def _step_distance(current_xy, previous_xy):
+				if current_xy is None or previous_xy is None:
+					return None
+				return float(np.linalg.norm(current_xy - previous_xy))
+
+			planner_step_distance = _step_distance(planner_xy, self.prev_debug_planner_xy)
+			filtered_step_distance = _step_distance(filtered_xy, self.prev_debug_filtered_xy)
+			raw_step_distance = _step_distance(raw_xy, self.prev_debug_raw_xy)
+			hero_step_distance = _step_distance(hero_xy, self.prev_debug_hero_xy)
+
+			self.pid_metadata.update({
+				'gps_raw': tick_data['gps_raw'].tolist() if isinstance(tick_data.get('gps_raw'), np.ndarray) else tick_data.get('gps_raw'),
+				'gps_filtered': tick_data['gps_filtered'].tolist() if isinstance(tick_data.get('gps_filtered'), np.ndarray) else tick_data.get('gps_filtered'),
+				'gps_planner': tick_data['gps'].tolist() if isinstance(tick_data.get('gps'), np.ndarray) else tick_data.get('gps'),
+				'target_pose_source': tick_data.get('target_pose_source'),
+				'compass_raw': float(tick_data.get('compass_raw', 0.0)),
+				'compass_filtered': float(tick_data.get('compass_filtered', 0.0)),
+				'compass_planner': float(tick_data.get('compass', 0.0)),
+				'target_geom_theta': float(tick_data.get('target_geom_theta', tick_data.get('compass', 0.0))),
+				'target_yaw_sign': TARGET_YAW_SIGN,
+				'target_geom_yaw_sign': TARGET_GEOM_YAW_SIGN,
+				'theta_model': float(tick_data.get('theta', 0.0)),
+				'hero_location_world': [
+					float(vehicle_transform.location.x),
+					float(vehicle_transform.location.y),
+					float(vehicle_transform.location.z),
+				],
+				'hero_yaw_world_deg': float(vehicle_transform.rotation.yaw),
+				'planner_vs_hero_xy_error': float(np.linalg.norm(planner_xy - hero_xy)),
+				'filtered_vs_hero_xy_error': float(np.linalg.norm(filtered_xy - hero_xy)),
+				'raw_vs_hero_xy_error': float(np.linalg.norm(raw_xy - hero_xy)),
+				'planner_step_distance': planner_step_distance,
+				'filtered_step_distance': filtered_step_distance,
+				'raw_step_distance': raw_step_distance,
+				'hero_step_distance': hero_step_distance,
+				'expected_step_distance': expected_step_distance,
+				'target_point_ego': tick_data['target_point'].tolist() if isinstance(tick_data.get('target_point'), np.ndarray) else tick_data.get('target_point'),
+				'next_target_point_ego': tick_data['next_target_point'].tolist() if isinstance(tick_data.get('next_target_point'), np.ndarray) else tick_data.get('next_target_point'),
+				'target_point_world': tick_data['target_point_world'].tolist() if isinstance(tick_data.get('target_point_world'), np.ndarray) else tick_data.get('target_point_world'),
+				'next_target_point_world': tick_data['next_target_point_world'].tolist() if isinstance(tick_data.get('next_target_point_world'), np.ndarray) else tick_data.get('next_target_point_world'),
+				'model_route_pred_ego': self.last_route_pred.tolist() if isinstance(self.last_route_pred, np.ndarray) else self.last_route_pred,
+				'model_dp_traj_ego': self.last_dp_pred_traj.tolist() if isinstance(self.last_dp_pred_traj, np.ndarray) else self.last_dp_pred_traj,
+				'target_dot_forward': float(tick_data.get('target_dot_forward', 0.0)),
+				'next_target_dot_forward': float(tick_data.get('next_target_dot_forward', 0.0)),
+				'target_cross_forward': float(tick_data.get('target_cross_forward', 0.0)),
+				'next_target_cross_forward': float(tick_data.get('next_target_cross_forward', 0.0)),
+				'target_angle_deg': float(tick_data.get('target_angle_deg', 0.0)),
+				'next_target_angle_deg': float(tick_data.get('next_target_angle_deg', 0.0)),
+				'target_is_behind': bool(tick_data.get('target_is_behind', False)),
+				'next_target_is_behind': bool(tick_data.get('next_target_is_behind', False)),
+				'target_is_right': bool(tick_data.get('target_is_right', False)),
+				'next_target_is_right': bool(tick_data.get('next_target_is_right', False)),
+				'target_is_left': bool(tick_data.get('target_is_left', False)),
+				'next_target_is_left': bool(tick_data.get('next_target_is_left', False)),
+				'steer_requested_lookahead_idx': self.last_steer_debug.get('requested_lookahead_idx'),
+				'steer_target_idx': self.last_steer_debug.get('target_idx'),
+				'steer_forward_valid_count': self.last_steer_debug.get('forward_valid_count'),
+				'steer_desired_heading_vec': self.last_steer_debug.get('desired_heading_vec'),
+				'steer_yaw_path_deg': self.last_steer_debug.get('yaw_path_deg'),
+				'steer_heading_error_deg': self.last_steer_debug.get('heading_error_deg'),
+				'steer_heading_error_norm': self.last_steer_debug.get('heading_error_norm'),
+				'steer_raw_before_round': self.last_steer_debug.get('steer_raw'),
+			})
+			if isinstance(self.last_route_pred, np.ndarray) and len(self.last_route_pred) > 0:
+				self.pid_metadata['model_route_pred_first'] = self.last_route_pred[0].tolist()
+				self.pid_metadata['model_route_pred_last'] = self.last_route_pred[-1].tolist()
+			if isinstance(self.last_dp_pred_traj, np.ndarray) and len(self.last_dp_pred_traj) > 0:
+				self.pid_metadata['model_dp_traj_first'] = self.last_dp_pred_traj[0].tolist()
+				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
+			self.prev_debug_planner_xy = planner_xy.copy()
+			self.prev_debug_filtered_xy = filtered_xy.copy()
+			self.prev_debug_raw_xy = raw_xy.copy()
+			self.prev_debug_hero_xy = hero_xy.copy()
+			waypoint_route_world = tick_data.get('waypoint_route_world')
+			waypoint_route_ego = tick_data.get('waypoint_route_ego')
+			if isinstance(waypoint_route_world, np.ndarray) and len(waypoint_route_world) > 0:
+				self.pid_metadata['waypoint_route_world_first'] = waypoint_route_world[0].tolist()
+				self.pid_metadata['waypoint_route_world_last'] = waypoint_route_world[-1].tolist()
+				self.pid_metadata['waypoint_route_world'] = waypoint_route_world.tolist()
+			if isinstance(waypoint_route_ego, np.ndarray) and len(waypoint_route_ego) > 0:
+				self.pid_metadata['waypoint_route_ego_first'] = waypoint_route_ego[0].tolist()
+				self.pid_metadata['waypoint_route_ego_last'] = waypoint_route_ego[-1].tolist()
+				self.pid_metadata['waypoint_route_ego'] = waypoint_route_ego.tolist()
 
 			self.prev_control = control
 			self.control = control  # Update control for UKF prediction in next tick
@@ -1411,11 +1670,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			tp_for_render = target_point.cpu().float().numpy().copy()
 			if tp_for_render.ndim == 2:
 				tp_for_render = tp_for_render.squeeze(0)
-			tp_for_render[1] = -tp_for_render[1]  # Negate y: left -> right
 
 			# Prepare dp_pred_traj for rendering (red)
 			dp_traj_for_render = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) - already numpy
-			dp_traj_for_render[:, 1] = -dp_traj_for_render[:, 1]  # Negate y: left -> right
 			dp_trajectory = np.concatenate((dp_traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
 			dp_trajectory = dp_trajectory[:, [1, 0]]
 			dp_trajectory[:, 0] = -dp_trajectory[:, 0]
@@ -1428,7 +1685,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			if USE_MOT and pred_traj is not None:
 				# Prepare MoT pred_traj for rendering (green)
 				traj_for_render = pred_traj.squeeze(0).cpu().float().numpy().copy()
-				traj_for_render[:, 1] = -traj_for_render[:, 1]
 				trajectory = np.concatenate((traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
 				trajectory = trajectory[:, [1, 0]]
 				trajectory[:, 0] = -trajectory[:, 0]
@@ -1494,7 +1750,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Pass last_route_pred for visualization (20 waypoints for lateral control, blue points)
 			# Pass both target_point and next_target_point for visualization
 			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point,
-			                                        self.last_next_target_point, self.last_dp_pred_traj, self.last_route_pred)
+			                                        self.last_next_target_point, self.last_dp_pred_traj, self.last_route_pred,
+			                                        self.last_waypoint_route)
 		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		debug_img = self._compose_debug_visualization(tick_data['rgb_front'], bev_img)
@@ -1504,8 +1761,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			lidar_bev_tensor = tick_data['lidar_bev']
 			if isinstance(lidar_bev_tensor, torch.Tensor):
 				lidar_bev_tensor = lidar_bev_tensor.cpu().numpy()
-			lidar_bev_img = (lidar_bev_tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
-			imageio.imwrite(str(self.save_path / 'lidar_bev' / (f'{frame:04d}.png')), lidar_bev_img)
+			# Remove batch dim if present: (1, C, H, W) -> (C, H, W)
+			while lidar_bev_tensor.ndim > 3:
+				lidar_bev_tensor = lidar_bev_tensor[0]
+			if lidar_bev_tensor.ndim == 3:
+				# Take first 3 channels for RGB visualization
+				lidar_bev_img = (lidar_bev_tensor[:3].transpose(1, 2, 0) * 255).astype(np.uint8)
+			elif lidar_bev_tensor.ndim == 2:
+				lidar_bev_img = (lidar_bev_tensor * 255).astype(np.uint8)
+			else:
+				lidar_bev_img = None
+			if lidar_bev_img is not None:
+				imageio.imwrite(str(self.save_path / 'lidar_bev' / (f'{frame:04d}.png')), lidar_bev_img)
 
 		outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
 		json.dump(self.pid_metadata, outfile, indent=4)
@@ -1529,9 +1796,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"frame: {self.step}",
 			f"speed_kmh: {float(self.pid_metadata.get('speed', 0.0)) * 3.6:.2f}",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
+			f"steer_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
 			f"throttle: {float(self.pid_metadata.get('throttle', 0.0)):.3f}",
 			f"brake: {float(self.pid_metadata.get('brake', 0.0)):.3f}",
 			f"command: {self.pid_metadata.get('command', 'N/A')}",
+			f"target_pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
 		]
 
 		if self.last_target_point is not None:
@@ -1544,9 +1813,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 
 		status_lines.extend([
-			f"energy_collision: {self.last_energy_debug.get('energy_collision', float('nan')):.4f}",
+			f"target_angle_deg: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.2f}",
+			f"target_is_right: {self.pid_metadata.get('target_is_right', False)}",
+			f"target_is_left: {self.pid_metadata.get('target_is_left', False)}",
+			f"target_is_behind: {self.pid_metadata.get('target_is_behind', False)}",
+			f"steer_heading_error_deg: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.2f}",
+			f"steer_target_idx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
+			f"energy_front: {self.last_energy_debug.get('energy_front', float('nan')):.4f}",
+			f"energy_left: {self.last_energy_debug.get('energy_left', float('nan')):.4f}",
+			f"energy_right: {self.last_energy_debug.get('energy_right', float('nan')):.4f}",
+			f"energy_ped: {self.last_energy_debug.get('energy_pedestrian', float('nan')):.4f}",
 			f"energy_offroad: {self.last_energy_debug.get('energy_offroad', float('nan')):.4f}",
-			f"energy_target: {self.last_energy_debug.get('energy_target', float('nan')):.4f}",
+			f"energy_route: {self.last_energy_debug.get('energy_route', float('nan')):.4f}",
 		])
 
 		for idx, line in enumerate(status_lines):
@@ -1560,6 +1838,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			("traj", (0, 255, 0)),
 			("dp_traj", (255, 0, 0)),
 			("route", (0, 0, 255)),
+			("wp_route", (255, 255, 255)),
 			("target", (0, 255, 255)),
 			("next_target", (255, 0, 255)),
 		]
@@ -1580,7 +1859,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cv2.putText(canvas, "BEV + Status", (820, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
 		return canvas
 
-	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, next_target_point=None, dp_traj=None, route_pred=None):
+	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, next_target_point=None, dp_traj=None, route_pred=None, waypoint_route=None):
 		"""
 		Draw predicted trajectory on BEV image.
 		
@@ -1589,17 +1868,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		- FOV: 50 degrees
 		- Image size: 512x512
 		
-		Trajectory is in ego frame: [x, y] where x is forward, y is left (model convention)
-		For BEV visualization, we negate y to convert to right-positive convention.
+		Trajectory is in ego frame: [x, y] where x is forward, y is lateral with
+		y > 0 meaning right (training-data / model convention from docs).
 		BEV image: center is ego position, up is forward (negative x in image coords)
 		
 		Args:
 			bev_img: numpy array (512, 512, 3) RGB image
-			traj: numpy array (6, 2) trajectory points in ego frame [x_forward, y_left]
-			target_point: numpy array (2,) target point in ego frame [x_forward, y_left], optional
-			next_target_point: numpy array (2,) next target point in ego frame [x_forward, y_left], optional
+			traj: numpy array (6, 2) trajectory points in ego frame [x_forward, y_right]
+			target_point: numpy array (2,) target point in ego frame [x_forward, y_right], optional
+			next_target_point: numpy array (2,) next target point in ego frame [x_forward, y_right], optional
 			dp_traj: numpy array (6, 2) DP refined trajectory points in ego frame, optional
 			route_pred: numpy array (20, 2) route waypoints for lateral control, optional
+			waypoint_route: numpy array (N, 2) planner waypoint route in ego frame, optional
 		
 		Returns:
 			bev_img: numpy array with trajectory drawn
@@ -1618,18 +1898,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cx, cy = img_w // 2, img_h // 2
 		
 		# Convert trajectory points to pixel coordinates
-		# Model ego frame: x is forward, y is LEFT (positive y = left)
+		# Model/data ego frame: x is forward, y is RIGHT (positive y = right)
 		# BEV image: center is ego, up (-row) is forward, right (+col) is right
-		# Need to negate y to convert from left-positive to right-positive
-		# So: pixel_col = cx + y / meters_per_pixel (negate y: left -> right, then right is +col)
+		# So: pixel_col = cx + y / meters_per_pixel
 		#     pixel_row = cy - x / meters_per_pixel (x forward -> -row, i.e., up)
 		
 		pixels = []
 		if traj is not None:
 			for i in range(len(traj)):
-				x, y = traj[i]  # x: forward, y: left (model convention)
-				# Negate y for visualization: left-positive -> right-positive
-				pixel_col = int(cx + y / meters_per_pixel)  # y_left negated: +y_left -> -col, so use + to flip
+				x, y = traj[i]  # x: forward, y: right (data/model convention)
+				pixel_col = int(cx + y / meters_per_pixel)
 				pixel_row = int(cy - x / meters_per_pixel)
 				pixels.append((pixel_col, pixel_row))
 		
@@ -1655,7 +1933,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if dp_traj is not None:
 			dp_pixels = []
 			for i in range(len(dp_traj)):
-				x, y = dp_traj[i]  # x: forward, y: left (model convention)
+				x, y = dp_traj[i]  # x: forward, y: right (data/model convention)
 				pixel_col = int(cx + y / meters_per_pixel)
 				pixel_row = int(cy - x / meters_per_pixel)
 				dp_pixels.append((pixel_col, pixel_row))
@@ -1679,7 +1957,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if route_pred is not None:
 			route_pixels = []
 			for i in range(len(route_pred)):
-				x, y = route_pred[i]  # x: forward, y: left (model convention)
+				x, y = route_pred[i]  # x: forward, y: right (data/model convention)
 				pixel_col = int(cx + y / meters_per_pixel)
 				pixel_row = int(cy - x / meters_per_pixel)
 				route_pixels.append((pixel_col, pixel_row))
@@ -1697,21 +1975,53 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				if 0 <= col < img_w and 0 <= row < img_h:
 					# Solid blue points for route_pred
 					cv2.circle(bev_img, (col, row), 3, (0, 0, 255), -1)  # Blue circles (smaller)
+
+		# Draw planner waypoint_route if provided (white color)
+		if waypoint_route is not None:
+			wp_pixels = []
+			for i in range(len(waypoint_route)):
+				x, y = waypoint_route[i]
+				pixel_col = int(cx + y / meters_per_pixel)
+				pixel_row = int(cy - x / meters_per_pixel)
+				wp_pixels.append((pixel_col, pixel_row))
+
+			for i in range(len(wp_pixels) - 1):
+				pt1 = wp_pixels[i]
+				pt2 = wp_pixels[i + 1]
+				if (0 <= pt1[0] < img_w and 0 <= pt1[1] < img_h and
+					0 <= pt2[0] < img_w and 0 <= pt2[1] < img_h):
+					cv2.line(bev_img, pt1, pt2, (255, 255, 255), 1)
+
+			for i, (col, row) in enumerate(wp_pixels):
+				if 0 <= col < img_w and 0 <= row < img_h:
+					radius = 4 if i in (0, len(wp_pixels) - 1) else 2
+					cv2.circle(bev_img, (col, row), radius, (255, 255, 255), -1)
 		
+		target_overlaps_next = (
+			target_point is not None and
+			next_target_point is not None and
+			np.linalg.norm(np.asarray(target_point) - np.asarray(next_target_point)) < 1e-3
+		)
+
 		# Draw target point if provided (cyan/aqua color with larger circle)
 		if target_point is not None:
-			x, y = target_point[0], target_point[1]  # x: forward, y: left (model convention)
-			# Negate y for visualization
-			tp_col = int(cx + y / meters_per_pixel)  # Negate y: +y_left -> -col, use + to flip
+			x, y = target_point[0], target_point[1]  # x: forward, y: right (data/model convention)
+			tp_col = int(cx + y / meters_per_pixel)
 			tp_row = int(cy - x / meters_per_pixel)
 			if 0 <= tp_col < img_w and 0 <= tp_row < img_h:
-				cv2.circle(bev_img, (tp_col, tp_row), 10, (0, 255, 255), -1)  # Cyan circle for target point
-				cv2.circle(bev_img, (tp_col, tp_row), 12, (255, 255, 255), 2)  # White border
+				if target_overlaps_next:
+					cv2.circle(bev_img, (tp_col, tp_row), 13, (255, 0, 255), -1)
+					cv2.circle(bev_img, (tp_col, tp_row), 8, (0, 255, 255), -1)
+					cv2.circle(bev_img, (tp_col, tp_row), 15, (255, 255, 255), 2)
+					cv2.putText(bev_img, "TP/NTP", (tp_col + 10, tp_row - 10),
+					            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+				else:
+					cv2.circle(bev_img, (tp_col, tp_row), 10, (0, 255, 255), -1)
+					cv2.circle(bev_img, (tp_col, tp_row), 12, (255, 255, 255), 2)
 		
 		# Draw next target point if provided (magenta/pink color with larger circle)
-		if next_target_point is not None:
-			x, y = next_target_point[0], next_target_point[1]  # x: forward, y: left (model convention)
-			# Negate y for visualization
+		if next_target_point is not None and not target_overlaps_next:
+			x, y = next_target_point[0], next_target_point[1]  # x: forward, y: right (data/model convention)
 			ntp_col = int(cx + y / meters_per_pixel)
 			ntp_row = int(cy - x / meters_per_pixel)
 			if 0 <= ntp_col < img_w and 0 <= ntp_row < img_h:
@@ -1720,6 +2030,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Draw ego position (center)
 		cv2.circle(bev_img, (cx, cy), 8, (255, 255, 0), -1)  # Yellow circle for ego
+		
+		# Draw ego-frame axes to make the BEV convention explicit.
+		# In this visualization: forward is up, right is right.
+		axis_len = 42
+		forward_end = (cx, cy - axis_len)
+		right_end = (cx + axis_len, cy)
+		left_end = (cx - axis_len, cy)
+		cv2.arrowedLine(bev_img, (cx, cy), forward_end, (255, 255, 0), 2, tipLength=0.25)
+		cv2.arrowedLine(bev_img, (cx, cy), right_end, (0, 255, 255), 2, tipLength=0.25)
+		cv2.arrowedLine(bev_img, (cx, cy), left_end, (160, 160, 160), 1, tipLength=0.2)
+		cv2.putText(bev_img, "FWD", (forward_end[0] + 8, forward_end[1] - 6),
+		            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+		cv2.putText(bev_img, "RIGHT(+y)", (right_end[0] + 6, right_end[1] - 8),
+		            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+		cv2.putText(bev_img, "LEFT", (left_end[0] - 46, left_end[1] - 8),
+		            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
 		
 		return bev_img
 
@@ -1736,7 +2062,3 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		y = scale * EARTH_RADIUS_EQUA * math.log(math.tan((90.0 + self.lat_ref) * math.pi / 360.0)) - my
 		x = mx - scale * self.lon_ref * math.pi * EARTH_RADIUS_EQUA / 180.0
 		return np.array([x, y])
-
-
-
-

@@ -454,27 +454,16 @@ class BridgeAgent(autonomous_agent.AutonomousAgent):
 
         waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
 
-        if len(waypoint_route) > 2:
-            target_point, far_command = waypoint_route[1]
-            next_target_point, _ = waypoint_route[2]
-        elif len(waypoint_route) > 1:
-            target_point, far_command = waypoint_route[1]
-            ego_pos = result['gps'][:2]
-            direction = target_point[:2] - ego_pos
-            dist = np.linalg.norm(direction)
-            direction_normalized = direction / dist if dist > 1e-3 else np.array([np.cos(result['compass']), np.sin(result['compass'])])
-            next_target_point = target_point[:2] + direction_normalized * 50.0
-        elif len(waypoint_route) > 0:
-            target_point, far_command = waypoint_route[0]
-            ego_pos = result['gps'][:2]
-            direction = target_point[:2] - ego_pos
-            dist = np.linalg.norm(direction)
-            direction_normalized = direction / dist if dist > 1e-3 else np.array([np.cos(result['compass']), np.sin(result['compass'])])
-            next_target_point = target_point[:2] + direction_normalized * 50.0
+        # Use the farthest waypoint (waypoint_route[-1]) as target_point for stability.
+        # Close waypoints (e.g. waypoint_route[1] at ~7.5m) are too sensitive to GPS noise,
+        # causing target_point angle to jitter. The farthest point (~50m) is much more stable.
+        # This follows the proven HPC agent convention.
+        if len(waypoint_route) > 0:
+            target_point, far_command = waypoint_route[-1]
+            next_target_point = waypoint_route[-1][0]
         else:
             target_point, far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
-            direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
-            next_target_point = result['gps'][:2] + direction_normalized * 50.0
+            next_target_point = result['gps'][:2]
 
         if self.last_command_tmp != far_command:
             self.last_command = self.last_command_tmp
