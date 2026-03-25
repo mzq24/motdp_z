@@ -91,7 +91,7 @@ policy:
   obs_as_cond: true
   n_cond_layers: 6
   action_horizon: 6
-  traj_can_attend_route: false
+  traj_can_attend_route: true
 
 # ========== Route B+: Compositional Energy Guidance ==========
 route_b:
@@ -126,7 +126,7 @@ truncated_diffusion:
   num_diffusion_steps: 10
   eta: 0.0
   prediction_type: "sample"
-  route_loss_weight: 0.6
+  route_loss_weight: 2.0
   # Normalization: delta z-score (per-step mean/std from delta_stats_path)
   # Old norm params removed — no longer used
 
@@ -162,8 +162,8 @@ logging:
   log_freq: 50
 augmentation:
   gps_noise:
-    enabled: false    # GPS noise on target_point/waypoints during training
+    enabled: true     # GPS noise on target_point/waypoints during training
     sigma: 0.4        # meters, matches complementary filter residual
-    probability: 0.8  # fraction of training samples that receive noise
+    probability: 0.5  # fraction of training samples that receive noise
 model_optimization:
   use_mixed_precision: true

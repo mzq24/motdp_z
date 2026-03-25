@@ -87,6 +87,7 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     metrics = {}
     
     # === L2 误差指标 ===
+    metrics['ADE'] = np.mean(l2_errors)
 
     if T >= 2:  
         metrics['L2_1s'] = np.mean(l2_errors[:, 1])
@@ -790,8 +791,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             if rank == 0:
                 print(f"\n✓ Validation completed")
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
-                l2_keys = ['val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
-                            'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
+                l2_keys = ['val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
+                            'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
                 for key in l2_keys:
                     if key in val_metrics:
                         tag = " (1-step)" if "_1step" in key else ""
@@ -1067,8 +1068,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 safe_wandb_log(log_dict, use_wandb)
 
                 print(f"Validation metrics: (total {len(val_metrics)} metrics)")
-                l2_keys = ['val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
-                            'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
+                l2_keys = ['val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
+                            'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
                 for key in l2_keys:
                     if key in val_metrics:
                         tag = " (1-step)" if "_1step" in key else ""
