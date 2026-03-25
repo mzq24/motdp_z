@@ -2,7 +2,16 @@
 import os
 import sys
 import torch
-from torch.amp import autocast, GradScaler
+try:
+    from torch.amp import autocast as torch_autocast, GradScaler
+
+    def autocast_cuda(enabled, dtype):
+        return torch_autocast('cuda', enabled=enabled, dtype=dtype)
+except ImportError:
+    from torch.cuda.amp import autocast as torch_autocast, GradScaler
+
+    def autocast_cuda(enabled, dtype):
+        return torch_autocast(enabled=enabled, dtype=dtype)
 import yaml
 import wandb
 import numpy as np
@@ -135,7 +144,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
-            with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+            with autocast_cuda(use_amp, amp_dtype):
                 # Route B can explicitly choose unified or split-forward validation.
                 if hasattr(model_for_inference, 'compute_unified_loss') and \
                    getattr(model_for_inference, 'anchor_centers_abs', None) is not None:
@@ -843,7 +852,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 optimizer_energy.zero_grad(set_to_none=True)
                 optimizer.zero_grad(set_to_none=True)
 
-                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                with autocast_cuda(use_amp, amp_dtype):
                     loss_dict = policy(batch, return_loss_dict=True, phase=route_b_phase)
                     total_loss = loss_dict['total_loss']
 
@@ -880,7 +889,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             else:
                 # ===== Route A: Single-phase training (unchanged) =====
                 optimizer.zero_grad(set_to_none=True)
-                with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                with autocast_cuda(use_amp, amp_dtype):
                     loss_dict = policy(batch, return_loss_dict=True)
                     loss = loss_dict['total_loss']
 
