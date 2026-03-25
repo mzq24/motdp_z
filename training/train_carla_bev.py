@@ -115,6 +115,8 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
 
     # Get the actual model (unwrap DDP if needed)
     model_for_inference = policy.module if world_size > 1 else policy
+    route_b_cfg = getattr(model_for_inference, 'route_b_cfg', {}) or {}
+    route_b_phase = 'split' if route_b_cfg.get('use_split_forward', False) else 'unified'
 
     val_metrics = defaultdict(list)
 
@@ -134,10 +136,10 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                     batch[key] = batch[key].to(device, non_blocking=True)
 
             with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                # Use unified forward for Route B+ to match training (position encoding consistency)
+                # Route B can explicitly choose unified or split-forward validation.
                 if hasattr(model_for_inference, 'compute_unified_loss') and \
                    getattr(model_for_inference, 'anchor_centers_abs', None) is not None:
-                    loss_dict = model_for_inference(batch, return_loss_dict=True, phase='unified')
+                    loss_dict = model_for_inference(batch, return_loss_dict=True, phase=route_b_phase)
                 else:
                     loss_dict = model_for_inference.compute_loss(batch)
                 loss = loss_dict['total_loss']
@@ -655,6 +657,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     # Route A: single optimizer (unchanged)
     optimizer_energy = None
     policy_for_params = policy.module if world_size > 1 else policy
+    route_b_cfg = config.get('route_b', {})
+    route_b_phase = 'split' if route_b_cfg.get('use_split_forward', False) else 'unified'
 
     if policy_type == 'anchor_free':
         # Separate energy head params from decoder params
@@ -833,15 +837,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
 
             if policy_type == 'anchor_free' and optimizer_energy is not None:
-                # ===== Route B+: Unified single-forward training =====
-                # One forward pass with 34 modes (32 anchor + 1 GT + 1 x_t),
-                # then separate backward for energy heads vs diffusion decoder.
+                # ===== Route B+: Explicit unified/split training path =====
+                # Split-forward is the default for the MOA refactor branch.
 
                 optimizer_energy.zero_grad(set_to_none=True)
                 optimizer.zero_grad(set_to_none=True)
 
                 with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    loss_dict = policy(batch, return_loss_dict=True, phase='unified')
+                    loss_dict = policy(batch, return_loss_dict=True, phase=route_b_phase)
                     total_loss = loss_dict['total_loss']
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):

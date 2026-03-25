@@ -93,6 +93,7 @@ route_b:
   num_samples: 1           # Diffusion denoising: single mode (no multi-candidate selection)
   num_energy_modes: 32     # Energy head training: use all anchors for diverse pos/neg samples
   num_inference_steps: 10  # 10-step DDIM (5x of Route A's 2-step)
+  use_split_forward: true  # Use split ego/energy forwards for MOA refactor
   guidance_scale: 0.1      # Global energy gradient scale (start small, tune up)
   # Per-head energy weights (6 heads: front/left/right/pedestrian/offroad/route)
   energy_front_weight: 1.0

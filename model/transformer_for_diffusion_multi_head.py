@@ -1000,6 +1000,15 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             lidar_max_x=32.0,
             lidar_max_y=32.0
         )
+        # Ego path uses one BEV sample per waypoint token.
+        self.bev_point_attn = GridSampleCrossBEVAttention(
+            embed_dims=d_model,
+            num_heads=nhead,
+            in_bev_dims=transfuser_bev_upsample_dim,
+            num_points=1,
+            lidar_max_x=32.0,
+            lidar_max_y=32.0
+        )
         
         # Position embeddings for cross-attention sources (BEV tokens only now)
         # Total tokens: 64 (bev)
@@ -1129,6 +1138,32 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         mask[T_traj:, :T_traj] = float('-inf')
 
         return mask
+
+    def _create_ego_mask(self, T_traj: int, T_route: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Ego-path mask for [traj_wp | route].
+
+        - Trajectory waypoints can attend to each other.
+        - Trajectory waypoints can optionally attend to route tokens.
+        - Route tokens cannot attend to trajectory waypoints.
+        - Route tokens can attend to each other.
+        """
+        T_total = T_traj + T_route
+        mask = torch.zeros((T_total, T_total), device=device, dtype=dtype)
+
+        if not self.traj_can_attend_route:
+            mask[:T_traj, T_traj:] = float('-inf')
+
+        mask[T_traj:, :T_traj] = float('-inf')
+        return mask
+
+    def compute_bev_proj(self, transfuser_bev_feature: torch.Tensor) -> torch.Tensor:
+        """Precompute BEV token projection for reuse across split forwards."""
+        bev_feat = transfuser_bev_feature.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
+        bev_proj = self.bev_feature_proj(bev_feat)  # (B, 64, d_model)
+        if bev_proj.shape[1] <= self.combined_pos_emb.shape[1]:
+            bev_proj = bev_proj + self.combined_pos_emb[:, :bev_proj.shape[1], :]
+        return bev_proj
     
     def forward(
         self,
@@ -1138,6 +1173,10 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         conditioning: torch.Tensor,                 # (B, d_model)
         traj_points: Optional[torch.Tensor] = None,  # (B, T_traj, 2) or (B, T_traj, horizon, 2) for GridSampleCrossBEVAttention
         route_conditioning: Optional[torch.Tensor] = None,  # (B, d_model) - route-specific conditioning
+        bev_proj_cached: Optional[torch.Tensor] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
+        route_pos_offset: int = 0,
+        spatial_mode: str = "anchor",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass with unified queries and multi-source attention (DiffusionDriveV2 style).
@@ -1175,7 +1214,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Get sinusoidal position encoding for trajectory
         traj_pos = self.unified_pos_encoding[:, :T_traj, :] * self.traj_pos_scale
         # Get sinusoidal position encoding for route  
-        route_pos = self.unified_pos_encoding[:, :T_route, :] * self.route_pos_scale
+        route_pos = self.unified_pos_encoding[:, route_pos_offset:route_pos_offset + T_route, :] * self.route_pos_scale
         
         # Add position + segment embeddings to trajectory
         traj_emb = traj_emb + traj_pos + self.traj_segment_emb
@@ -1186,25 +1225,28 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Concatenate queries: [trajectory | route]
         x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
         
-        # Create anchor-isolated self-attention mask
-        self_attn_mask = self._create_block_diagonal_mask(
-            T_traj, T_route, device=x.device, dtype=x.dtype
-        )
+        if self_attn_mask is None:
+            self_attn_mask = self._create_block_diagonal_mask(
+                T_traj, T_route, device=x.device, dtype=x.dtype
+            )
         
         # ========== Process Transfuser Features (DiffusionDriveV2 style) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, 1512) -> (B, 64, d_model)
-        bev_feat = transfuser_bev_feature.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
-        bev_proj = self.bev_feature_proj(bev_feat)  # (B, 64, d_model)
-        
-        # Add position embeddings to BEV feature
-        if bev_proj.shape[1] <= self.combined_pos_emb.shape[1]:
-            bev_proj = bev_proj + self.combined_pos_emb[:, :bev_proj.shape[1], :]
+        if bev_proj_cached is not None:
+            bev_proj = bev_proj_cached
+        else:
+            bev_proj = self.compute_bev_proj(transfuser_bev_feature)
         
         # ========== Apply GridSampleCrossBEVAttention for spatial BEV (DiffusionDriveV2 style) ==========
         # This enhances trajectory queries with spatially-sampled BEV features
         if traj_points is not None:
             x_traj = x[:, :T_traj, :]  # (B, T_traj, d_model)
-            x_traj = self.bev_spatial_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
+            if spatial_mode == "ego":
+                if traj_points.dim() == 3:
+                    traj_points = traj_points.unsqueeze(2)
+                x_traj = self.bev_point_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
+            else:
+                x_traj = self.bev_spatial_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
             x = torch.cat([x_traj, x[:, T_traj:, :]], dim=1)
 
         # Decoder layers with multi-source attention
@@ -1315,6 +1357,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
+        self.wp_emb = nn.Sequential(
+            nn.Linear(self.anchor_pos_hidden_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
 
         # Learnable mode queries for each anchor (energy training uses all num_modes)
         self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
@@ -1368,6 +1415,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.trajectory_head = TrajectoryMLPHead(
             n_emb=n_emb,
             output_dim=horizon * output_dim,
+            p_drop=p_drop_emb,
+            num_heads=n_head,
+        )
+        self.trajectory_wp_head = TrajectoryMLPHead(
+            n_emb=n_emb,
+            output_dim=output_dim,
             p_drop=p_drop_emb,
             num_heads=n_head,
         )
@@ -1493,6 +1546,211 @@ class TransformerForDiffusion(ModuleAttrMixin):
     def configure_optimizers(self, learning_rate: float = 1e-4, weight_decay: float = 1e-3,
                             betas: Tuple[float, float] = (0.9, 0.95)):
         return torch.optim.AdamW(self.get_optim_groups(weight_decay), lr=learning_rate, betas=betas)
+
+    def _compute_conditioning(
+        self,
+        timestep: Union[torch.Tensor, float, int],
+        ego_status: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared conditioning builder for split forwards."""
+        B = ego_status.shape[0]
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=device)
+        elif len(timestep.shape) == 0:
+            timestep = timestep[None].to(device)
+        timesteps = timestep.expand(B)
+
+        time_emb = self.time_emb(timesteps).to(dtype=model_dtype)
+        current_status = ego_status[:, -1, :]
+        status_emb = self.ego_status_proj(current_status)
+        hist_global_emb = self.history_encoder(ego_status)
+        conditioning = time_emb + status_emb + hist_global_emb
+        route_conditioning = self.route_status_proj(current_status)
+        return conditioning, current_status, route_conditioning
+
+    def _embed_trajectory(self, traj_abs: torch.Tensor) -> torch.Tensor:
+        """Trajectory-level embedding: (B, M, T, 2) -> (B, M, n_emb)."""
+        anchor_pos_embed = gen_sineembed_for_position(
+            traj_abs, hidden_dim=self.anchor_pos_hidden_dim
+        )
+        anchor_pos_embed = anchor_pos_embed.flatten(-2)
+        return self.anchor_emb(anchor_pos_embed)
+
+    def _embed_waypoint_tokens(self, traj_abs: torch.Tensor) -> torch.Tensor:
+        """Waypoint-level embedding for ego path: (B, T, 2) -> (B, T, n_emb)."""
+        wp_pos_embed = gen_sineembed_for_position(
+            traj_abs, hidden_dim=self.anchor_pos_hidden_dim
+        )
+        return self.wp_emb(wp_pos_embed)
+
+    def _compute_energy_scores(self, energy_input: torch.Tensor, include_route: bool = True) -> dict:
+        energy_scores = {
+            'front': self.energy_front_head(energy_input).squeeze(-1),
+            'left': self.energy_left_head(energy_input).squeeze(-1),
+            'right': self.energy_right_head(energy_input).squeeze(-1),
+            'pedestrian': self.energy_pedestrian_head(energy_input).squeeze(-1),
+            'offroad': self.energy_offroad_head(energy_input).squeeze(-1),
+        }
+        if include_route and hasattr(self, 'energy_route_head'):
+            energy_scores['route'] = self.energy_route_head(energy_input).squeeze(-1)
+        return energy_scores
+
+    def forward_ego(
+        self,
+        x_t: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        x_t_abs: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Ego denoising path with waypoint-level trajectory tokens.
+
+        Returns:
+            poses_reg: (B, 1, T, 2) normalized trajectory prediction
+            route_pred: (B, num_waypoints, 2)
+            traj_out: (B, T, n_emb) ego trajectory tokens after decoder
+            conditioning: (B, n_emb)
+        """
+        model_dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
+
+        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
+        ego_status = ego_status.to(device=device, dtype=model_dtype)
+
+        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
+        if bev_traj_points.dim() == 4:
+            traj_points = bev_traj_points[:, 0, :, :]
+        else:
+            traj_points = bev_traj_points
+
+        B, T_traj, _ = traj_points.shape
+        conditioning, current_status, route_conditioning = self._compute_conditioning(
+            timestep, ego_status, device, model_dtype
+        )
+
+        wp_emb = self._embed_waypoint_tokens(traj_points)
+        diff_query = self.diff_mode_query.expand(B, T_traj, -1)
+        traj_emb = wp_emb + diff_query + conditioning.unsqueeze(1)
+        traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
+
+        ego_mask = self.decoder._create_ego_mask(
+            T_traj=T_traj,
+            T_route=self.num_waypoints,
+            device=traj_emb.device,
+            dtype=traj_emb.dtype,
+        )
+        traj_out, route_out = self.decoder(
+            traj_emb=traj_emb,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            conditioning=conditioning,
+            traj_points=traj_points,
+            route_conditioning=route_conditioning,
+            bev_proj_cached=bev_proj_cached,
+            self_attn_mask=ego_mask,
+            route_pos_offset=T_traj,
+            spatial_mode="ego",
+        )
+
+        traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
+        poses_reg = traj_pred.unsqueeze(1)
+        route_pred = self.route_head(route_out, conditioning, current_status)
+        return poses_reg, route_pred, traj_out, conditioning
+
+    def forward_energy(
+        self,
+        x_t: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        x_t_abs: Optional[torch.Tensor] = None,
+        traj_for_energy: Optional[torch.Tensor] = None,
+        behavior_labels: Optional[torch.Tensor] = None,
+        allowed_flags: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+    ) -> Tuple[dict, torch.Tensor]:
+        """
+        Trajectory-level energy path. Anchors/GT remain 1 token per trajectory.
+        Route is context only; route-token energies are not produced here.
+        """
+        model_dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
+
+        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
+        ego_status = ego_status.to(device=device, dtype=model_dtype)
+        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
+
+        B, M, _, _ = bev_traj_points.shape
+        conditioning, _, route_conditioning = self._compute_conditioning(
+            timestep, ego_status, device, model_dtype
+        )
+
+        traj_emb = self._embed_trajectory(bev_traj_points)
+        if M == 1:
+            mode_queries = self.diff_mode_query.expand(B, -1, -1)
+        else:
+            base_queries = torch.cat([self.mode_queries, self.gt_mode_query], dim=1)
+            mode_queries = base_queries[:, :M, :].expand(B, -1, -1)
+
+        mode_emb = traj_emb + mode_queries + conditioning.unsqueeze(1)
+        if self.num_behaviors > 0 and behavior_labels is not None and allowed_flags is not None:
+            behavior_emb = self.behavior_emb(behavior_labels.to(device))
+            allowed_emb = self.allowed_emb(allowed_flags.long().to(device))
+            mode_emb = mode_emb + behavior_emb + allowed_emb
+
+        mode_emb = self.pre_decoder_norm(self.drop(mode_emb))
+        mode_out, _ = self.decoder(
+            traj_emb=mode_emb,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            conditioning=conditioning,
+            traj_points=bev_traj_points,
+            route_conditioning=route_conditioning,
+            bev_proj_cached=bev_proj_cached,
+            route_pos_offset=M,
+            spatial_mode="anchor",
+        )
+
+        eval_traj = traj_for_energy if traj_for_energy is not None else bev_traj_points
+        eval_traj_flat = eval_traj.flatten(-2)
+        energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)
+        return self._compute_energy_scores(energy_input, include_route=False), mode_out
+
+    def forward_energy_eval(
+        self,
+        x_t: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        x_t_abs: Optional[torch.Tensor] = None,
+        traj_for_energy: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+    ) -> Tuple[dict, torch.Tensor]:
+        """
+        Guidance/alignment energy evaluation on a single predicted trajectory.
+        """
+        B = x_t.shape[0]
+        timestep = torch.zeros(B, dtype=torch.long, device=x_t.device)
+        return self.forward_energy(
+            x_t=x_t,
+            x_t_abs=x_t_abs,
+            timestep=timestep,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            traj_for_energy=traj_for_energy,
+            bev_proj_cached=bev_proj_cached,
+        )
     
     def forward(
         self,

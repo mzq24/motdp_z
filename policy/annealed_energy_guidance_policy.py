@@ -109,10 +109,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Route B specific config
         route_b_cfg = config.get('route_b', {})
+        self.route_b_cfg = route_b_cfg
         self.num_samples = route_b_cfg.get('num_samples', 1)  # diffusion denoising: single mode
         self.num_energy_modes = route_b_cfg.get('num_energy_modes', 32)  # energy training: multi-anchor
         self.num_inference_steps = route_b_cfg.get('num_inference_steps', 10)
         self.guidance_scale = route_b_cfg.get('guidance_scale', 1.0)  # global energy guidance multiplier
+        self.use_split_forward = route_b_cfg.get('use_split_forward', True)
         # Per-head energy weights (used in alignment loss and guidance)
         self.energy_front_weight      = route_b_cfg.get('energy_front_weight', 1.0)
         self.energy_left_weight       = route_b_cfg.get('energy_left_weight', 1.0)
@@ -384,7 +386,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
           - 'energy': Phase 1 only — train energy heads (legacy, for ablation)
           - 'diffusion': Phase 2 only — train decoder (legacy, for ablation)
         """
-        if phase == 'unified':
+        if phase == 'split' or (phase == 'unified' and self.use_split_forward):
+            loss_dict = self.compute_split_loss(batch)
+        elif phase == 'unified':
             loss_dict = self.compute_unified_loss(batch)
         elif phase == 'energy':
             loss_dict = self.compute_energy_loss(batch)
@@ -395,6 +399,187 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             return loss_dict
         else:
             return loss_dict['total_loss']
+
+    # ========== Unified Training: Single Forward Pass ==========
+    def compute_split_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Split-forward Route B training.
+
+        1. Ego path: waypoint-token denoising for pred_x0 + route prediction
+        2. Energy path: anchor/GT trajectory-level scoring
+        3. Alignment path: evaluate pred_x0 as a single trajectory with detached energy heads
+        """
+        device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
+
+        trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
+        B, T, D = trajectory.shape
+        M_anchor = self.num_energy_modes
+
+        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
+
+        route_gt = batch.get('route', None)
+        if route_gt is not None:
+            route_gt = route_gt.to(device=device, dtype=model_dtype)
+
+        behavior_labels = batch.get('behavior_labels', None)
+        allowed_flags = batch.get('allowed_flags', None)
+        has_energy = (self.anchor_centers_abs is not None
+                      and behavior_labels is not None
+                      and allowed_flags is not None)
+
+        bev_proj = self.model.decoder.compute_bev_proj(transfuser_bev_feature)
+
+        # ===== Forward 1: Ego denoising (M=1) =====
+        traj_normed = self.abs_to_norm(trajectory)  # (B, T, 2)
+        diff_timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
+        noise = torch.randn(B, T, D, dtype=torch.float32, device=device)
+        noisy_flat = self.diffusion_scheduler.add_noise(
+            original_samples=traj_normed,
+            noise=noise,
+            timesteps=diff_timesteps,
+        )
+        noisy_traj = noisy_flat.unsqueeze(1)  # (B, 1, T, 2)
+        noisy_traj_abs = self.norm_to_abs(noisy_traj)
+
+        poses_reg, route_pred, _, _ = self.model.forward_ego(
+            x_t=noisy_traj,
+            x_t_abs=noisy_traj_abs,
+            timestep=diff_timesteps,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            bev_proj_cached=bev_proj,
+        )
+        poses_reg_abs = self.norm_to_abs(poses_reg)
+        traj_target = trajectory.unsqueeze(1)
+        loss_reg = F.l1_loss(poses_reg_abs, traj_target, reduction='mean')
+
+        route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        if route_gt is not None and route_pred is not None:
+            route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+
+        # ===== Forward 2: Energy training (anchors + GT) =====
+        zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
+        energy_loss = zero_t
+        loss_front = loss_left = loss_right = loss_ped = loss_off = zero_t
+        loss_route = zero_t
+
+        if has_energy:
+            anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1).clone()
+            behavior_labels_dev = behavior_labels.to(device=device).clone()
+            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype).clone()
+
+            K = min(self.num_gt_augmentations, M_anchor)
+            if K > 0:
+                gt_aug = self._augment_gt(trajectory, K)
+                anchor_abs[:, :K] = gt_aug
+                behavior_labels_dev[:, :K] = 0
+                allowed_flags_dev[:, :K] = 1.0
+
+            gt_abs = trajectory.unsqueeze(1)
+            energy_abs = torch.cat([anchor_abs, gt_abs], dim=1)  # (B, 33, T, 2)
+            energy_normed = self.abs_to_norm(energy_abs)
+
+            gt_behavior = torch.zeros(B, 1, device=device, dtype=behavior_labels_dev.dtype)
+            behavior_all = torch.cat([behavior_labels_dev, gt_behavior], dim=1)
+            allowed_all = torch.cat([
+                allowed_flags_dev,
+                torch.ones(B, 1, device=device, dtype=model_dtype),
+            ], dim=1)
+
+            energy_scores, _ = self.model.forward_energy(
+                x_t=energy_normed,
+                x_t_abs=energy_abs,
+                timestep=torch.zeros(B, device=device, dtype=torch.long),
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                traj_for_energy=energy_abs,
+                behavior_labels=behavior_all,
+                allowed_flags=allowed_all,
+                bev_proj_cached=bev_proj,
+            )
+
+            front_target = (behavior_all == 1).float()
+            left_target = (behavior_all == 2).float()
+            right_target = (behavior_all == 3).float()
+            ped_target = (behavior_all == 4).float()
+            offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
+
+            def _sl1e(pred, tgt, mask=None):
+                return F.smooth_l1_loss(pred[mask], tgt[mask]) if mask is not None else F.smooth_l1_loss(pred, tgt)
+
+            if not self.use_safe_anchors:
+                active_mask = torch.ones(B, M_anchor + 1, device=device, dtype=torch.bool)
+                active_mask[:, K:M_anchor] = (allowed_all[:, K:M_anchor] < 0.5)
+                active_mask[:, M_anchor] = True
+                n_active = active_mask.sum()
+                if n_active > 0:
+                    loss_front = _sl1e(energy_scores['front'], front_target, active_mask)
+                    loss_left = _sl1e(energy_scores['left'], left_target, active_mask)
+                    loss_right = _sl1e(energy_scores['right'], right_target, active_mask)
+                    loss_ped = _sl1e(energy_scores['pedestrian'], ped_target, active_mask)
+                    loss_off = _sl1e(energy_scores['offroad'], offroad_target, active_mask)
+            else:
+                loss_front = _sl1e(energy_scores['front'], front_target)
+                loss_left = _sl1e(energy_scores['left'], left_target)
+                loss_right = _sl1e(energy_scores['right'], right_target)
+                loss_ped = _sl1e(energy_scores['pedestrian'], ped_target)
+                loss_off = _sl1e(energy_scores['offroad'], offroad_target)
+
+            energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
+
+        # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
+        alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
+        if self.alignment_loss_weight > 0 and has_energy and alignment_active:
+            _, mode_out_clean = self.model.forward_energy_eval(
+                x_t=poses_reg,
+                x_t_abs=poses_reg_abs,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                traj_for_energy=poses_reg_abs,
+                bev_proj_cached=bev_proj,
+            )
+            align_input = torch.cat([poses_reg_abs.flatten(-2), mode_out_clean], dim=-1)
+            a_front = self._eval_energy_head_detached(self.model.energy_front_head, align_input).squeeze(-1)
+            a_left = self._eval_energy_head_detached(self.model.energy_left_head, align_input).squeeze(-1)
+            a_right = self._eval_energy_head_detached(self.model.energy_right_head, align_input).squeeze(-1)
+            a_ped = self._eval_energy_head_detached(self.model.energy_pedestrian_head, align_input).squeeze(-1)
+            a_off = self._eval_energy_head_detached(self.model.energy_offroad_head, align_input).squeeze(-1)
+            alignment_loss = (
+                self.energy_front_weight * torch.sigmoid(a_front).mean()
+                + self.energy_left_weight * torch.sigmoid(a_left).mean()
+                + self.energy_right_weight * torch.sigmoid(a_right).mean()
+                + self.energy_pedestrian_weight * torch.sigmoid(a_ped).mean()
+                + self.energy_offroad_weight * torch.sigmoid(a_off).mean()
+            )
+
+        total_loss = (
+            self.energy_loss_weight * energy_loss
+            + self.reg_loss_weight * loss_reg
+            + self.route_loss_weight * route_loss
+            + self.alignment_loss_weight * alignment_loss
+        )
+
+        return {
+            'total_loss': total_loss,
+            'energy_loss': energy_loss,
+            'energy_front_loss': loss_front,
+            'energy_left_loss': loss_left,
+            'energy_right_loss': loss_right,
+            'energy_ped_loss': loss_ped,
+            'energy_off_loss': loss_off,
+            'energy_route_loss': loss_route,
+            'reg_loss': loss_reg,
+            'cls_loss': torch.tensor(0.0, device=device),
+            'route_loss': route_loss,
+            'alignment_loss': alignment_loss,
+        }
 
     # ========== Unified Training: Single Forward Pass ==========
     def compute_unified_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1049,10 +1234,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         w_right_cfg = _w('right',      self.energy_right_weight)
         w_ped_cfg   = _w('pedestrian', self.energy_pedestrian_weight)
         w_off_cfg   = _w('offroad',    self.energy_offroad_weight)
-        w_rte_cfg   = _w('route',      self.energy_route_weight)
 
         # Start from pure Gaussian noise in z-scored delta space
         x_t = torch.randn(B, M, T, 2, device=device, dtype=torch.float32)
+        bev_proj = self.model.decoder.compute_bev_proj(
+            transfuser_bev_feature.to(device=device, dtype=model_dtype)
+        )
 
         # Set up DDIM timestep schedule
         num_steps = self.num_inference_steps
@@ -1071,7 +1258,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             t_next = roll_timesteps[step_i + 1].item() if step_i + 1 < len(roll_timesteps) else 0
 
             # Get annealed energy weights for current noise level
-            w_route, w_veh, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
+            _, w_veh, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
 
             # ========== Forward pass 1: denoise x_t → pred_x0 ==========
             x_input = x_t.to(dtype=model_dtype)
@@ -1079,57 +1266,42 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
             t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
 
-            use_guidance = self.guidance_scale > 0 and (w_route + w_veh + w_off) > 0
+            use_guidance = self.guidance_scale > 0 and (w_veh + w_off) > 0
 
             if use_guidance:
                 # Pass 1: get pred_x0 from denoising (no energy eval yet)
                 with torch.no_grad():
-                    poses_reg, poses_cls, route_pred, _, _ = self.model(
+                    poses_reg, route_pred, _, _ = self.model.forward_ego(
                         x_t=x_input,
                         x_t_abs=x_t_abs,
                         timestep=t_tensor,
                         transfuser_bev_feature=transfuser_bev_feature,
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                         ego_status=ego_status,
+                        bev_proj_cached=bev_proj,
                     )
                     pred_x0 = poses_reg.detach()  # (B, M, T, 2) z-normed delta
 
-                # Pass 2: feed pred_x0 as input to get mode_out along pred_x0's path,
-                # then energy head evaluates pred_x0 in abs space (spatial properties).
-                # Gradient flows: energy → abs → z_denorm+cumsum → pred_x0 (z-normed delta).
+                # Pass 2: re-embed pred_x0 as a trajectory-level energy-eval sample.
                 pred_x0_for_grad = pred_x0.clone().requires_grad_(True)
 
                 with torch.enable_grad():
                     pred_x0_abs = self.norm_to_abs(pred_x0_for_grad)  # differentiable: z-denorm + cumsum
-                    _, _, _, _, energy_scores = self.model(
+                    energy_scores, _ = self.model.forward_energy_eval(
                         x_t=pred_x0_for_grad,
                         x_t_abs=pred_x0_abs,
-                        timestep=torch.zeros(B, dtype=torch.long, device=device),  # t=0 for clean pred_x0
                         transfuser_bev_feature=transfuser_bev_feature,
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                         ego_status=ego_status,
                         traj_for_energy=pred_x0_abs,  # abs space for spatial energy evaluation
+                        bev_proj_cached=bev_proj,
                     )
-
-                    # Compute route deviation target for guidance (if route available)
-                    if route_for_guidance is not None:
-                        # pred_x0_abs: (B, M, T, 2) — use as anchor_abs for route target
-                        rte_target = self.compute_route_target(
-                            pred_x0_abs,
-                            route_for_guidance.to(device=device, dtype=model_dtype),
-                            pred_x0_abs[:, 0, :, :],  # placeholder gt (not needed for inference)
-                        )  # (B, M)
-                        # Route guidance: pull toward route (minimize route deviation)
-                        route_guidance_energy = w_rte_cfg * w_route * rte_target.sum()
-                    else:
-                        route_guidance_energy = w_rte_cfg * w_route * energy_scores['route'].sum()
 
                     # Compute total energy
                     total_energy = torch.zeros(1, device=device)
                     if energy_scores is not None:
                         total_energy = (
-                            route_guidance_energy
-                            + w_veh * (
+                            w_veh * (
                                 w_front_cfg * energy_scores['front'].sum()
                                 + w_left_cfg  * energy_scores['left'].sum()
                                 + w_right_cfg * energy_scores['right'].sum()
@@ -1152,17 +1324,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
                 # Correct pred_x0, then DDIM step
                 pred_x0_corrected = pred_x0.float() - self.guidance_scale * grad
-                poses_cls = poses_cls.detach()
+                poses_cls = None
             else:
                 with torch.no_grad():
-                    poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
+                    poses_reg, route_pred, _, _ = self.model.forward_ego(
                         x_t=x_input,
                         x_t_abs=x_t_abs,
                         timestep=t_tensor,
                         transfuser_bev_feature=transfuser_bev_feature,
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                         ego_status=ego_status,
+                        bev_proj_cached=bev_proj,
                     )
+                energy_scores = None
                 pred_x0_corrected = poses_reg.float()
 
             # ========== DDIM Step with corrected pred_x0 ==========
