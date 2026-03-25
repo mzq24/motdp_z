@@ -1698,9 +1698,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_emb = self._embed_trajectory(bev_traj_points)
         if M == 1:
             mode_queries = self.diff_mode_query.expand(B, -1, -1)
+        elif M <= self.mode_queries.shape[1]:
+            mode_queries = self.mode_queries[:, :M, :].expand(B, -1, -1)
+        elif M == self.mode_queries.shape[1] + 1:
+            # Build anchor/GT queries directly instead of slicing from a concatenated
+            # temporary buffer; this keeps self.mode_queries gradients in the parameter's
+            # native layout and avoids DDP grad-stride mismatch warnings.
+            anchor_queries = self.mode_queries.expand(B, -1, -1)
+            gt_queries = self.gt_mode_query.expand(B, -1, -1)
+            mode_queries = torch.cat([anchor_queries, gt_queries], dim=1)
         else:
-            base_queries = torch.cat([self.mode_queries, self.gt_mode_query], dim=1)
-            mode_queries = base_queries[:, :M, :].expand(B, -1, -1)
+            raise ValueError(f"Unsupported energy mode count M={M}, expected <= {self.mode_queries.shape[1] + 1}")
 
         mode_emb = traj_emb + mode_queries + conditioning.unsqueeze(1)
         if self.num_behaviors > 0 and behavior_labels is not None and allowed_flags is not None:
@@ -1839,19 +1847,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
         M_anchor = self.mode_queries.shape[1]  # num_energy_modes (e.g. 32)
         if M == 1 and self.anchor_free:
             # Single-mode diffusion denoising: use dedicated diff_mode_query
-            mode_queries = self.diff_mode_query
-        elif self.anchor_free and M > M_anchor:
+            mode_queries = self.diff_mode_query.expand(B, -1, -1)
+        elif self.anchor_free and M == M_anchor + 2:
             # Unified training: M = 1 (x_t) + M_anchor (32) + 1 (GT) = 34
-            # - Slot  [0]:            x_t — diff_mode_query (matches M=1 inference position)
-            # - Slots [1, M_anchor+1): anchor mode_queries
-            # - Slot  [M_anchor+1]:    GT — dedicated gt_mode_query
-            mode_queries = torch.cat([self.diff_mode_query, self.mode_queries, self.gt_mode_query], dim=1)  # (1, 34, n_emb)
+            # Build each block separately to preserve native parameter strides for DDP.
+            diff_queries = self.diff_mode_query.expand(B, -1, -1)
+            anchor_queries = self.mode_queries.expand(B, -1, -1)
+            gt_queries = self.gt_mode_query.expand(B, -1, -1)
+            mode_queries = torch.cat([diff_queries, anchor_queries, gt_queries], dim=1)
         elif M > M_anchor:
-            # VLM anchor added: concatenate vqa_mode_query for the extra mode
-            mode_queries = torch.cat([self.mode_queries, self.vqa_mode_query], dim=1)
+            if M != M_anchor + 1:
+                raise ValueError(f"Unsupported mode count M={M}, expected <= {M_anchor + 2}")
+            # VLM anchor added: concatenate vqa_mode_query for the extra mode.
+            anchor_queries = self.mode_queries.expand(B, -1, -1)
+            vqa_queries = self.vqa_mode_query.expand(B, -1, -1)
+            mode_queries = torch.cat([anchor_queries, vqa_queries], dim=1)
         else:
-            mode_queries = self.mode_queries[:, :M, :]
-        mode_queries = mode_queries.expand(B, -1, -1)  # (B, M, n_emb)
+            mode_queries = self.mode_queries[:, :M, :].expand(B, -1, -1)
 
         # Combine: anchor embedding + mode queries + conditioning
         mode_emb = anchor_emb + mode_queries + conditioning.unsqueeze(1)  # (B, num_modes, n_emb)
