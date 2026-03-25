@@ -377,11 +377,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 print(f"[Semantic Behavior] WARNING: anchor file not found: {anchor_path}, disabling")
             semantic_behavior_cfg = {}
 
+    gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
+
     train_dataset = CARLAImageDataset(
         dataset_path=train_dataset_path, image_data_root=image_data_root,
         use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
         anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
         cache_dir=cache_dir,
+        gps_noise_cfg=gps_noise_cfg,
     )
     # Val dataset: skip memmap, will inject RAM features after config is parsed
     val_dataset_orig = CARLAImageDataset(

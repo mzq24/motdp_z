@@ -152,5 +152,10 @@ logging:
   checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_annealed_energy/
   save_every: 5
   log_freq: 50
+augmentation:
+  gps_noise:
+    enabled: false    # GPS noise on target_point/waypoints during training
+    sigma: 0.4        # meters, matches complementary filter residual
+    probability: 0.8  # fraction of training samples that receive noise
 model_optimization:
   use_mixed_precision: true

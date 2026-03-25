@@ -72,6 +72,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  use_per_frame: bool = False, # True for local SSD: load individual .pt files directly (no pack/memmap)
                  use_vqa_anchor: bool = False, # True to load VLM-predicted anchor from dp_vl_feature/*.pt
                  cache_dir: str = None,       # Override memmap cache dir (e.g. /tmp/tmp_data for tmpfs)
+                 gps_noise_cfg: dict = None,  # GPS noise augmentation config
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -96,6 +97,12 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             and semantic_behavior_cfg.get('enabled', False)
         )
         self.semantic_behavior_cfg = semantic_behavior_cfg or {}
+
+        # GPS noise augmentation (train only)
+        gps_cfg = gps_noise_cfg or {}
+        self._gps_noise_enabled = gps_cfg.get('enabled', False)
+        self._gps_noise_sigma = gps_cfg.get('sigma', 0.4)
+        self._gps_noise_prob = gps_cfg.get('probability', 0.8)
 
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
@@ -611,6 +618,22 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample['allowed_flags'] = torch.ones(n_modes, dtype=torch.float32)
                     from tools.anchor_semantic_labeler import NUM_BUCKET_CATEGORIES
                     final_sample['scene_buckets'] = torch.zeros(NUM_BUCKET_CATEGORIES, dtype=torch.float32)
+
+        # ========== GPS Noise Augmentation ==========
+        if self._gps_noise_enabled and self.mode == 'train':
+            if random.random() < self._gps_noise_prob:
+                sigma = self._gps_noise_sigma
+                obs_horizon = final_sample['target_point_hist'].shape[0]
+                frame_noise = torch.randn(obs_horizon, 2) * sigma
+
+                # target_point and next_target_point share same noise per frame (same GPS reading)
+                final_sample['target_point_hist'] = final_sample['target_point_hist'] + frame_noise
+                final_sample['target_point_next_hist'] = final_sample['target_point_next_hist'] + frame_noise
+
+                # waypoints_hist: relative displacement between frames
+                # noise = epsilon_t - epsilon_current (current frame cancels to 0)
+                current_noise = frame_noise[-1:]  # (1, 2)
+                final_sample['waypoints_hist'] = final_sample['waypoints_hist'] + (frame_noise - current_noise)
 
         # Build ego_status: concatenate historical low-dimensional states
         # Total: 1 + 1 + 6 + 2 + 2 + 2 = 14 (must match bev_encoder.state_dim)
