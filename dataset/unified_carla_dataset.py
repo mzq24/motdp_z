@@ -367,6 +367,14 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         sample = self._sample_cache[idx]
+        clone_keys = set()
+
+        def _from_numpy(value, key, dtype=torch.float32):
+            tensor = torch.from_numpy(value)
+            if dtype is not None:
+                tensor = tensor.to(dtype=dtype)
+            clone_keys.add(key)
+            return tensor
 
         # --- Load Transfuser Features ---
         # Memmap path: zero-copy from shared memory (all DDP ranks share same pages)
@@ -394,7 +402,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 if abs_idx is not None:
                     cached = self._ram_features.get(abs_idx)
                     if cached is not None:
-                        transfuser_bev_feature = cached[0].clone()
+                        transfuser_bev_feature = cached[0]
                         ups_ds = cached[1]
                         transfuser_bev_feature_upsample = F.interpolate(
                             ups_ds.unsqueeze(0).float(), size=(64, 64),
@@ -407,7 +415,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     if frame_id is not None and frame_id < n_frames:
                         abs_idx = route_info['offset'] + frame_id
                         transfuser_bev_feature = torch.from_numpy(
-                            self._feat_mmap[abs_idx].copy()).clone()  # (1512, 8, 8) float16
+                            self._feat_mmap[abs_idx].copy())  # (1512, 8, 8) float16
+                        clone_keys.add('transfuser_bev_feature')
                         # Stored as (64, 32, 32) after 2x downsample, interpolate back
                         ups_ds = torch.from_numpy(
                             self._ups_mmap[abs_idx].copy())           # (64, 32, 32) float16
@@ -451,9 +460,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 continue
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
-                final_sample['speed'] = torch.from_numpy(speed_data).float()
+                final_sample['speed'] = _from_numpy(speed_data, 'speed')
             elif key == 'ego_waypoints':
-                ego_waypoints = torch.from_numpy(sample['ego_waypoints'][1:]).float()
+                ego_waypoints = _from_numpy(sample['ego_waypoints'][1:], 'agent_pos')
                 final_sample['agent_pos'] = ego_waypoints
             elif key == 'vqa':
                 if self._use_vqa_anchor and vqa_anchor_cached is not None:
@@ -461,18 +470,29 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 continue
             elif key == 'route':
                 # Load route waypoints (expected shape: (20, 2))
-                route_data = torch.from_numpy(value).float()
+                route_data = _from_numpy(value, 'route')
                 final_sample['route'] = route_data
             elif key == 'target_point_hist':
                 # Two data formats exist:
                 #   Old HPC packed: (T, 4) = [target_point, target_point_next] concatenated
                 #   Standard:       (T, 2) = target_point only (target_point_next is separate key)
-                tp = torch.from_numpy(value).float()
+                tp = _from_numpy(value, 'target_point_hist')
                 final_sample['target_point_hist'] = tp[..., :2]
                 if tp.shape[-1] == 4:
+                    clone_keys.add('target_point_next_hist')
                     final_sample['target_point_next_hist'] = tp[..., 2:]
             elif key == 'target_point_next_hist':
-                final_sample['target_point_next_hist'] = torch.from_numpy(value).float()
+                final_sample['target_point_next_hist'] = _from_numpy(value, 'target_point_next_hist')
+            elif key == 'ego_status':
+                final_sample['ego_status'] = _from_numpy(value, 'ego_status')
+            elif key == 'energy_targets':
+                final_sample['energy_targets'] = _from_numpy(value, 'energy_targets')
+            elif key == 'energy_active_mask':
+                final_sample['energy_active_mask'] = _from_numpy(
+                    value.astype(np.bool_) if isinstance(value, np.ndarray) else value,
+                    'energy_active_mask',
+                    dtype=None,
+                ).bool()
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
                 continue
@@ -480,7 +500,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 # Skip None values to avoid DataLoader collate errors
                 continue
             elif isinstance(value, np.ndarray):
-                final_sample[key] = torch.from_numpy(value).float()
+                final_sample[key] = _from_numpy(value, key)
             else:
                 final_sample[key] = value
 
@@ -620,6 +640,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample['scene_buckets'] = torch.zeros(NUM_BUCKET_CATEGORIES, dtype=torch.float32)
 
         # ========== GPS Noise Augmentation ==========
+        gps_noise_applied = False
         if self._gps_noise_enabled and self.mode == 'train':
             if random.random() < self._gps_noise_prob:
                 sigma = self._gps_noise_sigma
@@ -634,46 +655,48 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 # noise = epsilon_t - epsilon_current (current frame cancels to 0)
                 current_noise = frame_noise[-1:]  # (1, 2)
                 final_sample['waypoints_hist'] = final_sample['waypoints_hist'] + (frame_noise - current_noise)
+                gps_noise_applied = True
 
-        # Build ego_status: concatenate historical low-dimensional states
-        # Total: 1 + 1 + 6 + 2 + 2 + 2 = 14 (must match bev_encoder.state_dim)
-        ego_status_components = []
-        
-        # 1. speed_hist (obs_horizon,) -> (obs_horizon, 1)
-        speed_data = final_sample.get('speed', final_sample.get('speed_hist'))
-        if speed_data is None:
-            raise KeyError("Neither 'speed' nor 'speed_hist' found in sample")
-        ego_status_components.append(speed_data.unsqueeze(-1))  # (obs_horizon, 1)
-        
-        # 2. theta_hist (obs_horizon,) -> (obs_horizon, 1)
-        theta_data = final_sample['theta_hist']
-        ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
-        
-        # 3. command_hist (obs_horizon, 6)
-        command_data = final_sample['command_hist']
-        ego_status_components.append(command_data)  # (obs_horizon, 6)
+        # Build or update ego_status: [speed | theta | command | tp | tp_next | waypoints]
+        if 'ego_status' in final_sample:
+            if gps_noise_applied:
+                if 'ego_status' in clone_keys:
+                    final_sample['ego_status'] = final_sample['ego_status'].clone()
+                    clone_keys.discard('ego_status')
+                final_sample['ego_status'][..., 8:10] = final_sample['target_point_hist']
+                final_sample['ego_status'][..., 10:12] = final_sample['target_point_next_hist']
+                final_sample['ego_status'][..., 12:14] = final_sample['waypoints_hist']
+        else:
+            ego_status_components = []
 
-        # 4. target_point_hist (obs_horizon, 2) — normalized during data loading
-        target_point_data = final_sample['target_point_hist']
-        ego_status_components.append(target_point_data)  # (obs_horizon, 2)
-        
-        # 5. target_point_next_hist (obs_horizon, 2) — guaranteed present after loading
-        target_point_next_data = final_sample['target_point_next_hist']
-        ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
-        
-        # 6. waypoints_hist (obs_horizon, 2)
-        waypoints_data = final_sample['waypoints_hist']
-        ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
-        
-        # Concatenate all components along the feature dimension
-        final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
+            speed_data = final_sample.get('speed', final_sample.get('speed_hist'))
+            if speed_data is None:
+                raise KeyError("Neither 'speed' nor 'speed_hist' found in sample")
+            ego_status_components.append(speed_data.unsqueeze(-1))  # (obs_horizon, 1)
+
+            theta_data = final_sample['theta_hist']
+            ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
+
+            command_data = final_sample['command_hist']
+            ego_status_components.append(command_data)  # (obs_horizon, 6)
+
+            target_point_data = final_sample['target_point_hist']
+            ego_status_components.append(target_point_data)  # (obs_horizon, 2)
+
+            target_point_next_data = final_sample['target_point_next_hist']
+            ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
+
+            waypoints_data = final_sample['waypoints_hist']
+            ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
+
+            final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, 14)
 
 
-        # Ensure all tensors have resizable storage (torch.from_numpy creates
-        # non-resizable storage which causes collate failures with num_workers>0)
-        for k, v in final_sample.items():
-            if isinstance(v, torch.Tensor) and not v.is_cuda:
-                final_sample[k] = v.clone()
+        # Only tensors created from numpy-backed storage need a clone for safe multi-worker collate.
+        for key in clone_keys:
+            value = final_sample.get(key)
+            if isinstance(value, torch.Tensor) and not value.is_cuda:
+                final_sample[key] = value.clone()
 
         return final_sample
 
@@ -990,4 +1013,3 @@ def test_pdm():
 if __name__ == "__main__":
     test_pdm()
     
-

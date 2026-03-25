@@ -426,6 +426,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         behavior_labels = batch.get('behavior_labels', None)
         allowed_flags = batch.get('allowed_flags', None)
+        energy_targets = batch.get('energy_targets', None)
+        energy_active_mask = batch.get('energy_active_mask', None)
         has_energy = (self.anchor_centers_abs is not None
                       and behavior_labels is not None
                       and allowed_flags is not None)
@@ -468,16 +470,33 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_route = zero_t
 
         if has_energy:
-            anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1).clone()
-            behavior_labels_dev = behavior_labels.to(device=device).clone()
-            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype).clone()
+            anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1)
+            behavior_labels_dev = behavior_labels.to(device=device)
+            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype)
+            energy_targets_dev = None
+            energy_active_mask_dev = None
+            if energy_targets is not None:
+                energy_targets_dev = energy_targets.to(device=device, dtype=model_dtype)
+            if energy_active_mask is not None:
+                energy_active_mask_dev = energy_active_mask.to(device=device, dtype=torch.bool)
 
             K = min(self.num_gt_augmentations, M_anchor)
             if K > 0:
+                anchor_abs = anchor_abs.clone()
+                behavior_labels_dev = behavior_labels_dev.clone()
+                allowed_flags_dev = allowed_flags_dev.clone()
+                if energy_targets_dev is not None:
+                    energy_targets_dev = energy_targets_dev.clone()
+                if energy_active_mask_dev is not None:
+                    energy_active_mask_dev = energy_active_mask_dev.clone()
                 gt_aug = self._augment_gt(trajectory, K)
                 anchor_abs[:, :K] = gt_aug
                 behavior_labels_dev[:, :K] = 0
                 allowed_flags_dev[:, :K] = 1.0
+                if energy_targets_dev is not None:
+                    energy_targets_dev[:, :K] = 0.0
+                if energy_active_mask_dev is not None:
+                    energy_active_mask_dev[:, :K] = True
 
             gt_abs = trajectory.unsqueeze(1)
             energy_abs = torch.cat([anchor_abs, gt_abs], dim=1)  # (B, 33, T, 2)
@@ -503,19 +522,32 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 bev_proj_cached=bev_proj,
             )
 
-            front_target = (behavior_all == 1).float()
-            left_target = (behavior_all == 2).float()
-            right_target = (behavior_all == 3).float()
-            ped_target = (behavior_all == 4).float()
-            offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
+            if energy_targets_dev is not None:
+                gt_targets = torch.zeros(B, 1, energy_targets_dev.shape[-1], device=device, dtype=model_dtype)
+                energy_targets_all = torch.cat([energy_targets_dev, gt_targets], dim=1)
+                front_target = energy_targets_all[..., 0]
+                left_target = energy_targets_all[..., 1]
+                right_target = energy_targets_all[..., 2]
+                ped_target = energy_targets_all[..., 3]
+                offroad_target = energy_targets_all[..., 4]
+            else:
+                front_target = (behavior_all == 1).float()
+                left_target = (behavior_all == 2).float()
+                right_target = (behavior_all == 3).float()
+                ped_target = (behavior_all == 4).float()
+                offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
 
             def _sl1e(pred, tgt, mask=None):
                 return F.smooth_l1_loss(pred[mask], tgt[mask]) if mask is not None else F.smooth_l1_loss(pred, tgt)
 
             if not self.use_safe_anchors:
-                active_mask = torch.ones(B, M_anchor + 1, device=device, dtype=torch.bool)
-                active_mask[:, K:M_anchor] = (allowed_all[:, K:M_anchor] < 0.5)
-                active_mask[:, M_anchor] = True
+                if energy_active_mask_dev is not None:
+                    gt_active = torch.ones(B, 1, device=device, dtype=torch.bool)
+                    active_mask = torch.cat([energy_active_mask_dev, gt_active], dim=1)
+                else:
+                    active_mask = torch.ones(B, M_anchor + 1, device=device, dtype=torch.bool)
+                    active_mask[:, K:M_anchor] = (allowed_all[:, K:M_anchor] < 0.5)
+                    active_mask[:, M_anchor] = True
                 n_active = active_mask.sum()
                 if n_active > 0:
                     loss_front = _sl1e(energy_scores['front'], front_target, active_mask)

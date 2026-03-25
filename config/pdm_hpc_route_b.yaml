@@ -112,7 +112,7 @@ route_b:
   route_energy_norm: 5.0
   energy_loss_weight: 1.0
   train_max_timesteps: 1000
-  alignment_loss_weight: 0.1
+  alignment_loss_weight: 0.0  # Disabled for now: shared decoder/energy objectives were unstable
   num_gt_augmentations: 0
   use_safe_anchors: false
   energy_noisy_training: false

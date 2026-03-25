@@ -108,7 +108,7 @@ route_b:
   energy_loss_weight: 1.0  # Weight of energy loss in total training loss
   train_max_timesteps: 1000 # Full range for pure N(0,I) diffusion (must match num_train_timesteps)
   # Route B+ additions
-  alignment_loss_weight: 0.1   # β — alignment loss (decoder → low energy)
+  alignment_loss_weight: 0.0   # Disabled for now: shared decoder/energy objectives were unstable
   num_gt_augmentations: 0      # GT augmentation disabled for now
   use_safe_anchors: false      # Trust allowed anchor labels as positive samples
   energy_noisy_training: false # Train energy heads on clean (t=0) or noisy (random t)
