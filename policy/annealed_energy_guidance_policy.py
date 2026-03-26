@@ -1232,6 +1232,36 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         policy.eval()
         return policy, ckpt
 
+    def build_roll_timesteps(self, num_steps=None, device=None):
+        """Build DDIM rollout timesteps for inference.
+
+        The existing multi-step schedule is kept unchanged. For 1-step inference,
+        start from the highest training noise level instead of the degenerate t=0.
+        """
+        if num_steps is None:
+            num_steps = self.num_inference_steps
+        num_steps = int(num_steps)
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
+
+        max_t = int(self.train_max_timesteps)
+        if max_t <= 0:
+            raise ValueError(f"train_max_timesteps must be positive, got {max_t}")
+
+        if num_steps == 1:
+            roll_timesteps = np.array([max_t - 1], dtype=np.int64)
+        else:
+            step_ratio = max_t / num_steps
+            roll_timesteps = (
+                np.arange(0, num_steps) * step_ratio
+            ).round()[::-1].copy().astype(np.int64)
+            roll_timesteps = np.clip(roll_timesteps, 0, max_t - 1)
+
+        roll_timesteps = torch.from_numpy(roll_timesteps)
+        if device is not None:
+            roll_timesteps = roll_timesteps.to(device)
+        return roll_timesteps
+
     # ========== Inference with Energy Guidance ==========
     @torch.no_grad()
     def conditional_sample(
@@ -1275,9 +1305,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Set up DDIM timestep schedule
         num_steps = self.num_inference_steps
-        step_ratio = self.train_max_timesteps / num_steps
-        roll_timesteps = (np.arange(0, num_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+        roll_timesteps = self.build_roll_timesteps(num_steps=num_steps, device=device)
 
         alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device)
 

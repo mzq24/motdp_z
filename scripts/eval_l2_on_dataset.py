@@ -11,13 +11,27 @@ from tqdm import tqdm
 
 
 def _record_l2(result_dict, pred, gt):
-    """Compute and record L2 metrics."""
+    """Compute and record metrics with the same definition as train-time validation."""
     gt_trim = gt[:, :pred.shape[1]]
     T_len = gt_trim.shape[1]
     l2_per_t = ((pred - gt_trim) ** 2).sum(dim=-1).sqrt()
-    result_dict['l2_1s'].append(l2_per_t[:, :min(2, T_len)].mean(dim=1).cpu().numpy())
-    result_dict['l2_2s'].append(l2_per_t[:, :min(4, T_len)].mean(dim=1).cpu().numpy())
-    result_dict['l2_3s'].append(l2_per_t[:, :min(6, T_len)].mean(dim=1).cpu().numpy())
+    result_dict['ade'].append(l2_per_t.mean(dim=1).cpu().numpy())
+
+    selected = []
+    if T_len >= 2:
+        l2_1s = l2_per_t[:, 1].cpu().numpy()
+        result_dict['l2_1s'].append(l2_1s)
+        selected.append(l2_1s)
+    if T_len >= 4:
+        l2_2s = l2_per_t[:, 3].cpu().numpy()
+        result_dict['l2_2s'].append(l2_2s)
+        selected.append(l2_2s)
+    if T_len >= 6:
+        l2_3s = l2_per_t[:, 5].cpu().numpy()
+        result_dict['l2_3s'].append(l2_3s)
+        selected.append(l2_3s)
+    if selected:
+        result_dict['l2_avg'].append(np.stack(selected, axis=0).mean(axis=0))
 
 
 def _record_route_l2(result_dict, result, batch, device):
@@ -57,9 +71,7 @@ def _predict_action_m34_constructed(policy, obs_dict, device):
 
     # DDIM schedule
     num_steps = policy.num_inference_steps
-    step_ratio = policy.train_max_timesteps / num_steps
-    roll_timesteps = (np.arange(0, num_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-    roll_timesteps_t = torch.from_numpy(roll_timesteps).to(device)
+    roll_timesteps_t = policy.build_roll_timesteps(num_steps=num_steps, device=device)
     alphas_cumprod = policy.diffusion_scheduler.alphas_cumprod.to(device)
 
     route_pred = None
@@ -114,6 +126,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None, help='path to .pt checkpoint (default: best)')
     parser.add_argument('--max_batches', type=int, default=10)
     parser.add_argument('--split', type=str, default='both', choices=['train', 'val', 'both'])
+    parser.add_argument('--num_inference_steps', type=int, default=None,
+                        help='Override policy.num_inference_steps for eval (e.g. 1 for corrected 1-step DDIM)')
     args = parser.parse_args()
 
     with open(args.config_path) as f:
@@ -144,6 +158,9 @@ def main():
     print(f"Loaded: epoch={ckpt.get('epoch', 'N/A')}, "
           f"train_loss={ckpt.get('train_loss', 'N/A')}, "
           f"val_loss={ckpt.get('val_loss', 'N/A')}")
+    if args.num_inference_steps is not None:
+        policy.num_inference_steps = int(args.num_inference_steps)
+        print(f"Overriding num_inference_steps -> {policy.num_inference_steps}")
 
     for split in splits:
         print(f"\n{'='*60}")
@@ -170,7 +187,10 @@ def main():
         all_reg_loss = []
         all_reg_loss_unified = []
         modes = ['M=1', 'M=34_constructed']
-        all_ddim_results = {m: {'l2_1s': [], 'l2_2s': [], 'l2_3s': [], 'route_l2': []} for m in modes}
+        all_ddim_results = {
+            m: {'ade': [], 'l2_1s': [], 'l2_2s': [], 'l2_3s': [], 'l2_avg': [], 'route_l2': []}
+            for m in modes
+        }
 
         has_anchors = getattr(policy, 'anchor_centers_abs', None) is not None
 
@@ -231,11 +251,14 @@ def main():
 
         for mode_name in modes:
             r = all_ddim_results[mode_name]
-            if r['l2_1s']:
-                l2_1s = np.mean(np.concatenate(r['l2_1s']))
-                l2_2s = np.mean(np.concatenate(r['l2_2s']))
-                l2_3s = np.mean(np.concatenate(r['l2_3s']))
-                l2_avg = (l2_1s + l2_2s + l2_3s) / 3
+            if r['ade']:
+                ade = np.mean(np.concatenate(r['ade']))
+                print(f"  ADE (DDIM {mode_name}):    {ade:.4f}")
+            if r['l2_avg']:
+                l2_1s = np.mean(np.concatenate(r['l2_1s'])) if r['l2_1s'] else float('nan')
+                l2_2s = np.mean(np.concatenate(r['l2_2s'])) if r['l2_2s'] else float('nan')
+                l2_3s = np.mean(np.concatenate(r['l2_3s'])) if r['l2_3s'] else float('nan')
+                l2_avg = np.mean(np.concatenate(r['l2_avg']))
                 print(f"  L2_1s (DDIM {mode_name}):  {l2_1s:.4f}")
                 print(f"  L2_2s (DDIM {mode_name}):  {l2_2s:.4f}")
                 print(f"  L2_3s (DDIM {mode_name}):  {l2_3s:.4f}")
