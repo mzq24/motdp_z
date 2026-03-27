@@ -20,9 +20,11 @@ import math
 import numpy as np
 
 from route_b_constructed_b2d_agent import RouteBConstructedAgent
+from agents.navigation.local_planner import RoadOption
 from team_code.ego_localizer import EgoLocalizer
 import team_code.simlingo.transfuser_utils as t_u
 from team_code.lidar_utils import lidar_to_ego_coordinate, algin_lidar
+from team_code.ukf_utils import bicycle_model_forward
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 
 import cv2
@@ -35,6 +37,15 @@ IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 LOCALIZER_STRATEGY = os.environ.get('LOCALIZER_STRATEGY', 'complementary').lower()
 LOCALIZER_ALPHA = float(os.environ.get('LOCALIZER_ALPHA', '0.5'))
 LIDAR_POSE_SOURCE = os.environ.get('LIDAR_POSE_SOURCE', 'ukf').lower()  # 'ukf' or 'localizer'
+LOCALIZER_LATENCY_COMPENSATION = os.environ.get('LOCALIZER_LATENCY_COMPENSATION', '0').lower() in (
+    '1', 'true', 'yes', 'on'
+)
+LIDAR_LATENCY_COMPENSATION = os.environ.get('LIDAR_LATENCY_COMPENSATION', '0').lower() in (
+    '1', 'true', 'yes', 'on'
+)
+TARGET_POINT_PROMOTION_DISTANCE_M = 3.0
+TARGET_POINT_BEHIND_EGO_EPS_M = 0.5
+TARGET_POINT_DEMOTION_DISTANCE_M = 4.0
 
 
 def get_entry_point():
@@ -51,9 +62,158 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
             strategy=LOCALIZER_STRATEGY,
             dt=self.carla_frame_rate,
             gps_alpha=LOCALIZER_ALPHA,
-            latency_compensation=False,  # offline eval showed no benefit
+            latency_compensation=LOCALIZER_LATENCY_COMPENSATION,
         )
-        print(f"[EgoLocalizer] strategy={LOCALIZER_STRATEGY}, alpha={LOCALIZER_ALPHA}, lidar_pose={LIDAR_POSE_SOURCE}")
+        print(
+            f"[EgoLocalizer] strategy={LOCALIZER_STRATEGY}, alpha={LOCALIZER_ALPHA}, "
+            f"target_latency_comp={LOCALIZER_LATENCY_COMPENSATION}, "
+            f"lidar_pose={LIDAR_POSE_SOURCE}, lidar_latency_comp={LIDAR_LATENCY_COMPENSATION}"
+        )
+        self.guard_target_point_world = None
+        self.guard_next_target_point_world = None
+        self.guard_command = None
+        self.target_selection_pair = None
+        self.target_selection_prefers_next = False
+
+    def _is_lane_change_command(self, command):
+        return command in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT)
+
+    def _lane_change_distances(self, gps_xy, target_point_world, next_target_point_world):
+        start_xy = np.asarray(target_point_world[:2], dtype=np.float32)
+        end_xy = np.asarray(next_target_point_world[:2], dtype=np.float32)
+        route_dir = end_xy - start_xy
+        route_len = float(np.linalg.norm(route_dir))
+        if route_len <= 1e-6:
+            return None, None, None
+
+        ego_vec = np.asarray(gps_xy[:2], dtype=np.float32) - start_xy
+        lateral = abs(route_dir[0] * ego_vec[1] - route_dir[1] * ego_vec[0]) / route_len
+        longitudinal = float(np.dot(route_dir, ego_vec) / route_len)
+        return float(lateral), longitudinal, route_len
+
+    def _clear_target_point_guard(self):
+        self.guard_target_point_world = None
+        self.guard_next_target_point_world = None
+        self.guard_command = None
+
+    def _guard_lane_change_still_active(self, gps_xy):
+        if (
+            self.guard_target_point_world is None
+            or self.guard_next_target_point_world is None
+            or self.guard_command is None
+        ):
+            return False
+
+        lateral_dist, longitudinal_dist, route_len = self._lane_change_distances(
+            gps_xy,
+            self.guard_target_point_world,
+            self.guard_next_target_point_world,
+        )
+        if lateral_dist is None:
+            self._clear_target_point_guard()
+            return False
+
+        if longitudinal_dist is not None and route_len is not None and longitudinal_dist >= route_len:
+            self._clear_target_point_guard()
+            return False
+
+        if lateral_dist <= 2.5:
+            self._clear_target_point_guard()
+            return False
+
+        return True
+
+    def _apply_target_point_guard(self, gps_xy, target_point, next_target_point, far_command):
+        target_world = np.asarray(target_point[:2], dtype=np.float32)
+        next_target_world = np.asarray(next_target_point[:2], dtype=np.float32)
+        guard_active = self._guard_lane_change_still_active(gps_xy)
+
+        if self._is_lane_change_command(far_command):
+            if guard_active:
+                target_shift = float(np.linalg.norm(target_world - self.guard_target_point_world))
+                if target_shift > 1.0:
+                    return (
+                        self.guard_target_point_world.copy(),
+                        self.guard_next_target_point_world.copy(),
+                        self.guard_command,
+                    )
+
+            self.guard_target_point_world = target_world.copy()
+            self.guard_next_target_point_world = next_target_world.copy()
+            self.guard_command = far_command
+            return target_world, next_target_world, far_command
+
+        if not guard_active:
+            return target_world, next_target_world, far_command
+
+        return (
+            self.guard_target_point_world.copy(),
+            self.guard_next_target_point_world.copy(),
+            self.guard_command,
+        )
+
+    def _same_target_selection_pair(self, first_point_world, second_point_world):
+        if self.target_selection_pair is None:
+            return False
+
+        prev_first, prev_second = self.target_selection_pair
+        return (
+            np.linalg.norm(first_point_world - prev_first) <= 1e-3
+            and np.linalg.norm(second_point_world - prev_second) <= 1e-3
+        )
+
+    def _select_target_indices(self, waypoint_route, gps_xy, compass):
+        target_idx = 0
+        if len(waypoint_route) > 1:
+            first_point = np.asarray(waypoint_route[0][0][:2], dtype=np.float32)
+            second_point = np.asarray(waypoint_route[1][0][:2], dtype=np.float32)
+            ego_xy = np.asarray(gps_xy[:2], dtype=np.float32)
+            first_delta = first_point - ego_xy
+            first_dist = float(np.linalg.norm(first_delta))
+            forward_vec = np.array([np.cos(compass), np.sin(compass)], dtype=np.float32)
+            first_longitudinal = float(np.dot(first_delta, forward_vec))
+
+            if not self._same_target_selection_pair(first_point, second_point):
+                self.target_selection_pair = (first_point.copy(), second_point.copy())
+                self.target_selection_prefers_next = False
+
+            # Once the first remaining route point is clearly behind the ego,
+            # don't let the target selection bounce back to it.
+            if first_longitudinal < -TARGET_POINT_BEHIND_EGO_EPS_M:
+                self.target_selection_prefers_next = True
+            elif self.target_selection_prefers_next:
+                if first_dist >= TARGET_POINT_DEMOTION_DISTANCE_M:
+                    self.target_selection_prefers_next = False
+            elif first_dist <= TARGET_POINT_PROMOTION_DISTANCE_M:
+                self.target_selection_prefers_next = True
+
+            target_idx = 1 if self.target_selection_prefers_next else 0
+        else:
+            self.target_selection_pair = None
+            self.target_selection_prefers_next = False
+
+        next_idx = min(target_idx + 1, len(waypoint_route) - 1)
+        return target_idx, next_idx
+
+    def _maybe_compensate_lidar_pose(self, gps_xy, yaw, speed):
+        gps_xy = np.asarray(gps_xy, dtype=np.float64)
+        yaw = float(yaw)
+
+        if not LIDAR_LATENCY_COMPENSATION or speed < 0.5:
+            return gps_xy, yaw
+
+        # Avoid double-compensating when lidar pose already comes from a compensated localizer.
+        if LIDAR_POSE_SOURCE == 'localizer' and LOCALIZER_LATENCY_COMPENSATION:
+            return gps_xy, yaw
+
+        predicted_state = bicycle_model_forward(
+            np.array([gps_xy[0], gps_xy[1], yaw, speed], dtype=np.float64),
+            self.carla_frame_rate,
+            self.control.steer,
+            self.control.throttle,
+            self.control.brake,
+        )
+        return predicted_state[0:2], float(predicted_state[2])
 
     def tick(self, input_data):
         """
@@ -106,6 +266,10 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
         else:
             gps_lidar = gps_filtered
             compass_lidar = compass_filtered
+
+        gps_lidar, compass_lidar = self._maybe_compensate_lidar_pose(
+            gps_lidar, compass_lidar, speed
+        )
 
         gps_target_pose, compass_target_pose, target_pose_source = self._resolve_target_pose(
             gps_raw=np.array([gps_pos[0], gps_pos[1]], dtype=np.float32),
@@ -208,24 +372,27 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
             'transfuser_lidar_bev': transfuser_lidar_bev_tensor,
         }
 
-        from agents.navigation.local_planner import RoadOption
-
         waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
 
-        if len(waypoint_route) > 2:
-            target_point, far_command = waypoint_route[1]
-            next_target_point, next_far_command = waypoint_route[2]
-        elif len(waypoint_route) > 1:
-            target_point, far_command = waypoint_route[1]
-            ego_pos = result['gps'][:2]
-            direction = target_point[:2] - ego_pos
-            dist = np.linalg.norm(direction)
-            if dist > 1e-3:
-                direction_normalized = direction / dist
+        if len(waypoint_route) > 1:
+            target_idx, next_idx = self._select_target_indices(
+                waypoint_route,
+                result['gps'],
+                result['compass'],
+            )
+            target_point, far_command = waypoint_route[target_idx]
+            if next_idx > target_idx:
+                next_target_point, next_far_command = waypoint_route[next_idx]
             else:
-                direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
-            next_target_point = target_point[:2] + direction_normalized * 50.0
-            next_far_command = far_command
+                ego_pos = result['gps'][:2]
+                direction = target_point[:2] - ego_pos
+                dist = np.linalg.norm(direction)
+                if dist > 1e-3:
+                    direction_normalized = direction / dist
+                else:
+                    direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
+                next_target_point = target_point[:2] + direction_normalized * 50.0
+                next_far_command = far_command
         elif len(waypoint_route) > 0:
             target_point, far_command = waypoint_route[0]
             ego_pos = result['gps'][:2]
@@ -242,6 +409,13 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
             direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
             next_target_point = result['gps'][:2] + direction_normalized * 50.0
             next_far_command = RoadOption.LANEFOLLOW
+
+        target_point, next_target_point, far_command = self._apply_target_point_guard(
+            result['gps'],
+            target_point,
+            next_target_point,
+            far_command,
+        )
 
         if self.last_command_tmp != far_command:
             self.last_command = self.last_command_tmp

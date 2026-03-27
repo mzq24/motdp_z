@@ -121,6 +121,18 @@ TARGET_POSE_SOURCE = os.environ.get('TARGET_POSE_SOURCE', 'filtered').lower()
 STEER_SIGN_SCALE = float(os.environ.get('STEER_SIGN_SCALE', '1.0'))
 TARGET_YAW_SIGN = float(os.environ.get('TARGET_YAW_SIGN', '1.0'))
 TARGET_GEOM_YAW_SIGN = float(os.environ.get('TARGET_GEOM_YAW_SIGN', '1.0'))
+SOFT_SPEED_LIMIT_MS = float(os.environ.get('SOFT_SPEED_LIMIT_MS', '0.0'))
+HARD_SPEED_LIMIT_MS = float(os.environ.get('HARD_SPEED_LIMIT_MS', str(35.0 / 3.6)))
+NUM_INFERENCE_STEPS_OVERRIDE = os.environ.get('NUM_INFERENCE_STEPS_OVERRIDE', '').strip()
+
+ROAD_OPTION_TEXT = {
+	1: 'left',
+	2: 'right',
+	3: 'straight',
+	4: 'lane_follow',
+	5: 'change_left',
+	6: 'change_right',
+}
 
 # Entry point
 def get_entry_point():
@@ -193,6 +205,22 @@ def load_best_model(checkpoint_path, config, device):
 
 
 class MOTAgent(autonomous_agent.AutonomousAgent):
+	def _command_value_to_text(self, command_value):
+		try:
+			command_int = int(command_value)
+		except (TypeError, ValueError):
+			return 'unknown'
+		return ROAD_OPTION_TEXT.get(command_int, f'unknown({command_int})')
+
+	def _format_debug_value(self, value, fmt=".3f"):
+		try:
+			value_float = float(value)
+		except (TypeError, ValueError):
+			return "NA"
+		if not np.isfinite(value_float):
+			return "NA"
+		return format(value_float, fmt)
+
 	def get_default_config_path(self):
 		return "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
 
@@ -236,6 +264,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_path = self.resolve_checkpoint_path()
 		self.net = load_best_model(checkpoint_path, self.config, device)
+		if NUM_INFERENCE_STEPS_OVERRIDE:
+			override_steps = int(NUM_INFERENCE_STEPS_OVERRIDE)
+			self.net.num_inference_steps = override_steps
+			self.config.setdefault('route_b', {})['num_inference_steps'] = override_steps
+			if hasattr(self.net, 'route_b_cfg') and isinstance(self.net.route_b_cfg, dict):
+				self.net.route_b_cfg['num_inference_steps'] = override_steps
+			print(f"Overriding Route-B num_inference_steps -> {override_steps}")
 		print("✓ Diffusion policy loaded (float32).")
 		
 		# Aggressive memory cleanup before loading MoT model
@@ -421,6 +456,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_waypoint_route = None  # Store the planner waypoint route (in ego frame)
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 		self.last_energy_debug = {}
+		self.last_speed_debug = {}
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
 		self.prev_debug_raw_xy = None
@@ -1190,9 +1226,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Fallback: use first point distance, assuming it represents 0.5s travel
 			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
 
-		# Speed limit: cap desired_speed at 35 km/h = 35/3.6 ≈ 9.72 m/s
-		# max_desired_speed_ms = 35.0 / 3.6  # 35 km/h in m/s
-		# desired_speed = min(desired_speed, max_desired_speed_ms)
+		desired_speed_raw = float(desired_speed)
+		if SOFT_SPEED_LIMIT_MS > 0.0:
+			desired_speed = min(desired_speed, SOFT_SPEED_LIMIT_MS)
+		self.last_speed_debug = {
+			'desired_speed_raw': desired_speed_raw,
+			'desired_speed_capped': float(desired_speed),
+			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
+			'hard_speed_limit_ms': float(HARD_SPEED_LIMIT_MS),
+		}
 
 		# OLD PID throttle (kept for reference):
 		# brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
@@ -1323,10 +1365,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		one_hot_command = t_u.command_to_one_hot(self.commands[-2])
 		cmd_one_hot = torch.from_numpy(one_hot_command[np.newaxis]).to('cuda', dtype=torch.float32)
 		# Keep command variable for metadata (convert from 1-6 to 0-5 range)
-		command = tick_data['next_command']
-		if command < 0:
-			command = 4
-		command -= 1
+		command_value = tick_data['next_command']
+		if command_value < 0:
+			command_value = 4
+		command = command_value - 1
+		command_text = self._command_value_to_text(command_value)
 		speed = torch.FloatTensor([float(tick_data['speed'])]).view(1,1).to('cuda', dtype=torch.float32)
 		theta = torch.FloatTensor([float(tick_data['theta'])]).view(1,1).to('cuda', dtype=torch.float32)
 		lidar = tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
@@ -1539,12 +1582,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.throttle = float(throttle)
 			control.brake = float(brake)
 			
-			# Speed limit enforcement: if current speed > 35 km/h, force brake
-			# gt_velocity is in m/s, convert to km/h by multiplying 3.6
-			if gt_velocity * 3.6 > 35:
+			# Optional hard speed limit: force brake only if explicitly enabled.
+			if HARD_SPEED_LIMIT_MS > 0.0 and gt_velocity > HARD_SPEED_LIMIT_MS:
 				control.throttle = 0.0
 				control.brake = 1.0
-				# print(f"[Speed Limit] Speed {gt_velocity * 3.6:.2f} km/h > 35 km/h, forcing brake!")
 			
 			# Store metadata
 			self.pid_metadata = {
@@ -1556,6 +1597,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'brake': control.brake,
 				'speed': gt_velocity,
 				'command': command,
+				'command_value': int(command_value),
+				'command_text': command_text,
+				'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
+				'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
+				'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
+				'hard_speed_limit_ms': self.last_speed_debug.get('hard_speed_limit_ms'),
 			}
 			vehicle_transform = vehicle.get_transform()
 			hero_xy = np.array([
@@ -1636,6 +1683,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			if isinstance(self.last_dp_pred_traj, np.ndarray) and len(self.last_dp_pred_traj) > 0:
 				self.pid_metadata['model_dp_traj_first'] = self.last_dp_pred_traj[0].tolist()
 				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
+			for energy_key, energy_value in self.last_energy_debug.items():
+				self.pid_metadata[energy_key] = float(energy_value)
 			self.prev_debug_planner_xy = planner_xy.copy()
 			self.prev_debug_filtered_xy = filtered_xy.copy()
 			self.prev_debug_raw_xy = raw_xy.copy()
@@ -1788,49 +1837,67 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		right = cv2.resize(bev_img, (800, 600))
 
 		overlay = right.copy()
-		panel_top = 350
+		panel_top = 290
 		cv2.rectangle(overlay, (20, panel_top), (780, 580), (20, 20, 20), -1)
 		right = cv2.addWeighted(overlay, 0.45, right, 0.55, 0.0)
 
-		status_lines = [
-			f"frame: {self.step}",
-			f"speed_kmh: {float(self.pid_metadata.get('speed', 0.0)) * 3.6:.2f}",
+		speed_kmh = float(self.pid_metadata.get('speed', 0.0)) * 3.6
+		command_value = self.pid_metadata.get('command_value', 'N/A')
+		command_text = self.pid_metadata.get('command_text', 'unknown')
+
+		left_status_lines = [
+			f"frm: {self.step}",
+			f"v: {speed_kmh:.2f} km/h",
+			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
+			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
+			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')}",
+			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')}",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
-			f"steer_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
-			f"throttle: {float(self.pid_metadata.get('throttle', 0.0)):.3f}",
-			f"brake: {float(self.pid_metadata.get('brake', 0.0)):.3f}",
-			f"command: {self.pid_metadata.get('command', 'N/A')}",
-			f"target_pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
+			f"st_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
+			f"thr/brk: {float(self.pid_metadata.get('throttle', 0.0)):.3f} / {float(self.pid_metadata.get('brake', 0.0)):.3f}",
+			f"cmd: {command_text} ({command_value})",
+			f"pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
 		]
 
 		if self.last_target_point is not None:
-			status_lines.append(
-				f"target_point: [{self.last_target_point[0]:.2f}, {self.last_target_point[1]:.2f}]"
+			left_status_lines.append(
+				f"tp: [{self.last_target_point[0]:.2f}, {self.last_target_point[1]:.2f}]"
 			)
 		if self.last_next_target_point is not None:
-			status_lines.append(
-				f"next_target_point: [{self.last_next_target_point[0]:.2f}, {self.last_next_target_point[1]:.2f}]"
+			left_status_lines.append(
+				f"ntp: [{self.last_next_target_point[0]:.2f}, {self.last_next_target_point[1]:.2f}]"
 			)
 
-		status_lines.extend([
-			f"target_angle_deg: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.2f}",
-			f"target_is_right: {self.pid_metadata.get('target_is_right', False)}",
-			f"target_is_left: {self.pid_metadata.get('target_is_left', False)}",
-			f"target_is_behind: {self.pid_metadata.get('target_is_behind', False)}",
-			f"steer_heading_error_deg: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.2f}",
-			f"steer_target_idx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
-			f"energy_front: {self.last_energy_debug.get('energy_front', float('nan')):.4f}",
-			f"energy_left: {self.last_energy_debug.get('energy_left', float('nan')):.4f}",
-			f"energy_right: {self.last_energy_debug.get('energy_right', float('nan')):.4f}",
-			f"energy_ped: {self.last_energy_debug.get('energy_pedestrian', float('nan')):.4f}",
-			f"energy_offroad: {self.last_energy_debug.get('energy_offroad', float('nan')):.4f}",
-			f"energy_route: {self.last_energy_debug.get('energy_route', float('nan')):.4f}",
-		])
+		right_status_lines = [
+			f"tp_ang: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.2f}",
+			f"tp_L/R/B: {int(bool(self.pid_metadata.get('target_is_left', False)))}/{int(bool(self.pid_metadata.get('target_is_right', False)))}/{int(bool(self.pid_metadata.get('target_is_behind', False)))}",
+			f"hdg_err: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.2f}",
+			f"st_idx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
+			f"E_f: {self._format_debug_value(self.last_energy_debug.get('energy_front'), '.4f')}",
+			f"E_l: {self._format_debug_value(self.last_energy_debug.get('energy_left'), '.4f')}",
+			f"E_r: {self._format_debug_value(self.last_energy_debug.get('energy_right'), '.4f')}",
+			f"E_p: {self._format_debug_value(self.last_energy_debug.get('energy_pedestrian'), '.4f')}",
+			f"E_off: {self._format_debug_value(self.last_energy_debug.get('energy_offroad'), '.4f')}",
+			f"E_rt: {self._format_debug_value(self.last_energy_debug.get('energy_route'), '.4f')}",
+		]
 
-		for idx, line in enumerate(status_lines):
-			y = panel_top + 30 + idx * 22
+		line_gap = 21
+		font_scale = 0.52
+		col1_x = 35
+		col2_x = 405
+		start_y = panel_top + 28
+
+		for idx, line in enumerate(left_status_lines):
+			y = start_y + idx * line_gap
 			cv2.putText(
-				right, line, (35, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+				right, line, (col1_x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+				(255, 255, 255), 1, cv2.LINE_AA
+			)
+
+		for idx, line in enumerate(right_status_lines):
+			y = start_y + idx * line_gap
+			cv2.putText(
+				right, line, (col2_x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
 				(255, 255, 255), 1, cv2.LINE_AA
 			)
 
@@ -1843,7 +1910,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			("next_target", (255, 0, 255)),
 		]
 		legend_x = 35
-		legend_y = 330
+		legend_y = 270
 		for label, color in legend_items:
 			cv2.circle(right, (legend_x, legend_y), 7, color, -1)
 			cv2.putText(
