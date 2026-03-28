@@ -123,6 +123,10 @@ TARGET_GEOM_YAW_SIGN = float(os.environ.get('TARGET_GEOM_YAW_SIGN', '1.0'))
 SOFT_SPEED_LIMIT_MS = float(os.environ.get('SOFT_SPEED_LIMIT_MS', '0.0'))
 HARD_SPEED_LIMIT_MS = float(os.environ.get('HARD_SPEED_LIMIT_MS', str(35.0 / 3.6)))
 NUM_INFERENCE_STEPS_OVERRIDE = os.environ.get('NUM_INFERENCE_STEPS_OVERRIDE', '').strip()
+TERMINAL_ROUTE_ACTIVE_POINTS_MAX = int(os.environ.get('TERMINAL_ROUTE_ACTIVE_POINTS_MAX', '2'))
+TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTANCE_M', '3.0'))
+TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
+TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -274,12 +278,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_tl_min_pixels = 6
 		self.semantic_stop_min_pixels = 3
 		self.semantic_tl_roi = (0.0, 25.0, -10.0, 10.0)
+		self.semantic_tl_green_release_delay_frames = int(
+			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_DELAY_FRAMES', '50')
+		)
+		self.semantic_tl_green_release_speed_threshold = float(
+			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_SPEED_THRESHOLD', '0.5')
+		)
 		self.semantic_stop_roi = (0.0, 12.0, -8.0, 8.0)
 		self.semantic_stop_brake_distance_m = 6.0
 		self.semantic_stop_min_stop_frames = 10
 		self.semantic_stop_reset_missing_frames = 5
 		self.semantic_planner_stop_speed_threshold = 0.05
 
+		self.semantic_tl_prev_state = 'none'
+		self.semantic_tl_green_hold_frames = 0
 		self.semantic_stop_state = 'NONE'
 		self.semantic_stop_stopped_frames = 0
 		self.semantic_stop_missing_frames = 0
@@ -444,12 +456,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		}
 
 	def _apply_semantic_hazard_postprocess(
-		self, ego_speed, desired_speed_capped, throttle, brake, bev_classes
+		self,
+		ego_speed,
+		desired_speed_capped,
+		throttle,
+		brake,
+		bev_classes,
+		external_force_move_block_reason=None,
 	):
 		if bev_classes is None:
 			return throttle, brake, {
 				'traffic_light_state': 'none',
 				'traffic_light_block_force_move': False,
+				'traffic_light_green_hold_active': False,
+				'traffic_light_green_hold_frames_remaining': int(self.semantic_tl_green_hold_frames),
 				'traffic_light_red_pixels': 0,
 				'traffic_light_yellow_pixels': 0,
 				'traffic_light_green_pixels': 0,
@@ -464,15 +484,36 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		traffic_light_debug = self._get_semantic_traffic_light_debug(bev_classes)
 		stop_sign_debug = self._update_semantic_stop_sign_debug(bev_classes, ego_speed)
+		traffic_light_state = traffic_light_debug['state']
+		if (
+			traffic_light_state == 'green'
+			and self.semantic_tl_prev_state in ('red', 'yellow')
+			and ego_speed < self.semantic_tl_green_release_speed_threshold
+		):
+			self.semantic_tl_green_hold_frames = self.semantic_tl_green_release_delay_frames
+
+		green_hold_active = False
+		if traffic_light_state == 'green':
+			if self.semantic_tl_green_hold_frames > 0:
+				green_hold_active = True
+				self.semantic_tl_green_hold_frames -= 1
+		else:
+			self.semantic_tl_green_hold_frames = 0
+
+		self.semantic_tl_prev_state = traffic_light_state
 		planner_wants_stop = (
 			desired_speed_capped is not None
 			and desired_speed_capped < self.semantic_planner_stop_speed_threshold
 			and ego_speed < 0.1
 		)
 
-		force_move_blocked_reason = None
-		if planner_wants_stop:
+		force_move_blocked_reason = external_force_move_block_reason
+		if force_move_blocked_reason is not None:
+			self.force_move = 0
+		elif planner_wants_stop:
 			force_move_blocked_reason = 'planner_stop'
+		elif green_hold_active:
+			force_move_blocked_reason = 'traffic_light_green_hold'
 		elif traffic_light_debug['block_force_move']:
 			force_move_blocked_reason = f"traffic_light_{traffic_light_debug['state']}"
 		elif stop_sign_debug['hold_force_move']:
@@ -495,6 +536,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			brake = False
 			self.force_move -= 1
 
+		if green_hold_active:
+			throttle = 0.0
+			brake = 1.0
+			self.stuck_detector = 0
+			self.force_move = 0
+
 		if stop_sign_debug['apply_stop']:
 			throttle = 0.0
 			brake = 1.0
@@ -506,6 +553,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		debug = {
 			'traffic_light_state': traffic_light_debug['state'],
 			'traffic_light_block_force_move': traffic_light_debug['block_force_move'],
+			'traffic_light_green_hold_active': bool(green_hold_active),
+			'traffic_light_green_hold_frames_remaining': int(self.semantic_tl_green_hold_frames),
 			'traffic_light_red_pixels': int(traffic_light_debug['red_pixels']),
 			'traffic_light_yellow_pixels': int(traffic_light_debug['yellow_pixels']),
 			'traffic_light_green_pixels': int(traffic_light_debug['green_pixels']),
@@ -524,6 +573,58 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		}
 		self.last_semantic_debug = debug
 		return throttle, brake, debug
+
+	def _get_terminal_route_speed_cap(self, tick_data):
+		waypoint_route_ego = tick_data.get('waypoint_route_ego')
+		target_point_ego = tick_data.get('target_point')
+
+		debug = {
+			'active': False,
+			'reason': None,
+			'speed_cap_ms': None,
+			'remaining_route_points': 0,
+			'target_distance_m': None,
+			'target_forward_m': None,
+		}
+
+		if waypoint_route_ego is None or target_point_ego is None:
+			return debug
+
+		waypoint_route_ego = np.asarray(waypoint_route_ego, dtype=np.float32)
+		target_point_ego = np.asarray(target_point_ego[:2], dtype=np.float32)
+
+		if waypoint_route_ego.ndim != 2 or waypoint_route_ego.shape[0] == 0:
+			return debug
+
+		remaining_points = int(waypoint_route_ego.shape[0])
+		target_distance = float(np.linalg.norm(target_point_ego))
+		target_forward = float(target_point_ego[0])
+
+		debug.update({
+			'remaining_route_points': remaining_points,
+			'target_distance_m': target_distance,
+			'target_forward_m': target_forward,
+		})
+
+		if remaining_points > TERMINAL_ROUTE_ACTIVE_POINTS_MAX:
+			return debug
+
+		if target_forward < 0.0:
+			debug.update({
+				'active': True,
+				'reason': 'terminal_target_behind',
+				'speed_cap_ms': float(TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS),
+			})
+			return debug
+
+		if target_distance <= TERMINAL_ROUTE_NEAR_DISTANCE_M:
+			debug.update({
+				'active': True,
+				'reason': 'terminal_target_near',
+				'speed_cap_ms': float(TERMINAL_ROUTE_SPEED_CAP_MS),
+			})
+
+		return debug
 
 	def get_default_config_path(self):
 		return "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
@@ -766,6 +867,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 		self.last_energy_debug = {}
 		self.last_speed_debug = {}
+		self.last_terminal_route_debug = {}
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
 		self.prev_debug_raw_xy = None
@@ -824,19 +926,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if len(self._global_plan_world_coord) > 0:
 			first_wp = self._global_plan_world_coord[0]
 		
-			# Use _global_plan_world_coord with gps=False (recommended, GPS is deprecated in nav_planner.py)
-			self._route_planner.set_route(self._global_plan_world_coord, gps=False)
+		# Use _global_plan_world_coord with gps=False (recommended, GPS is deprecated in nav_planner.py)
+		self._route_planner.set_route(self._global_plan_world_coord, gps=False)
 
-			# Initialize command tracking
-			self.commands = deque(maxlen=2)
-			self.commands.append(4)
-			self.commands.append(4)
-			self.target_point_prev = [1e5, 1e5, 1e5]
-			self.last_command = -1
-			self.last_command_tmp = -1
+		# Initialize command tracking
+		self.commands = deque(maxlen=2)
+		self.commands.append(4)
+		self.commands.append(4)
+		self.target_point_prev = [1e5, 1e5, 1e5]
+		self.last_command = -1
+		self.last_command_tmp = -1
 
-			self.initialized = True
-			self.metric_info = {}
+		self.initialized = True
+		self.metric_info = {}
 		# self._hic = DisplayInterface()
 
 	def _build_obs_dict(self, tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point, cmd_one_hot, waypoint):
@@ -1494,7 +1596,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		return truncated, truncation_idx
 	
-	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None):
+	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None, terminal_speed_cap_ms=None):
 		"""
 		Predicts vehicle control with a PID controller.
 		
@@ -1533,10 +1635,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		desired_speed_raw = float(desired_speed)
 		if SOFT_SPEED_LIMIT_MS > 0.0:
 			desired_speed = min(desired_speed, SOFT_SPEED_LIMIT_MS)
+		if terminal_speed_cap_ms is not None and terminal_speed_cap_ms > 0.0:
+			desired_speed = min(desired_speed, terminal_speed_cap_ms)
 		self.last_speed_debug = {
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
+			'terminal_speed_cap_ms': float(terminal_speed_cap_ms) if terminal_speed_cap_ms is not None else None,
 			'hard_speed_limit_ms': float(HARD_SPEED_LIMIT_MS),
 		}
 
@@ -1838,24 +1943,36 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# 	print(f"  ego_status last: speed={ego_status_stacked[0,-1,0].item():.2f}, tp={ego_status_stacked[0,-1,6:8].cpu().numpy().round(2).tolist()}")
 
 			
-				gt_velocity = tick_data['speed']
-				
-				# Use target_point to truncate route for lateral control
-				steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=target_point)
-				throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
-					ego_speed=gt_velocity,
-					desired_speed_capped=self.last_speed_debug.get('desired_speed_capped'),
-					throttle=throttle,
-					brake=brake,
-					bev_classes=bev_semantic_classes,
-				)
+			gt_velocity = tick_data['speed']
+			
+			terminal_route_debug = self._get_terminal_route_speed_cap(tick_data)
+			self.last_terminal_route_debug = terminal_route_debug
 
-				applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
-				control = carla.VehicleControl()
-				control.steer = applied_steer
-				control.throttle = float(throttle)
-				control.brake = float(brake)
-				vehicle = CarlaDataProvider.get_hero_actor()
+			# Use target_point to truncate route for lateral control
+			steer, throttle, brake = self.control_pid(
+				route_waypoints,
+				gt_velocity,
+				speed_waypoints,
+				target_point=target_point,
+				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
+			)
+			throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
+				ego_speed=gt_velocity,
+				desired_speed_capped=self.last_speed_debug.get('desired_speed_capped'),
+				throttle=throttle,
+				brake=brake,
+				bev_classes=bev_semantic_classes,
+				external_force_move_block_reason=(
+					terminal_route_debug.get('reason') if terminal_route_debug.get('active') else None
+				),
+			)
+
+			applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
+			control = carla.VehicleControl()
+			control.steer = applied_steer
+			control.throttle = float(throttle)
+			control.brake = float(brake)
+			vehicle = CarlaDataProvider.get_hero_actor()
 			
 			# Optional hard speed limit: force brake only if explicitly enabled.
 			if HARD_SPEED_LIMIT_MS > 0.0 and gt_velocity > HARD_SPEED_LIMIT_MS:
@@ -1877,11 +1994,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
 					'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
 					'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
+					'terminal_speed_cap_ms': self.last_speed_debug.get('terminal_speed_cap_ms'),
 					'hard_speed_limit_ms': self.last_speed_debug.get('hard_speed_limit_ms'),
+					'terminal_route_speed_cap_active': bool(terminal_route_debug.get('active', False)),
+					'terminal_route_speed_cap_reason': terminal_route_debug.get('reason'),
+					'terminal_route_remaining_points': terminal_route_debug.get('remaining_route_points'),
+					'terminal_route_target_distance_m': terminal_route_debug.get('target_distance_m'),
+					'terminal_route_target_forward_m': terminal_route_debug.get('target_forward_m'),
 					'stuck_detector': int(self.stuck_detector),
 					'force_move': int(self.force_move),
 					'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
 					'traffic_light_semantic_block_force_move': bool(semantic_debug.get('traffic_light_block_force_move', False)),
+					'traffic_light_semantic_green_hold_active': bool(semantic_debug.get('traffic_light_green_hold_active', False)),
+					'traffic_light_semantic_green_hold_frames_remaining': int(semantic_debug.get('traffic_light_green_hold_frames_remaining', 0)),
 					'traffic_light_semantic_red_pixels': int(semantic_debug.get('traffic_light_red_pixels', 0)),
 					'traffic_light_semantic_yellow_pixels': int(semantic_debug.get('traffic_light_yellow_pixels', 0)),
 					'traffic_light_semantic_green_pixels': int(semantic_debug.get('traffic_light_green_pixels', 0)),
