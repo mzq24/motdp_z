@@ -33,7 +33,6 @@ sys.path = [str(p) for p in sys.path]
 from leaderboard.autoagents import autonomous_agent
 from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
 from team_code.simlingo.nav_planner import RoutePlanner, LateralPIDController, get_throttle
-from team_code.simlingo.birds_eye_view.run_stop_sign import RunStopSign
 from agents.navigation.local_planner import RoadOption
 import team_code.simlingo.transfuser_utils as t_u  
 from team_code.render import render, render_self_car, render_waypoints
@@ -134,6 +133,11 @@ ROAD_OPTION_TEXT = {
 	6: 'change_right',
 }
 
+SEMANTIC_STOP_SIGN_CLASS = 5
+SEMANTIC_LIGHT_GREEN_CLASS = 6
+SEMANTIC_LIGHT_YELLOW_CLASS = 7
+SEMANTIC_LIGHT_RED_CLASS = 8
+
 # Entry point
 def get_entry_point():
 	return 'MOTAgent'
@@ -220,6 +224,306 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if not np.isfinite(value_float):
 			return "NA"
 		return format(value_float, fmt)
+
+	def _build_transfuser_bev_semantic_decoder(self, model_path, device):
+		decoder = torch.nn.Sequential(
+			torch.nn.Conv2d(
+				self.transfuser_config.bev_features_chanels,
+				self.transfuser_config.bev_features_chanels,
+				kernel_size=3,
+				stride=1,
+				padding=1,
+				bias=True,
+			),
+			torch.nn.ReLU(inplace=True),
+			torch.nn.Conv2d(
+				self.transfuser_config.bev_features_chanels,
+				self.transfuser_config.num_bev_semantic_classes,
+				kernel_size=1,
+				stride=1,
+				padding=0,
+				bias=True,
+			),
+			torch.nn.Upsample(
+				size=(
+					self.transfuser_config.lidar_resolution_height,
+					self.transfuser_config.lidar_resolution_width,
+				),
+				mode='bilinear',
+				align_corners=False,
+			),
+		).to(device)
+
+		state_dict = torch.load(model_path, map_location='cpu')
+		prefix = 'bev_semantic_decoder.'
+		decoder_state = {
+			key[len(prefix):]: value
+			for key, value in state_dict.items()
+			if key.startswith(prefix)
+		}
+		if not decoder_state:
+			raise RuntimeError(f"Missing BEV semantic decoder weights in {model_path}")
+		decoder.load_state_dict(decoder_state, strict=True)
+		for param in decoder.parameters():
+			param.requires_grad = False
+		decoder.eval()
+		return decoder
+
+	def _init_semantic_hazard_state(self):
+		self.semantic_bev_pixels_per_meter = 2.0
+		self.semantic_tl_min_pixels = 6
+		self.semantic_stop_min_pixels = 3
+		self.semantic_tl_roi = (0.0, 25.0, -10.0, 10.0)
+		self.semantic_stop_roi = (0.0, 12.0, -8.0, 8.0)
+		self.semantic_stop_brake_distance_m = 6.0
+		self.semantic_stop_min_stop_frames = 10
+		self.semantic_stop_reset_missing_frames = 5
+		self.semantic_planner_stop_speed_threshold = 0.05
+
+		self.semantic_stop_state = 'NONE'
+		self.semantic_stop_stopped_frames = 0
+		self.semantic_stop_missing_frames = 0
+		self.last_semantic_debug = {}
+
+	def _decode_bev_semantic_classes(self, bev_feature_upscale):
+		if bev_feature_upscale is None:
+			return None
+		decoder_device = next(self.transfuser_bev_semantic_decoder.parameters()).device
+		with torch.no_grad():
+			semantic_logits = self.transfuser_bev_semantic_decoder(
+				bev_feature_upscale.to(device=decoder_device, dtype=torch.float32)
+			)
+		return (
+			semantic_logits.argmax(dim=1)
+			.squeeze(0)
+			.detach()
+			.cpu()
+			.numpy()
+			.astype(np.uint8)
+		)
+
+	def _bev_roi_bounds(self, bev_classes, x_min_m, x_max_m, y_min_m, y_max_m):
+		height, width = bev_classes.shape
+		center_col = width / 2.0
+		center_row = height / 2.0
+		ppm = self.semantic_bev_pixels_per_meter
+
+		col_start = int(np.floor(center_col + x_min_m * ppm))
+		col_end = int(np.ceil(center_col + x_max_m * ppm))
+		row_start = int(np.floor(center_row + y_min_m * ppm))
+		row_end = int(np.ceil(center_row + y_max_m * ppm))
+
+		col_start = max(0, min(width, col_start))
+		col_end = max(0, min(width, col_end))
+		row_start = max(0, min(height, row_start))
+		row_end = max(0, min(height, row_end))
+		return row_start, row_end, col_start, col_end
+
+	def _semantic_class_stats(self, bev_classes, class_id, roi):
+		x_min_m, x_max_m, y_min_m, y_max_m = roi
+		row_start, row_end, col_start, col_end = self._bev_roi_bounds(
+			bev_classes, x_min_m, x_max_m, y_min_m, y_max_m
+		)
+		if row_end <= row_start or col_end <= col_start:
+			return {
+				'count': 0,
+				'closest_forward_m': None,
+				'mean_forward_m': None,
+				'mean_lateral_m': None,
+			}
+
+		roi_classes = bev_classes[row_start:row_end, col_start:col_end]
+		mask = roi_classes == class_id
+		count = int(mask.sum())
+		if count == 0:
+			return {
+				'count': 0,
+				'closest_forward_m': None,
+				'mean_forward_m': None,
+				'mean_lateral_m': None,
+			}
+
+		rows, cols = np.nonzero(mask)
+		rows = rows.astype(np.float32) + float(row_start)
+		cols = cols.astype(np.float32) + float(col_start)
+		center_col = bev_classes.shape[1] / 2.0
+		center_row = bev_classes.shape[0] / 2.0
+		ppm = self.semantic_bev_pixels_per_meter
+		x_forward = (cols - center_col) / ppm
+		y_lateral = (rows - center_row) / ppm
+		return {
+			'count': count,
+			'closest_forward_m': float(np.min(x_forward)),
+			'mean_forward_m': float(np.mean(x_forward)),
+			'mean_lateral_m': float(np.mean(y_lateral)),
+		}
+
+	def _get_semantic_traffic_light_debug(self, bev_classes):
+		red_stats = self._semantic_class_stats(
+			bev_classes, SEMANTIC_LIGHT_RED_CLASS, self.semantic_tl_roi
+		)
+		yellow_stats = self._semantic_class_stats(
+			bev_classes, SEMANTIC_LIGHT_YELLOW_CLASS, self.semantic_tl_roi
+		)
+		green_stats = self._semantic_class_stats(
+			bev_classes, SEMANTIC_LIGHT_GREEN_CLASS, self.semantic_tl_roi
+		)
+
+		state = 'none'
+		block_force_move = False
+		if red_stats['count'] >= self.semantic_tl_min_pixels:
+			state = 'red'
+			block_force_move = True
+		elif yellow_stats['count'] >= self.semantic_tl_min_pixels:
+			state = 'yellow'
+			block_force_move = True
+		elif green_stats['count'] >= self.semantic_tl_min_pixels:
+			state = 'green'
+
+		return {
+			'state': state,
+			'block_force_move': block_force_move,
+			'red_pixels': red_stats['count'],
+			'yellow_pixels': yellow_stats['count'],
+			'green_pixels': green_stats['count'],
+			'red_closest_forward_m': red_stats['closest_forward_m'],
+			'yellow_closest_forward_m': yellow_stats['closest_forward_m'],
+			'green_closest_forward_m': green_stats['closest_forward_m'],
+		}
+
+	def _update_semantic_stop_sign_debug(self, bev_classes, ego_speed):
+		stop_stats = self._semantic_class_stats(
+			bev_classes, SEMANTIC_STOP_SIGN_CLASS, self.semantic_stop_roi
+		)
+		stop_detected = stop_stats['count'] >= self.semantic_stop_min_pixels
+
+		if stop_detected:
+			self.semantic_stop_missing_frames = 0
+		else:
+			self.semantic_stop_missing_frames += 1
+
+		if self.semantic_stop_state == 'CLEARED':
+			if self.semantic_stop_missing_frames >= self.semantic_stop_reset_missing_frames:
+				self.semantic_stop_state = 'NONE'
+				self.semantic_stop_stopped_frames = 0
+		elif self.semantic_stop_state == 'NONE':
+			if stop_detected:
+				self.semantic_stop_state = 'APPROACHING'
+				self.semantic_stop_stopped_frames = 0
+		elif self.semantic_stop_state == 'APPROACHING':
+			if not stop_detected and self.semantic_stop_missing_frames >= self.semantic_stop_reset_missing_frames:
+				self.semantic_stop_state = 'NONE'
+				self.semantic_stop_stopped_frames = 0
+			elif ego_speed < 0.1:
+				self.semantic_stop_stopped_frames += 1
+				if self.semantic_stop_stopped_frames >= self.semantic_stop_min_stop_frames:
+					self.semantic_stop_state = 'STOPPED'
+			else:
+				self.semantic_stop_stopped_frames = 0
+		elif self.semantic_stop_state == 'STOPPED':
+			self.semantic_stop_state = 'CLEARED'
+			self.semantic_stop_stopped_frames = 0
+
+		closest_forward_m = stop_stats['closest_forward_m']
+		apply_stop = (
+			self.semantic_stop_state == 'APPROACHING'
+			and stop_detected
+			and closest_forward_m is not None
+			and closest_forward_m <= self.semantic_stop_brake_distance_m
+		)
+		hold_force_move = self.semantic_stop_state in ('APPROACHING', 'STOPPED')
+
+		return {
+			'state': self.semantic_stop_state,
+			'hold_force_move': hold_force_move,
+			'apply_stop': apply_stop,
+			'pixels': stop_stats['count'],
+			'closest_forward_m': closest_forward_m,
+			'mean_lateral_m': stop_stats['mean_lateral_m'],
+			'stopped_frames': int(self.semantic_stop_stopped_frames),
+		}
+
+	def _apply_semantic_hazard_postprocess(
+		self, ego_speed, desired_speed_capped, throttle, brake, bev_classes
+	):
+		if bev_classes is None:
+			return throttle, brake, {
+				'traffic_light_state': 'none',
+				'traffic_light_block_force_move': False,
+				'traffic_light_red_pixels': 0,
+				'traffic_light_yellow_pixels': 0,
+				'traffic_light_green_pixels': 0,
+				'stop_sign_state': self.semantic_stop_state,
+				'stop_sign_hold_force_move': False,
+				'stop_sign_apply_stop': False,
+				'stop_sign_pixels': 0,
+				'stop_sign_closest_forward_m': None,
+				'force_move_blocked_reason': None,
+				'planner_wants_stop': False,
+			}
+
+		traffic_light_debug = self._get_semantic_traffic_light_debug(bev_classes)
+		stop_sign_debug = self._update_semantic_stop_sign_debug(bev_classes, ego_speed)
+		planner_wants_stop = (
+			desired_speed_capped is not None
+			and desired_speed_capped < self.semantic_planner_stop_speed_threshold
+			and ego_speed < 0.1
+		)
+
+		force_move_blocked_reason = None
+		if planner_wants_stop:
+			force_move_blocked_reason = 'planner_stop'
+		elif traffic_light_debug['block_force_move']:
+			force_move_blocked_reason = f"traffic_light_{traffic_light_debug['state']}"
+		elif stop_sign_debug['hold_force_move']:
+			force_move_blocked_reason = 'stop_sign'
+
+		if ego_speed < 0.1:
+			if force_move_blocked_reason is None:
+				self.stuck_detector += 1
+			else:
+				self.stuck_detector = 0
+				self.force_move = 0
+		elif ego_speed >= 1.0:
+			self.stuck_detector = 0
+
+		if force_move_blocked_reason is None and self.stuck_detector > self.stuck_threshold:
+			self.force_move = self.creep_duration
+
+		if self.force_move > 0:
+			throttle = max(self.creep_throttle, throttle)
+			brake = False
+			self.force_move -= 1
+
+		if stop_sign_debug['apply_stop']:
+			throttle = 0.0
+			brake = 1.0
+			self.stuck_detector = 0
+			self.force_move = 0
+			if force_move_blocked_reason is None:
+				force_move_blocked_reason = 'stop_sign'
+
+		debug = {
+			'traffic_light_state': traffic_light_debug['state'],
+			'traffic_light_block_force_move': traffic_light_debug['block_force_move'],
+			'traffic_light_red_pixels': int(traffic_light_debug['red_pixels']),
+			'traffic_light_yellow_pixels': int(traffic_light_debug['yellow_pixels']),
+			'traffic_light_green_pixels': int(traffic_light_debug['green_pixels']),
+			'traffic_light_red_closest_forward_m': traffic_light_debug['red_closest_forward_m'],
+			'traffic_light_yellow_closest_forward_m': traffic_light_debug['yellow_closest_forward_m'],
+			'traffic_light_green_closest_forward_m': traffic_light_debug['green_closest_forward_m'],
+			'stop_sign_state': stop_sign_debug['state'],
+			'stop_sign_hold_force_move': stop_sign_debug['hold_force_move'],
+			'stop_sign_apply_stop': stop_sign_debug['apply_stop'],
+			'stop_sign_pixels': int(stop_sign_debug['pixels']),
+			'stop_sign_closest_forward_m': stop_sign_debug['closest_forward_m'],
+			'stop_sign_mean_lateral_m': stop_sign_debug['mean_lateral_m'],
+			'stop_sign_stopped_frames': int(stop_sign_debug['stopped_frames']),
+			'force_move_blocked_reason': force_move_blocked_reason,
+			'planner_wants_stop': bool(planner_wants_stop),
+		}
+		self.last_semantic_debug = debug
+		return throttle, brake, debug
 
 	def get_default_config_path(self):
 		return "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
@@ -310,22 +614,27 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			print("[USE_MOT=False] Skipping MoT model loading.")
 
-		# ========== Load TransFuser Backbone for DP features ==========
-		print("Loading TransFuser backbone for DP features...")
-		transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
-		transfuser_model_path = os.path.join(transfuser_config_path, "model_0030_1.pth")
-		self.transfuser_backbone = TransFuserBackboneExtractor(
-			config_path=transfuser_config_path,
-			model_path=transfuser_model_path,
-			device='cuda:0'
-		)
-		# Backbone is already frozen in TransFuserBackboneExtractor
-		self.transfuser_backbone.eval()
-		# Get transfuser config for lidar processing
-		self.transfuser_config = self.transfuser_backbone.config
-		# Initialize TransfuserData for lidar histogram conversion
-		self.transfuser_data = TransfuserData(root=[], config=self.transfuser_config, shared_dict=None)
-		print("✓ TransFuser backbone loaded, frozen, and using float32.")
+			# ========== Load TransFuser Backbone for DP features ==========
+			print("Loading TransFuser backbone for DP features...")
+			transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
+			transfuser_model_path = os.path.join(transfuser_config_path, "model_0030_1.pth")
+			self.transfuser_backbone = TransFuserBackboneExtractor(
+				config_path=transfuser_config_path,
+				model_path=transfuser_model_path,
+				device='cuda:0'
+			)
+			# Backbone is already frozen in TransFuserBackboneExtractor
+			self.transfuser_backbone.eval()
+			# Get transfuser config for lidar processing
+			self.transfuser_config = self.transfuser_backbone.config
+			self.transfuser_bev_semantic_decoder = self._build_transfuser_bev_semantic_decoder(
+				model_path=transfuser_model_path,
+				device='cuda:0',
+			)
+			self._init_semantic_hazard_state()
+			# Initialize TransfuserData for lidar histogram conversion
+			self.transfuser_data = TransfuserData(root=[], config=self.transfuser_config, shared_dict=None)
+			print("✓ TransFuser backbone and BEV semantic decoder loaded, frozen, and using float32.")
 		
 		# Initialize transfuser lidar buffer for temporal alignment
 		self.transfuser_lidar_buffer = deque(maxlen=self.transfuser_config.lidar_seq_len * self.transfuser_config.data_save_freq)
@@ -515,24 +824,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if len(self._global_plan_world_coord) > 0:
 			first_wp = self._global_plan_world_coord[0]
 		
-		# Use _global_plan_world_coord with gps=False (recommended, GPS is deprecated in nav_planner.py)
-		self._route_planner.set_route(self._global_plan_world_coord, gps=False)
-		
-				
-		# Initialize command tracking 
-		self.commands = deque(maxlen=2)
-		self.commands.append(4)
-		self.commands.append(4)
-		self.target_point_prev = [1e5, 1e5, 1e5]
-		self.last_command = -1
-		self.last_command_tmp = -1
-		
-		# Stop sign post-processor (CARLA API-based, no model needed)
-		world = CarlaDataProvider.get_world()
-		self.stop_sign_criteria = RunStopSign(world)
+			# Use _global_plan_world_coord with gps=False (recommended, GPS is deprecated in nav_planner.py)
+			self._route_planner.set_route(self._global_plan_world_coord, gps=False)
 
-		self.initialized = True
-		self.metric_info = {}
+			# Initialize command tracking
+			self.commands = deque(maxlen=2)
+			self.commands.append(4)
+			self.commands.append(4)
+			self.target_point_prev = [1e5, 1e5, 1e5]
+			self.last_command = -1
+			self.last_command_tmp = -1
+
+			self.initialized = True
+			self.metric_info = {}
 		# self._hic = DisplayInterface()
 
 	def _build_obs_dict(self, tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point, cmd_one_hot, waypoint):
@@ -1478,17 +1782,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					rgb=transfuser_rgb_fp32,  # (1, 3, H, W) on GPU, float32
 					lidar_bev=transfuser_lidar_bev_fp32  # (1, C, H, W) on GPU, float32
 				)
-			
+				
 			# Extract transfuser features (following DiffusionDriveV2: only 2 features)
-			# bev_feature: (B, 1512, 8, 8) - original BEV feature (x4)
-			# bev_feature_upscale: (B, 64, 64, 64) - upsampled BEV (p3)
-			transfuser_bev_feature = transfuser_output['bev_feature']  # (1, 1512, 8, 8)
-			transfuser_bev_feature_upsample = transfuser_output['bev_feature_upscale']  # (1, 64, 64, 64)
-			
-			# Build dp_obs_dict with transfuser features
-			dp_obs_dict = {
-				'ego_status': ego_status_stacked,
-				'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
+				# bev_feature: (B, 1512, 8, 8) - original BEV feature (x4)
+				# bev_feature_upscale: (B, 64, 64, 64) - upsampled BEV (p3)
+				transfuser_bev_feature = transfuser_output['bev_feature']  # (1, 1512, 8, 8)
+				transfuser_bev_feature_upsample = transfuser_output['bev_feature_upscale']  # (1, 64, 64, 64)
+				bev_semantic_classes = self._decode_bev_semantic_classes(
+					transfuser_bev_feature_upsample
+				)
+				
+				# Build dp_obs_dict with transfuser features
+				dp_obs_dict = {
+					'ego_status': ego_status_stacked,
+					'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
 				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
 			}
 			dp_pred_traj = self._predict_dp_action(dp_obs_dict)
@@ -1531,56 +1838,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# 	print(f"  ego_status last: speed={ego_status_stacked[0,-1,0].item():.2f}, tp={ego_status_stacked[0,-1,6:8].cpu().numpy().round(2).tolist()}")
 
 			
-			gt_velocity = tick_data['speed']
-			
-			# Use target_point to truncate route for lateral control
-			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=target_point)
-			
-			# Restart mechanism in case the car got stuck (following simlingo logic)
-			# 0.1 is just an arbitrary low number to threshold when the car is stopped
-			if gt_velocity < 0.1:
-				self.stuck_detector += 1
-			
-			elif gt_velocity >= 1.0:
-				self.stuck_detector = 0
-			
-			# If stuck for too long, trigger force_move
-			if self.stuck_detector > self.stuck_threshold:
-				self.force_move = self.creep_duration
-			
-			# Force move: override throttle and brake to get unstuck
-			if self.force_move > 0:
-				throttle = max(self.creep_throttle, throttle)
-				brake = False
-				self.force_move -= 1
-				# print(f"force_move: {self.force_move}")
+				gt_velocity = tick_data['speed']
+				
+				# Use target_point to truncate route for lateral control
+				steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=target_point)
+				throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
+					ego_speed=gt_velocity,
+					desired_speed_capped=self.last_speed_debug.get('desired_speed_capped'),
+					throttle=throttle,
+					brake=brake,
+					bev_classes=bev_semantic_classes,
+				)
 
-			# print(f"stuck_detector: {self.stuck_detector}")
-
-			# ---- BridgeDrive-style post-processing ----
-
-			# Traffic light: stop on red/yellow (CARLA API, no model needed)
-			vehicle = CarlaDataProvider.get_hero_actor()
-			if vehicle.is_at_traffic_light():
-				tl = vehicle.get_traffic_light()
-				tl_state = tl.get_state()
-				if tl_state == carla.TrafficLightState.Red or tl_state == carla.TrafficLightState.Yellow:
-					throttle = 0.0
-					brake = 1.0
-					self.stuck_detector = 0  # Waiting at TL is not stuck
-
-			# Stop sign: brake to a full stop, then continue
-			self.stop_sign_criteria.tick(vehicle)
-			if self.stop_sign_criteria.target_stop_sign is not None and not self.stop_sign_criteria.stop_completed:
-				throttle = 0.0
-				brake = 1.0
-				self.stuck_detector = 0  # Waiting at stop sign is not stuck
-
-			applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
-			control = carla.VehicleControl()
-			control.steer = applied_steer
-			control.throttle = float(throttle)
-			control.brake = float(brake)
+				applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
+				control = carla.VehicleControl()
+				control.steer = applied_steer
+				control.throttle = float(throttle)
+				control.brake = float(brake)
+				vehicle = CarlaDataProvider.get_hero_actor()
 			
 			# Optional hard speed limit: force brake only if explicitly enabled.
 			if HARD_SPEED_LIMIT_MS > 0.0 and gt_velocity > HARD_SPEED_LIMIT_MS:
@@ -1588,22 +1863,41 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				control.brake = 1.0
 			
 			# Store metadata
-			self.pid_metadata = {
-				'agent': 'mot',
-				'steer': control.steer,
-				'steer_controller': float(steer),
-				'steer_sign_scale': STEER_SIGN_SCALE,
+				self.pid_metadata = {
+					'agent': 'mot',
+					'steer': control.steer,
+					'steer_controller': float(steer),
+					'steer_sign_scale': STEER_SIGN_SCALE,
 				'throttle': control.throttle,
 				'brake': control.brake,
 				'speed': gt_velocity,
 				'command': command,
 				'command_value': int(command_value),
-				'command_text': command_text,
-				'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
-				'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
-				'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
-				'hard_speed_limit_ms': self.last_speed_debug.get('hard_speed_limit_ms'),
-			}
+					'command_text': command_text,
+					'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
+					'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
+					'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
+					'hard_speed_limit_ms': self.last_speed_debug.get('hard_speed_limit_ms'),
+					'stuck_detector': int(self.stuck_detector),
+					'force_move': int(self.force_move),
+					'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
+					'traffic_light_semantic_block_force_move': bool(semantic_debug.get('traffic_light_block_force_move', False)),
+					'traffic_light_semantic_red_pixels': int(semantic_debug.get('traffic_light_red_pixels', 0)),
+					'traffic_light_semantic_yellow_pixels': int(semantic_debug.get('traffic_light_yellow_pixels', 0)),
+					'traffic_light_semantic_green_pixels': int(semantic_debug.get('traffic_light_green_pixels', 0)),
+					'traffic_light_semantic_red_closest_forward_m': semantic_debug.get('traffic_light_red_closest_forward_m'),
+					'traffic_light_semantic_yellow_closest_forward_m': semantic_debug.get('traffic_light_yellow_closest_forward_m'),
+					'traffic_light_semantic_green_closest_forward_m': semantic_debug.get('traffic_light_green_closest_forward_m'),
+					'stop_sign_semantic_state': semantic_debug.get('stop_sign_state'),
+					'stop_sign_semantic_hold_force_move': bool(semantic_debug.get('stop_sign_hold_force_move', False)),
+					'stop_sign_semantic_apply_stop': bool(semantic_debug.get('stop_sign_apply_stop', False)),
+					'stop_sign_semantic_pixels': int(semantic_debug.get('stop_sign_pixels', 0)),
+					'stop_sign_semantic_closest_forward_m': semantic_debug.get('stop_sign_closest_forward_m'),
+					'stop_sign_semantic_mean_lateral_m': semantic_debug.get('stop_sign_mean_lateral_m'),
+					'stop_sign_semantic_stopped_frames': int(semantic_debug.get('stop_sign_stopped_frames', 0)),
+					'force_move_blocked_reason': semantic_debug.get('force_move_blocked_reason'),
+					'planner_wants_stop_for_force_move': bool(semantic_debug.get('planner_wants_stop', False)),
+				}
 			vehicle_transform = vehicle.get_transform()
 			hero_xy = np.array([
 				float(vehicle_transform.location.x),
