@@ -1,0 +1,212 @@
+# Route B eval config for Bench2Drive.
+# Same as pdm_local_route_b.yaml, but checkpoint paths point to the
+# abs0328 single-file checkpoint (gps noise 0.25, n_emb 512).
+
+policy_type: anchor_free
+anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
+abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats_hpc.npz
+
+device:
+  gpu_ids:
+  - 0
+dataset:
+  use_per_frame: false
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  prefetch_factor: 4
+  shuffle: true
+  use_route_group_sampler: false
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 5.0e-05
+  weight_decay: 1.0e-04
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+enable_action_normalization: true
+bev_encoder:
+  state_dim: 14
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  n_obs_steps: 4
+  cond_dim: 256
+  obs_as_global_cond: true
+  n_layer: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 6
+  action_horizon: 6
+  traj_can_attend_route: true
+
+route_b:
+  num_samples: 1
+  num_energy_modes: 32
+  num_inference_steps: 10
+  use_split_forward: true
+  guidance_scale: 0.0
+  energy_front_weight: 1.0
+  energy_left_weight: 1.0
+  energy_right_weight: 1.0
+  energy_pedestrian_weight: 1.0
+  energy_offroad_weight: 1.0
+  energy_route_weight: 1.0
+  route_energy_margin: 1.0
+  route_energy_norm: 5.0
+  energy_loss_weight: 1.0
+  train_max_timesteps: 1000
+  alignment_loss_weight: 0.0
+  num_gt_augmentations: 0
+  use_safe_anchors: false
+  energy_noisy_training: false
+  alignment_warmup_epochs: 50
+  energy_grad_clip_norm: 1.0
+
+lane_interaction:
+  enabled: true
+  stage1_aux_only: true
+  num_centerline_points: 50
+  centerline_spacing_m: 1.0
+  lookahead_min_m: 20.0
+  lookahead_max_m: 40.0
+  lookahead_speed_gain: 2.0
+  lookahead_speed_bias: 4.0
+  lane_width_m: 3.5
+  valid_drivable_thresh: 0.55
+  wait_progress_margin_m: 1.0
+  borrow_min_steps: 2
+  nominal_horizon_s: 4.0
+  future_horizon_steps: 40
+  hotspot_max_lookahead_m: 40.0
+  hotspot_route_half_width_scale: 1.5
+  hotspot_object_half_width_scale: 1.5
+  hotspot_pre_base_m: 2.0
+  hotspot_pre_ego_speed_gain: 0.4
+  hotspot_pre_rel_speed_gain: 0.6
+  hotspot_post_base_m: 3.0
+  hotspot_post_ego_speed_gain: 0.2
+  hotspot_same_lane_block_speed_thresh: 1.0
+  hotspot_oncoming_merge_margin_m: 2.0
+  source_attention_extension_m: 20.0
+  source_attention_window_m: 2.0
+  source_attention_max_objects: 8
+  source_object_arm_drivable_thresh: 0.45
+  source_object_arm_probe_start_m: 2.5
+  source_rule_window_m: 2.0
+  source_rule_lateral_thresh_m: 4.5
+  wait_speed_thresh: 0.5
+  slowdown_ratio_thresh: 0.5
+  arrival_delay_thresh: 0.6
+  ready_speed_thresh: 1.0
+  release_accel_horizon_s: 1.0
+  speed_band_low_mps: 3.0
+  speed_band_high_mps: 8.0
+  lane_deviation_norm: 3.0
+  energy_target_max: 2.0
+  vehicle_interaction_target_scale: 2.0
+  use_new_energy_for_guidance: false
+  train_with_legacy_vehicle_heads: true
+  lane_choice_loss_weight: 1.0
+  hotspot_loss_weight: 1.0
+  need_wait_loss_weight: 1.0
+  ready_to_go_loss_weight: 1.0
+  hotspot_focal_alpha: 0.75
+  hotspot_focal_gamma: 2.0
+  energy_lane_loss_weight: 1.0
+  energy_vehicle_interact_loss_weight: 1.0
+  energy_lane_weight: 1.0
+  energy_vehicle_interact_weight: 1.0
+  bev_ppm: 2.0
+  bev_size: 256
+
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 1000
+  train_trunc_timesteps: 1000
+  num_diffusion_steps: 10
+  eta: 0.0
+  prediction_type: "sample"
+  route_loss_weight: 2.0
+
+num_modes: 32
+cls_loss_weight: 0.0
+reg_loss_weight: 8.0
+
+training:
+  num_epochs: 300
+  max_grad_norm: 1.0
+  warmup_epochs: 10
+  use_lr_scheduler: true
+  dataset_path: /media/z/data/dataset/pdm_lite_mini
+  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  sample_interval: 1
+  lr_final: 1e-7
+  validation_freq: 5
+  save_freq: 5
+  early_stopping_patience: 15
+  checkpoint_path: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy_abs0328/dit_policy_best.pt
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy_abs0328
+logging:
+  use_wandb: true
+  wandb_project: route_b_annealed_energy
+  run_name: route_b_hpc_abs0328
+  checkpoint_path: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy_abs0328/dit_policy_best.pt
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_annealed_energy_abs0328
+  save_every: 5
+  log_freq: 50
+  wandb_entity: m240117_z
+  wandb_api_key: bddb5a05a0820c1157702750c9f0ce60bcac2bba
+augmentation:
+  gps_noise:
+    enabled: true
+    sigma: 0.25
+    probability: 0.5
+model_optimization:
+  use_mixed_precision: true
