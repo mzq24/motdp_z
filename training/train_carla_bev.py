@@ -161,6 +161,8 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                 if 'energy_loss' in loss_dict:
                     val_metrics['energy_loss'].append(loss_dict['energy_loss'].item())
                     val_metrics['alignment_loss'].append(loss_dict['alignment_loss'].item())
+                if 'speed_loss' in loss_dict:
+                    val_metrics['speed_loss'].append(loss_dict['speed_loss'].item())
                 
                 # Multimodal model: only needs bev_feature, bev_feature_upsample, ego_status
                 # No more reasoning_query_tokens or anchor needed (anchor is loaded from wp_tokens.pkl)
@@ -391,11 +393,12 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
 
+    feature_suffix = config.get('dataset', {}).get('feature_suffix', '')
     train_dataset = CARLAImageDataset(
         dataset_path=train_dataset_path, image_data_root=image_data_root,
         use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
         anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
-        cache_dir=cache_dir,
+        cache_dir=cache_dir, feature_suffix=feature_suffix,
         gps_noise_cfg=gps_noise_cfg,
     )
     # Val dataset: skip memmap, will inject RAM features after config is parsed
@@ -938,6 +941,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     postfix['E'] = f'{loss_dict["energy_loss"].item():.3f}'
                 if 'alignment_loss' in loss_dict:
                     postfix['align'] = f'{loss_dict["alignment_loss"].item():.3f}'
+                if 'speed_loss' in loss_dict:
+                    postfix['spd'] = f'{loss_dict["speed_loss"].item():.3f}'
                 pbar.set_postfix(postfix)
 
             # Log to wandb less frequently to reduce overhead
@@ -955,7 +960,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0,
                 }
                 # Individual losses
-                for lk in ('cls_loss', 'reg_loss', 'route_loss', 'energy_loss', 'alignment_loss',
+                for lk in ('cls_loss', 'reg_loss', 'route_loss', 'speed_loss',
+                           'energy_loss', 'alignment_loss',
                            'energy_front_loss', 'energy_left_loss', 'energy_right_loss',
                            'energy_ped_loss', 'energy_off_loss', 'energy_route_loss'):
                     if lk in loss_dict:

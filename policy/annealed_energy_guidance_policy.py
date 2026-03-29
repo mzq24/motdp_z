@@ -191,6 +191,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.reg_loss_weight = config.get('reg_loss_weight', 1.0)
         self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
         self.energy_loss_weight = route_b_cfg.get('energy_loss_weight', 1.0)
+        self.speed_loss_weight = route_b_cfg.get('speed_loss_weight', 1.0)
 
         # DDIM Scheduler
         self.diffusion_scheduler = DDIMScheduler(
@@ -216,6 +217,61 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             anchor_centers_abs = torch.from_numpy(anchor_centers_abs).float()
         device = next(self.parameters()).device
         self.register_buffer('anchor_centers_abs', anchor_centers_abs.to(device))
+
+    # ========== Speed Target Computation ==========
+    def _compute_speed_target(self, trajectory, device):
+        """Compute two-hot speed target from GT trajectory for speed head training.
+
+        Target speed = displacement magnitude over 1 second (waypoints 0→2 at 0.5s interval).
+        Encoded as two-hot distribution over speed bins for cross-entropy loss.
+
+        Args:
+            trajectory: (B, T, 2) absolute GT trajectory
+            device: torch device
+
+        Returns:
+            two_hot: (B, num_classes) soft labels, or None if trajectory too short
+        """
+        if trajectory.shape[1] < 3:
+            return None
+        # Speed = ||wp[2] - wp[0]|| / 1.0s  (2 steps × 0.5s)
+        displacement = trajectory[:, 2] - trajectory[:, 0]  # (B, 2)
+        target_speed = displacement.norm(dim=-1)  # (B,) in m/s
+
+        speed_classes = self.model.speed_classes
+        num_classes = len(speed_classes)
+        bins = torch.tensor(speed_classes, device=device, dtype=target_speed.dtype)
+
+        # Clamp to valid range
+        target_speed = target_speed.clamp(min=bins[0], max=bins[-1])
+
+        # Two-hot encoding: interpolate between adjacent bins
+        B = target_speed.shape[0]
+        two_hot = torch.zeros(B, num_classes, device=device, dtype=target_speed.dtype)
+        for i in range(num_classes - 1):
+            mask = (target_speed >= bins[i]) & (target_speed < bins[i + 1])
+            if i == num_classes - 2:  # last bin: include upper bound
+                mask = mask | (target_speed == bins[i + 1])
+            if mask.any():
+                ratio = (target_speed[mask] - bins[i]) / (bins[i + 1] - bins[i]).clamp(min=1e-6)
+                two_hot[mask, i] = 1.0 - ratio
+                two_hot[mask, i + 1] = ratio
+        return two_hot
+
+    @staticmethod
+    def decode_speed_two_hot(speed_logits, speed_classes):
+        """Decode speed logits to scalar m/s via softmax weighted sum.
+
+        Args:
+            speed_logits: (B, num_classes) raw logits
+            speed_classes: list of float, bin centers
+
+        Returns:
+            speed_scalar: (B,) in m/s
+        """
+        bins = torch.tensor(speed_classes, device=speed_logits.device, dtype=speed_logits.dtype)
+        probs = torch.softmax(speed_logits.float(), dim=-1)
+        return (probs * bins).sum(dim=-1)
 
     # ========== GT Augmentation ==========
     def _augment_gt(self, trajectory, K):
@@ -446,7 +502,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         noisy_traj = noisy_flat.unsqueeze(1)  # (B, 1, T, 2)
         noisy_traj_abs = self.norm_to_abs(noisy_traj)
 
-        poses_reg, route_pred, _, _ = self.model.forward_ego(
+        poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
             x_t=noisy_traj,
             x_t_abs=noisy_traj_abs,
             timestep=diff_timesteps,
@@ -462,6 +518,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if route_gt is not None and route_pred is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+            # FDE: extra weight on final route point
+            route_loss = route_loss + F.l1_loss(route_pred[:, -1], route_gt[:, -1], reduction='mean')
+
+        # Speed loss: two-hot cross-entropy
+        speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        if speed_pred is not None:
+            speed_target = self._compute_speed_target(trajectory, device)
+            if speed_target is not None:
+                speed_loss = F.cross_entropy(speed_pred.float(), speed_target)
 
         # ===== Forward 2: Energy training (anchors + GT) =====
         zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -596,6 +661,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.reg_loss_weight * loss_reg
             + self.route_loss_weight * route_loss
             + self.alignment_loss_weight * alignment_loss
+            + self.speed_loss_weight * speed_loss
         )
 
         return {
@@ -610,6 +676,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'reg_loss': loss_reg,
             'cls_loss': torch.tensor(0.0, device=device),
             'route_loss': route_loss,
+            'speed_loss': speed_loss,
             'alignment_loss': alignment_loss,
         }
 
@@ -1135,6 +1202,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if route_gt is not None and route_pred is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+            # FDE: extra weight on final route point
+            route_loss = route_loss + F.l1_loss(route_pred[:, -1], route_gt[:, -1], reduction='mean')
 
         # ========== Alignment Loss ==========
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -1161,6 +1230,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'reg_loss': loss_reg,
             'cls_loss': torch.tensor(0.0, device=device),
             'route_loss': route_loss,
+            'speed_loss': torch.tensor(0.0, device=device),
             'alignment_loss': alignment_loss,
         }
         return loss_dict
@@ -1331,7 +1401,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if use_guidance:
                 # Pass 1: get pred_x0 from denoising (no energy eval yet)
                 with torch.no_grad():
-                    poses_reg, route_pred, _, _ = self.model.forward_ego(
+                    poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
                         x_t=x_input,
                         x_t_abs=x_t_abs,
                         timestep=t_tensor,
@@ -1387,7 +1457,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 poses_cls = None
             else:
                 with torch.no_grad():
-                    poses_reg, route_pred, _, _ = self.model.forward_ego(
+                    poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
                         x_t=x_input,
                         x_t_abs=x_t_abs,
                         timestep=t_tensor,
@@ -1410,6 +1480,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         final_abs = self.norm_to_abs(pred_x0_corrected)  # (B, 1, T, 2)
         best_trajectory = final_abs.squeeze(1)  # (B, T, 2)
 
+        # Decode speed prediction to scalar m/s
+        target_speed_pred = None
+        if speed_pred is not None:
+            target_speed_pred = self.decode_speed_two_hot(
+                speed_pred, self.model.speed_classes
+            )  # (B,)
+
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
             'route_pred': route_pred,                 # (B, 20, 2)
@@ -1417,6 +1494,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'energy_scores': energy_scores,           # dict of (B, 1)
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
+            'target_speed': target_speed_pred,        # (B,) m/s
         }
 
     # ========== Predict Action (standard interface) ==========
@@ -1460,6 +1538,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'all_trajectories': sample_result['all_trajectories'].detach().float().cpu().numpy(),
             'best_idx': sample_result['best_idx'].detach().cpu().numpy(),
         }
+
+        # Add predicted target speed (scalar m/s)
+        if sample_result.get('target_speed') is not None:
+            result['target_speed'] = sample_result['target_speed'].detach().float().cpu().numpy()
 
         # Add energy scores if available
         if sample_result['energy_scores'] is not None:

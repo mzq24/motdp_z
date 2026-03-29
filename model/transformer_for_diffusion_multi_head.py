@@ -1459,7 +1459,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
             output_dim=2,
             p_drop=p_drop_emb,
         )
-        
+
+        # Speed prediction head: two-hot classification over discrete speed bins
+        # Input: mean-pooled traj tokens (n_emb) from ego forward path
+        # Output: logits over speed classes (default 8 bins: 0-20 m/s)
+        self.speed_classes = [0.0, 4.0, 8.0, 10.0, 13.89, 16.0, 17.78, 20.0]
+        self.speed_head = nn.Sequential(
+            nn.Linear(n_emb, n_emb // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(n_emb // 2, len(self.speed_classes)),
+        )
+
         self.apply(self._init_weights)
         
         logger.info("TransformerForDiffusion (Multimodal) - parameters: %e", 
@@ -1606,7 +1616,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         ego_status: torch.Tensor,
         x_t_abs: Optional[torch.Tensor] = None,
         bev_proj_cached: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Ego denoising path with waypoint-level trajectory tokens.
 
@@ -1615,6 +1625,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_pred: (B, num_waypoints, 2)
             traj_out: (B, T, n_emb) ego trajectory tokens after decoder
             conditioning: (B, n_emb)
+            speed_pred: (B, num_speed_classes) logits over speed bins
         """
         model_dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
@@ -1662,7 +1673,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
         poses_reg = traj_pred.unsqueeze(1)
         route_pred = self.route_head(route_out, conditioning, current_status)
-        return poses_reg, route_pred, traj_out, conditioning
+        speed_pred = self.speed_head(traj_out.mean(dim=1))  # (B, num_speed_classes)
+        return poses_reg, route_pred, traj_out, conditioning, speed_pred
 
     def forward_energy(
         self,

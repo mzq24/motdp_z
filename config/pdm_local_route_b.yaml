@@ -78,7 +78,7 @@ policy:
   obs_as_global_cond: true
   n_layer: 4
   n_head: 8
-  n_emb: 1024
+  n_emb: 512
   p_drop_emb: 0.1
   p_drop_attn: 0.1
   causal_attn: true
@@ -94,7 +94,7 @@ route_b:
   num_energy_modes: 32     # Energy head training: use all anchors for diverse pos/neg samples
   num_inference_steps: 10  # 10-step DDIM (5x of Route A's 2-step)
   use_split_forward: true  # Use split ego/energy forwards for MOA refactor
-  guidance_scale: 0.1      # Global energy gradient scale (start small, tune up)
+  guidance_scale: 0.05      # Global energy gradient scale (start small, tune up)
   # Per-head energy weights (6 heads: front/left/right/pedestrian/offroad/route)
   energy_front_weight: 1.0
   energy_left_weight: 1.0
@@ -106,6 +106,7 @@ route_b:
   route_energy_margin: 1.0   # corridor half-width (m): within 1m of route/GT = deviation 0
   route_energy_norm: 5.0     # normalization factor (m): 5m outside corridor = target 1.0
   energy_loss_weight: 1.0  # Weight of energy loss in total training loss
+  speed_loss_weight: 1.0   # Weight of speed prediction (two-hot classification) loss
   train_max_timesteps: 1000 # Full range for pure N(0,I) diffusion (must match num_train_timesteps)
   # Route B+ additions
   alignment_loss_weight: 0.0   # Disabled for now: shared decoder/energy objectives were unstable

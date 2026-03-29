@@ -72,6 +72,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  use_per_frame: bool = False, # True for local SSD: load individual .pt files directly (no pack/memmap)
                  use_vqa_anchor: bool = False, # True to load VLM-predicted anchor from dp_vl_feature/*.pt
                  cache_dir: str = None,       # Override memmap cache dir (e.g. /tmp/tmp_data for tmpfs)
+                 feature_suffix: str = '',    # Suffix for feature files (e.g. 'ensemble' → bev_features_fp16_ensemble.bin)
                  gps_noise_cfg: dict = None,  # GPS noise augmentation config
                  ):
 
@@ -248,9 +249,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # ===== Load feature cache (memmap, shared across DDP ranks) =====
         if cache_dir is None:
             cache_dir = os.path.join(image_data_root, 'tmp_data')
-        index_path = os.path.join(cache_dir, 'feature_index.pkl')
-        feat_bin = os.path.join(cache_dir, 'bev_features_fp16.bin')
-        ups_bin = os.path.join(cache_dir, 'bev_upsamples_fp16.bin')
+        sfx = f'_{feature_suffix}' if feature_suffix else ''
+        index_path = os.path.join(cache_dir, f'feature_index{sfx}.pkl')
+        feat_bin = os.path.join(cache_dir, f'bev_features_fp16{sfx}.bin')
+        ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}.bin')
 
         if skip_memmap:
             print(f"[Rank {rank}] Skipping memmap (will use inject_ram_features later).")

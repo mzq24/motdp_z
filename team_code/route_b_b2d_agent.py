@@ -1618,19 +1618,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# if truncation_idx >= 0:
 			# 	print(f"[Lateral] Route truncated at index {truncation_idx}, remaining points: {len(route_waypoints_np)}")
 		
+		# Trajectory-based speed estimate (always computed, used as safety upper bound)
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
-		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
-		mot_waypoint_interval = 0.5  # seconds between waypoints
-		one_second_idx = 2 #1  # point[1] is at 1.0s
-		half_second_idx = 0  # point[0] is at 0.5s
-		
+		one_second_idx = 2
+		half_second_idx = 0
 		if speed_waypoints_np.shape[0] >= 2:
-			# Displacement from 0.5s to 1.0s position, multiply by 2 to get m/s
-			# desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx]) * 2.0
-			desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx])
+			traj_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx])
 		else:
-			# Fallback: use first point distance, assuming it represents 0.5s travel
-			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
+			traj_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
+
+		# Fuse: speed head as primary, traj displacement as safety upper bound
+		if hasattr(self, '_last_target_speed') and self._last_target_speed is not None:
+			desired_speed = float(self._last_target_speed)
+			# Traj upper bound: if traj says slow down, respect it (prevent speed head being too aggressive)
+			desired_speed = min(desired_speed, traj_speed * 1.2)
+		else:
+			desired_speed = traj_speed
 
 		desired_speed_raw = float(desired_speed)
 		if SOFT_SPEED_LIMIT_MS > 0.0:
@@ -1904,6 +1907,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
 			}
 			dp_pred_traj = self._predict_dp_action(dp_obs_dict)
+			# Store predicted target speed for control_pid
+			self._last_target_speed = dp_pred_traj.get('target_speed', None)
+			if self._last_target_speed is not None:
+				self._last_target_speed = float(np.asarray(self._last_target_speed).reshape(-1)[0])
 			# self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			# if self.step % 20 == 0:
 			# 	bev_f = transfuser_bev_feature.float()

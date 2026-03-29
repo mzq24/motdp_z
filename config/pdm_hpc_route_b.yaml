@@ -111,6 +111,7 @@ route_b:
   route_energy_margin: 1.0
   route_energy_norm: 5.0
   energy_loss_weight: 1.0
+  speed_loss_weight: 1.0
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0  # Disabled for now: shared decoder/energy objectives were unstable
   num_gt_augmentations: 0
@@ -136,6 +137,7 @@ reg_loss_weight: 8.0
 
 dataset:
   use_per_frame: false
+  feature_suffix: ensemble  # Use averaged BEV features from 3 TransFuser checkpoints
   cache_dir: null
 
 training:
