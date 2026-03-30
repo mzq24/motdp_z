@@ -777,9 +777,19 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     ema_update_interval = ema_cfg.get('update_interval', 10)  # Update every N steps
     # Restore EMA state from checkpoint if available
     if checkpoint is not None and 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
-        ema_model.load_state_dict(checkpoint['ema_state_dict'])
-        if rank == 0:
-            print("  ✓ EMA state restored")
+        ema_saved = checkpoint['ema_state_dict']
+        # Check if shadow_params shapes match current model (may differ after architecture changes)
+        current_params = list(model_for_ema.parameters())
+        saved_shadows = ema_saved.get('shadow_params', [])
+        if len(saved_shadows) == len(current_params) and all(
+            s.shape == p.shape for s, p in zip(saved_shadows, current_params)
+        ):
+            ema_model.load_state_dict(ema_saved)
+            if rank == 0:
+                print("  ✓ EMA state restored")
+        else:
+            if rank == 0:
+                print("  ⚠ EMA shape mismatch (model architecture changed), re-initializing EMA from current model")
     if rank == 0:
         print(f"✓ EMA initialized (max_value={ema_cfg.get('max_value', 0.9999)})")
 
