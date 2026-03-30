@@ -637,8 +637,20 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print(f"Loading checkpoint from {resume_path}...")
         checkpoint = torch.load(resume_path, map_location=device)
+        # Filter out shape-mismatched keys (strict=False only handles missing/unexpected, not shape mismatch)
+        saved_state = checkpoint['model_state_dict']
+        current_state = policy.state_dict()
+        filtered_state = {}
+        shape_mismatch_keys = []
+        for k, v in saved_state.items():
+            if k in current_state and current_state[k].shape != v.shape:
+                shape_mismatch_keys.append(k)
+            else:
+                filtered_state[k] = v
+        if rank == 0 and shape_mismatch_keys:
+            print(f"  Skipped {len(shape_mismatch_keys)} shape-mismatched keys: {shape_mismatch_keys[:8]}")
         missing_keys, unexpected_keys = policy.load_state_dict(
-            checkpoint['model_state_dict'],
+            filtered_state,
             strict=False,
         )
         start_epoch = checkpoint.get('epoch', 0) + 1
