@@ -580,6 +580,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         global_abs_stats_path = config.get('global_abs_stats_path', None)
         abs_stats_path = config.get('abs_stats_path', None)
         delta_stats_path = config.get('delta_stats_path', None)
+        route_abs_stats_path = config.get('route_abs_stats_path', None)
         if global_abs_stats_path:
             gdata = np.load(global_abs_stats_path)
             policy.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
@@ -598,6 +599,16 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         else:
             if rank == 0:
                 print(f"  ⚠ No normalization stats configured — will fail!")
+        if route_abs_stats_path:
+            route_data = np.load(route_abs_stats_path)
+            policy.register_route_abs_stats(route_data['route_abs_mean'], route_data['route_abs_std'])
+            if rank == 0:
+                print(
+                    f"  ✓ Route abs stats registered: mean={route_data['route_abs_mean'].shape}, "
+                    f"std={route_data['route_abs_std'].shape}"
+                )
+        else:
+            raise ValueError("route_abs_stats_path is required for joint Route B ego diffusion")
         # Register anchor trajectories for energy head training (before DDP wrapping)
         anchor_path = config.get('anchor_path', None)
         if anchor_path:
@@ -626,10 +637,21 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print(f"Loading checkpoint from {resume_path}...")
         checkpoint = torch.load(resume_path, map_location=device)
-        policy.load_state_dict(checkpoint['model_state_dict'])
+        missing_keys, unexpected_keys = policy.load_state_dict(
+            checkpoint['model_state_dict'],
+            strict=False,
+        )
         start_epoch = checkpoint.get('epoch', 0) + 1
         if rank == 0:
             print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            if missing_keys:
+                preview = missing_keys[:8]
+                suffix = "..." if len(missing_keys) > 8 else ""
+                print(f"  Missing model keys during warm-start: {preview}{suffix}")
+            if unexpected_keys:
+                preview = unexpected_keys[:8]
+                suffix = "..." if len(unexpected_keys) > 8 else ""
+                print(f"  Unexpected model keys during warm-start: {preview}{suffix}")
             if 'val_metrics' in checkpoint:
                 print(f"  Previous val_metrics: {checkpoint['val_metrics']}")
         # Restore scaler state if available (for AMP resume)

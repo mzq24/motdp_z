@@ -6,6 +6,7 @@ policy_type: anchor_free  # Use AnnealedEnergyGuidancePolicy
 anchor_path: dd_baseline/anchors/carla_kmeans_32.npy  # K-means anchor trajectories (32, 6, 2)
 # global_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/global_abs_stats.npz
 abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats_hpc.npz  # per-step abs, for ablation
+route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
 # delta_stats_path: /media/z/data/dataset/pdm_lite_mini/delta_stats.npz  # delta, for ablation
 
 device:

@@ -982,7 +982,8 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.horizon = horizon
         self.num_waypoints = num_waypoints
         self.traj_can_attend_route = traj_can_attend_route
-        
+        self.ego_detail_activation_t = 400
+
         # ========== Transfuser Feature Projections (following DiffusionDriveV2) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, d_model)
         self.bev_feature_proj = nn.Sequential(
@@ -1009,6 +1010,30 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             lidar_max_x=32.0,
             lidar_max_y=32.0
         )
+        self.route_point_attn = GridSampleCrossBEVAttention(
+            embed_dims=d_model,
+            num_heads=nhead,
+            in_bev_dims=transfuser_bev_upsample_dim,
+            num_points=1,
+            lidar_max_x=32.0,
+            lidar_max_y=32.0
+        )
+        self.traj_detail_attn = GridSampleCrossBEVAttention(
+            embed_dims=d_model,
+            num_heads=nhead,
+            in_bev_dims=transfuser_bev_upsample_dim,
+            num_points=7,
+            lidar_max_x=32.0,
+            lidar_max_y=32.0
+        )
+        self.route_detail_attn = GridSampleCrossBEVAttention(
+            embed_dims=d_model,
+            num_heads=nhead,
+            in_bev_dims=transfuser_bev_upsample_dim,
+            num_points=num_waypoints,
+            lidar_max_x=32.0,
+            lidar_max_y=32.0
+        )
         
         # Position embeddings for cross-attention sources (BEV tokens only now)
         # Total tokens: 64 (bev)
@@ -1023,6 +1048,19 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.register_buffer(
             "unified_pos_encoding",
             self._create_sinusoidal_pos_encoding(max_seq_len, d_model)
+        )
+        self.register_buffer(
+            "ego_detail_offsets",
+            torch.tensor([
+                [0.0, 1.5],
+                [0.0, -1.5],
+                [1.5, 1.0],
+                [1.5, -1.0],
+                [-3.0, 1.5],
+                [-3.0, -1.5],
+                [-3.0, 0.0],
+            ], dtype=torch.float32),
+            persistent=False,
         )
         
         # Learnable position scaling for each modality
@@ -1157,6 +1195,23 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         mask[T_traj:, :T_traj] = float('-inf')
         return mask
 
+    def _build_traj_detail_points(self, traj_points: torch.Tensor) -> torch.Tensor:
+        offsets = self.ego_detail_offsets.to(device=traj_points.device, dtype=traj_points.dtype)
+        return traj_points.unsqueeze(2) + offsets.view(1, 1, offsets.shape[0], 2)
+
+    def _detail_gate(self, timesteps: Optional[torch.Tensor], batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if timesteps is None:
+            return torch.zeros(batch_size, 1, 1, device=device, dtype=dtype)
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], device=device, dtype=torch.long)
+        else:
+            timesteps = timesteps.to(device=device, dtype=torch.long).reshape(-1)
+        if timesteps.numel() == 1:
+            timesteps = timesteps.expand(batch_size)
+        elif timesteps.numel() != batch_size:
+            raise ValueError(f"Expected 1 or {batch_size} timesteps, got {timesteps.numel()}")
+        return (timesteps <= self.ego_detail_activation_t).to(dtype=dtype).view(batch_size, 1, 1)
+
     def compute_bev_proj(self, transfuser_bev_feature: torch.Tensor) -> torch.Tensor:
         """Precompute BEV token projection for reuse across split forwards."""
         bev_feat = transfuser_bev_feature.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
@@ -1172,6 +1227,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         transfuser_bev_feature_upsample: torch.Tensor,  # (B, 64, 64, 64)
         conditioning: torch.Tensor,                 # (B, d_model)
         traj_points: Optional[torch.Tensor] = None,  # (B, T_traj, 2) or (B, T_traj, horizon, 2) for GridSampleCrossBEVAttention
+        route_emb: Optional[torch.Tensor] = None,   # (B, T_route, d_model) - route query embeddings for ego diffusion
+        route_points: Optional[torch.Tensor] = None,  # (B, T_route, 2) absolute route points for BEV sampling
+        timesteps: Optional[torch.Tensor] = None,   # (B,) diffusion timesteps for detail gating
         route_conditioning: Optional[torch.Tensor] = None,  # (B, d_model) - route-specific conditioning
         bev_proj_cached: Optional[torch.Tensor] = None,
         self_attn_mask: Optional[torch.Tensor] = None,
@@ -1200,6 +1258,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             reasoning_tokens: (B, T_r, reasoning_dim) - reasoning tokens
             conditioning: (B, d_model) - timestep + current_status conditioning
             traj_points: (B, horizon, 2) - trajectory points for spatial BEV attention
+            route_emb: (B, num_waypoints, d_model) - route query embeddings
+            route_points: (B, num_waypoints, 2) - route points for fine-BEV sampling
+            timesteps: (B,) diffusion timestep used to gate detail branches
             route_conditioning: (B, d_model) - route-specific conditioning (optional)
             
         Returns:
@@ -1220,7 +1281,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         traj_emb = traj_emb + traj_pos + self.traj_segment_emb
         
         # Route queries with position and segment embeddings
-        route_emb = self.route_queries.expand(B, -1, -1) + route_pos + self.route_segment_emb
+        if route_emb is None:
+            route_emb = self.route_queries.expand(B, -1, -1)
+        route_emb = route_emb + route_pos + self.route_segment_emb
         
         # Concatenate queries: [trajectory | route]
         x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
@@ -1242,12 +1305,30 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         if traj_points is not None:
             x_traj = x[:, :T_traj, :]  # (B, T_traj, d_model)
             if spatial_mode == "ego":
-                if traj_points.dim() == 3:
-                    traj_points = traj_points.unsqueeze(2)
-                x_traj = self.bev_point_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
+                if traj_points.dim() != 3:
+                    raise ValueError(f"Ego traj_points must be (B, T, 2), got {traj_points.shape}")
+                center_points = traj_points.unsqueeze(2)
+                x_traj_center = self.bev_point_attn(x_traj, center_points, transfuser_bev_feature_upsample)
+                detail_gate = self._detail_gate(timesteps, B, x_traj.device, x_traj.dtype)
+                traj_detail_points = self._build_traj_detail_points(traj_points)
+                traj_local_detail = self.traj_detail_attn(x_traj, traj_detail_points, transfuser_bev_feature_upsample) - x_traj
+                if route_points is None:
+                    raise ValueError("route_points are required for ego diffusion route detail sampling")
+                traj_route_detail = self.route_detail_attn(x_traj, route_points, transfuser_bev_feature_upsample) - x_traj
+                x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail)
+                x_route = x[:, T_traj:, :]
+                if route_points is not None:
+                    if route_points.dim() != 3:
+                        raise ValueError(f"Ego route_points must be (B, T_route, 2), got {route_points.shape}")
+                    x_route = self.route_point_attn(
+                        x_route,
+                        route_points.unsqueeze(2),
+                        transfuser_bev_feature_upsample,
+                    )
             else:
                 x_traj = self.bev_spatial_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
-            x = torch.cat([x_traj, x[:, T_traj:, :]], dim=1)
+                x_route = x[:, T_traj:, :]
+            x = torch.cat([x_traj, x_route], dim=1)
 
         # Decoder layers with multi-source attention
         # Pass separate feature tokens and T_traj for route-specific processing
@@ -1346,6 +1427,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.transfuser_bev_upsample_dim = transfuser_bev_upsample_dim
         self.T = horizon
         self.output_dim = output_dim
+        self.ego_joint_horizon = horizon + num_waypoints
         
         # ========== Anchor Embedding ==========
         # Encode full noisy trajectory shape per mode (not just mean point) to preserve
@@ -1362,11 +1444,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
+        self.route_wp_emb = nn.Sequential(
+            nn.Linear(self.anchor_pos_hidden_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
 
         # Learnable mode queries for each anchor (energy training uses all num_modes)
         self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
         # Dedicated diffusion mode query (single-mode denoising in Route B)
         self.diff_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
+        self.route_diff_query = nn.Parameter(torch.randn(1, 1, n_emb))
         # Dedicated GT mode query (unified training: GT slot in energy evaluation)
         self.gt_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
         # Extra learnable query for VLM anchor (33rd mode), used when use_vqa_anchor=True
@@ -1459,6 +1547,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
             output_dim=2,
             p_drop=p_drop_emb,
         )
+        self.route_norm_head = RouteMLPHead(
+            n_emb=n_emb,
+            status_dim=status_dim,
+            output_dim=2,
+            p_drop=p_drop_emb,
+        )
 
         # Speed prediction head: two-hot classification over discrete speed bins
         # Input: mean-pooled traj tokens (n_emb) from ego forward path
@@ -1516,7 +1610,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         for name in param_dict:
             if 'pos_emb' in name or '_dummy_variable' in name or 'segment_emb' in name:
                 no_decay.add(name)
-            elif 'route_queries' in name or 'pool_query' in name or 'mode_queries' in name:
+            elif 'route_queries' in name or 'pool_query' in name or 'mode_queries' in name or 'route_diff_query' in name:
                 no_decay.add(name)
             elif 'gating_factor' in name:
                 no_decay.add(name)
@@ -1595,6 +1689,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         return self.wp_emb(wp_pos_embed)
 
+    def _embed_route_waypoint_tokens(self, route_abs: torch.Tensor) -> torch.Tensor:
+        """Waypoint-level embedding for route diffusion path: (B, T_route, 2) -> (B, T_route, n_emb)."""
+        route_pos_embed = gen_sineembed_for_position(
+            route_abs, hidden_dim=self.anchor_pos_hidden_dim
+        )
+        return self.route_wp_emb(route_pos_embed)
+
     def _compute_energy_scores(self, energy_input: torch.Tensor, include_route: bool = True) -> dict:
         energy_scores = {
             'front': self.energy_front_head(energy_input).squeeze(-1),
@@ -1618,11 +1719,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         bev_proj_cached: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Ego denoising path with waypoint-level trajectory tokens.
+        Ego denoising path with joint trajectory+route waypoint diffusion.
 
         Returns:
             poses_reg: (B, 1, T, 2) normalized trajectory prediction
-            route_pred: (B, num_waypoints, 2)
+            route_pred: (B, num_waypoints, 2) normalized route prediction
             traj_out: (B, T, n_emb) ego trajectory tokens after decoder
             conditioning: (B, n_emb)
             speed_pred: (B, num_speed_classes) logits over speed bins
@@ -1635,13 +1736,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
         transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
         ego_status = ego_status.to(device=device, dtype=model_dtype)
 
-        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
-        if bev_traj_points.dim() == 4:
-            traj_points = bev_traj_points[:, 0, :, :]
-        else:
-            traj_points = bev_traj_points
+        joint_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
+        if joint_points.dim() == 4:
+            if joint_points.shape[1] != 1:
+                raise ValueError(f"forward_ego expects a single joint ego sample, got shape {joint_points.shape}")
+            joint_points = joint_points[:, 0, :, :]
+        if joint_points.dim() != 3:
+            raise ValueError(f"forward_ego expects (B, 1, T_joint, 2) or (B, T_joint, 2), got {joint_points.shape}")
+        if joint_points.shape[1] != self.ego_joint_horizon:
+            raise ValueError(
+                f"forward_ego expects T_joint={self.ego_joint_horizon}, got {joint_points.shape[1]}"
+            )
+
+        traj_points = joint_points[:, :self.horizon, :]
+        route_points = joint_points[:, self.horizon:self.ego_joint_horizon, :]
 
         B, T_traj, _ = traj_points.shape
+        T_route = route_points.shape[1]
         conditioning, current_status, route_conditioning = self._compute_conditioning(
             timestep, ego_status, device, model_dtype
         )
@@ -1651,9 +1762,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_emb = wp_emb + diff_query + conditioning.unsqueeze(1)
         traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
 
+        route_wp_emb = self._embed_route_waypoint_tokens(route_points)
+        route_diff_query = self.route_diff_query.expand(B, T_route, -1)
+        route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
+        route_emb = self.pre_decoder_norm(self.drop(route_emb))
+
         ego_mask = self.decoder._create_ego_mask(
             T_traj=T_traj,
-            T_route=self.num_waypoints,
+            T_route=T_route,
             device=traj_emb.device,
             dtype=traj_emb.dtype,
         )
@@ -1663,6 +1779,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
             conditioning=conditioning,
             traj_points=traj_points,
+            route_emb=route_emb,
+            route_points=route_points,
+            timesteps=timestep,
             route_conditioning=route_conditioning,
             bev_proj_cached=bev_proj_cached,
             self_attn_mask=ego_mask,
@@ -1672,7 +1791,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
         poses_reg = traj_pred.unsqueeze(1)
-        route_pred = self.route_head(route_out, conditioning, current_status)
+        route_pred = self.route_norm_head(route_out, conditioning, current_status)
         speed_pred = self.speed_head(traj_out.mean(dim=1))  # (B, num_speed_classes)
         return poses_reg, route_pred, traj_out, conditioning, speed_pred
 

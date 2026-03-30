@@ -4,6 +4,7 @@
 policy_type: anchor_free
 anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
 abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats_hpc.npz
+route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
 
 device:
   gpu_ids:

@@ -4,6 +4,7 @@
 policy_type: anchor_free  # Use AnnealedEnergyGuidancePolicy
 anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
 global_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/global_abs_stats.npz
+route_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/route_abs_stats.npz
 
 device:
   gpu_ids:

@@ -134,6 +134,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.energy_noisy_training = route_b_cfg.get('energy_noisy_training', False)
         self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
         self._current_epoch = 0
+        self.route_abs_stats_path = config.get('route_abs_stats_path', None)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -182,6 +183,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # Per-timestep abs z-score normalization buffers (ablation)
         self.register_buffer('abs_mean', None)  # (T, 2)
         self.register_buffer('abs_std', None)   # (T, 2)
+        # Route per-waypoint abs z-score normalization buffers for joint route diffusion
+        self.register_buffer('route_abs_mean', None)  # (T_route, 2)
+        self.register_buffer('route_abs_std', None)   # (T_route, 2)
         # Global abs z-score normalization buffers
         self.register_buffer('global_abs_mean', None)  # (2,)
         self.register_buffer('global_abs_std', None)   # (2,)
@@ -383,6 +387,53 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         std = self.abs_std.to(z.device)    # (T, 2)
         return z * std + mean
 
+    # ========== Normalization: Route Per-Waypoint Abs Z-Score ==========
+    def register_route_abs_stats(self, route_abs_mean, route_abs_std):
+        """Register per-waypoint absolute route stats for route diffusion."""
+        if isinstance(route_abs_mean, np.ndarray):
+            route_abs_mean = torch.from_numpy(route_abs_mean).float()
+        if isinstance(route_abs_std, np.ndarray):
+            route_abs_std = torch.from_numpy(route_abs_std).float()
+        device = next(self.parameters()).device
+        self.register_buffer('route_abs_mean', route_abs_mean.to(device))
+        self.register_buffer('route_abs_std', route_abs_std.to(device))
+
+    def _require_route_abs_stats(self):
+        if self.route_abs_mean is None or self.route_abs_std is None:
+            raise RuntimeError(
+                "Joint Route B ego diffusion requires route_abs_stats_path to be configured "
+                "and loaded (route_abs_mean/route_abs_std)."
+            )
+
+    def route_abs_to_norm(self, abs_route: torch.Tensor) -> torch.Tensor:
+        """Per-waypoint z-score on route absolute coordinates."""
+        self._require_route_abs_stats()
+        mean = self.route_abs_mean.to(abs_route.device)
+        std = self.route_abs_std.to(abs_route.device)
+        return (abs_route - mean) / std.clamp(min=1e-6)
+
+    def route_norm_to_abs(self, z: torch.Tensor) -> torch.Tensor:
+        """Inverse per-waypoint z-score for route absolute coordinates."""
+        self._require_route_abs_stats()
+        mean = self.route_abs_mean.to(z.device)
+        std = self.route_abs_std.to(z.device)
+        return z * std + mean
+
+    def joint_abs_to_norm(self, traj_abs: torch.Tensor, route_abs: torch.Tensor) -> torch.Tensor:
+        """Concatenate normalized trajectory and route diffusion states."""
+        traj_norm = self.abs_to_norm(traj_abs)
+        route_norm = self.route_abs_to_norm(route_abs)
+        return torch.cat([traj_norm, route_norm], dim=-2)
+
+    def joint_norm_to_abs(self, joint_z: torch.Tensor) -> torch.Tensor:
+        """Split a joint traj+route diffusion state back to absolute coordinates."""
+        joint_len = self.horizon + self.num_waypoints
+        if joint_z.shape[-2] != joint_len:
+            raise ValueError(f"Expected joint diffusion length {joint_len}, got {joint_z.shape[-2]}")
+        traj_abs = self.norm_to_abs(joint_z[..., :self.horizon, :])
+        route_abs = self.route_norm_to_abs(joint_z[..., self.horizon:, :])
+        return torch.cat([traj_abs, route_abs], dim=-2)
+
     # ========== Normalization: Global Abs Z-Score ==========
     def register_global_abs_stats(self, global_abs_mean, global_abs_std):
         """Register global abs mean/std for z-score normalization.
@@ -479,6 +530,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_gt = batch.get('route', None)
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)
+        else:
+            raise KeyError("Joint Route B ego diffusion requires 'route' in the training batch")
 
         behavior_labels = batch.get('behavior_labels', None)
         allowed_flags = batch.get('allowed_flags', None)
@@ -491,20 +544,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         bev_proj = self.model.decoder.compute_bev_proj(transfuser_bev_feature)
 
         # ===== Forward 1: Ego denoising (M=1) =====
-        traj_normed = self.abs_to_norm(trajectory)  # (B, T, 2)
+        if route_gt.shape[1] != self.num_waypoints:
+            raise ValueError(f"Expected route_gt with {self.num_waypoints} waypoints, got {route_gt.shape}")
+        traj_route_normed = self.joint_abs_to_norm(trajectory, route_gt)  # (B, T_joint, 2)
         diff_timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
-        noise = torch.randn(B, T, D, dtype=torch.float32, device=device)
+        noise = torch.randn(B, self.horizon + self.num_waypoints, D, dtype=torch.float32, device=device)
         noisy_flat = self.diffusion_scheduler.add_noise(
-            original_samples=traj_normed,
+            original_samples=traj_route_normed,
             noise=noise,
             timesteps=diff_timesteps,
         )
-        noisy_traj = noisy_flat.unsqueeze(1)  # (B, 1, T, 2)
-        noisy_traj_abs = self.norm_to_abs(noisy_traj)
+        noisy_joint = noisy_flat.unsqueeze(1)  # (B, 1, T_joint, 2)
+        noisy_joint_abs = self.joint_norm_to_abs(noisy_joint)
 
         poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
-            x_t=noisy_traj,
-            x_t_abs=noisy_traj_abs,
+            x_t=noisy_joint,
+            x_t_abs=noisy_joint_abs,
             timestep=diff_timesteps,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -512,14 +567,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             bev_proj_cached=bev_proj,
         )
         poses_reg_abs = self.norm_to_abs(poses_reg)
+        route_pred_abs = self.route_norm_to_abs(route_pred)
         traj_target = trajectory.unsqueeze(1)
         loss_reg = F.l1_loss(poses_reg_abs, traj_target, reduction='mean')
 
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        if route_gt is not None and route_pred is not None:
-            route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+        if route_pred is not None:
+            route_loss = F.l1_loss(route_pred_abs, route_gt, reduction='mean')
             # FDE: extra weight on final route point
-            route_loss = route_loss + F.l1_loss(route_pred[:, -1], route_gt[:, -1], reduction='mean')
+            route_loss = route_loss + F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='mean')
 
         # Speed loss: two-hot cross-entropy
         speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -1258,6 +1314,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         global_abs_stats_path = config.get('global_abs_stats_path')
         abs_stats_path = config.get('abs_stats_path')
         delta_stats_path = config.get('delta_stats_path')
+        route_abs_stats_path = config.get('route_abs_stats_path')
         if global_abs_stats_path:
             gdata = np.load(global_abs_stats_path)
             policy.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
@@ -1267,6 +1324,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         elif delta_stats_path:
             ddata = np.load(delta_stats_path)
             policy.register_delta_stats(ddata['delta_mean'], ddata['delta_std'])
+        if route_abs_stats_path:
+            rdata = np.load(route_abs_stats_path)
+            policy.register_route_abs_stats(rdata['route_abs_mean'], rdata['route_abs_std'])
+        else:
+            raise ValueError("route_abs_stats_path is required for joint Route B ego diffusion")
 
         # Register anchor centers
         anchor_path = config.get('anchor_path')
@@ -1288,6 +1350,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Restore any buffers still unexpected (config didn't have stats but checkpoint does)
         _BUFFER_NAMES = ['delta_mean', 'delta_std', 'abs_mean', 'abs_std',
+                         'route_abs_mean', 'route_abs_std',
                          'global_abs_mean', 'global_abs_std', 'anchor_centers_abs']
         for buf_name in _BUFFER_NAMES:
             if buf_name in sd and sd[buf_name] is not None and getattr(policy, buf_name, None) is None:
@@ -1357,6 +1420,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         B = transfuser_bev_feature.shape[0]
         M = self.num_samples
         T = self.horizon
+        joint_T = self.horizon + self.num_waypoints
+        if M != 1:
+            raise NotImplementedError(f"Joint Route B ego diffusion currently expects num_samples=1, got {M}")
+        self._require_route_abs_stats()
 
         # Dynamic weight override (LLM Router interface — runtime per-head weight control)
         def _w(key, default):
@@ -1367,8 +1434,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         w_ped_cfg   = _w('pedestrian', self.energy_pedestrian_weight)
         w_off_cfg   = _w('offroad',    self.energy_offroad_weight)
 
-        # Start from pure Gaussian noise in z-scored delta space
-        x_t = torch.randn(B, M, T, 2, device=device, dtype=torch.float32)
+        # Start from pure Gaussian noise in joint normalized traj+route space
+        x_t = torch.randn(B, M, joint_T, 2, device=device, dtype=torch.float32)
         bev_proj = self.model.decoder.compute_bev_proj(
             transfuser_bev_feature.to(device=device, dtype=model_dtype)
         )
@@ -1382,6 +1449,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         poses_cls = None
         route_pred = None
         energy_scores = None
+        speed_pred = None
 
         for step_i, k in enumerate(roll_timesteps):
             t_cur = k.item()
@@ -1392,7 +1460,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
             # ========== Forward pass 1: denoise x_t → pred_x0 ==========
             x_input = x_t.to(dtype=model_dtype)
-            x_t_abs = self.norm_to_abs(x_input)
+            x_t_abs = self.joint_norm_to_abs(x_input)
 
             t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
 
@@ -1410,7 +1478,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         ego_status=ego_status,
                         bev_proj_cached=bev_proj,
                     )
-                    pred_x0 = poses_reg.detach()  # (B, M, T, 2) z-normed delta
+                    pred_x0 = poses_reg.detach()  # (B, M, T, 2)
+                    route_pred_norm = route_pred.detach().unsqueeze(1)  # (B, 1, T_route, 2)
 
                 # Pass 2: re-embed pred_x0 as a trajectory-level energy-eval sample.
                 pred_x0_for_grad = pred_x0.clone().requires_grad_(True)
@@ -1450,10 +1519,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         max_norm = self.energy_grad_clip_norm
                         grad = grad * torch.clamp(max_norm / grad_norm, max=1.0)
                     else:
-                        grad = torch.zeros_like(x_t)
+                        grad = torch.zeros_like(pred_x0_for_grad)
 
                 # Correct pred_x0, then DDIM step
-                pred_x0_corrected = pred_x0.float() - self.guidance_scale * grad
+                pred_x0_corrected = torch.cat([
+                    pred_x0.float() - self.guidance_scale * grad,
+                    route_pred_norm.float(),
+                ], dim=2)
                 poses_cls = None
             else:
                 with torch.no_grad():
@@ -1467,7 +1539,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         bev_proj_cached=bev_proj,
                     )
                 energy_scores = None
-                pred_x0_corrected = poses_reg.float()
+                pred_x0_corrected = torch.cat([
+                    poses_reg.float(),
+                    route_pred.unsqueeze(1).float(),
+                ], dim=2)
 
             # ========== DDIM Step with corrected pred_x0 ==========
             alpha_t = alphas_cumprod[t_cur]
@@ -1477,8 +1552,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             x_t = alpha_next.sqrt() * pred_x0_corrected + (1 - alpha_next).sqrt() * pred_eps
 
         # ========== Output trajectory ==========
-        final_abs = self.norm_to_abs(pred_x0_corrected)  # (B, 1, T, 2)
-        best_trajectory = final_abs.squeeze(1)  # (B, T, 2)
+        final_joint_abs = self.joint_norm_to_abs(pred_x0_corrected)  # (B, 1, T_joint, 2)
+        final_traj_abs = final_joint_abs[:, :, :self.horizon, :]
+        route_pred = final_joint_abs[:, 0, self.horizon:, :]
+        best_trajectory = final_traj_abs.squeeze(1)  # (B, T, 2)
 
         # Decode speed prediction to scalar m/s
         target_speed_pred = None
@@ -1490,7 +1567,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
             'route_pred': route_pred,                 # (B, 20, 2)
-            'all_trajectories': final_abs,            # (B, 1, T, 2)
+            'all_trajectories': final_traj_abs,       # (B, 1, T, 2)
             'energy_scores': energy_scores,           # dict of (B, 1)
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0

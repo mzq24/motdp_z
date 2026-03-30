@@ -109,6 +109,16 @@ else
     FAIL=1
 fi
 
+echo ""
+echo "[6c] Route B+ route_abs_stats..."
+ROUTE_ABS="${PROCESSED_DIR}/route_abs_stats.npz"
+if [ -f "${ROUTE_ABS}" ]; then
+    echo "  OK: route_abs_stats.npz ($(du -h "${ROUTE_ABS}" | cut -f1))"
+else
+    echo "  MISSING: ${ROUTE_ABS} — run: python dataset/compute_action_stats.py --mode route_abs --dataset_path ${PROCESSED_DIR} --route_points 20"
+    FAIL=1
+fi
+
 # 7. Conda
 echo ""
 echo "[7] Conda..."

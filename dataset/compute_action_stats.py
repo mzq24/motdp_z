@@ -183,6 +183,116 @@ def compute_abs_stats_from_dataset(dataset_path, max_samples=None):
     return abs_mean.astype(np.float32), abs_std.astype(np.float32)
 
 
+def compute_route_abs_stats_from_dataset(dataset_path, max_samples=None, num_points=20):
+    """
+    统计 route 的 per-waypoint absolute coordinate mean/std，用于 Route B route diffusion。
+
+    Returns:
+        route_abs_mean: (T_route, 2)
+        route_abs_std:  (T_route, 2)
+    """
+    print(f"\n{'='*60}")
+    print(f"Computing route per-waypoint absolute coordinate statistics...")
+    print(f"Dataset path: {dataset_path}")
+    print(f"Route points: {num_points}")
+    print(f"{'='*60}\n")
+
+    all_routes = []
+    failed = 0
+    train_packed = os.path.join(dataset_path, "train", "samples_packed.pkl")
+    val_packed = os.path.join(dataset_path, "val", "samples_packed.pkl")
+    packed_paths = [p for p in (train_packed, val_packed) if os.path.exists(p)]
+
+    def _append_route(sample):
+        route = sample.get('route')
+        if route is None:
+            return
+        if isinstance(route, torch.Tensor):
+            if route.dtype == torch.bfloat16:
+                route = route.float()
+            route = route.cpu().numpy()
+        elif not isinstance(route, np.ndarray):
+            route = np.array(route)
+        if route.shape[0] < num_points:
+            return
+        all_routes.append(route[:num_points])
+
+    if packed_paths:
+        print(f"Using packed samples: {packed_paths}")
+        remaining = max_samples
+        total_loaded = 0
+        for packed_path in packed_paths:
+            with open(packed_path, 'rb') as f:
+                packed_samples = pickle.load(f)
+            samples = packed_samples
+            if remaining is not None:
+                samples = packed_samples[:remaining]
+            print(f"Loaded {len(samples)} packed samples from {packed_path}")
+            total_loaded += len(samples)
+
+            split_name = os.path.basename(os.path.dirname(packed_path))
+            for sample in tqdm(samples, desc=f"Processing {split_name} packed"):
+                try:
+                    _append_route(sample)
+                except Exception:
+                    failed += 1
+                    continue
+
+            if remaining is not None:
+                remaining -= len(samples)
+                if remaining <= 0:
+                    break
+        print(f"Found {total_loaded} packed samples")
+    else:
+        train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
+        val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
+        direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
+
+        if train_files or val_files:
+            all_files = sorted(train_files + val_files)
+            print(f"Found {len(all_files)} samples ({len(train_files)} train, {len(val_files)} val)")
+        elif direct_files:
+            all_files = sorted(direct_files)
+            print(f"Found {len(all_files)} samples")
+        else:
+            raise FileNotFoundError(f"No pkl files found in {dataset_path}")
+
+        if max_samples is not None:
+            all_files = all_files[:max_samples]
+            print(f"Limiting to {len(all_files)} samples")
+
+        for pkl_file in tqdm(all_files, desc="Processing"):
+            try:
+                with open(pkl_file, 'rb') as f:
+                    sample = pickle.load(f)
+                _append_route(sample)
+            except Exception:
+                failed += 1
+                continue
+
+    if failed > 0:
+        print(f"Failed to load {failed} samples")
+
+    if len(all_routes) == 0:
+        raise ValueError("No valid route trajectories found!")
+
+    all_routes = np.stack(all_routes, axis=0)
+    print(f"Collected {all_routes.shape[0]} routes, T_route={all_routes.shape[1]}")
+
+    route_abs_mean = all_routes.mean(axis=0)
+    route_abs_std = all_routes.std(axis=0)
+    route_abs_std = np.maximum(route_abs_std, 1e-6)
+
+    print(f"\nPer-waypoint route absolute coordinate statistics:")
+    for t in range(route_abs_mean.shape[0]):
+        print(
+            f"  step {t}: mean=({route_abs_mean[t, 0]:+.4f}, {route_abs_mean[t, 1]:+.4f})  "
+            f"std=({route_abs_std[t, 0]:.4f}, {route_abs_std[t, 1]:.4f})"
+        )
+
+    return route_abs_mean.astype(np.float32), route_abs_std.astype(np.float32)
+
+
 def compute_delta_stats_from_dataset(dataset_path, max_samples=None):
     """
     统计 per-step delta 的 mean 和 std，用于 delta z-score 归一化。
@@ -541,8 +651,8 @@ def main():
 
     parser = argparse.ArgumentParser(description='Compute action statistics from CARLA dataset')
     parser.add_argument(
-        '--mode', type=str, default='legacy', choices=['legacy', 'delta', 'abs', 'global_abs'],
-        help='legacy: min/max; delta: per-step delta z-score; abs: per-step abs z-score; global_abs: global abs z-score'
+        '--mode', type=str, default='legacy', choices=['legacy', 'delta', 'abs', 'global_abs', 'route_abs'],
+        help='legacy: min/max; delta: per-step delta z-score; abs: per-step abs z-score; global_abs: global abs z-score; route_abs: per-waypoint route abs z-score'
     )
     parser.add_argument(
         '--dataset_path', type=str, default='/share-data/pdm_lite/tmp_data',
@@ -567,6 +677,10 @@ def main():
     parser.add_argument(
         '--output_path', type=str, default=None,
         help='Output path (legacy: config yaml; delta: .npz file)'
+    )
+    parser.add_argument(
+        '--route_points', type=int, default=20,
+        help='Number of route waypoints to include when --mode route_abs'
     )
 
     args = parser.parse_args()
@@ -606,6 +720,17 @@ def main():
                 np.savez(out, delta_mean=delta_mean, delta_std=delta_std)
                 print(f"\nSaved delta stats to {out}")
             print("\nDelta statistics computation completed!")
+        elif args.mode == 'route_abs':
+            route_abs_mean, route_abs_std = compute_route_abs_stats_from_dataset(
+                dataset_path=args.dataset_path,
+                max_samples=args.max_samples,
+                num_points=args.route_points,
+            )
+            if not args.no_save:
+                out = args.output_path or os.path.join(args.dataset_path, 'route_abs_stats.npz')
+                np.savez(out, route_abs_mean=route_abs_mean, route_abs_std=route_abs_std)
+                print(f"\nSaved route abs stats to {out}")
+            print("\nRoute abs statistics computation completed!")
         else:
             stats = compute_action_stats_from_dataset(
                 dataset_path=args.dataset_path,
