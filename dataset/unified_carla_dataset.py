@@ -193,10 +193,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 route_has_features.add(rn)
         print(f"[Rank {rank}] Routes with route_features.pt: {len(route_has_features)}/{len(route_name_to_event)}")
 
+        # Load bad routes exclude list if it exists
+        bad_routes_path = os.path.join(image_data_root, 'bad_routes.txt')
+        bad_routes_set = set()
+        if os.path.exists(bad_routes_path):
+            with open(bad_routes_path) as f:
+                bad_routes_set = {line.strip() for line in f if line.strip()}
+            if rank == 0:
+                print(f"[Rank {rank}] Loaded {len(bad_routes_set)} bad routes from {bad_routes_path}")
+
         # Patch transfuser_bev_feature path and filter samples
         before_count = len(all_samples)
         patched = 0
         missing_routes = set()
+        bad_route_dropped = 0
         self._sample_cache = []
         for s in all_samples:
             route = s.get('route_name', '')
@@ -205,6 +215,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             # Skip if route has no route_features.pt
             if route not in route_has_features:
                 missing_routes.add(route)
+                continue
+
+            # Skip bad routes (collisions, crashes, etc.)
+            if route in bad_routes_set:
+                bad_route_dropped += 1
                 continue
 
             # Derive transfuser_bev_feature path if missing
@@ -223,6 +238,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         del all_samples
         if patched > 0:
             print(f"[Rank {rank}] Patched {patched} samples with derived transfuser_bev_feature path.")
+        if bad_route_dropped > 0:
+            print(f"[Rank {rank}] Filtered {bad_route_dropped} samples from {len(bad_routes_set)} bad routes (collisions/crashes).")
         if dropped > 0:
             print(f"[Rank {rank}] WARNING: Dropped {dropped}/{before_count} samples "
                   f"({len(missing_routes)} routes missing route_features.pt).")
