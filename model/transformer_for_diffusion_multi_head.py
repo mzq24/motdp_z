@@ -1555,11 +1555,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
 
         # Speed prediction head: two-hot classification over discrete speed bins
-        # Input: mean-pooled traj tokens (n_emb) from ego forward path
-        # Output: logits over speed classes (default 8 bins: 0-20 m/s)
+        # Input: global-pooled fine BEV (full scene, incl. behind/sides) + conditioning (ego state + route intent)
+        # Decoupled from traj decoder output so it can provide complementary speed signal
         self.speed_classes = [0.0, 4.0, 8.0, 10.0, 13.89, 16.0, 17.78, 20.0]
+        bev_upsample_channels = 64  # bev_feature_upsample: (B, 64, 64, 64)
+        self.speed_bev_proj = nn.Linear(bev_upsample_channels, n_emb)
         self.speed_head = nn.Sequential(
-            nn.Linear(n_emb, n_emb // 2),
+            nn.Linear(n_emb * 3, n_emb // 2),  # concat(bev_proj, conditioning, traj_out)
             nn.ReLU(inplace=True),
             nn.Linear(n_emb // 2, len(self.speed_classes)),
         )
@@ -1792,7 +1794,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
         poses_reg = traj_pred.unsqueeze(1)
         route_pred = self.route_norm_head(route_out, conditioning, current_status)
-        speed_pred = self.speed_head(traj_out.mean(dim=1))  # (B, num_speed_classes)
+        bev_global = transfuser_bev_feature_upsample.mean(dim=[-2, -1])  # (B, 64)
+        speed_input = torch.cat([
+            self.speed_bev_proj(bev_global),  # full scene (behind/sides/front)
+            conditioning,                      # ego state + route intent
+            traj_out.mean(dim=1),              # trajectory-path perception
+        ], dim=-1)  # (B, n_emb*3)
+        speed_pred = self.speed_head(speed_input)  # (B, num_speed_classes)
         return poses_reg, route_pred, traj_out, conditioning, speed_pred
 
     def forward_energy(
