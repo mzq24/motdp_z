@@ -133,6 +133,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_safe_anchors = route_b_cfg.get('use_safe_anchors', False)
         self.energy_noisy_training = route_b_cfg.get('energy_noisy_training', False)
         self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
+        self.train_energy = route_b_cfg.get('train_energy', True)
         self._current_epoch = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
 
@@ -166,6 +167,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             traj_can_attend_route=policy_cfg.get('traj_can_attend_route', True),
             anchor_free=True,
             energy_heads=True,
+            ego_detail_activation_t=policy_cfg.get('ego_detail_activation_t', 400),
         )
         self.model = model
 
@@ -590,7 +592,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_front = loss_left = loss_right = loss_ped = loss_off = zero_t
         loss_route = zero_t
 
-        if has_energy:
+        if has_energy and self.train_energy:
             anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1)
             behavior_labels_dev = behavior_labels.to(device=device)
             allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype)
@@ -688,7 +690,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and has_energy and alignment_active:
+        if self.alignment_loss_weight > 0 and has_energy and self.train_energy and alignment_active:
             _, mode_out_clean = self.model.forward_energy_eval(
                 x_t=poses_reg,
                 x_t_abs=poses_reg_abs,
@@ -773,7 +775,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         behavior_labels = batch.get('behavior_labels', None)  # (B, M_anchor) or None
         allowed_flags = batch.get('allowed_flags', None)      # (B, M_anchor) or None
 
-        has_energy = (self.anchor_centers_abs is not None
+        has_energy = (self.train_energy
+                      and self.anchor_centers_abs is not None
                       and behavior_labels is not None
                       and allowed_flags is not None)
 

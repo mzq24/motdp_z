@@ -975,6 +975,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         num_waypoints: int = 20,
         max_seq_len: int = 64,  # Max length for unified position encoding
         traj_can_attend_route: bool = True,
+        ego_detail_activation_t: int = 400,
     ):
         super().__init__()
         self.d_model = d_model
@@ -982,7 +983,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.horizon = horizon
         self.num_waypoints = num_waypoints
         self.traj_can_attend_route = traj_can_attend_route
-        self.ego_detail_activation_t = 400
+        self.ego_detail_activation_t = ego_detail_activation_t
 
         # ========== Transfuser Feature Projections (following DiffusionDriveV2) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, d_model)
@@ -1022,7 +1023,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             embed_dims=d_model,
             num_heads=nhead,
             in_bev_dims=transfuser_bev_upsample_dim,
-            num_points=7,
+            num_points=14,  # 7 near-field + 7 far-field
             lidar_max_x=32.0,
             lidar_max_y=32.0
         )
@@ -1030,7 +1031,15 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             embed_dims=d_model,
             num_heads=nhead,
             in_bev_dims=transfuser_bev_upsample_dim,
-            num_points=num_waypoints,
+            num_points=num_waypoints * 3,  # per route point: center + lateral left/right, flattened
+            lidar_max_x=32.0,
+            lidar_max_y=32.0
+        )
+        self.route_far_detail_attn = GridSampleCrossBEVAttention(
+            embed_dims=d_model,
+            num_heads=nhead,
+            in_bev_dims=transfuser_bev_upsample_dim,
+            num_points=3,  # farthest route point: longitudinal look-ahead
             lidar_max_x=32.0,
             lidar_max_y=32.0
         )
@@ -1052,13 +1061,41 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.register_buffer(
             "ego_detail_offsets",
             torch.tensor([
-                [0.0, 1.5],
-                [0.0, -1.5],
-                [1.5, 1.0],
-                [1.5, -1.0],
-                [-3.0, 1.5],
-                [-3.0, -1.5],
-                [-3.0, 0.0],
+                # Near-field: car body envelope (7 points)
+                [ 0.0,  1.5],   # left side
+                [ 0.0, -1.5],   # right side
+                [ 1.5,  1.0],   # front-left
+                [ 1.5, -1.0],   # front-right
+                [-3.0,  1.5],   # rear-left
+                [-3.0, -1.5],   # rear-right
+                [-3.0,  0.0],   # rear-center
+                # Far-field: lane change & following traffic (7 points)
+                [ 0.0,  4.0],   # left lane center (lane change gap)
+                [ 0.0, -4.0],   # right lane center
+                [ 5.0,  3.5],   # front-left far (merge point)
+                [ 5.0, -3.5],   # front-right far
+                [-6.0,  3.5],   # rear-left far (approaching traffic)
+                [-6.0, -3.5],   # rear-right far
+                [-8.0,  0.0],   # rear far (following distance)
+            ], dtype=torch.float32),
+            persistent=False,
+        )
+        # Route detail: lateral offsets per route point
+        self.register_buffer(
+            "route_lateral_offsets",
+            torch.tensor([
+                [ 0.0,  3.5],   # left adjacent lane
+                [ 0.0, -3.5],   # right adjacent lane
+            ], dtype=torch.float32),
+            persistent=False,
+        )
+        # Route far: longitudinal look-ahead at farthest route point
+        self.register_buffer(
+            "route_far_offsets",
+            torch.tensor([
+                [10.0,  0.0],   # straight ahead
+                [10.0,  3.0],   # ahead-left
+                [10.0, -3.0],   # ahead-right
             ], dtype=torch.float32),
             persistent=False,
         )
@@ -1196,8 +1233,71 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         return mask
 
     def _build_traj_detail_points(self, traj_points: torch.Tensor) -> torch.Tensor:
+        """Expand each traj waypoint with ego detail offsets. (B, T, 2) -> (B, T, 14, 2)"""
         offsets = self.ego_detail_offsets.to(device=traj_points.device, dtype=traj_points.dtype)
         return traj_points.unsqueeze(2) + offsets.view(1, 1, offsets.shape[0], 2)
+
+    def _build_route_detail_points(self, route_points: torch.Tensor) -> torch.Tensor:
+        """Expand each route point with center + lateral offsets, rotated to route heading.
+        (B, T_route, 2) -> (B, T_route, 3, 2)
+        """
+        B, T, _ = route_points.shape
+        lat_offsets = self.route_lateral_offsets.to(device=route_points.device, dtype=route_points.dtype)  # (2, 2)
+
+        # Compute per-point heading from adjacent route points
+        # Forward difference, last point copies from previous
+        diff = torch.zeros_like(route_points)  # (B, T, 2)
+        diff[:, :-1, :] = route_points[:, 1:, :] - route_points[:, :-1, :]
+        diff[:, -1, :] = diff[:, -2, :] if T > 1 else torch.tensor([1.0, 0.0], device=route_points.device)
+
+        heading_norm = diff.norm(dim=-1, keepdim=True).clamp(min=1e-4)  # (B, T, 1)
+        dx = diff[..., 0:1] / heading_norm  # (B, T, 1)
+        dy = diff[..., 1:2] / heading_norm  # (B, T, 1)
+
+        # Rotation matrix per point: [dx, -dy; dy, dx]
+        # Rotate each lateral offset by local heading
+        # lat_offsets: (N_off, 2) where [along_route, perpendicular]
+        along = lat_offsets[:, 0]  # (N_off,)
+        perp = lat_offsets[:, 1]   # (N_off,)
+
+        # Rotated offset = along * heading + perp * heading_perp
+        # heading = (dx, dy), heading_perp = (-dy, dx)
+        # (B, T, 1) * (N_off,) -> broadcast
+        rot_x = dx * along.view(1, 1, -1) + (-dy) * perp.view(1, 1, -1)  # (B, T, N_off)
+        rot_y = dy * along.view(1, 1, -1) + dx * perp.view(1, 1, -1)     # (B, T, N_off)
+        rotated_offsets = torch.stack([rot_x, rot_y], dim=-1)  # (B, T, N_off, 2)
+
+        # Center point + rotated lateral offsets -> (B, T, 1+N_off, 2)
+        center = route_points.unsqueeze(2)  # (B, T, 1, 2)
+        detail_points = route_points.unsqueeze(2) + rotated_offsets  # (B, T, N_off, 2)
+        return torch.cat([center, detail_points], dim=2)  # (B, T, 3, 2)
+
+    def _build_route_far_detail_points(self, route_points: torch.Tensor) -> torch.Tensor:
+        """Build look-ahead points at the farthest route point, rotated to its heading.
+        (B, T_route, 2) -> (B, 1, 3, 2)
+        """
+        far_offsets = self.route_far_offsets.to(device=route_points.device, dtype=route_points.dtype)  # (3, 2)
+        T = route_points.shape[1]
+
+        # Heading at farthest point (from second-to-last to last)
+        if T > 1:
+            diff = route_points[:, -1, :] - route_points[:, -2, :]  # (B, 2)
+        else:
+            diff = torch.tensor([[1.0, 0.0]], device=route_points.device).expand(route_points.shape[0], -1)
+
+        heading_norm = diff.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+        dx = diff[:, 0:1] / heading_norm  # (B, 1)
+        dy = diff[:, 1:2] / heading_norm  # (B, 1)
+
+        along = far_offsets[:, 0]  # (3,)
+        perp = far_offsets[:, 1]   # (3,)
+
+        rot_x = dx * along.view(1, -1) + (-dy) * perp.view(1, -1)  # (B, 3)
+        rot_y = dy * along.view(1, -1) + dx * perp.view(1, -1)     # (B, 3)
+        rotated = torch.stack([rot_x, rot_y], dim=-1)  # (B, 3, 2)
+
+        far_point = route_points[:, -1:, :].unsqueeze(2)  # (B, 1, 1, 2)
+        return (far_point + rotated.unsqueeze(1))  # (B, 1, 3, 2)
 
     def _detail_gate(self, timesteps: Optional[torch.Tensor], batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if timesteps is None:
@@ -1310,12 +1410,21 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                 center_points = traj_points.unsqueeze(2)
                 x_traj_center = self.bev_point_attn(x_traj, center_points, transfuser_bev_feature_upsample)
                 detail_gate = self._detail_gate(timesteps, B, x_traj.device, x_traj.dtype)
-                traj_detail_points = self._build_traj_detail_points(traj_points)
+                # Ego detail: near-field (car body) + far-field (lane change, following)
+                traj_detail_points = self._build_traj_detail_points(traj_points)  # (B, T, 14, 2)
                 traj_local_detail = self.traj_detail_attn(x_traj, traj_detail_points, transfuser_bev_feature_upsample) - x_traj
+                # Route detail: center + rotated lateral offsets per route point
                 if route_points is None:
                     raise ValueError("route_points are required for ego diffusion route detail sampling")
-                traj_route_detail = self.route_detail_attn(x_traj, route_points, transfuser_bev_feature_upsample) - x_traj
-                x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail)
+                route_detail_points = self._build_route_detail_points(route_points)  # (B, T_route, 3, 2)
+                # Flatten to (B, T_route*3, 2) so all route detail points are shared across traj queries
+                route_detail_flat = route_detail_points.view(B, -1, 2)  # (B, T_route*3, 2)
+                traj_route_detail = self.route_detail_attn(x_traj, route_detail_flat, transfuser_bev_feature_upsample) - x_traj
+                # Route far detail: longitudinal look-ahead at farthest route point
+                route_far_points = self._build_route_far_detail_points(route_points)  # (B, 1, 3, 2)
+                route_far_flat = route_far_points.view(B, -1, 2)  # (B, 3, 2)
+                traj_route_far = self.route_far_detail_attn(x_traj, route_far_flat, transfuser_bev_feature_upsample) - x_traj
+                x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail + traj_route_far)
                 x_route = x[:, T_traj:, :]
                 if route_points is not None:
                     if route_points.dim() != 3:
@@ -1409,6 +1518,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_can_attend_route: bool = True,
         anchor_free: bool = False,  # Route B: no anchor residual, predict absolute trajectory
         energy_heads: bool = False,  # Route B: energy evaluator heads for gradient guidance
+        ego_detail_activation_t: int = 400,  # Timestep threshold for detail gate
     ) -> None:
         super().__init__()
 
@@ -1495,6 +1605,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             horizon=horizon,        # used for GridSampleCrossBEVAttention.num_points
             num_waypoints=num_waypoints,
             traj_can_attend_route=traj_can_attend_route,
+            ego_detail_activation_t=ego_detail_activation_t,
         )
 
         # ========== Output Heads ==========
