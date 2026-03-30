@@ -127,6 +127,7 @@ TERMINAL_ROUTE_ACTIVE_POINTS_MAX = int(os.environ.get('TERMINAL_ROUTE_ACTIVE_POI
 TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTANCE_M', '3.0'))
 TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
 TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
+SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'fuse'
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -168,7 +169,7 @@ def create_carla_config(config_path=None):
         candidate_from_project = os.path.abspath(os.path.join(mot_dp_root, path_value))
         return candidate_from_project
 
-    for key in ['anchor_path', 'abs_stats_path', 'delta_stats_path', 'global_abs_stats_path']:
+    for key in ['anchor_path', 'abs_stats_path', 'delta_stats_path', 'global_abs_stats_path', 'route_abs_stats_path']:
         if key in config:
             config[key] = _resolve_path(config.get(key))
 
@@ -925,8 +926,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.lat_ref, self.lon_ref = 0.0, 0.0
 		
 
-		self.route_planner_min_distance = 7.5
-		self.route_planner_max_distance = 50.0
+		self.route_planner_min_distance = float(os.environ.get('ROUTE_PLANNER_MIN_DISTANCE', '7.5'))
+		self.route_planner_max_distance = float(os.environ.get('ROUTE_PLANNER_MAX_DISTANCE', '50.0'))
 		self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
 										   self.lat_ref, self.lon_ref)
 		
@@ -1634,11 +1635,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			traj_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
 
-		# Fuse: speed head as primary, traj displacement as safety upper bound
-		if hasattr(self, '_last_target_speed') and self._last_target_speed is not None:
-			desired_speed = float(self._last_target_speed)
-			# Traj upper bound: if traj says slow down, respect it (prevent speed head being too aggressive)
-			desired_speed = min(desired_speed, traj_speed * 1.2)
+		# Speed source selection via SPEED_SOURCE env var
+		speed_head_speed = float(self._last_target_speed) if hasattr(self, '_last_target_speed') and self._last_target_speed is not None else None
+
+		if SPEED_SOURCE == 'traj':
+			desired_speed = traj_speed
+		elif SPEED_SOURCE == 'fuse' and speed_head_speed is not None:
+			# speed head primary, traj lower bound
+			desired_speed = speed_head_speed
+			desired_speed = max(desired_speed, traj_speed * 0.5)
+		elif SPEED_SOURCE == 'fuse_traj' and speed_head_speed is not None:
+			# traj primary, speed head lower bound
+			desired_speed = traj_speed
+			desired_speed = max(desired_speed, speed_head_speed * 0.5)
+		elif speed_head_speed is not None:
+			# 'speed_head': speed head only
+			desired_speed = speed_head_speed
 		else:
 			desired_speed = traj_speed
 
@@ -1648,6 +1660,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if terminal_speed_cap_ms is not None and terminal_speed_cap_ms > 0.0:
 			desired_speed = min(desired_speed, terminal_speed_cap_ms)
 		self.last_speed_debug = {
+			'speed_source': SPEED_SOURCE,
+			'speed_head_speed': speed_head_speed,
+			'traj_speed': float(traj_speed),
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
@@ -2007,6 +2022,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'command': command,
 				'command_value': int(command_value),
 				'command_text': command_text,
+				'speed_source': self.last_speed_debug.get('speed_source'),
+				'speed_head_speed': self.last_speed_debug.get('speed_head_speed'),
+				'traj_speed': self.last_speed_debug.get('traj_speed'),
 				'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
 				'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
 				'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
