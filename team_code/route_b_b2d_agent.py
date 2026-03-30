@@ -715,21 +715,28 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			print("[USE_MOT=False] Skipping MoT model loading.")
 
-			# ========== Load TransFuser Backbone for DP features ==========
-			print("Loading TransFuser backbone for DP features...")
+			# ========== Load TransFuser Backbone(s) for DP features ==========
 			transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
-			transfuser_model_path = os.path.join(transfuser_config_path, "model_0030_1.pth")
-			self.transfuser_backbone = TransFuserBackboneExtractor(
-				config_path=transfuser_config_path,
-				model_path=transfuser_model_path,
-				device='cuda:0'
-			)
-			# Backbone is already frozen in TransFuserBackboneExtractor
-			self.transfuser_backbone.eval()
-			# Get transfuser config for lidar processing
-			self.transfuser_config = self.transfuser_backbone.config
+			transfuser_model_paths = [
+				os.path.join(transfuser_config_path, "model_0030_0.pth"),
+				os.path.join(transfuser_config_path, "model_0030_1.pth"),
+				os.path.join(transfuser_config_path, "model_0030_2.pth"),
+			]
+			self.transfuser_backbones = []
+			for mp in transfuser_model_paths:
+				print(f"Loading TransFuser backbone: {os.path.basename(mp)}")
+				bb = TransFuserBackboneExtractor(
+					config_path=transfuser_config_path,
+					model_path=mp,
+					device='cuda:0'
+				)
+				bb.eval()
+				self.transfuser_backbones.append(bb)
+			# Keep first backbone's config (all share same architecture)
+			self.transfuser_config = self.transfuser_backbones[0].config
+			# BEV semantic decoder uses first checkpoint
 			self.transfuser_bev_semantic_decoder = self._build_transfuser_bev_semantic_decoder(
-				model_path=transfuser_model_path,
+				model_path=transfuser_model_paths[0],
 				device='cuda:0',
 			)
 			self._init_semantic_hazard_state()
@@ -1886,16 +1893,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				# Keep float32 inputs for full precision inference
 				transfuser_rgb_fp32 = tick_data['transfuser_rgb'].to(torch.float32)
 				transfuser_lidar_bev_fp32 = tick_data['transfuser_lidar_bev'].to(torch.float32)
-				transfuser_output = self.transfuser_backbone(
-					rgb=transfuser_rgb_fp32,  # (1, 3, H, W) on GPU, float32
-					lidar_bev=transfuser_lidar_bev_fp32  # (1, C, H, W) on GPU, float32
-				)
-				
-			# Extract transfuser features (following DiffusionDriveV2: only 2 features)
-				# bev_feature: (B, 1512, 8, 8) - original BEV feature (x4)
-				# bev_feature_upscale: (B, 64, 64, 64) - upsampled BEV (p3)
-				transfuser_bev_feature = transfuser_output['bev_feature']  # (1, 1512, 8, 8)
-				transfuser_bev_feature_upsample = transfuser_output['bev_feature_upscale']  # (1, 64, 64, 64)
+				# Ensemble: run all backbones and average BEV features
+				bev_features = []
+				bev_upsamples = []
+				for bb in self.transfuser_backbones:
+					out = bb(
+						rgb=transfuser_rgb_fp32,
+						lidar_bev=transfuser_lidar_bev_fp32
+					)
+					bev_features.append(out['bev_feature'])
+					bev_upsamples.append(out['bev_feature_upscale'])
+				transfuser_bev_feature = torch.stack(bev_features).mean(dim=0)  # (1, 1512, 8, 8)
+				transfuser_bev_feature_upsample = torch.stack(bev_upsamples).mean(dim=0)  # (1, 64, 64, 64)
 				bev_semantic_classes = self._decode_bev_semantic_classes(
 					transfuser_bev_feature_upsample
 				)
