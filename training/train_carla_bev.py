@@ -575,30 +575,27 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         policy = AnnealedEnergyGuidancePolicy(config).to(device)
         if rank == 0:
             print(f"  Policy: AnnealedEnergyGuidancePolicy (Route B+ - anchor-free)")
-        # Register normalization stats (before DDP wrapping)
-        # Priority: global_abs > per-step abs > delta (legacy)
-        global_abs_stats_path = config.get('global_abs_stats_path', None)
-        abs_stats_path = config.get('abs_stats_path', None)
-        delta_stats_path = config.get('delta_stats_path', None)
+        # Register normalization stats (before DDP wrapping).
+        # Route B uses strict config selection: exactly one normalization family
+        # must be specified, and checkpoint loading must not silently override it.
+        norm_mode = policy.register_norm_stats_from_config(config)
         route_abs_stats_path = config.get('route_abs_stats_path', None)
-        if global_abs_stats_path:
-            gdata = np.load(global_abs_stats_path)
-            policy.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
-            if rank == 0:
-                print(f"  ✓ Global abs stats registered: mean={gdata['global_abs_mean']}, std={gdata['global_abs_std']}")
-        elif abs_stats_path:
-            abs_data = np.load(abs_stats_path)
-            policy.register_abs_stats(abs_data['abs_mean'], abs_data['abs_std'])
-            if rank == 0:
-                print(f"  ✓ Per-step abs stats registered: mean={abs_data['abs_mean'].shape}, std={abs_data['abs_std'].shape}")
-        elif delta_stats_path:
-            delta_data = np.load(delta_stats_path)
-            policy.register_delta_stats(delta_data['delta_mean'], delta_data['delta_std'])
-            if rank == 0:
-                print(f"  ✓ Delta stats registered (legacy): mean={delta_data['delta_mean'].shape}, std={delta_data['delta_std'].shape}")
-        else:
-            if rank == 0:
-                print(f"  ⚠ No normalization stats configured — will fail!")
+        if rank == 0:
+            if norm_mode == 'global_abs':
+                print(
+                    "  ✓ Global abs stats registered: "
+                    f"mean={tuple(policy.global_abs_mean.shape)}, std={tuple(policy.global_abs_std.shape)}"
+                )
+            elif norm_mode == 'abs':
+                print(
+                    "  ✓ Per-step abs stats registered: "
+                    f"mean={tuple(policy.abs_mean.shape)}, std={tuple(policy.abs_std.shape)}"
+                )
+            else:
+                print(
+                    "  ✓ Delta stats registered (legacy): "
+                    f"mean={tuple(policy.delta_mean.shape)}, std={tuple(policy.delta_std.shape)}"
+                )
         if route_abs_stats_path:
             route_data = np.load(route_abs_stats_path)
             policy.register_route_abs_stats(route_data['route_abs_mean'], route_data['route_abs_std'])
@@ -831,6 +828,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print("Running validation only (--val_only mode)")
             print("=" * 60)
         try:
+            ema_model.store(model_for_ema.parameters())
+            ema_model.copy_to(model_for_ema.parameters())
             val_metrics = validate_model(
                 policy, val_loader, device, rank=rank, world_size=world_size,
                 use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches
@@ -852,6 +851,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 print(f"✗ Error during validation: {e}")
                 import traceback
                 traceback.print_exc()
+        finally:
+            ema_model.restore(model_for_ema.parameters())
 
         # Clean up and exit
         if world_size > 1:

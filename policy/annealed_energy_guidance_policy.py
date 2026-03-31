@@ -311,6 +311,45 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.register_buffer('delta_mean', delta_mean.to(device))
         self.register_buffer('delta_std', delta_std.to(device))
 
+    @staticmethod
+    def select_norm_stats_config(config: Dict):
+        """Select exactly one trajectory normalization source from config.
+
+        Route B should not silently fall back across normalization families.
+        The config must explicitly choose exactly one of:
+          - global_abs_stats_path
+          - abs_stats_path
+          - delta_stats_path
+        """
+        candidates = [
+            ('global_abs', config.get('global_abs_stats_path')),
+            ('abs', config.get('abs_stats_path')),
+            ('delta', config.get('delta_stats_path')),
+        ]
+        specified = [(name, path) for name, path in candidates if path]
+        if len(specified) != 1:
+            pretty = {name: path for name, path in candidates}
+            raise ValueError(
+                "Route B requires exactly one normalization config among "
+                "`global_abs_stats_path`, `abs_stats_path`, and `delta_stats_path`. "
+                f"Got: {pretty}"
+            )
+        return specified[0]
+
+    def register_norm_stats_from_config(self, config: Dict):
+        """Register the explicitly configured trajectory normalization stats."""
+        norm_mode, stats_path = self.select_norm_stats_config(config)
+        if norm_mode == 'global_abs':
+            gdata = np.load(stats_path)
+            self.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
+        elif norm_mode == 'abs':
+            adata = np.load(stats_path)
+            self.register_abs_stats(adata['abs_mean'], adata['abs_std'])
+        else:
+            ddata = np.load(stats_path)
+            self.register_delta_stats(ddata['delta_mean'], ddata['delta_std'])
+        return norm_mode
+
     # ========== Normalization: Delta Z-Score ==========
     @staticmethod
     def abs_to_delta(abs_traj: torch.Tensor) -> torch.Tensor:
@@ -1314,19 +1353,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         policy = cls(config)
 
         # Register norm stats from config FIRST (makes buffers non-None so load_state_dict can find them)
-        global_abs_stats_path = config.get('global_abs_stats_path')
-        abs_stats_path = config.get('abs_stats_path')
-        delta_stats_path = config.get('delta_stats_path')
+        policy.register_norm_stats_from_config(config)
         route_abs_stats_path = config.get('route_abs_stats_path')
-        if global_abs_stats_path:
-            gdata = np.load(global_abs_stats_path)
-            policy.register_global_abs_stats(gdata['global_abs_mean'], gdata['global_abs_std'])
-        elif abs_stats_path:
-            adata = np.load(abs_stats_path)
-            policy.register_abs_stats(adata['abs_mean'], adata['abs_std'])
-        elif delta_stats_path:
-            ddata = np.load(delta_stats_path)
-            policy.register_delta_stats(ddata['delta_mean'], ddata['delta_std'])
         if route_abs_stats_path:
             rdata = np.load(route_abs_stats_path)
             policy.register_route_abs_stats(rdata['route_abs_mean'], rdata['route_abs_std'])
@@ -1350,14 +1378,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Load state dict — buffers are now non-None so they can be matched
         missing, unexpected = policy.load_state_dict(sd, strict=False)
-
-        # Restore any buffers still unexpected (config didn't have stats but checkpoint does)
-        _BUFFER_NAMES = ['delta_mean', 'delta_std', 'abs_mean', 'abs_std',
-                         'route_abs_mean', 'route_abs_std',
-                         'global_abs_mean', 'global_abs_std', 'anchor_centers_abs']
-        for buf_name in _BUFFER_NAMES:
-            if buf_name in sd and sd[buf_name] is not None and getattr(policy, buf_name, None) is None:
-                policy.register_buffer(buf_name, sd[buf_name])
 
         if missing:
             print(f"  [load_checkpoint] Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
