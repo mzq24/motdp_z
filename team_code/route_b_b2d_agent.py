@@ -127,7 +127,7 @@ TERMINAL_ROUTE_ACTIVE_POINTS_MAX = int(os.environ.get('TERMINAL_ROUTE_ACTIVE_POI
 TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTANCE_M', '3.0'))
 TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
 TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
-SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'fuse'
+SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'fuse', 'fuse_traj', 'fuse3_median', 'fuse3_adaptive'
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -1626,14 +1626,23 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# if truncation_idx >= 0:
 			# 	print(f"[Lateral] Route truncated at index {truncation_idx}, remaining points: {len(route_waypoints_np)}")
 		
-		# Trajectory-based speed estimate (always computed, used as safety upper bound)
+		# Trajectory-based speed estimates (always computed)
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
-		one_second_idx = 2
-		half_second_idx = 0
-		if speed_waypoints_np.shape[0] >= 2:
-			traj_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx])
+		# traj_1s: ||wp[2] - wp[0]|| — 1.0s window, smoother, better at high speed
+		# traj_05s: ||wp[1] - wp[0]|| * 2 — 0.5s window, more reactive, better at low speed
+		if speed_waypoints_np.shape[0] >= 3:
+			traj_speed_1s = float(np.linalg.norm(speed_waypoints_np[2] - speed_waypoints_np[0]))
+		elif speed_waypoints_np.shape[0] >= 2:
+			traj_speed_1s = float(np.linalg.norm(speed_waypoints_np[1] - speed_waypoints_np[0]) * 2.0)
 		else:
-			traj_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
+			traj_speed_1s = float(np.linalg.norm(speed_waypoints_np[0]) * 2.0)
+
+		if speed_waypoints_np.shape[0] >= 2:
+			traj_speed_05s = float(np.linalg.norm(speed_waypoints_np[1] - speed_waypoints_np[0]) * 2.0)
+		else:
+			traj_speed_05s = float(np.linalg.norm(speed_waypoints_np[0]) * 2.0)
+
+		traj_speed = traj_speed_1s  # default traj speed for legacy modes
 
 		# Speed source selection via SPEED_SOURCE env var
 		speed_head_speed = float(self._last_target_speed) if hasattr(self, '_last_target_speed') and self._last_target_speed is not None else None
@@ -1648,6 +1657,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# traj primary, speed head lower bound
 			desired_speed = traj_speed
 			desired_speed = max(desired_speed, speed_head_speed * 0.5)
+		elif SPEED_SOURCE == 'fuse3_median' and speed_head_speed is not None:
+			# Median of three: robust to any single source outlier
+			desired_speed = float(np.median([speed_head_speed, traj_speed_1s, traj_speed_05s]))
+		elif SPEED_SOURCE == 'fuse3_adaptive' and speed_head_speed is not None:
+			# Adaptive by speed regime:
+			#   stopped/low (<3 m/s): traj_0.5s best (MAE 0.287)
+			#   medium (3-10 m/s): speed_head best (MAE 0.638)
+			#   high (>10 m/s): traj_1s best (MAE 0.823)
+			# Use median as initial estimate to pick regime
+			rough = float(np.median([speed_head_speed, traj_speed_1s, traj_speed_05s]))
+			if rough < 3.0:
+				# Low speed: 60% traj_0.5s + 20% speed_head + 20% traj_1s
+				desired_speed = 0.6 * traj_speed_05s + 0.2 * speed_head_speed + 0.2 * traj_speed_1s
+			elif rough < 10.0:
+				# Medium: 50% speed_head + 25% traj_1s + 25% traj_0.5s
+				desired_speed = 0.5 * speed_head_speed + 0.25 * traj_speed_1s + 0.25 * traj_speed_05s
+			else:
+				# High speed: 50% traj_1s + 30% speed_head + 20% traj_0.5s
+				desired_speed = 0.5 * traj_speed_1s + 0.3 * speed_head_speed + 0.2 * traj_speed_05s
 		elif speed_head_speed is not None:
 			# 'speed_head': speed head only
 			desired_speed = speed_head_speed
@@ -1662,7 +1690,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_speed_debug = {
 			'speed_source': SPEED_SOURCE,
 			'speed_head_speed': speed_head_speed,
-			'traj_speed': float(traj_speed),
+			'traj_speed_1s': traj_speed_1s,
+			'traj_speed_05s': traj_speed_05s,
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
@@ -2024,7 +2053,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'command_text': command_text,
 				'speed_source': self.last_speed_debug.get('speed_source'),
 				'speed_head_speed': self.last_speed_debug.get('speed_head_speed'),
-				'traj_speed': self.last_speed_debug.get('traj_speed'),
+				'traj_speed_1s': self.last_speed_debug.get('traj_speed_1s'),
+				'traj_speed_05s': self.last_speed_debug.get('traj_speed_05s'),
 				'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
 				'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
 				'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
