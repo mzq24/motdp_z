@@ -128,6 +128,9 @@ TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTA
 TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
 TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
 SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'fuse', 'fuse_traj', 'fuse3_median', 'fuse3_adaptive'
+SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
+    '1', 'true', 'yes', 'on'
+)
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -142,6 +145,7 @@ SEMANTIC_STOP_SIGN_CLASS = 5
 SEMANTIC_LIGHT_GREEN_CLASS = 6
 SEMANTIC_LIGHT_YELLOW_CLASS = 7
 SEMANTIC_LIGHT_RED_CLASS = 8
+SEMANTIC_VEHICLE_CLASS = 9
 
 # Entry point
 def get_entry_point():
@@ -278,6 +282,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_bev_pixels_per_meter = 2.0
 		self.semantic_tl_min_pixels = 6
 		self.semantic_stop_min_pixels = 3
+		self.semantic_tl_min_models = max(
+			1,
+			int(os.environ.get('SEMANTIC_TL_MIN_MODELS', '2'))
+		)
+		self.semantic_stop_min_models = max(
+			1,
+			int(os.environ.get('SEMANTIC_STOP_MIN_MODELS', '1'))
+		)
 		self.semantic_tl_roi = (0.0, 25.0, -10.0, 10.0)
 		self.semantic_tl_green_release_delay_frames = int(
 			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_DELAY_FRAMES', '50')
@@ -286,7 +298,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_SPEED_THRESHOLD', '0.5')
 		)
 		self.semantic_stop_roi = (0.0, 12.0, -8.0, 8.0)
-		self.semantic_stop_brake_distance_m = 6.0
+		self.semantic_stop_brake_distance_m = 12.0
 		self.semantic_stop_min_stop_frames = 10
 		self.semantic_stop_reset_missing_frames = 5
 		self.semantic_planner_stop_speed_threshold = 0.05
@@ -301,6 +313,27 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def _decode_bev_semantic_classes(self, bev_feature_upscale):
 		if bev_feature_upscale is None:
 			return None
+		if isinstance(bev_feature_upscale, (list, tuple)):
+			decoded_classes = []
+			for feature_upscale, decoder in zip(
+				bev_feature_upscale,
+				self.transfuser_bev_semantic_decoders,
+			):
+				decoder_device = next(decoder.parameters()).device
+				with torch.no_grad():
+					semantic_logits = decoder(
+						feature_upscale.to(device=decoder_device, dtype=torch.float32)
+					)
+				decoded_classes.append(
+					semantic_logits.argmax(dim=1)
+					.squeeze(0)
+					.detach()
+					.cpu()
+					.numpy()
+					.astype(np.uint8)
+				)
+			return decoded_classes
+
 		decoder_device = next(self.transfuser_bev_semantic_decoder.parameters()).device
 		with torch.no_grad():
 			semantic_logits = self.transfuser_bev_semantic_decoder(
@@ -315,8 +348,107 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			.astype(np.uint8)
 		)
 
+	def _get_semantic_vote_threshold(self, class_id, num_models):
+		if num_models <= 1:
+			return 1
+		if class_id == SEMANTIC_STOP_SIGN_CLASS:
+			return min(num_models, self.semantic_stop_min_models)
+		if class_id in (
+			SEMANTIC_LIGHT_RED_CLASS,
+			SEMANTIC_LIGHT_YELLOW_CLASS,
+			SEMANTIC_LIGHT_GREEN_CLASS,
+		):
+			return min(num_models, self.semantic_tl_min_models)
+		return max(1, (num_models + 1) // 2)
+
+	def _fuse_bev_semantic_classes_for_visualization(self, bev_classes):
+		if bev_classes is None:
+			return None
+		if not isinstance(bev_classes, (list, tuple)):
+			return np.asarray(bev_classes, dtype=np.uint8)
+		if len(bev_classes) == 0:
+			return None
+		if len(bev_classes) == 1:
+			return np.asarray(bev_classes[0], dtype=np.uint8)
+
+		stack = np.stack([np.asarray(bc, dtype=np.uint8) for bc in bev_classes], axis=0)
+		fused = np.zeros_like(stack[0], dtype=np.uint8)
+		num_models = stack.shape[0]
+		num_classes = int(getattr(self.transfuser_config, 'num_bev_semantic_classes', 11))
+
+		for class_id in range(num_classes):
+			threshold = self._get_semantic_vote_threshold(class_id, num_models)
+			class_votes = (stack == class_id).sum(axis=0)
+			fused[class_votes >= threshold] = class_id
+
+		return fused
+
+	def _rotate_bev_ego_up(self, bev_img):
+		if bev_img is None:
+			return None
+		return np.rot90(bev_img, k=1).copy()
+
+	def _render_transfuser_lidar_bev_image(self, transfuser_lidar_bev_tensor):
+		if transfuser_lidar_bev_tensor is None:
+			return None
+		if isinstance(transfuser_lidar_bev_tensor, torch.Tensor):
+			lidar_bev = transfuser_lidar_bev_tensor.detach().cpu().numpy()
+		else:
+			lidar_bev = np.asarray(transfuser_lidar_bev_tensor)
+
+		while lidar_bev.ndim > 3:
+			lidar_bev = lidar_bev[0]
+		if lidar_bev.ndim != 3:
+			return None
+
+		channels = min(3, lidar_bev.shape[0])
+		lidar_vis = lidar_bev[:channels].transpose(1, 2, 0)
+		lidar_vis = np.clip(lidar_vis * 255.0, 0, 255).astype(np.uint8)
+		if lidar_vis.shape[2] == 1:
+			lidar_vis = np.repeat(lidar_vis, 3, axis=2)
+		elif lidar_vis.shape[2] == 2:
+			third = np.zeros_like(lidar_vis[:, :, :1])
+			lidar_vis = np.concatenate([lidar_vis, third], axis=2)
+
+		return self._rotate_bev_ego_up(lidar_vis)
+
+	def _render_bev_semantic_image(self, bev_classes):
+		fused_classes = self._fuse_bev_semantic_classes_for_visualization(bev_classes)
+		if fused_classes is None:
+			return None, None
+
+		palette = np.array([
+			[0, 0, 0],         # 0 unlabeled
+			[90, 90, 90],      # 1 road
+			[160, 160, 160],   # 2 sidewalk
+			[255, 215, 0],     # 3 lane_solid
+			[255, 255, 255],   # 4 lane_broken
+			[255, 140, 0],     # 5 stop_sign
+			[0, 200, 0],       # 6 light_green
+			[255, 215, 0],     # 7 light_yellow
+			[220, 30, 30],     # 8 light_red
+			[0, 120, 255],     # 9 vehicle
+			[255, 0, 255],     # 10 walker
+		], dtype=np.uint8)
+
+		semantic_vis = palette[np.clip(fused_classes, 0, len(palette) - 1)]
+		vehicle_mask = (fused_classes == SEMANTIC_VEHICLE_CLASS).astype(np.uint8) * 255
+		vehicle_vis = np.stack([vehicle_mask, vehicle_mask, vehicle_mask], axis=-1)
+
+		return (
+			self._rotate_bev_ego_up(semantic_vis),
+			self._rotate_bev_ego_up(vehicle_vis),
+		)
+
 	def _bev_roi_bounds(self, bev_classes, x_min_m, x_max_m, y_min_m, y_max_m):
-		height, width = bev_classes.shape
+		if isinstance(bev_classes, (list, tuple)):
+			if len(bev_classes) == 0:
+				return 0, 0, 0, 0
+			bev_reference = bev_classes[0]
+		else:
+			bev_reference = bev_classes
+
+		height, width = bev_reference.shape
 		center_col = width / 2.0
 		center_row = height / 2.0
 		ppm = self.semantic_bev_pixels_per_meter
@@ -345,8 +477,29 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'mean_lateral_m': None,
 			}
 
-		roi_classes = bev_classes[row_start:row_end, col_start:col_end]
-		mask = roi_classes == class_id
+		if isinstance(bev_classes, (list, tuple)):
+			if len(bev_classes) == 0:
+				return {
+					'count': 0,
+					'closest_forward_m': None,
+					'mean_forward_m': None,
+					'mean_lateral_m': None,
+				}
+			masks = np.stack(
+				[
+					bev_class[row_start:row_end, col_start:col_end] == class_id
+					for bev_class in bev_classes
+				],
+				axis=0,
+			)
+			vote_threshold = self._get_semantic_vote_threshold(class_id, masks.shape[0])
+			mask = masks.sum(axis=0) >= vote_threshold
+			bev_reference = bev_classes[0]
+		else:
+			roi_classes = bev_classes[row_start:row_end, col_start:col_end]
+			mask = roi_classes == class_id
+			bev_reference = bev_classes
+
 		count = int(mask.sum())
 		if count == 0:
 			return {
@@ -359,8 +512,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rows, cols = np.nonzero(mask)
 		rows = rows.astype(np.float32) + float(row_start)
 		cols = cols.astype(np.float32) + float(col_start)
-		center_col = bev_classes.shape[1] / 2.0
-		center_row = bev_classes.shape[0] / 2.0
+		center_col = bev_reference.shape[1] / 2.0
+		center_row = bev_reference.shape[0] / 2.0
 		ppm = self.semantic_bev_pixels_per_meter
 		x_forward = (cols - center_col) / ppm
 		y_lateral = (rows - center_row) / ppm
@@ -724,6 +877,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				os.path.join(transfuser_config_path, "model_0030_2.pth"),
 			]
 			self.transfuser_backbones = []
+			self.transfuser_bev_semantic_decoders = []
 			for mp in transfuser_model_paths:
 				print(f"Loading TransFuser backbone: {os.path.basename(mp)}")
 				bb = TransFuserBackboneExtractor(
@@ -733,13 +887,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				)
 				bb.eval()
 				self.transfuser_backbones.append(bb)
+				if not hasattr(self, 'transfuser_config'):
+					self.transfuser_config = bb.config
+				self.transfuser_bev_semantic_decoders.append(
+					self._build_transfuser_bev_semantic_decoder(
+						model_path=mp,
+						device='cuda:0',
+					)
+				)
 			# Keep first backbone's config (all share same architecture)
 			self.transfuser_config = self.transfuser_backbones[0].config
-			# BEV semantic decoder uses first checkpoint
-			self.transfuser_bev_semantic_decoder = self._build_transfuser_bev_semantic_decoder(
-				model_path=transfuser_model_paths[0],
-				device='cuda:0',
-			)
+			self.transfuser_bev_semantic_decoder = self.transfuser_bev_semantic_decoders[0]
 			self._init_semantic_hazard_state()
 			# Initialize TransfuserData for lidar histogram conversion
 			self.transfuser_data = TransfuserData(root=[], config=self.transfuser_config, shared_dict=None)
@@ -843,6 +1001,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		(self.save_path / 'meta').mkdir()
 		(self.save_path / 'bev').mkdir()
 		(self.save_path / 'lidar_bev').mkdir()
+		if SAVE_TRANSFUSER_BEV_DEBUG:
+			(self.save_path / 'transfuser_lidar_bev').mkdir()
+			(self.save_path / 'transfuser_bev_semantic').mkdir()
+			(self.save_path / 'transfuser_bev_vehicle').mkdir()
 		(self.save_path / 'debug_vis').mkdir()
 		
 		# Initialize lidar buffer for combining two frames
@@ -1646,6 +1808,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		# Speed source selection via SPEED_SOURCE env var
 		speed_head_speed = float(self._last_target_speed) if hasattr(self, '_last_target_speed') and self._last_target_speed is not None else None
+		fusion_regime = 'single_source'
+		fusion_rough_speed = None
+		fusion_weights = None
 
 		if SPEED_SOURCE == 'traj':
 			desired_speed = traj_speed
@@ -1660,22 +1825,42 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		elif SPEED_SOURCE == 'fuse3_median' and speed_head_speed is not None:
 			# Median of three: robust to any single source outlier
 			desired_speed = float(np.median([speed_head_speed, traj_speed_1s, traj_speed_05s]))
+			fusion_regime = 'median'
+			fusion_rough_speed = desired_speed
+			fusion_weights = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
 		elif SPEED_SOURCE == 'fuse3_adaptive' and speed_head_speed is not None:
-			# Adaptive by speed regime:
-			#   stopped/low (<3 m/s): traj_0.5s best (MAE 0.287)
-			#   medium (3-10 m/s): speed_head best (MAE 0.638)
-			#   high (>10 m/s): traj_1s best (MAE 0.823)
-			# Use median as initial estimate to pick regime
+			# Adaptive three-way fusion based on measured MAE by regime.
+			# Sources: [speed_head, traj_1s, traj_0.5s*2]
+			# stop/near-stop: [0.29, 0.30, 0.41]
+			# medium speed:   [0.36, 0.34, 0.30]
+			# high speed:     [0.30, 0.37, 0.33]
+			# Use the median as a robust rough estimate to choose the regime.
 			rough = float(np.median([speed_head_speed, traj_speed_1s, traj_speed_05s]))
-			if rough < 3.0:
-				# Low speed: 60% traj_0.5s + 20% speed_head + 20% traj_1s
-				desired_speed = 0.6 * traj_speed_05s + 0.2 * speed_head_speed + 0.2 * traj_speed_1s
+			fusion_rough_speed = rough
+			if rough < 2.5:
+				fusion_regime = 'low'
+				fusion_weights = [0.29, 0.30, 0.41]
+				desired_speed = (
+					fusion_weights[0] * speed_head_speed
+					+ fusion_weights[1] * traj_speed_1s
+					+ fusion_weights[2] * traj_speed_05s
+				)
 			elif rough < 10.0:
-				# Medium: 50% speed_head + 25% traj_1s + 25% traj_0.5s
-				desired_speed = 0.5 * speed_head_speed + 0.25 * traj_speed_1s + 0.25 * traj_speed_05s
+				fusion_regime = 'medium'
+				fusion_weights = [0.36, 0.34, 0.30]
+				desired_speed = (
+					fusion_weights[0] * speed_head_speed
+					+ fusion_weights[1] * traj_speed_1s
+					+ fusion_weights[2] * traj_speed_05s
+				)
 			else:
-				# High speed: 50% traj_1s + 30% speed_head + 20% traj_0.5s
-				desired_speed = 0.5 * traj_speed_1s + 0.3 * speed_head_speed + 0.2 * traj_speed_05s
+				fusion_regime = 'high'
+				fusion_weights = [0.30, 0.37, 0.33]
+				desired_speed = (
+					fusion_weights[0] * speed_head_speed
+					+ fusion_weights[1] * traj_speed_1s
+					+ fusion_weights[2] * traj_speed_05s
+				)
 		elif speed_head_speed is not None:
 			# 'speed_head': speed head only
 			desired_speed = speed_head_speed
@@ -1692,6 +1877,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'speed_head_speed': speed_head_speed,
 			'traj_speed_1s': traj_speed_1s,
 			'traj_speed_05s': traj_speed_05s,
+			'fusion_regime': fusion_regime,
+			'fusion_rough_speed': fusion_rough_speed,
+			'fusion_weights': fusion_weights,
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
@@ -1950,8 +2138,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				transfuser_bev_feature = torch.stack(bev_features).mean(dim=0)  # (1, 1512, 8, 8)
 				transfuser_bev_feature_upsample = torch.stack(bev_upsamples).mean(dim=0)  # (1, 64, 64, 64)
 				bev_semantic_classes = self._decode_bev_semantic_classes(
-					transfuser_bev_feature_upsample
+					bev_upsamples
 				)
+				tick_data['bev_semantic_classes'] = bev_semantic_classes
 				
 				# Build dp_obs_dict with transfuser features
 				dp_obs_dict = {
@@ -2168,6 +2357,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
 			for energy_key, energy_value in self.last_energy_debug.items():
 				self.pid_metadata[energy_key] = float(energy_value)
+			for speed_key, speed_value in self.last_speed_debug.items():
+				self.pid_metadata[speed_key] = speed_value
 			self.prev_debug_planner_xy = planner_xy.copy()
 			self.prev_debug_filtered_xy = filtered_xy.copy()
 			self.prev_debug_raw_xy = raw_xy.copy()
@@ -2305,6 +2496,31 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				lidar_bev_img = None
 			if lidar_bev_img is not None:
 				imageio.imwrite(str(self.save_path / 'lidar_bev' / (f'{frame:04d}.png')), lidar_bev_img)
+
+		if SAVE_TRANSFUSER_BEV_DEBUG and 'transfuser_lidar_bev' in tick_data:
+			transfuser_lidar_bev_img = self._render_transfuser_lidar_bev_image(
+				tick_data['transfuser_lidar_bev']
+			)
+			if transfuser_lidar_bev_img is not None:
+				imageio.imwrite(
+					str(self.save_path / 'transfuser_lidar_bev' / (f'{frame:04d}.png')),
+					transfuser_lidar_bev_img
+				)
+
+		if SAVE_TRANSFUSER_BEV_DEBUG and 'bev_semantic_classes' in tick_data:
+			semantic_vis, vehicle_vis = self._render_bev_semantic_image(
+				tick_data['bev_semantic_classes']
+			)
+			if semantic_vis is not None:
+				imageio.imwrite(
+					str(self.save_path / 'transfuser_bev_semantic' / (f'{frame:04d}.png')),
+					semantic_vis
+				)
+			if vehicle_vis is not None:
+				imageio.imwrite(
+					str(self.save_path / 'transfuser_bev_vehicle' / (f'{frame:04d}.png')),
+					vehicle_vis
+				)
 
 		outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
 		json.dump(self.pid_metadata, outfile, indent=4)

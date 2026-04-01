@@ -46,6 +46,16 @@ LIDAR_LATENCY_COMPENSATION = os.environ.get('LIDAR_LATENCY_COMPENSATION', '0').l
 TARGET_POINT_PROMOTION_DISTANCE_M = 3.0
 TARGET_POINT_BEHIND_EGO_EPS_M = 0.5
 TARGET_POINT_DEMOTION_DISTANCE_M = 4.0
+TARGET_GUARD_FORWARD_JUMP_M = 5.0
+TARGET_GUARD_MAX_LATERAL_DELTA_M = 2.5
+TARGET_GUARD_MAX_LATERAL_GAIN_M = 2.0
+TARGET_LANE_CHANGE_PROMOTION_MIN_M = 3.0
+TARGET_LANE_CHANGE_PROMOTION_MAX_M = 8.0
+TARGET_LANE_CHANGE_SPEED_LOOKAHEAD_GAIN = 0.8
+TARGET_LANE_CHANGE_DEMOTION_MARGIN_M = 1.5
+TARGET_POST_LANE_CHANGE_HOLD_FRAMES = 6
+TARGET_POST_LANE_CHANGE_MIN_SPEED_MPS = 6.0
+TARGET_POST_LANE_CHANGE_MAX_FIRST_DIST_M = 18.0
 
 
 def get_entry_point():
@@ -72,85 +82,95 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
         self.guard_target_point_world = None
         self.guard_next_target_point_world = None
         self.guard_command = None
+        self.guard_debounce_signature = None
         self.target_selection_pair = None
         self.target_selection_prefers_next = False
+        self.target_selection_recent_lane_change_frames = 0
 
     def _is_lane_change_command(self, command):
         return command in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT)
-
-    def _lane_change_distances(self, gps_xy, target_point_world, next_target_point_world):
-        start_xy = np.asarray(target_point_world[:2], dtype=np.float32)
-        end_xy = np.asarray(next_target_point_world[:2], dtype=np.float32)
-        route_dir = end_xy - start_xy
-        route_len = float(np.linalg.norm(route_dir))
-        if route_len <= 1e-6:
-            return None, None, None
-
-        ego_vec = np.asarray(gps_xy[:2], dtype=np.float32) - start_xy
-        lateral = abs(route_dir[0] * ego_vec[1] - route_dir[1] * ego_vec[0]) / route_len
-        longitudinal = float(np.dot(route_dir, ego_vec) / route_len)
-        return float(lateral), longitudinal, route_len
 
     def _clear_target_point_guard(self):
         self.guard_target_point_world = None
         self.guard_next_target_point_world = None
         self.guard_command = None
+        self.guard_debounce_signature = None
 
-    def _guard_lane_change_still_active(self, gps_xy):
-        if (
-            self.guard_target_point_world is None
-            or self.guard_next_target_point_world is None
-            or self.guard_command is None
-        ):
-            return False
-
-        lateral_dist, longitudinal_dist, route_len = self._lane_change_distances(
-            gps_xy,
-            self.guard_target_point_world,
-            self.guard_next_target_point_world,
+    def _build_guard_signature(self, previous_target_world, current_target_world, far_command):
+        command_value = getattr(far_command, 'value', far_command)
+        return (
+            round(float(previous_target_world[0]), 1),
+            round(float(previous_target_world[1]), 1),
+            round(float(current_target_world[0]), 1),
+            round(float(current_target_world[1]), 1),
+            int(command_value),
         )
-        if lateral_dist is None:
-            self._clear_target_point_guard()
-            return False
 
-        if longitudinal_dist is not None and route_len is not None and longitudinal_dist >= route_len:
-            self._clear_target_point_guard()
-            return False
+    def _is_suspicious_target_promotion(self, gps_xy, compass, current_target_world, far_command):
+        if self.guard_target_point_world is None or self.guard_command is None:
+            return False, None
 
-        if lateral_dist <= 2.5:
-            self._clear_target_point_guard()
-            return False
+        if not (
+            self._is_lane_change_command(self.guard_command)
+            or self._is_lane_change_command(far_command)
+        ):
+            return False, None
 
-        return True
+        previous_target_ego = t_u.inverse_conversion_2d(
+            self.guard_target_point_world[:2], gps_xy, compass
+        )
+        current_target_ego = t_u.inverse_conversion_2d(
+            current_target_world[:2], gps_xy, compass
+        )
 
-    def _apply_target_point_guard(self, gps_xy, target_point, next_target_point, far_command):
+        forward_jump = float(current_target_ego[0] - previous_target_ego[0])
+        lateral_delta = float(current_target_ego[1] - previous_target_ego[1])
+        lateral_gain = float(abs(current_target_ego[1]) - abs(previous_target_ego[1]))
+
+        suspicious = (
+            previous_target_ego[0] > 0.0
+            and forward_jump > TARGET_GUARD_FORWARD_JUMP_M
+            and abs(lateral_delta) < TARGET_GUARD_MAX_LATERAL_DELTA_M
+            and lateral_gain < TARGET_GUARD_MAX_LATERAL_GAIN_M
+        )
+        if not suspicious:
+            return False, None
+
+        return True, self._build_guard_signature(
+            self.guard_target_point_world,
+            current_target_world,
+            far_command,
+        )
+
+    def _apply_target_point_guard(self, gps_xy, compass, target_point, next_target_point, far_command):
         target_world = np.asarray(target_point[:2], dtype=np.float32)
         next_target_world = np.asarray(next_target_point[:2], dtype=np.float32)
-        guard_active = self._guard_lane_change_still_active(gps_xy)
+
+        should_debounce, debounce_signature = self._is_suspicious_target_promotion(
+            gps_xy,
+            compass,
+            target_world,
+            far_command,
+        )
+
+        if should_debounce and debounce_signature != self.guard_debounce_signature:
+            self.guard_debounce_signature = debounce_signature
+            return (
+                self.guard_target_point_world.copy(),
+                self.guard_next_target_point_world.copy(),
+                self.guard_command,
+            )
+
+        self.guard_debounce_signature = None
 
         if self._is_lane_change_command(far_command):
-            if guard_active:
-                target_shift = float(np.linalg.norm(target_world - self.guard_target_point_world))
-                if target_shift > 1.0:
-                    return (
-                        self.guard_target_point_world.copy(),
-                        self.guard_next_target_point_world.copy(),
-                        self.guard_command,
-                    )
-
             self.guard_target_point_world = target_world.copy()
             self.guard_next_target_point_world = next_target_world.copy()
             self.guard_command = far_command
-            return target_world, next_target_world, far_command
+        else:
+            self._clear_target_point_guard()
 
-        if not guard_active:
-            return target_world, next_target_world, far_command
-
-        return (
-            self.guard_target_point_world.copy(),
-            self.guard_next_target_point_world.copy(),
-            self.guard_command,
-        )
+        return target_world, next_target_world, far_command
 
     def _same_target_selection_pair(self, first_point_world, second_point_world):
         if self.target_selection_pair is None:
@@ -162,25 +182,54 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
             and np.linalg.norm(second_point_world - prev_second) <= 1e-3
         )
 
-    def _select_target_indices(self, waypoint_route, gps_xy, compass):
+    def _select_target_indices(self, waypoint_route, gps_xy, compass, speed):
         target_idx = 0
         if len(waypoint_route) > 1:
             first_point = np.asarray(waypoint_route[0][0][:2], dtype=np.float32)
             second_point = np.asarray(waypoint_route[1][0][:2], dtype=np.float32)
+            first_command = waypoint_route[0][1]
+            second_command = waypoint_route[1][1]
             ego_xy = np.asarray(gps_xy[:2], dtype=np.float32)
             first_delta = first_point - ego_xy
             first_dist = float(np.linalg.norm(first_delta))
             forward_vec = np.array([np.cos(compass), np.sin(compass)], dtype=np.float32)
             first_longitudinal = float(np.dot(first_delta, forward_vec))
+            lane_change_context = (
+                self._is_lane_change_command(first_command)
+                or self._is_lane_change_command(second_command)
+            )
+            lane_change_promotion_m = float(np.clip(
+                speed * TARGET_LANE_CHANGE_SPEED_LOOKAHEAD_GAIN,
+                TARGET_LANE_CHANGE_PROMOTION_MIN_M,
+                TARGET_LANE_CHANGE_PROMOTION_MAX_M,
+            ))
+            lane_change_demotion_m = lane_change_promotion_m + TARGET_LANE_CHANGE_DEMOTION_MARGIN_M
+
+            if lane_change_context:
+                self.target_selection_recent_lane_change_frames = TARGET_POST_LANE_CHANGE_HOLD_FRAMES
+            elif self.target_selection_recent_lane_change_frames > 0:
+                self.target_selection_recent_lane_change_frames -= 1
 
             if not self._same_target_selection_pair(first_point, second_point):
                 self.target_selection_pair = (first_point.copy(), second_point.copy())
-                self.target_selection_prefers_next = False
 
             # Once the first remaining route point is clearly behind the ego,
             # don't let the target selection bounce back to it.
             if first_longitudinal < -TARGET_POINT_BEHIND_EGO_EPS_M:
                 self.target_selection_prefers_next = True
+            elif lane_change_context:
+                if self.target_selection_prefers_next:
+                    if first_longitudinal >= lane_change_demotion_m:
+                        self.target_selection_prefers_next = False
+                elif first_longitudinal <= lane_change_promotion_m:
+                    self.target_selection_prefers_next = True
+            elif (
+                self.target_selection_prefers_next
+                and self.target_selection_recent_lane_change_frames > 0
+                and speed >= TARGET_POST_LANE_CHANGE_MIN_SPEED_MPS
+                and first_dist <= TARGET_POST_LANE_CHANGE_MAX_FIRST_DIST_M
+            ):
+                pass
             elif self.target_selection_prefers_next:
                 if first_dist >= TARGET_POINT_DEMOTION_DISTANCE_M:
                     self.target_selection_prefers_next = False
@@ -191,6 +240,7 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
         else:
             self.target_selection_pair = None
             self.target_selection_prefers_next = False
+            self.target_selection_recent_lane_change_frames = 0
 
         next_idx = min(target_idx + 1, len(waypoint_route) - 1)
         return target_idx, next_idx
@@ -379,6 +429,7 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
                 waypoint_route,
                 result['gps'],
                 result['compass'],
+                result['speed'],
             )
             target_point, far_command = waypoint_route[target_idx]
             if next_idx > target_idx:
@@ -412,6 +463,7 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
 
         target_point, next_target_point, far_command = self._apply_target_point_guard(
             result['gps'],
+            result['compass'],
             target_point,
             next_target_point,
             far_command,
