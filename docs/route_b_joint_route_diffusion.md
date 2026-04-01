@@ -105,6 +105,111 @@ and only falls back to scanning individual `*.pkl` files if packed samples are a
 
 This matters on HPC because scanning hundreds of thousands of individual pkl files is much slower than reading the packed files.
 
+## LiDAR BEV Compatibility Mode
+
+After adding side/rear LiDAR-BEV detail sampling, Route B now has an explicit compatibility switch:
+
+- key: `route_b.use_lidar_bev_detail`
+- baseline Route B configs: `false`
+- LiDAR experiment configs: `true`
+
+The purpose is to keep one code line while treating:
+
+- non-LiDAR Route B
+- LiDAR-enhanced Route B
+
+as two different model variants.
+
+### What the switch does
+
+When `use_lidar_bev_detail: false`:
+
+- dataset does not try to load `transfuser_lidar_bev/*.npy`
+- policy does not pass LiDAR BEV into the model
+- the decoder does not instantiate LiDAR-specific parameters:
+  - `lidar_bev_encoder`
+  - `traj_lidar_detail_attn`
+
+So the non-LiDAR path stays behaviorally close to the pre-LiDAR version.
+
+When `use_lidar_bev_detail: true`:
+
+- dataset loads and inverts TransFuser LiDAR BEV histograms
+- policy forwards `transfuser_lidar_bev`
+- the decoder adds LiDAR obstacle detail into the traj detail fusion path
+
+### Why this matters for checkpoint compatibility
+
+The main point is not just convenience. It is to avoid silent mixed-model warm-starting.
+
+With this switch:
+
+- old non-LiDAR checkpoints should be resumed only with `use_lidar_bev_detail: false`
+- LiDAR configs are treated as a separate model variant
+- old non-LiDAR checkpoints should not be silently reused for the LiDAR variant
+
+This is stricter than the previous behavior where new branches could be randomly initialized and silently joined into training.
+
+### Dataset behavior
+
+Even when LiDAR loading is disabled, the dataset still returns:
+
+- `transfuser_lidar_bev = zeros(2, 256, 256)`
+
+This keeps batch schema and collate behavior stable, while avoiding LiDAR file IO on the non-LiDAR path.
+
+## Strict Checkpoint Resume
+
+Checkpoint resume was changed back to strict behavior in `training/train_carla_bev.py`.
+
+Current behavior:
+
+- no shape-mismatch filtering
+- no `strict=False` warm-start
+- resume now requires exact checkpoint/model agreement
+
+Before `load_state_dict(..., strict=True)`, training now checks and prints grouped mismatch information:
+
+- missing keys
+- unexpected keys
+- shape mismatches in the form:
+  - `checkpoint_shape -> model_shape`
+
+Then it raises immediately.
+
+### Practical consequence
+
+This means:
+
+- matching non-LiDAR checkpoint + non-LiDAR config:
+  - should load cleanly
+- non-LiDAR checkpoint + LiDAR config:
+  - should fail loudly because LiDAR branch parameters are absent from the checkpoint
+
+This is the intended behavior. We now prefer fail-fast over silent partial initialization.
+
+### Important caveat
+
+Strict resume does not only test the LiDAR switch. It tests full architectural equality.
+
+In practice, some older Route B checkpoints may still fail even with:
+
+- `use_lidar_bev_detail: false`
+
+if they come from an earlier Route B architecture that also differs in other ways, for example:
+
+- earlier route-detail branch structure
+- different decoder depth / width
+- older normalization buffers
+- pre-joint-route-diffusion layouts
+
+So:
+
+- `use_lidar_bev_detail: false` is necessary for old non-LiDAR continuation
+- but it is not sufficient if the checkpoint is older than other major Route B refactors
+
+The switch isolates the LiDAR difference cleanly, but strict resume will still reject any broader architecture drift.
+
 ## Why Epoch Time Increased
 
 The current slowdown is expected and mainly comes from the new fine-BEV compute in the ego path.

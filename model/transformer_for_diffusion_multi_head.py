@@ -976,6 +976,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         max_seq_len: int = 64,  # Max length for unified position encoding
         traj_can_attend_route: bool = True,
         ego_detail_activation_t: int = 400,
+        use_lidar_bev_detail: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -984,6 +985,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.num_waypoints = num_waypoints
         self.traj_can_attend_route = traj_can_attend_route
         self.ego_detail_activation_t = ego_detail_activation_t
+        self.use_lidar_bev_detail = use_lidar_bev_detail
 
         # ========== Transfuser Feature Projections (following DiffusionDriveV2) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, d_model)
@@ -1043,7 +1045,29 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             lidar_max_x=32.0,
             lidar_max_y=32.0
         )
-        
+
+        if self.use_lidar_bev_detail:
+            # ========== LiDAR BEV encoder + detail attention ==========
+            # Input: inverted transfuser_lidar_bev (B, 2, 256, 256)
+            # Output: (B, 64, 64, 64) matching bev_feature_upsample spatial layout
+            lidar_bev_in_channels = 2  # below / above histogram channels
+            self.lidar_bev_encoder = nn.Sequential(
+                nn.Conv2d(lidar_bev_in_channels, 32, kernel_size=5, stride=2, padding=2),  # → 128
+                nn.GroupNorm(8, 32),
+                nn.GELU(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # → 64
+                nn.GroupNorm(8, 64),
+                nn.GELU(),
+            )  # (B, 64, 64, 64)
+            self.traj_lidar_detail_attn = GridSampleCrossBEVAttention(
+                embed_dims=d_model,
+                num_heads=nhead,
+                in_bev_dims=64,  # lidar_bev_encoder output channels
+                num_points=14,   # same detail offsets as traj_detail_attn
+                lidar_max_x=32.0,
+                lidar_max_y=32.0
+            )
+
         # Position embeddings for cross-attention sources (BEV tokens only now)
         # Total tokens: 64 (bev)
         self.combined_pos_emb = nn.Parameter(torch.zeros(1, 64, d_model))
@@ -1335,6 +1359,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self_attn_mask: Optional[torch.Tensor] = None,
         route_pos_offset: int = 0,
         spatial_mode: str = "anchor",
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,  # (B, 2, 256, 256) inverted LiDAR BEV
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass with unified queries and multi-source attention (DiffusionDriveV2 style).
@@ -1424,7 +1449,12 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                 route_far_points = self._build_route_far_detail_points(route_points)  # (B, 1, 3, 2)
                 route_far_flat = route_far_points.view(B, -1, 2)  # (B, 3, 2)
                 traj_route_far = self.route_far_detail_attn(x_traj, route_far_flat, transfuser_bev_feature_upsample) - x_traj
-                x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail + traj_route_far)
+                # LiDAR BEV detail: sample obstacle occupancy at same detail points
+                traj_lidar_detail = torch.zeros_like(traj_local_detail)
+                if self.use_lidar_bev_detail and transfuser_lidar_bev is not None:
+                    lidar_feat = self.lidar_bev_encoder(transfuser_lidar_bev)  # (B, 64, 64, 64)
+                    traj_lidar_detail = self.traj_lidar_detail_attn(x_traj, traj_detail_points, lidar_feat) - x_traj
+                x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail + traj_route_far + traj_lidar_detail)
                 x_route = x[:, T_traj:, :]
                 if route_points is not None:
                     if route_points.dim() != 3:
@@ -1519,6 +1549,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         anchor_free: bool = False,  # Route B: no anchor residual, predict absolute trajectory
         energy_heads: bool = False,  # Route B: energy evaluator heads for gradient guidance
         ego_detail_activation_t: int = 400,  # Timestep threshold for detail gate
+        use_lidar_bev_detail: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1538,6 +1569,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.T = horizon
         self.output_dim = output_dim
         self.ego_joint_horizon = horizon + num_waypoints
+        self.use_lidar_bev_detail = use_lidar_bev_detail
         
         # ========== Anchor Embedding ==========
         # Encode full noisy trajectory shape per mode (not just mean point) to preserve
@@ -1606,6 +1638,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             num_waypoints=num_waypoints,
             traj_can_attend_route=traj_can_attend_route,
             ego_detail_activation_t=ego_detail_activation_t,
+            use_lidar_bev_detail=use_lidar_bev_detail,
         )
 
         # ========== Output Heads ==========
@@ -1830,6 +1863,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         ego_status: torch.Tensor,
         x_t_abs: Optional[torch.Tensor] = None,
         bev_proj_cached: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Ego denoising path with joint trajectory+route waypoint diffusion.
@@ -1900,6 +1934,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self_attn_mask=ego_mask,
             route_pos_offset=T_traj,
             spatial_mode="ego",
+            transfuser_lidar_bev=transfuser_lidar_bev,
         )
 
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)

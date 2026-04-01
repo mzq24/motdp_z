@@ -1,0 +1,140 @@
+# Route B + LiDAR BEV detail sampling experiment on pdm_lite_mini
+# Based on 0331_clean config, adapted for local mini training
+
+policy_type: anchor_free
+anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
+global_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/global_abs_stats.npz
+route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
+
+device:
+  gpu_ids:
+  - 0
+dataset:
+  use_per_frame: false
+  # No feature_suffix: use default (non-ensemble) memmap cache
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  persistent_workers: false
+  pin_memory: true
+  prefetch_factor: 4
+  shuffle: true
+  use_route_group_sampler: false
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 5.0e-05
+  weight_decay: 1.0e-04
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+enable_action_normalization: true
+bev_encoder:
+  state_dim: 14
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  n_obs_steps: 4
+  cond_dim: 256
+  obs_as_global_cond: true
+  n_layer: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 6
+  action_horizon: 6
+  traj_can_attend_route: true
+
+route_b:
+  num_samples: 1
+  num_energy_modes: 32
+  num_inference_steps: 10
+  use_split_forward: true
+  use_lidar_bev_detail: true
+  guidance_scale: 0.0
+  speed_loss_weight: 2.0
+  train_max_timesteps: 1000
+  train_energy: false
+
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 1000
+  train_trunc_timesteps: 1000
+  num_diffusion_steps: 10
+  eta: 0.0
+  prediction_type: "sample"
+  route_loss_weight: 2.0
+
+num_modes: 32
+cls_loss_weight: 0.0
+reg_loss_weight: 8.0
+
+training:
+  num_epochs: 50
+  max_grad_norm: 1.0
+  warmup_epochs: 5
+  use_lr_scheduler: true
+  dataset_path: /media/z/data/dataset/pdm_lite_mini
+  image_data_root: /media/z/data/dataset/pdm_lite_mini
+  sample_interval: 1
+  lr_final: 1e-7
+  validation_freq: 5
+  save_freq: 5
+  early_stopping_patience: 20
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_lidar_bev_mini
+logging:
+  use_wandb: false
+  wandb_project: route_b_lidar_bev
+  run_name: route_b_lidar_bev_mini
+  checkpoint_dir: /media/z/data/mzq/others/MoT-DP/checkpoints/route_b_lidar_bev_mini
+  save_every: 5
+  log_freq: 50
+augmentation:
+  gps_noise:
+    enabled: true
+    sigma: 0.25
+    probability: 0.8
+model_optimization:
+  use_mixed_precision: true

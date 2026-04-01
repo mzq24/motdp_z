@@ -136,6 +136,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.train_energy = route_b_cfg.get('train_energy', True)
         self._current_epoch = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
+        self.use_lidar_bev_detail = route_b_cfg.get('use_lidar_bev_detail', False)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -168,6 +169,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             anchor_free=True,
             energy_heads=True,
             ego_detail_activation_t=policy_cfg.get('ego_detail_activation_t', 400),
+            use_lidar_bev_detail=self.use_lidar_bev_detail,
         )
         self.model = model
 
@@ -223,6 +225,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             anchor_centers_abs = torch.from_numpy(anchor_centers_abs).float()
         device = next(self.parameters()).device
         self.register_buffer('anchor_centers_abs', anchor_centers_abs.to(device))
+
+    def _get_transfuser_lidar_bev(
+        self,
+        tensor_dict: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_lidar_bev_detail:
+            return None
+        transfuser_lidar_bev = tensor_dict.get('transfuser_lidar_bev')
+        if transfuser_lidar_bev is None:
+            return None
+        return transfuser_lidar_bev.to(device=device, dtype=model_dtype)
 
     # ========== Speed Target Computation ==========
     def _compute_speed_target(self, trajectory, device):
@@ -566,6 +581,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        transfuser_lidar_bev = self._get_transfuser_lidar_bev(batch, device, model_dtype)
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
         route_gt = batch.get('route', None)
@@ -606,6 +622,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
             ego_status=ego_status,
             bev_proj_cached=bev_proj,
+            transfuser_lidar_bev=transfuser_lidar_bev,
         )
         poses_reg_abs = self.norm_to_abs(poses_reg)
         route_pred_abs = self.route_norm_to_abs(route_pred)
@@ -805,6 +822,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        transfuser_lidar_bev = self._get_transfuser_lidar_bev(batch, device, model_dtype)
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
         route_gt = batch.get('route', None)
@@ -1256,6 +1274,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        transfuser_lidar_bev = self._get_transfuser_lidar_bev(batch, device, model_dtype)
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
         route_gt = batch.get('route', None)
@@ -1429,6 +1448,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         model_dtype: torch.dtype,
         route_for_guidance: Optional[torch.Tensor] = None,
         energy_weights: Optional[Dict[str, float]] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
     ):
         """
         DDIM from N(0,I) with annealed energy gradient guidance.
@@ -1500,6 +1520,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                         ego_status=ego_status,
                         bev_proj_cached=bev_proj,
+                        transfuser_lidar_bev=transfuser_lidar_bev,
                     )
                     pred_x0 = poses_reg.detach()  # (B, M, T, 2)
                     route_pred_norm = route_pred.detach().unsqueeze(1)  # (B, 1, T_route, 2)
@@ -1560,6 +1581,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                         ego_status=ego_status,
                         bev_proj_cached=bev_proj,
+                        transfuser_lidar_bev=transfuser_lidar_bev,
                     )
                 energy_scores = None
                 pred_x0_corrected = torch.cat([
@@ -1609,6 +1631,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        transfuser_lidar_bev = self._get_transfuser_lidar_bev(nobs, device, model_dtype)
         ego_status = nobs['ego_status'].to(dtype=model_dtype)
 
         route_for_guidance = nobs.get('route', None)
@@ -1626,6 +1649,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             model_dtype=model_dtype,
             route_for_guidance=route_for_guidance,
             energy_weights=energy_weights,
+            transfuser_lidar_bev=transfuser_lidar_bev,
         )
 
         best_traj = sample_result['best_trajectory']

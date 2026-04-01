@@ -169,6 +169,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                 obs_dict = {
                     'transfuser_bev_feature': batch['transfuser_bev_feature'],
                     'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
+                    'transfuser_lidar_bev': batch['transfuser_lidar_bev'],
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],
                 }
                 if getattr(model_for_inference, 'use_vqa_anchor', False) and 'vqa_anchor' in batch:
@@ -363,6 +364,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     use_per_frame = config.get('dataset', {}).get('use_per_frame', False)
     cache_dir = config.get('dataset', {}).get('cache_dir', None)  # e.g. /tmp/tmp_data for tmpfs
     use_vqa_anchor = config.get('use_vqa_anchor', False)
+    use_lidar_bev_detail = config.get('route_b', {}).get('use_lidar_bev_detail', False)
 
     # Load anchor_centers_abs for semantic behavior labeling
     policy_type = config.get('policy_type', 'anchor')  # 'anchor' (Route A) or 'anchor_free' (Route B)
@@ -400,12 +402,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
         cache_dir=cache_dir, feature_suffix=feature_suffix,
         gps_noise_cfg=gps_noise_cfg,
+        load_transfuser_lidar_bev=use_lidar_bev_detail,
     )
     # Val dataset: skip memmap, will inject RAM features after config is parsed
     val_dataset_orig = CARLAImageDataset(
         dataset_path=val_dataset_path, image_data_root=image_data_root,
         skip_memmap=True, use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
         anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+        load_transfuser_lidar_bev=use_lidar_bev_detail,
     )
     # if val_only:
     #     val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
@@ -634,33 +638,44 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print(f"Loading checkpoint from {resume_path}...")
         checkpoint = torch.load(resume_path, map_location=device)
-        # Filter out shape-mismatched keys (strict=False only handles missing/unexpected, not shape mismatch)
         saved_state = checkpoint['model_state_dict']
         current_state = policy.state_dict()
-        filtered_state = {}
-        shape_mismatch_keys = []
-        for k, v in saved_state.items():
-            if k in current_state and current_state[k].shape != v.shape:
-                shape_mismatch_keys.append(k)
-            else:
-                filtered_state[k] = v
-        if rank == 0 and shape_mismatch_keys:
-            print(f"  Skipped {len(shape_mismatch_keys)} shape-mismatched keys: {shape_mismatch_keys[:8]}")
-        missing_keys, unexpected_keys = policy.load_state_dict(
-            filtered_state,
-            strict=False,
-        )
+        saved_keys = set(saved_state.keys())
+        current_keys = set(current_state.keys())
+        missing_keys = sorted(current_keys - saved_keys)
+        unexpected_keys = sorted(saved_keys - current_keys)
+        mismatched_shapes = []
+        for key in sorted(saved_keys & current_keys):
+            current_shape = tuple(current_state[key].shape)
+            saved_shape = tuple(saved_state[key].shape)
+            if current_shape != saved_shape:
+                mismatched_shapes.append((key, saved_shape, current_shape))
+
+        if missing_keys or unexpected_keys or mismatched_shapes:
+            if rank == 0:
+                print("  Checkpoint/model mismatch detected during strict resume.")
+                if missing_keys:
+                    preview = missing_keys[:8]
+                    suffix = "..." if len(missing_keys) > 8 else ""
+                    print(f"  Missing keys ({len(missing_keys)}): {preview}{suffix}")
+                if unexpected_keys:
+                    preview = unexpected_keys[:8]
+                    suffix = "..." if len(unexpected_keys) > 8 else ""
+                    print(f"  Unexpected keys ({len(unexpected_keys)}): {preview}{suffix}")
+                if mismatched_shapes:
+                    preview = mismatched_shapes[:8]
+                    formatted = [f"{k}: ckpt{saved_shape} -> model{current_shape}" for k, saved_shape, current_shape in preview]
+                    suffix = "..." if len(mismatched_shapes) > 8 else ""
+                    print(f"  Shape mismatches ({len(mismatched_shapes)}): {formatted}{suffix}")
+            raise RuntimeError(
+                "Strict checkpoint resume failed due to model/ckpt mismatch. "
+                "See grouped summary above."
+            )
+
+        policy.load_state_dict(saved_state, strict=True)
         start_epoch = checkpoint.get('epoch', 0) + 1
         if rank == 0:
             print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-            if missing_keys:
-                preview = missing_keys[:8]
-                suffix = "..." if len(missing_keys) > 8 else ""
-                print(f"  Missing model keys during warm-start: {preview}{suffix}")
-            if unexpected_keys:
-                preview = unexpected_keys[:8]
-                suffix = "..." if len(unexpected_keys) > 8 else ""
-                print(f"  Unexpected model keys during warm-start: {preview}{suffix}")
             if 'val_metrics' in checkpoint:
                 print(f"  Previous val_metrics: {checkpoint['val_metrics']}")
         # Restore scaler state if available (for AMP resume)

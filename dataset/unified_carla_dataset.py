@@ -74,6 +74,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  cache_dir: str = None,       # Override memmap cache dir (e.g. /tmp/tmp_data for tmpfs)
                  feature_suffix: str = '',    # Suffix for feature files (e.g. 'ensemble' → bev_features_fp16_ensemble.bin)
                  gps_noise_cfg: dict = None,  # GPS noise augmentation config
+                 load_transfuser_lidar_bev: bool = False,  # Load LiDAR BEV detail input
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -89,6 +90,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._ram_features = None    # dict: abs_idx -> (feat_tensor, ups_tensor), set by preload_to_ram()
         self._use_per_frame = use_per_frame  # Local SSD mode: read individual .pt files
         self._use_vqa_anchor = use_vqa_anchor  # Load VLM anchor from dp_vl_feature
+        self._load_transfuser_lidar_bev = load_transfuser_lidar_bev
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -545,6 +547,27 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             final_sample['transfuser_bev_feature_upsample'] = transfuser_bev_feature_upsample
         else:
             final_sample['transfuser_bev_feature_upsample'] = torch.zeros(64, 64, 64, dtype=torch.float16)
+
+        # --- Load TransFuser LiDAR BEV histogram (2, 256, 256) ---
+        # Derive path: .../transfuser_feature/{fid}_feature.pt → .../transfuser_lidar_bev/{fid}.npy
+        transfuser_lidar_bev = None
+        if self._load_transfuser_lidar_bev and 'transfuser_bev_feature' in sample:
+            feat_rel = sample['transfuser_bev_feature']
+            # e.g. "Accident/Town12_.../transfuser_feature/0006_feature.pt"
+            #    → "Accident/Town12_.../transfuser_lidar_bev/0006.npy"
+            lidar_bev_rel = feat_rel.replace(
+                'transfuser_feature/', 'transfuser_lidar_bev/').replace(
+                '_feature.pt', '.npy')
+            lidar_bev_path = os.path.join(self.image_data_root, lidar_bev_rel)
+            if os.path.exists(lidar_bev_path):
+                raw = np.load(lidar_bev_path)  # (2, 256, 256) float16
+                # Invert: 1.0 - value  →  obstacles become high-valued
+                transfuser_lidar_bev = torch.from_numpy(
+                    (1.0 - raw.astype(np.float32))).half()  # (2, 256, 256)
+        if transfuser_lidar_bev is not None:
+            final_sample['transfuser_lidar_bev'] = transfuser_lidar_bev
+        else:
+            final_sample['transfuser_lidar_bev'] = torch.zeros(2, 256, 256, dtype=torch.float16)
 
         # ========== Semantic Behavior Labeling ==========
         if self.semantic_behavior_enabled:
