@@ -664,8 +664,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		force_move_blocked_reason = external_force_move_block_reason
 		if force_move_blocked_reason is not None:
 			self.force_move = 0
-		elif planner_wants_stop:
-			force_move_blocked_reason = 'planner_stop'
 		elif green_hold_active:
 			force_move_blocked_reason = 'traffic_light_green_hold'
 		elif traffic_light_debug['block_force_move']:
@@ -1831,6 +1829,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		elif SPEED_SOURCE == 'fuse3_adaptive' and speed_head_speed is not None:
 			# Adaptive three-way fusion based on measured MAE by regime.
 			# Sources: [speed_head, traj_1s, traj_0.5s*2]
+			# startup from standstill: bias toward speed_head + traj_1s for quicker launch
 			# stop/near-stop: [0.29, 0.30, 0.41]
 			# medium speed:   [0.36, 0.34, 0.30]
 			# high speed:     [0.30, 0.37, 0.33]
@@ -1838,8 +1837,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			rough = float(np.median([speed_head_speed, traj_speed_1s, traj_speed_05s]))
 			fusion_rough_speed = rough
 			if rough < 2.5:
-				fusion_regime = 'low'
-				fusion_weights = [0.29, 0.30, 0.41]
+				if speed < 0.2:
+					fusion_regime = 'startup'
+					fusion_weights = [0.50, 0.35, 0.15]
+				else:
+					fusion_regime = 'low'
+					fusion_weights = [0.29, 0.30, 0.41]
 				desired_speed = (
 					fusion_weights[0] * speed_head_speed
 					+ fusion_weights[1] * traj_speed_1s
