@@ -134,6 +134,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.energy_noisy_training = route_b_cfg.get('energy_noisy_training', False)
         self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
         self.train_energy = route_b_cfg.get('train_energy', True)
+        self.use_front_route_risk_energy = route_b_cfg.get('use_front_route_risk_energy', False)
         self._current_epoch = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
         self.use_lidar_bev_detail = route_b_cfg.get('use_lidar_bev_detail', False)
@@ -238,6 +239,49 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if transfuser_lidar_bev is None:
             return None
         return transfuser_lidar_bev.to(device=device, dtype=model_dtype)
+
+    def _slice_energy_anchor_inputs(
+        self,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        behavior_labels: Optional[torch.Tensor] = None,
+        allowed_flags: Optional[torch.Tensor] = None,
+        energy_targets: Optional[torch.Tensor] = None,
+        energy_active_mask: Optional[torch.Tensor] = None,
+    ):
+        """Take the first num_energy_modes anchors and aligned supervision tensors."""
+        if self.anchor_centers_abs is None:
+            raise ValueError("anchor_centers_abs is not registered")
+
+        requested = int(self.num_energy_modes)
+        available = int(self.anchor_centers_abs.shape[0])
+        if requested > available:
+            raise ValueError(
+                f"num_energy_modes={requested} exceeds available anchors={available}"
+            )
+
+        def _slice_optional(name: str, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            if tensor.shape[1] < requested:
+                raise ValueError(
+                    f"{name} provides only {tensor.shape[1]} modes, expected at least {requested}"
+                )
+            return tensor[:, :requested]
+
+        anchor_subset = self.anchor_centers_abs[:requested].to(device=device, dtype=model_dtype)
+        behavior_subset = _slice_optional("behavior_labels", behavior_labels)
+        allowed_subset = _slice_optional("allowed_flags", allowed_flags)
+        energy_targets_subset = _slice_optional("energy_targets", energy_targets)
+        energy_active_mask_subset = _slice_optional("energy_active_mask", energy_active_mask)
+        return (
+            requested,
+            anchor_subset,
+            behavior_subset,
+            allowed_subset,
+            energy_targets_subset,
+            energy_active_mask_subset,
+        )
 
     # ========== Speed Target Computation ==========
     def _compute_speed_target(self, trajectory, device):
@@ -527,6 +571,68 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         focal_weight = alpha * (1 - p_t) ** gamma
         return (focal_weight * bce).mean()
 
+    def _get_front_route_energy_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ):
+        """Scene-level front risk supervision from precomputed route-constrained labels.
+
+        The new front/block/risk labels are scene-level, not anchor-level. We therefore
+        train the front energy head on the GT slot only instead of forcing the same target
+        onto every anchor sample.
+        """
+        hazard_bin = batch.get('front_route_hazard_bin', None)
+        if hazard_bin is not None:
+            target = hazard_bin.to(device=device, dtype=model_dtype).clamp(min=0.0, max=4.0) / 4.0
+        else:
+            risk = batch.get('front_route_risk', None)
+            if risk is None:
+                return None, None
+            target = risk.to(device=device, dtype=model_dtype).clamp(0.0, 1.0)
+            block_risk = batch.get('front_route_block_risk', None)
+            if block_risk is not None:
+                target = torch.maximum(
+                    target,
+                    block_risk.to(device=device, dtype=model_dtype).clamp(0.0, 1.0),
+                )
+
+        actor_weight = batch.get('front_route_actor_weight', None)
+        if actor_weight is None:
+            sample_weight = torch.ones_like(target)
+        else:
+            actor_weight = actor_weight.to(device=device, dtype=model_dtype)
+            positive_weight = actor_weight.clamp(min=1.0)
+            sample_weight = torch.where(
+                target > 0,
+                positive_weight,
+                torch.ones_like(target),
+            )
+        return target, sample_weight
+
+    def _compute_front_route_energy_loss(
+        self,
+        front_logits: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        targets, sample_weight = self._get_front_route_energy_targets(
+            batch=batch,
+            device=device,
+            model_dtype=model_dtype,
+        )
+        if targets is None:
+            return torch.tensor(0.0, device=device, dtype=model_dtype)
+        loss = F.binary_cross_entropy_with_logits(
+            front_logits.float(),
+            targets.float(),
+            reduction='none',
+        )
+        weighted = loss * sample_weight.float()
+        return weighted.sum() / sample_weight.float().sum().clamp(min=1.0)
+
     # ========== Energy Head Eval with Detached Weights ==========
     @staticmethod
     def _eval_energy_head_detached(head: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
@@ -649,15 +755,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_route = zero_t
 
         if has_energy and self.train_energy:
-            anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1)
-            behavior_labels_dev = behavior_labels.to(device=device)
-            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype)
+            (
+                M_anchor,
+                anchor_subset,
+                behavior_labels_subset,
+                allowed_flags_subset,
+                energy_targets_subset,
+                energy_active_mask_subset,
+            ) = self._slice_energy_anchor_inputs(
+                device=device,
+                model_dtype=model_dtype,
+                behavior_labels=behavior_labels,
+                allowed_flags=allowed_flags,
+                energy_targets=energy_targets,
+                energy_active_mask=energy_active_mask,
+            )
+            anchor_abs = anchor_subset.unsqueeze(0).expand(B, -1, -1, -1)
+            behavior_labels_dev = behavior_labels_subset.to(device=device)
+            allowed_flags_dev = allowed_flags_subset.to(device=device, dtype=model_dtype)
             energy_targets_dev = None
             energy_active_mask_dev = None
-            if energy_targets is not None:
-                energy_targets_dev = energy_targets.to(device=device, dtype=model_dtype)
-            if energy_active_mask is not None:
-                energy_active_mask_dev = energy_active_mask.to(device=device, dtype=torch.bool)
+            if energy_targets_subset is not None:
+                energy_targets_dev = energy_targets_subset.to(device=device, dtype=model_dtype)
+            if energy_active_mask_subset is not None:
+                energy_active_mask_dev = energy_active_mask_subset.to(device=device, dtype=torch.bool)
 
             K = min(self.num_gt_augmentations, M_anchor)
             if K > 0:
@@ -729,13 +850,29 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     active_mask[:, M_anchor] = True
                 n_active = active_mask.sum()
                 if n_active > 0:
-                    loss_front = _sl1e(energy_scores['front'], front_target, active_mask)
+                    if self.use_front_route_risk_energy:
+                        loss_front = self._compute_front_route_energy_loss(
+                            energy_scores['front'][:, -1],
+                            batch,
+                            device,
+                            model_dtype,
+                        )
+                    else:
+                        loss_front = _sl1e(energy_scores['front'], front_target, active_mask)
                     loss_left = _sl1e(energy_scores['left'], left_target, active_mask)
                     loss_right = _sl1e(energy_scores['right'], right_target, active_mask)
                     loss_ped = _sl1e(energy_scores['pedestrian'], ped_target, active_mask)
                     loss_off = _sl1e(energy_scores['offroad'], offroad_target, active_mask)
             else:
-                loss_front = _sl1e(energy_scores['front'], front_target)
+                if self.use_front_route_risk_energy:
+                    loss_front = self._compute_front_route_energy_loss(
+                        energy_scores['front'][:, -1],
+                        batch,
+                        device,
+                        model_dtype,
+                    )
+                else:
+                    loss_front = _sl1e(energy_scores['front'], front_target)
                 loss_left = _sl1e(energy_scores['left'], left_target)
                 loss_right = _sl1e(energy_scores['right'], right_target)
                 loss_ped = _sl1e(energy_scores['pedestrian'], ped_target)
@@ -837,19 +974,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                       and behavior_labels is not None
                       and allowed_flags is not None)
 
-        # ========== Build anchor slots (32) ==========
-        if has_energy:
-            anchor_abs = self.anchor_centers_abs.to(device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1, -1, -1).clone()  # (B, M_anchor, T, 2)
-            behavior_labels_dev = behavior_labels.to(device=device).clone()
-            allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype).clone()
-
-            # Replace first K slots with GT augmentation
-            K = min(self.num_gt_augmentations, M_anchor)
-            if K > 0:
-                gt_aug = self._augment_gt(trajectory, K)  # (B, K, T, 2)
-                anchor_abs[:, :K] = gt_aug
-                behavior_labels_dev[:, :K] = 0
-                allowed_flags_dev[:, :K] = 1.0
+        # ========== Build anchor slots ==========
 
         # ========== Build GT slot (1) ==========
         gt_abs = trajectory.unsqueeze(1)  # (B, 1, T, 2)
@@ -870,6 +995,29 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # IMPORTANT: x_t (diffusion) is at position 0 to match M=1 inference (predict_action).
         # Order: [x_t(0), anchors(1-32), GT(33)]
         if has_energy:
+            (
+                M_anchor,
+                anchor_subset,
+                behavior_labels_subset,
+                allowed_flags_subset,
+                _,
+                _,
+            ) = self._slice_energy_anchor_inputs(
+                device=device,
+                model_dtype=model_dtype,
+                behavior_labels=behavior_labels,
+                allowed_flags=allowed_flags,
+            )
+            anchor_abs = anchor_subset.unsqueeze(0).expand(B, -1, -1, -1).clone()
+            behavior_labels_dev = behavior_labels_subset.to(device=device).clone()
+            allowed_flags_dev = allowed_flags_subset.to(device=device, dtype=model_dtype).clone()
+            K = min(self.num_gt_augmentations, M_anchor)
+            if K > 0:
+                gt_aug = self._augment_gt(trajectory, K)
+                anchor_abs[:, :K] = gt_aug
+                behavior_labels_dev[:, :K] = 0
+                allowed_flags_dev[:, :K] = 1.0
+
             # Energy anchor input: normalize anchors
             anchor_normed = self.abs_to_norm(anchor_abs)  # (B, M_anchor, T, 2)
             gt_normed = self.abs_to_norm(gt_abs)           # (B, 1, T, 2)
@@ -957,7 +1105,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if not self.use_safe_anchors:
                 active_mask = torch.ones(B, M_energy, device=device, dtype=torch.bool)
                 allowed_flags_original = torch.cat([
-                    allowed_flags.to(device=device),
+                    allowed_flags_dev,
                     torch.ones(B, 1, device=device),  # GT always active
                 ], dim=1)
                 K = min(self.num_gt_augmentations, M_anchor)
@@ -966,7 +1114,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
                 n_active = active_mask.sum()
                 if n_active > 0:
-                    loss_front = _sl1e(energy_scores_energy['front'],  front_target,  active_mask)
+                    if self.use_front_route_risk_energy:
+                        loss_front = self._compute_front_route_energy_loss(
+                            energy_scores_energy['front'][:, -1],
+                            batch,
+                            device,
+                            model_dtype,
+                        )
+                    else:
+                        loss_front = _sl1e(energy_scores_energy['front'],  front_target,  active_mask)
                     loss_left  = _sl1e(energy_scores_energy['left'],   left_target,   active_mask)
                     loss_right = _sl1e(energy_scores_energy['right'],  right_target,  active_mask)
                     loss_ped   = _sl1e(energy_scores_energy['pedestrian'], ped_target, active_mask)
@@ -974,7 +1130,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 # Route loss on ALL slots (continuous metric)
                 loss_route = _sl1e(energy_scores_energy['route'], route_target_all)
             else:
-                loss_front = _sl1e(energy_scores_energy['front'],  front_target)
+                if self.use_front_route_risk_energy:
+                    loss_front = self._compute_front_route_energy_loss(
+                        energy_scores_energy['front'][:, -1],
+                        batch,
+                        device,
+                        model_dtype,
+                    )
+                else:
+                    loss_front = _sl1e(energy_scores_energy['front'],  front_target)
                 loss_left  = _sl1e(energy_scores_energy['left'],   left_target)
                 loss_right = _sl1e(energy_scores_energy['right'],  right_target)
                 loss_ped   = _sl1e(energy_scores_energy['pedestrian'], ped_target)
@@ -1151,9 +1315,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             }
 
         # --- Build mixed input: GT augmentation + anchors ---
-        anchor_abs = self.anchor_centers_abs.unsqueeze(0).expand(B, -1, -1, -1).clone()  # (B, M, T, 2)
-        behavior_labels_dev = behavior_labels.to(device=device).clone()
-        allowed_flags_dev = allowed_flags.to(device=device, dtype=model_dtype).clone()
+        (
+            M,
+            anchor_subset,
+            behavior_labels_subset,
+            allowed_flags_subset,
+            _,
+            _,
+        ) = self._slice_energy_anchor_inputs(
+            device=device,
+            model_dtype=model_dtype,
+            behavior_labels=behavior_labels,
+            allowed_flags=allowed_flags,
+        )
+        anchor_abs = anchor_subset.unsqueeze(0).expand(B, -1, -1, -1).clone()  # (B, M, T, 2)
+        behavior_labels_dev = behavior_labels_subset.to(device=device).clone()
+        allowed_flags_dev = allowed_flags_subset.to(device=device, dtype=model_dtype).clone()
 
         # Replace first K slots with GT augmentation (reliable positive samples)
         K = min(self.num_gt_augmentations, M)
@@ -1220,12 +1397,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if not self.use_safe_anchors:
             # Binary heads: GT augmentation (first K, always safe) + forbidden anchors only
             active_mask = torch.ones(B, M, device=device, dtype=torch.bool)
-            allowed_flags_original = allowed_flags.to(device=device)
-            active_mask[:, K:] = (allowed_flags_original[:, K:] < 0.5)
+            active_mask[:, K:] = (allowed_flags_dev[:, K:] < 0.5)
 
             n_active = active_mask.sum()
             if n_active > 0:
-                loss_front = _sl1(energy_scores['front'], front_target, active_mask)
+                if self.use_front_route_risk_energy:
+                    gt_like_front = energy_scores['front'].mean(dim=1)
+                    loss_front = self._compute_front_route_energy_loss(
+                        gt_like_front,
+                        batch,
+                        device,
+                        model_dtype,
+                    )
+                else:
+                    loss_front = _sl1(energy_scores['front'], front_target, active_mask)
                 loss_left  = _sl1(energy_scores['left'],  left_target,  active_mask)
                 loss_right = _sl1(energy_scores['right'], right_target, active_mask)
                 loss_ped   = _sl1(energy_scores['pedestrian'], ped_target, active_mask)
@@ -1235,7 +1420,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             # Route loss on ALL anchors (continuous metric, not safety-based masking)
             loss_route = _sl1(energy_scores['route'], route_target)
         else:
-            loss_front = _sl1(energy_scores['front'], front_target)
+            if self.use_front_route_risk_energy:
+                gt_like_front = energy_scores['front'].mean(dim=1)
+                loss_front = self._compute_front_route_energy_loss(
+                    gt_like_front,
+                    batch,
+                    device,
+                    model_dtype,
+                )
+            else:
+                loss_front = _sl1(energy_scores['front'], front_target)
             loss_left  = _sl1(energy_scores['left'],  left_target)
             loss_right = _sl1(energy_scores['right'], right_target)
             loss_ped   = _sl1(energy_scores['pedestrian'], ped_target)

@@ -396,6 +396,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
 
     feature_suffix = config.get('dataset', {}).get('feature_suffix', '')
+    validation_enabled = config.get('validation', {}).get('enabled', True)
+    build_validation = validation_enabled or val_only
+
     train_dataset = CARLAImageDataset(
         dataset_path=train_dataset_path, image_data_root=image_data_root,
         use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
@@ -404,21 +407,27 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         gps_noise_cfg=gps_noise_cfg,
         load_transfuser_lidar_bev=use_lidar_bev_detail,
     )
-    # Val dataset: skip memmap, will inject RAM features after config is parsed
-    val_dataset_orig = CARLAImageDataset(
-        dataset_path=val_dataset_path, image_data_root=image_data_root,
-        skip_memmap=True, use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
-        anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
-        load_transfuser_lidar_bev=use_lidar_bev_detail,
-    )
-    # if val_only:
-    #     val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
-    # else:
-    val_dataset = val_dataset_orig
+    val_dataset_orig = None
+    val_dataset = None
+    if build_validation:
+        # Val dataset: skip memmap, will inject RAM features after config is parsed
+        val_dataset_orig = CARLAImageDataset(
+            dataset_path=val_dataset_path, image_data_root=image_data_root,
+            skip_memmap=True, use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
+            anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+            load_transfuser_lidar_bev=use_lidar_bev_detail,
+        )
+        # if val_only:
+        #     val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
+        # else:
+        val_dataset = val_dataset_orig
 
     if rank == 0:
         print(f"\nTraining samples: {len(train_dataset)}")
-        print(f"Validation samples: {len(val_dataset)}" + (" (train+val combined)" if val_only else ""))
+        if val_dataset is not None:
+            print(f"Validation samples: {len(val_dataset)}" + (" (train+val combined)" if val_only else ""))
+        else:
+            print("Validation: disabled by config (validation.enabled=false)")
     
 
     
@@ -455,7 +464,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     # Inject val features from train's memmap into RAM (only this rank's samples)
     _max_val_per_rank = val_max_batches * val_batch_size if val_max_batches else None
-    if not use_per_frame:
+    if not use_per_frame and val_dataset_orig is not None:
         val_dataset_orig.inject_ram_features(train_dataset, rank=rank, world_size=world_size, max_val_samples=_max_val_per_rank)
 
     def safe_collate(batch):
@@ -529,41 +538,43 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     # Validation loader: only create meaningful loader for rank 0
     # Other ranks get an empty loader since they don't validate
-    if world_size > 1:
-        # All ranks participate in validation to avoid NCCL timeout
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            val_dataset,
-            shuffle=False,
-            num_replicas=world_size,
-            rank=rank,
-            drop_last=True
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=val_batch_size,
-            sampler=val_sampler,
-            shuffle=False,
-            num_workers=val_num_workers,
-            pin_memory=val_pin_memory,
-            persistent_workers=val_persistent_workers if val_num_workers > 0 else False,
-            prefetch_factor=val_prefetch_factor if val_num_workers > 0 else None,
-            drop_last=True,
-            collate_fn=safe_collate,
-        )
-    else:
-        # Single GPU: use full validation dataset
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=val_batch_size,
-            sampler=sampler_val,
-            shuffle=False,
-            num_workers=val_num_workers,
-            pin_memory=val_pin_memory,
-            persistent_workers=val_persistent_workers if val_num_workers > 0 else False,
-            prefetch_factor=val_prefetch_factor if val_num_workers > 0 else None,
-            drop_last=True,
-            collate_fn=safe_collate,
-        )
+    val_loader = None
+    if val_dataset is not None:
+        if world_size > 1:
+            # All ranks participate in validation to avoid NCCL timeout
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                val_dataset,
+                shuffle=False,
+                num_replicas=world_size,
+                rank=rank,
+                drop_last=True
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=val_batch_size,
+                sampler=val_sampler,
+                shuffle=False,
+                num_workers=val_num_workers,
+                pin_memory=val_pin_memory,
+                persistent_workers=val_persistent_workers if val_num_workers > 0 else False,
+                prefetch_factor=val_prefetch_factor if val_num_workers > 0 else None,
+                drop_last=True,
+                collate_fn=safe_collate,
+            )
+        else:
+            # Single GPU: use full validation dataset
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=val_batch_size,
+                sampler=sampler_val,
+                shuffle=False,
+                num_workers=val_num_workers,
+                pin_memory=val_pin_memory,
+                persistent_workers=val_persistent_workers if val_num_workers > 0 else False,
+                prefetch_factor=val_prefetch_factor if val_num_workers > 0 else None,
+                drop_last=True,
+                collate_fn=safe_collate,
+            )
 
     # Mixed precision (AMP) setup — prefer BF16 on supported hardware
     use_amp = config.get('model_optimization', {}).get('use_mixed_precision', True)
@@ -838,6 +849,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     # ========== Val Only Mode ==========
     if val_only:
+        if val_loader is None:
+            raise ValueError("Validation is disabled by config, but --val_only was requested.")
         if rank == 0:
             print("=" * 60)
             print("Running validation only (--val_only mode)")
@@ -1103,7 +1116,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 "train/samples_processed": (epoch + 1) * len(train_dataset)
             }, use_wandb)
 
-        if (epoch + 1) % validation_freq == 0:
+        if val_loader is not None and validation_freq > 0 and (epoch + 1) % validation_freq == 0:
             # Apply EMA weights for validation
             ema_model.store(model_for_ema.parameters())
             ema_model.copy_to(model_for_ema.parameters())
@@ -1180,7 +1193,10 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     if rank == 0:
         print("Training completed!")
-        print(f"Best L2_avg: {best_l2_avg:.4f}")
+        if val_loader is not None:
+            print(f"Best L2_avg: {best_l2_avg:.4f}")
+        else:
+            print("Validation was disabled for this run.")
         safe_wandb_log({
             "training/completed": 0.0,
             "training/total_epochs": num_epochs,
