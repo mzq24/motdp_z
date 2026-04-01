@@ -281,6 +281,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def _init_semantic_hazard_state(self):
 		self.semantic_bev_pixels_per_meter = 2.0
 		self.semantic_tl_min_pixels = 6
+		self.semantic_tl_brake_distance_m = float(
+			os.environ.get('SEMANTIC_TL_BRAKE_DISTANCE_M', '18.0')
+		)
 		self.semantic_stop_min_pixels = 3
 		self.semantic_tl_min_models = max(
 			1,
@@ -292,7 +295,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		)
 		self.semantic_tl_roi = (0.0, 25.0, -10.0, 10.0)
 		self.semantic_tl_green_release_delay_frames = int(
-			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_DELAY_FRAMES', '50')
+			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_DELAY_FRAMES', '10')
 		)
 		self.semantic_tl_green_release_speed_threshold = float(
 			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_SPEED_THRESHOLD', '0.5')
@@ -537,18 +540,30 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		state = 'none'
 		block_force_move = False
+		closest_forward_m = None
 		if red_stats['count'] >= self.semantic_tl_min_pixels:
 			state = 'red'
 			block_force_move = True
+			closest_forward_m = red_stats['closest_forward_m']
 		elif yellow_stats['count'] >= self.semantic_tl_min_pixels:
 			state = 'yellow'
 			block_force_move = True
+			closest_forward_m = yellow_stats['closest_forward_m']
 		elif green_stats['count'] >= self.semantic_tl_min_pixels:
 			state = 'green'
+			closest_forward_m = green_stats['closest_forward_m']
+
+		apply_stop = (
+			state in ('red', 'yellow')
+			and closest_forward_m is not None
+			and closest_forward_m <= self.semantic_tl_brake_distance_m
+		)
 
 		return {
 			'state': state,
 			'block_force_move': block_force_move,
+			'apply_stop': apply_stop,
+			'closest_forward_m': closest_forward_m,
 			'red_pixels': red_stats['count'],
 			'yellow_pixels': yellow_stats['count'],
 			'green_pixels': green_stats['count'],
@@ -694,6 +709,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.stuck_detector = 0
 			self.force_move = 0
 
+		if traffic_light_debug['apply_stop']:
+			throttle = 0.0
+			brake = 1.0
+			self.stuck_detector = 0
+			self.force_move = 0
+			if force_move_blocked_reason is None:
+				force_move_blocked_reason = f"traffic_light_{traffic_light_state}"
+
 		if stop_sign_debug['apply_stop']:
 			throttle = 0.0
 			brake = 1.0
@@ -705,6 +728,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		debug = {
 			'traffic_light_state': traffic_light_debug['state'],
 			'traffic_light_block_force_move': traffic_light_debug['block_force_move'],
+			'traffic_light_apply_stop': bool(traffic_light_debug['apply_stop']),
+			'traffic_light_closest_forward_m': traffic_light_debug['closest_forward_m'],
 			'traffic_light_green_hold_active': bool(green_hold_active),
 			'traffic_light_green_hold_frames_remaining': int(self.semantic_tl_green_hold_frames),
 			'traffic_light_red_pixels': int(traffic_light_debug['red_pixels']),
@@ -818,6 +843,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Load diffusion policy first (smaller model)
 		print("Loading diffusion policy...")
 		self.config = create_carla_config(self.config_path)
+		self.use_lidar_bev_detail = bool(
+			self.config.get('route_b', {}).get('use_lidar_bev_detail', False)
+		)
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_path = self.resolve_checkpoint_path()
 		self.net = load_best_model(checkpoint_path, self.config, device)
@@ -829,6 +857,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.net.route_b_cfg['num_inference_steps'] = override_steps
 			print(f"Overriding Route-B num_inference_steps -> {override_steps}")
 		print("✓ Diffusion policy loaded (float32).")
+		print(f"  - use_lidar_bev_detail: {self.use_lidar_bev_detail}")
 		
 		# Aggressive memory cleanup before loading MoT model
 		gc.collect()
@@ -1470,6 +1499,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			use_ground_plane=self.transfuser_config.use_ground_plane
 		)
 		transfuser_lidar_bev_tensor = torch.from_numpy(transfuser_lidar_bev).float().unsqueeze(0).to('cuda')
+		# Inverted LiDAR BEV for DiT detail sampling (obstacles → high values)
+		transfuser_lidar_bev_inv = 1.0 - transfuser_lidar_bev_tensor
 		
 		# Process other sensors
 		if IS_BENCH2DRIVE:
@@ -1491,7 +1522,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'target_pose_source': target_pose_source,
 				# TransFuser processed data for DP
 				'transfuser_rgb': transfuser_rgb_tensor,  # (1, 3, H, W) on GPU
-				'transfuser_lidar_bev': transfuser_lidar_bev_tensor,  # (1, C, H, W) on GPU
+				'transfuser_lidar_bev': transfuser_lidar_bev_tensor,  # (1, C, H, W) on GPU, raw for backbone
+				'transfuser_lidar_bev_inv': transfuser_lidar_bev_inv,  # (1, C, H, W) inverted for DiT detail
 				}
 		
 		waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
@@ -2145,12 +2177,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				)
 				tick_data['bev_semantic_classes'] = bev_semantic_classes
 				
+				# Keep predict_action batch schema stable on the non-LiDAR path.
+				# The policy will ignore this tensor when use_lidar_bev_detail is false,
+				# but dict_apply() still requires a real tensor instead of None.
+				transfuser_lidar_bev_detail = tick_data.get('transfuser_lidar_bev_inv')
+				if transfuser_lidar_bev_detail is None or not self.use_lidar_bev_detail:
+					transfuser_lidar_bev_detail = torch.zeros_like(
+						tick_data['transfuser_lidar_bev']
+					)
+
 				# Build dp_obs_dict with transfuser features
 				dp_obs_dict = {
 					'ego_status': ego_status_stacked,
 					'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
-				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
-			}
+					'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
+					'transfuser_lidar_bev': transfuser_lidar_bev_detail,  # (1, 2, 256, 256)
+				}
 			dp_pred_traj = self._predict_dp_action(dp_obs_dict)
 			# Store predicted target speed for control_pid
 			self._last_target_speed = dp_pred_traj.get('target_speed', None)
@@ -2261,6 +2303,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'force_move': int(self.force_move),
 				'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
 				'traffic_light_semantic_block_force_move': bool(semantic_debug.get('traffic_light_block_force_move', False)),
+				'traffic_light_semantic_apply_stop': bool(semantic_debug.get('traffic_light_apply_stop', False)),
+				'traffic_light_semantic_closest_forward_m': semantic_debug.get('traffic_light_closest_forward_m'),
 				'traffic_light_semantic_green_hold_active': bool(semantic_debug.get('traffic_light_green_hold_active', False)),
 				'traffic_light_semantic_green_hold_frames_remaining': int(semantic_debug.get('traffic_light_green_hold_frames_remaining', 0)),
 				'traffic_light_semantic_red_pixels': int(semantic_debug.get('traffic_light_red_pixels', 0)),
