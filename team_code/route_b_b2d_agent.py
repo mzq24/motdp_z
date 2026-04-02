@@ -131,6 +131,29 @@ SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_he
 SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
     '1', 'true', 'yes', 'on'
 )
+FRONT_ROUTE_RISK_SPEED_CAP_ENABLE = os.environ.get('FRONT_ROUTE_RISK_SPEED_CAP_ENABLE', '1').lower() in (
+	'1', 'true', 'yes', 'on'
+)
+FRONT_ROUTE_RISK_RECENT_WINDOW = max(1, int(os.environ.get('FRONT_ROUTE_RISK_RECENT_WINDOW', '8')))
+FRONT_ROUTE_RISK_HOLD_FRAMES = max(0, int(os.environ.get('FRONT_ROUTE_RISK_HOLD_FRAMES', '8')))
+FRONT_ROUTE_RISK_MIN_SPEED_MS = float(os.environ.get('FRONT_ROUTE_RISK_MIN_SPEED_MS', '5.0'))
+FRONT_ROUTE_RISK_GEOM_ANGLE_DEG = float(os.environ.get('FRONT_ROUTE_RISK_GEOM_ANGLE_DEG', '12.0'))
+FRONT_ROUTE_RISK_GEOM_LATERAL_M = float(os.environ.get('FRONT_ROUTE_RISK_GEOM_LATERAL_M', '2.5'))
+FRONT_ROUTE_RISK_MED_SIGMOID = float(os.environ.get('FRONT_ROUTE_RISK_MED_SIGMOID', '0.76'))
+FRONT_ROUTE_RISK_HIGH_SIGMOID = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_SIGMOID', '0.86'))
+FRONT_ROUTE_RISK_HIGH_EMA = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_EMA', '1.35'))
+FRONT_ROUTE_RISK_MED_CAP_MS = float(os.environ.get('FRONT_ROUTE_RISK_MED_CAP_MS', '6.5'))
+FRONT_ROUTE_RISK_HIGH_CAP_MS = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_CAP_MS', '4.5'))
+FRONT_ROUTE_RISK_EARLY_SPEED_START_MS = float(os.environ.get('FRONT_ROUTE_RISK_EARLY_SPEED_START_MS', '6.5'))
+FRONT_ROUTE_RISK_EARLY_SPEED_FULL_MS = float(os.environ.get('FRONT_ROUTE_RISK_EARLY_SPEED_FULL_MS', '9.0'))
+FRONT_ROUTE_RISK_MED_SIGMOID_SPEED_DELTA = float(os.environ.get('FRONT_ROUTE_RISK_MED_SIGMOID_SPEED_DELTA', '0.16'))
+FRONT_ROUTE_RISK_HIGH_SIGMOID_SPEED_DELTA = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_SIGMOID_SPEED_DELTA', '0.14'))
+FRONT_ROUTE_RISK_HIGH_EMA_SPEED_DELTA = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_EMA_SPEED_DELTA', '0.50'))
+FRONT_ROUTE_RISK_MED_SIGMOID_MIN = float(os.environ.get('FRONT_ROUTE_RISK_MED_SIGMOID_MIN', '0.60'))
+FRONT_ROUTE_RISK_HIGH_SIGMOID_MIN = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_SIGMOID_MIN', '0.72'))
+FRONT_ROUTE_RISK_HIGH_EMA_MIN = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_EMA_MIN', '0.80'))
+FRONT_ROUTE_RISK_RAW_OVERRIDE_SPEED_MS = float(os.environ.get('FRONT_ROUTE_RISK_RAW_OVERRIDE_SPEED_MS', '8.0'))
+FRONT_ROUTE_RISK_RAW_OVERRIDE_SCORE = float(os.environ.get('FRONT_ROUTE_RISK_RAW_OVERRIDE_SCORE', '1.6'))
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -803,6 +826,147 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		return debug
 
+	def _get_front_route_risk_speed_cap(self, tick_data, ego_speed):
+		debug = {
+			'active': False,
+			'reason': None,
+			'speed_cap_ms': None,
+			'raw_score': None,
+			'sigmoid': None,
+			'ema': None,
+			'recent_max_sigmoid': None,
+			'geometry_active': False,
+			'gate_active': False,
+			'raw_override_active': False,
+			'geometry_max_angle_deg': 0.0,
+			'geometry_lateral_mag_m': 0.0,
+			'speed_bias_ratio': 0.0,
+			'effective_med_sigmoid_threshold': float(FRONT_ROUTE_RISK_MED_SIGMOID),
+			'effective_high_sigmoid_threshold': float(FRONT_ROUTE_RISK_HIGH_SIGMOID),
+			'effective_high_ema_threshold': float(FRONT_ROUTE_RISK_HIGH_EMA),
+			'hold_frames_remaining': int(self.front_route_risk_cap_hold_frames),
+		}
+
+		if not self.use_front_route_risk_energy or not FRONT_ROUTE_RISK_SPEED_CAP_ENABLE:
+			self.front_route_risk_cap_hold_frames = 0
+			self.front_route_risk_cap_value_ms = None
+			return debug
+
+		raw_score = self.last_energy_debug.get('front_route_risk_score')
+		sigmoid = self.last_energy_debug.get('front_route_risk_sigmoid')
+		ema = self.last_energy_debug.get('front_route_risk_ema')
+		if raw_score is not None:
+			raw_score = float(raw_score)
+		if sigmoid is not None:
+			sigmoid = float(sigmoid)
+			self.front_route_risk_sigmoid_history.append(sigmoid)
+		if ema is not None:
+			ema = float(ema)
+
+		recent_max_sigmoid = None
+		if len(self.front_route_risk_sigmoid_history) > 0:
+			recent_max_sigmoid = float(max(self.front_route_risk_sigmoid_history))
+
+		target_angle = abs(float(tick_data.get('target_angle_deg', 0.0)))
+		next_target_angle = abs(float(tick_data.get('next_target_angle_deg', 0.0)))
+		target_point = tick_data.get('target_point')
+		next_target_point = tick_data.get('next_target_point')
+		target_lat = abs(float(target_point[1])) if target_point is not None else 0.0
+		next_target_lat = abs(float(next_target_point[1])) if next_target_point is not None else 0.0
+		max_angle = max(target_angle, next_target_angle)
+		lateral_mag = max(target_lat, next_target_lat)
+		geometry_active = (
+			max_angle >= FRONT_ROUTE_RISK_GEOM_ANGLE_DEG
+			or lateral_mag >= FRONT_ROUTE_RISK_GEOM_LATERAL_M
+		)
+
+		debug.update({
+			'raw_score': raw_score,
+			'sigmoid': sigmoid,
+			'ema': ema,
+			'recent_max_sigmoid': recent_max_sigmoid,
+			'geometry_active': bool(geometry_active),
+			'geometry_max_angle_deg': float(max_angle),
+			'geometry_lateral_mag_m': float(lateral_mag),
+		})
+
+		speed_bias_ratio = 0.0
+		if FRONT_ROUTE_RISK_EARLY_SPEED_FULL_MS > FRONT_ROUTE_RISK_EARLY_SPEED_START_MS:
+			speed_bias_ratio = float(np.clip(
+				(ego_speed - FRONT_ROUTE_RISK_EARLY_SPEED_START_MS) /
+				(FRONT_ROUTE_RISK_EARLY_SPEED_FULL_MS - FRONT_ROUTE_RISK_EARLY_SPEED_START_MS),
+				0.0,
+				1.0,
+			))
+		effective_med_sigmoid = max(
+			FRONT_ROUTE_RISK_MED_SIGMOID_MIN,
+			FRONT_ROUTE_RISK_MED_SIGMOID - FRONT_ROUTE_RISK_MED_SIGMOID_SPEED_DELTA * speed_bias_ratio,
+		)
+		effective_high_sigmoid = max(
+			FRONT_ROUTE_RISK_HIGH_SIGMOID_MIN,
+			FRONT_ROUTE_RISK_HIGH_SIGMOID - FRONT_ROUTE_RISK_HIGH_SIGMOID_SPEED_DELTA * speed_bias_ratio,
+		)
+		effective_high_ema = max(
+			FRONT_ROUTE_RISK_HIGH_EMA_MIN,
+			FRONT_ROUTE_RISK_HIGH_EMA - FRONT_ROUTE_RISK_HIGH_EMA_SPEED_DELTA * speed_bias_ratio,
+		)
+		debug.update({
+			'speed_bias_ratio': float(speed_bias_ratio),
+			'effective_med_sigmoid_threshold': float(effective_med_sigmoid),
+			'effective_high_sigmoid_threshold': float(effective_high_sigmoid),
+			'effective_high_ema_threshold': float(effective_high_ema),
+		})
+
+		gate_active = (
+			ego_speed >= FRONT_ROUTE_RISK_MIN_SPEED_MS
+			and recent_max_sigmoid is not None
+		)
+		debug.update({
+			'gate_active': bool(gate_active),
+			'raw_override_active': bool(gate_active),
+		})
+
+		candidate_cap_ms = None
+		reason = None
+		if gate_active:
+			if recent_max_sigmoid >= effective_high_sigmoid or (
+				ema is not None and ema >= effective_high_ema
+			):
+				candidate_cap_ms = float(FRONT_ROUTE_RISK_HIGH_CAP_MS)
+				reason = 'front_route_risk_high'
+			elif recent_max_sigmoid >= effective_med_sigmoid:
+				candidate_cap_ms = float(FRONT_ROUTE_RISK_MED_CAP_MS)
+				reason = 'front_route_risk_medium'
+
+		if candidate_cap_ms is not None:
+			self.front_route_risk_cap_value_ms = candidate_cap_ms
+			self.front_route_risk_cap_hold_frames = FRONT_ROUTE_RISK_HOLD_FRAMES
+			debug.update({
+				'active': True,
+				'reason': reason,
+				'speed_cap_ms': candidate_cap_ms,
+				'hold_frames_remaining': int(self.front_route_risk_cap_hold_frames),
+			})
+			return debug
+
+		if (
+			gate_active
+			and self.front_route_risk_cap_hold_frames > 0
+			and self.front_route_risk_cap_value_ms is not None
+		):
+			self.front_route_risk_cap_hold_frames -= 1
+			debug.update({
+				'active': True,
+				'reason': 'front_route_risk_hold',
+				'speed_cap_ms': float(self.front_route_risk_cap_value_ms),
+				'hold_frames_remaining': int(self.front_route_risk_cap_hold_frames),
+			})
+			return debug
+
+		self.front_route_risk_cap_hold_frames = 0
+		self.front_route_risk_cap_value_ms = None
+		return debug
+
 	def get_default_config_path(self):
 		return "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
 
@@ -825,6 +989,73 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def _predict_dp_action(self, dp_obs_dict):
 		return self.net.predict_action(dp_obs_dict, no_noise=True)
 
+	def _compute_front_route_risk_debug(
+		self,
+		dp_pred_traj,
+		transfuser_bev_feature,
+		transfuser_bev_feature_upsample,
+		ego_status_stacked,
+		transfuser_lidar_bev_detail,
+	):
+		if not getattr(self, 'use_front_route_risk_energy', False):
+			return None
+		if not hasattr(self, 'net') or not hasattr(self.net, 'model'):
+			return None
+		if not hasattr(self.net.model, 'forward_energy_eval'):
+			return None
+
+		try:
+			device = next(self.net.parameters()).device
+			model_dtype = next(self.net.parameters()).dtype
+
+			traj_abs = dp_pred_traj.get('action')
+			route_pred = dp_pred_traj.get('route_pred')
+			if traj_abs is None or route_pred is None:
+				return None
+
+			if isinstance(traj_abs, np.ndarray):
+				traj_abs = torch.from_numpy(traj_abs)
+			if isinstance(route_pred, np.ndarray):
+				route_pred = torch.from_numpy(route_pred)
+
+			traj_abs = traj_abs.to(device=device, dtype=model_dtype)
+			route_pred = route_pred.to(device=device, dtype=model_dtype)
+			if traj_abs.dim() == 2:
+				traj_abs = traj_abs.unsqueeze(0)
+			if route_pred.dim() == 2:
+				route_pred = route_pred.unsqueeze(0)
+
+			x_t_abs = traj_abs.unsqueeze(1)  # (B, 1, T, 2)
+			x_t = self.net.abs_to_norm(traj_abs).unsqueeze(1)
+
+			bev_proj = self.net.model.decoder.compute_bev_proj(
+				transfuser_bev_feature.to(device=device, dtype=model_dtype)
+			)
+
+			with torch.no_grad():
+				energy_scores, _ = self.net.model.forward_energy_eval(
+					x_t=x_t,
+					x_t_abs=x_t_abs,
+					transfuser_bev_feature=transfuser_bev_feature.to(device=device, dtype=model_dtype),
+					transfuser_bev_feature_upsample=transfuser_bev_feature_upsample.to(device=device, dtype=model_dtype),
+					ego_status=ego_status_stacked.to(device=device, dtype=model_dtype),
+					traj_for_energy=x_t_abs,
+					bev_proj_cached=bev_proj,
+					route_points=route_pred,
+					transfuser_lidar_bev=transfuser_lidar_bev_detail.to(device=device, dtype=model_dtype),
+				)
+
+			if energy_scores is None or 'front' not in energy_scores:
+				return None
+			front_score = energy_scores['front']
+			front_array = front_score.detach().float().reshape(-1)
+			if front_array.numel() == 0:
+				return None
+			return float(front_array[0].item())
+		except Exception as exc:
+			print(f"[front_route_risk_debug] failed: {exc}")
+			return None
+
 	def setup(self, path_to_conf_file):
 		self.track = autonomous_agent.Track.SENSORS
 		if IS_BENCH2DRIVE:
@@ -846,6 +1077,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.use_lidar_bev_detail = bool(
 			self.config.get('route_b', {}).get('use_lidar_bev_detail', False)
 		)
+		self.use_front_route_risk_energy = bool(
+			self.config.get('route_b', {}).get('use_front_route_risk_energy', False)
+		)
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_path = self.resolve_checkpoint_path()
 		self.net = load_best_model(checkpoint_path, self.config, device)
@@ -858,6 +1092,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"Overriding Route-B num_inference_steps -> {override_steps}")
 		print("✓ Diffusion policy loaded (float32).")
 		print(f"  - use_lidar_bev_detail: {self.use_lidar_bev_detail}")
+		print(f"  - use_front_route_risk_energy: {self.use_front_route_risk_energy}")
 		
 		# Aggressive memory cleanup before loading MoT model
 		gc.collect()
@@ -1063,7 +1298,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_waypoint_route = None  # Store the planner waypoint route (in ego frame)
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 		self.last_energy_debug = {}
+		self.last_model_input_debug = {}
 		self.last_speed_debug = {}
+		self.front_route_risk_ema = None
+		self.front_route_risk_sigmoid_history = deque(maxlen=FRONT_ROUTE_RISK_RECENT_WINDOW)
+		self.front_route_risk_cap_hold_frames = 0
+		self.front_route_risk_cap_value_ms = None
+		self.last_front_route_risk_cap_debug = {}
 		self.last_terminal_route_debug = {}
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
@@ -1499,8 +1740,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			use_ground_plane=self.transfuser_config.use_ground_plane
 		)
 		transfuser_lidar_bev_tensor = torch.from_numpy(transfuser_lidar_bev).float().unsqueeze(0).to('cuda')
-		# Inverted LiDAR BEV for DiT detail sampling (obstacles → high values)
-		transfuser_lidar_bev_inv = 1.0 - transfuser_lidar_bev_tensor
+		# LiDAR-detail path follows the 2-channel split histogram convention from docs:
+		# ch0 = below-split histogram, ch1 = above-split histogram, then inverted.
+		transfuser_lidar_bev_detail = self.transfuser_data.lidar_to_histogram_features(
+			transfuser_lidar_full,
+			use_ground_plane=True
+		)
+		transfuser_lidar_bev_detail_tensor = torch.from_numpy(
+			transfuser_lidar_bev_detail
+		).float().unsqueeze(0).to('cuda')
+		transfuser_lidar_bev_inv = 1.0 - transfuser_lidar_bev_detail_tensor
 		
 		# Process other sensors
 		if IS_BENCH2DRIVE:
@@ -1796,7 +2045,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		return truncated, truncation_idx
 	
-	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None, terminal_speed_cap_ms=None):
+	def control_pid(
+		self,
+		route_waypoints,
+		velocity,
+		speed_waypoints,
+		target_point=None,
+		terminal_speed_cap_ms=None,
+		front_route_risk_cap_ms=None,
+	):
 		"""
 		Predicts vehicle control with a PID controller.
 		
@@ -1903,10 +2160,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			desired_speed = traj_speed
 
 		desired_speed_raw = float(desired_speed)
+		desired_speed_after_soft_cap = float(desired_speed)
 		if SOFT_SPEED_LIMIT_MS > 0.0:
-			desired_speed = min(desired_speed, SOFT_SPEED_LIMIT_MS)
+			desired_speed_after_soft_cap = min(desired_speed_after_soft_cap, SOFT_SPEED_LIMIT_MS)
+		desired_speed_after_terminal_cap = float(desired_speed_after_soft_cap)
+		terminal_speed_cap_applied = False
 		if terminal_speed_cap_ms is not None and terminal_speed_cap_ms > 0.0:
-			desired_speed = min(desired_speed, terminal_speed_cap_ms)
+			terminal_speed_cap_applied = desired_speed_after_terminal_cap > float(terminal_speed_cap_ms)
+			desired_speed_after_terminal_cap = min(desired_speed_after_terminal_cap, terminal_speed_cap_ms)
+		desired_speed_after_front_route_risk_cap = float(desired_speed_after_terminal_cap)
+		front_route_risk_cap_applied = False
+		if front_route_risk_cap_ms is not None and front_route_risk_cap_ms > 0.0:
+			front_route_risk_cap_applied = (
+				desired_speed_after_front_route_risk_cap > float(front_route_risk_cap_ms)
+			)
+			desired_speed_after_front_route_risk_cap = min(
+				desired_speed_after_front_route_risk_cap,
+				front_route_risk_cap_ms,
+			)
+		desired_speed = float(desired_speed_after_front_route_risk_cap)
 		self.last_speed_debug = {
 			'speed_source': SPEED_SOURCE,
 			'speed_head_speed': speed_head_speed,
@@ -1917,8 +2189,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'fusion_weights': fusion_weights,
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
+			'desired_speed_after_soft_cap': float(desired_speed_after_soft_cap),
+			'desired_speed_after_terminal_cap': float(desired_speed_after_terminal_cap),
+			'desired_speed_after_front_route_risk_cap': float(desired_speed_after_front_route_risk_cap),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
 			'terminal_speed_cap_ms': float(terminal_speed_cap_ms) if terminal_speed_cap_ms is not None else None,
+			'terminal_speed_cap_applied': bool(terminal_speed_cap_applied),
+			'front_route_risk_cap_ms': float(front_route_risk_cap_ms) if front_route_risk_cap_ms is not None else None,
+			'front_route_risk_cap_applied': bool(front_route_risk_cap_applied),
 			'hard_speed_limit_ms': float(HARD_SPEED_LIMIT_MS),
 		}
 
@@ -2180,11 +2458,59 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				# Keep predict_action batch schema stable on the non-LiDAR path.
 				# The policy will ignore this tensor when use_lidar_bev_detail is false,
 				# but dict_apply() still requires a real tensor instead of None.
+				transfuser_lidar_bev_raw = tick_data['transfuser_lidar_bev']
 				transfuser_lidar_bev_detail = tick_data.get('transfuser_lidar_bev_inv')
-				if transfuser_lidar_bev_detail is None or not self.use_lidar_bev_detail:
-					transfuser_lidar_bev_detail = torch.zeros_like(
-						tick_data['transfuser_lidar_bev']
+				if transfuser_lidar_bev_detail is None:
+					batch_size = transfuser_lidar_bev_raw.shape[0]
+					height = transfuser_lidar_bev_raw.shape[-2]
+					width = transfuser_lidar_bev_raw.shape[-1]
+					transfuser_lidar_bev_detail = torch.zeros(
+						(batch_size, 2, height, width),
+						dtype=transfuser_lidar_bev_raw.dtype,
+						device=transfuser_lidar_bev_raw.device,
 					)
+				detail_input_fallback = not self.use_lidar_bev_detail
+				if detail_input_fallback:
+					transfuser_lidar_bev_detail = torch.zeros_like(
+						transfuser_lidar_bev_detail
+					)
+
+				def _tensor_debug_stats(value):
+					if value is None:
+						return {
+							'mean': None,
+							'max': None,
+							'nonzero_ratio': None,
+						}
+					if isinstance(value, torch.Tensor):
+						value_cpu = value.detach().float().cpu()
+					else:
+						value_cpu = torch.as_tensor(value).float()
+					if value_cpu.numel() == 0:
+						return {
+							'mean': None,
+							'max': None,
+							'nonzero_ratio': None,
+						}
+					return {
+						'mean': float(value_cpu.mean().item()),
+						'max': float(value_cpu.max().item()),
+						'nonzero_ratio': float((value_cpu != 0).float().mean().item()),
+					}
+
+				raw_lidar_stats = _tensor_debug_stats(transfuser_lidar_bev_raw)
+				detail_lidar_stats = _tensor_debug_stats(transfuser_lidar_bev_detail)
+				self.last_model_input_debug = {
+					'use_lidar_bev_detail': bool(self.use_lidar_bev_detail),
+					'use_front_route_risk_energy': bool(self.use_front_route_risk_energy),
+					'lidar_bev_detail_zero_fallback': bool(detail_input_fallback),
+					'lidar_bev_raw_mean': raw_lidar_stats['mean'],
+					'lidar_bev_raw_max': raw_lidar_stats['max'],
+					'lidar_bev_raw_nonzero_ratio': raw_lidar_stats['nonzero_ratio'],
+					'lidar_bev_detail_mean': detail_lidar_stats['mean'],
+					'lidar_bev_detail_max': detail_lidar_stats['max'],
+					'lidar_bev_detail_nonzero_ratio': detail_lidar_stats['nonzero_ratio'],
+				}
 
 				# Build dp_obs_dict with transfuser features
 				dp_obs_dict = {
@@ -2220,6 +2546,33 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				energy_array = np.asarray(energy_value).reshape(-1)
 				if energy_array.size > 0:
 					self.last_energy_debug[energy_key] = float(energy_array[0])
+			front_route_risk_score = self._compute_front_route_risk_debug(
+				dp_pred_traj=dp_pred_traj,
+				transfuser_bev_feature=transfuser_bev_feature,
+				transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+				ego_status_stacked=ego_status_stacked,
+				transfuser_lidar_bev_detail=transfuser_lidar_bev_detail,
+			)
+			if front_route_risk_score is not None:
+				front_route_risk_score = float(front_route_risk_score)
+				front_route_risk_sigmoid = float(1.0 / (1.0 + np.exp(-front_route_risk_score)))
+				if self.front_route_risk_ema is None:
+					self.front_route_risk_ema = front_route_risk_score
+				else:
+					self.front_route_risk_ema = 0.85 * self.front_route_risk_ema + 0.15 * front_route_risk_score
+				self.last_energy_debug['front_route_risk_score'] = front_route_risk_score
+				self.last_energy_debug['front_route_risk_sigmoid'] = front_route_risk_sigmoid
+				self.last_energy_debug['front_route_risk_ema'] = float(self.front_route_risk_ema)
+			elif 'energy_front' in self.last_energy_debug and self.use_front_route_risk_energy:
+				front_route_risk_score = float(self.last_energy_debug['energy_front'])
+				front_route_risk_sigmoid = float(1.0 / (1.0 + np.exp(-front_route_risk_score)))
+				if self.front_route_risk_ema is None:
+					self.front_route_risk_ema = front_route_risk_score
+				else:
+					self.front_route_risk_ema = 0.85 * self.front_route_risk_ema + 0.15 * front_route_risk_score
+				self.last_energy_debug['front_route_risk_score'] = front_route_risk_score
+				self.last_energy_debug['front_route_risk_sigmoid'] = front_route_risk_sigmoid
+				self.last_energy_debug['front_route_risk_ema'] = float(self.front_route_risk_ema)
 			
 			# route_pred is 20 waypoints with equal intervals for lateral control
 			route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
@@ -2241,6 +2594,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			terminal_route_debug = self._get_terminal_route_speed_cap(tick_data)
 			self.last_terminal_route_debug = terminal_route_debug
+			front_route_risk_cap_debug = self._get_front_route_risk_speed_cap(
+				tick_data,
+				gt_velocity,
+			)
+			self.last_front_route_risk_cap_debug = front_route_risk_cap_debug
 
 			# Use target_point to truncate route for lateral control
 			steer, throttle, brake = self.control_pid(
@@ -2249,6 +2607,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				speed_waypoints,
 				target_point=target_point,
 				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
+				front_route_risk_cap_ms=front_route_risk_cap_debug.get('speed_cap_ms'),
 			)
 			throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
 				ego_speed=gt_velocity,
@@ -2259,7 +2618,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				external_force_move_block_reason=(
 					terminal_route_debug.get('reason') if terminal_route_debug.get('active') else None
 				),
-			)
+				)
 
 			applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
 			control = carla.VehicleControl()
@@ -2299,6 +2658,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'terminal_route_remaining_points': terminal_route_debug.get('remaining_route_points'),
 				'terminal_route_target_distance_m': terminal_route_debug.get('target_distance_m'),
 				'terminal_route_target_forward_m': terminal_route_debug.get('target_forward_m'),
+				'front_route_risk_speed_cap_active': bool(front_route_risk_cap_debug.get('active', False)),
+				'front_route_risk_speed_cap_reason': front_route_risk_cap_debug.get('reason'),
+				'front_route_risk_speed_cap_ms': front_route_risk_cap_debug.get('speed_cap_ms'),
+				'front_route_risk_speed_cap_applied': bool(self.last_speed_debug.get('front_route_risk_cap_applied', False)),
+				'front_route_risk_raw_score': front_route_risk_cap_debug.get('raw_score'),
+				'front_route_risk_recent_max_sigmoid': front_route_risk_cap_debug.get('recent_max_sigmoid'),
+				'front_route_risk_gate_active': bool(front_route_risk_cap_debug.get('gate_active', False)),
+				'front_route_risk_geometry_active': bool(front_route_risk_cap_debug.get('geometry_active', False)),
+				'front_route_risk_geometry_max_angle_deg': front_route_risk_cap_debug.get('geometry_max_angle_deg'),
+				'front_route_risk_geometry_lateral_mag_m': front_route_risk_cap_debug.get('geometry_lateral_mag_m'),
+				'front_route_risk_speed_bias_ratio': front_route_risk_cap_debug.get('speed_bias_ratio'),
+				'front_route_risk_effective_med_sigmoid_threshold': front_route_risk_cap_debug.get('effective_med_sigmoid_threshold'),
+				'front_route_risk_effective_high_sigmoid_threshold': front_route_risk_cap_debug.get('effective_high_sigmoid_threshold'),
+				'front_route_risk_effective_high_ema_threshold': front_route_risk_cap_debug.get('effective_high_ema_threshold'),
+				'front_route_risk_cap_hold_frames_remaining': int(front_route_risk_cap_debug.get('hold_frames_remaining', 0)),
 				'stuck_detector': int(self.stuck_detector),
 				'force_move': int(self.force_move),
 				'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
@@ -2404,6 +2778,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
 			for energy_key, energy_value in self.last_energy_debug.items():
 				self.pid_metadata[energy_key] = float(energy_value)
+			for input_key, input_value in self.last_model_input_debug.items():
+				self.pid_metadata[input_key] = input_value
 			for speed_key, speed_value in self.last_speed_debug.items():
 				self.pid_metadata[speed_key] = speed_value
 			self.prev_debug_planner_xy = planner_xy.copy()
@@ -2594,43 +2970,52 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		left_status_lines = [
 			f"frm: {self.step}",
 			f"v: {speed_kmh:.2f} km/h",
+			f"src: {self.pid_metadata.get('speed_source', 'N/A')}",
+			f"fus: {self.pid_metadata.get('fusion_regime', 'N/A')}",
 			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
 			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
 			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')}",
 			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')}",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
-			f"st_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
 			f"thr/brk: {float(self.pid_metadata.get('throttle', 0.0)):.3f} / {float(self.pid_metadata.get('brake', 0.0)):.3f}",
-			f"cmd: {command_text} ({command_value})",
-			f"pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
 		]
 
-		if self.last_target_point is not None:
-			left_status_lines.append(
-				f"tp: [{self.last_target_point[0]:.2f}, {self.last_target_point[1]:.2f}]"
-			)
-		if self.last_next_target_point is not None:
-			left_status_lines.append(
-				f"ntp: [{self.last_next_target_point[0]:.2f}, {self.last_next_target_point[1]:.2f}]"
-			)
-
-		right_status_lines = [
+		mid_status_lines = [
+			f"cmd: {command_text} ({command_value})",
+			f"pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
 			f"tp_ang: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.2f}",
 			f"tp_L/R/B: {int(bool(self.pid_metadata.get('target_is_left', False)))}/{int(bool(self.pid_metadata.get('target_is_right', False)))}/{int(bool(self.pid_metadata.get('target_is_behind', False)))}",
 			f"hdg_err: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.2f}",
 			f"st_idx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
-			f"E_f: {self._format_debug_value(self.last_energy_debug.get('energy_front'), '.4f')}",
-			f"E_l: {self._format_debug_value(self.last_energy_debug.get('energy_left'), '.4f')}",
-			f"E_r: {self._format_debug_value(self.last_energy_debug.get('energy_right'), '.4f')}",
-			f"E_p: {self._format_debug_value(self.last_energy_debug.get('energy_pedestrian'), '.4f')}",
-			f"E_off: {self._format_debug_value(self.last_energy_debug.get('energy_offroad'), '.4f')}",
-			f"E_rt: {self._format_debug_value(self.last_energy_debug.get('energy_route'), '.4f')}",
+			f"st_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
+		]
+
+		if self.last_target_point is not None:
+			mid_status_lines.append(
+				f"tp: [{self.last_target_point[0]:.2f}, {self.last_target_point[1]:.2f}]"
+			)
+		if self.last_next_target_point is not None:
+			mid_status_lines.append(
+				f"ntp: [{self.last_next_target_point[0]:.2f}, {self.last_next_target_point[1]:.2f}]"
+			)
+
+		right_status_lines = [
+			f"v_h/1s/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.2f')}",
+			f"frisk r/s/e: {self._format_debug_value(self.pid_metadata.get('front_route_risk_score'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_sigmoid'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_ema'), '.3f')}",
+			f"fr thr m/h/e: {self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_med_sigmoid_threshold'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_high_sigmoid_threshold'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_high_ema_threshold'), '.3f')}",
+			f"fr cap/a/rmx: {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')}/{int(bool(self.pid_metadata.get('front_route_risk_speed_cap_applied', False)))}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_recent_max_sigmoid'), '.3f')}",
+			f"fr gate/g/h: {int(bool(self.pid_metadata.get('front_route_risk_gate_active', False)))}/{int(bool(self.pid_metadata.get('front_route_risk_geometry_active', False)))}/{int(self.pid_metadata.get('front_route_risk_cap_hold_frames_remaining', 0))}",
+			f"fr sbias: {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_bias_ratio'), '.2f')}",
+			f"raw nz/mx: {self._format_debug_value(self.pid_metadata.get('lidar_bev_raw_nonzero_ratio'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('lidar_bev_raw_max'), '.2f')}",
+			f"det nz/mx: {self._format_debug_value(self.pid_metadata.get('lidar_bev_detail_nonzero_ratio'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('lidar_bev_detail_max'), '.2f')}",
+			f"det_in: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('use_front_route_risk_energy', False)))} fb:{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
 		line_gap = 21
-		font_scale = 0.52
+		font_scale = 0.49
 		col1_x = 35
-		col2_x = 405
+		col2_x = 290
+		col3_x = 545
 		start_y = panel_top + 28
 
 		for idx, line in enumerate(left_status_lines):
@@ -2640,11 +3025,33 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				(255, 255, 255), 1, cv2.LINE_AA
 			)
 
-		for idx, line in enumerate(right_status_lines):
+		for idx, line in enumerate(mid_status_lines):
 			y = start_y + idx * line_gap
 			cv2.putText(
 				right, line, (col2_x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
 				(255, 255, 255), 1, cv2.LINE_AA
+			)
+
+		for idx, line in enumerate(right_status_lines):
+			y = start_y + idx * line_gap
+			cv2.putText(
+				right, line, (col3_x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+				(255, 255, 255), 1, cv2.LINE_AA
+			)
+
+		risk_cap_active = bool(self.pid_metadata.get('front_route_risk_speed_cap_active', False))
+		risk_cap_applied = bool(self.pid_metadata.get('front_route_risk_speed_cap_applied', False))
+		if risk_cap_active:
+			banner_color = (0, 140, 255) if risk_cap_applied else (90, 90, 90)
+			banner_text = (
+				f"RISK CAP APPLIED {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')} m/s"
+				if risk_cap_applied else
+				f"RISK CAP ACTIVE {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')} m/s"
+			)
+			cv2.rectangle(right, (24, 238), (476, 268), banner_color, -1)
+			cv2.putText(
+				right, banner_text, (36, 259), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+				(255, 255, 255), 2, cv2.LINE_AA
 			)
 
 		legend_items = [

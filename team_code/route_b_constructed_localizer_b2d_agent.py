@@ -400,6 +400,14 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
             use_ground_plane=self.transfuser_config.use_ground_plane
         )
         transfuser_lidar_bev_tensor = torch.from_numpy(transfuser_lidar_bev).float().unsqueeze(0).to('cuda')
+        transfuser_lidar_bev_detail = self.transfuser_data.lidar_to_histogram_features(
+            transfuser_lidar_full,
+            use_ground_plane=True
+        )
+        transfuser_lidar_bev_detail_tensor = torch.from_numpy(
+            transfuser_lidar_bev_detail
+        ).float().unsqueeze(0).to('cuda')
+        transfuser_lidar_bev_inv = 1.0 - transfuser_lidar_bev_detail_tensor
 
         if IS_BENCH2DRIVE:
             bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
@@ -420,6 +428,7 @@ class RouteBConstructedLocalizerAgent(RouteBConstructedAgent):
             'target_pose_source': target_pose_source,
             'transfuser_rgb': transfuser_rgb_tensor,
             'transfuser_lidar_bev': transfuser_lidar_bev_tensor,
+            'transfuser_lidar_bev_inv': transfuser_lidar_bev_inv,
         }
 
         waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
