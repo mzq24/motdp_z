@@ -171,6 +171,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             energy_heads=True,
             ego_detail_activation_t=policy_cfg.get('ego_detail_activation_t', 400),
             use_lidar_bev_detail=self.use_lidar_bev_detail,
+            use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
         )
         self.model = model
 
@@ -820,6 +821,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 behavior_labels=behavior_all,
                 allowed_flags=allowed_all,
                 bev_proj_cached=bev_proj,
+                route_points=route_gt,
+                transfuser_lidar_bev=transfuser_lidar_bev,
             )
 
             if energy_targets_dev is not None:
@@ -851,12 +854,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 n_active = active_mask.sum()
                 if n_active > 0:
                     if self.use_front_route_risk_energy:
-                        loss_front = self._compute_front_route_energy_loss(
-                            energy_scores['front'][:, -1],
-                            batch,
-                            device,
-                            model_dtype,
-                        )
+                        loss_front = zero_t
                     else:
                         loss_front = _sl1e(energy_scores['front'], front_target, active_mask)
                     loss_left = _sl1e(energy_scores['left'], left_target, active_mask)
@@ -865,12 +863,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     loss_off = _sl1e(energy_scores['offroad'], offroad_target, active_mask)
             else:
                 if self.use_front_route_risk_energy:
-                    loss_front = self._compute_front_route_energy_loss(
-                        energy_scores['front'][:, -1],
-                        batch,
-                        device,
-                        model_dtype,
-                    )
+                    loss_front = zero_t
                 else:
                     loss_front = _sl1e(energy_scores['front'], front_target)
                 loss_left = _sl1e(energy_scores['left'], left_target)
@@ -880,32 +873,78 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
             energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
 
-        # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
-        alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and has_energy and self.train_energy and alignment_active:
-            _, mode_out_clean = self.model.forward_energy_eval(
-                x_t=poses_reg,
-                x_t_abs=poses_reg_abs,
+        if self.use_front_route_risk_energy:
+            gt_abs = trajectory.unsqueeze(1)
+            gt_normed = self.abs_to_norm(gt_abs)
+            front_route_logits, _ = self.model.forward_front_route_risk(
+                x_t=gt_normed,
+                x_t_abs=gt_abs,
+                timestep=torch.zeros(B, device=device, dtype=torch.long),
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                 ego_status=ego_status,
-                traj_for_energy=poses_reg_abs,
+                traj_for_energy=gt_abs,
                 bev_proj_cached=bev_proj,
+                route_points=route_gt,
+                transfuser_lidar_bev=transfuser_lidar_bev,
             )
-            align_input = torch.cat([poses_reg_abs.flatten(-2), mode_out_clean], dim=-1)
-            a_front = self._eval_energy_head_detached(self.model.energy_front_head, align_input).squeeze(-1)
-            a_left = self._eval_energy_head_detached(self.model.energy_left_head, align_input).squeeze(-1)
-            a_right = self._eval_energy_head_detached(self.model.energy_right_head, align_input).squeeze(-1)
-            a_ped = self._eval_energy_head_detached(self.model.energy_pedestrian_head, align_input).squeeze(-1)
-            a_off = self._eval_energy_head_detached(self.model.energy_offroad_head, align_input).squeeze(-1)
-            alignment_loss = (
-                self.energy_front_weight * torch.sigmoid(a_front).mean()
-                + self.energy_left_weight * torch.sigmoid(a_left).mean()
-                + self.energy_right_weight * torch.sigmoid(a_right).mean()
-                + self.energy_pedestrian_weight * torch.sigmoid(a_ped).mean()
-                + self.energy_offroad_weight * torch.sigmoid(a_off).mean()
+            loss_front = self._compute_front_route_energy_loss(
+                front_route_logits[:, -1],
+                batch,
+                device,
+                model_dtype,
             )
+            energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
+
+        # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
+        alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
+        if self.alignment_loss_weight > 0 and alignment_active:
+            if self.use_front_route_risk_energy:
+                _, mode_out_front = self.model.forward_front_route_risk_eval(
+                    x_t=poses_reg,
+                    x_t_abs=poses_reg_abs,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    ego_status=ego_status,
+                    traj_for_energy=poses_reg_abs,
+                    bev_proj_cached=bev_proj,
+                    route_points=route_gt,
+                    transfuser_lidar_bev=transfuser_lidar_bev,
+                )
+                front_align_input = torch.cat([poses_reg_abs.flatten(-2), mode_out_front], dim=-1)
+                a_front = self._eval_energy_head_detached(
+                    self.model.front_route_risk_head,
+                    front_align_input,
+                ).squeeze(-1)
+                alignment_loss = alignment_loss + self.energy_front_weight * torch.sigmoid(a_front).mean()
+
+            if has_energy and self.train_energy:
+                _, mode_out_clean = self.model.forward_energy_eval(
+                    x_t=poses_reg,
+                    x_t_abs=poses_reg_abs,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    ego_status=ego_status,
+                    traj_for_energy=poses_reg_abs,
+                    bev_proj_cached=bev_proj,
+                    route_points=route_gt,
+                    transfuser_lidar_bev=transfuser_lidar_bev,
+                )
+                align_input = torch.cat([poses_reg_abs.flatten(-2), mode_out_clean], dim=-1)
+                if not self.use_front_route_risk_energy:
+                    a_front = self._eval_energy_head_detached(self.model.energy_front_head, align_input).squeeze(-1)
+                    alignment_loss = alignment_loss + self.energy_front_weight * torch.sigmoid(a_front).mean()
+                a_left = self._eval_energy_head_detached(self.model.energy_left_head, align_input).squeeze(-1)
+                a_right = self._eval_energy_head_detached(self.model.energy_right_head, align_input).squeeze(-1)
+                a_ped = self._eval_energy_head_detached(self.model.energy_pedestrian_head, align_input).squeeze(-1)
+                a_off = self._eval_energy_head_detached(self.model.energy_offroad_head, align_input).squeeze(-1)
+                alignment_loss = alignment_loss + (
+                    self.energy_left_weight * torch.sigmoid(a_left).mean()
+                    + self.energy_right_weight * torch.sigmoid(a_right).mean()
+                    + self.energy_pedestrian_weight * torch.sigmoid(a_ped).mean()
+                    + self.energy_offroad_weight * torch.sigmoid(a_off).mean()
+                )
 
         total_loss = (
             self.energy_loss_weight * energy_loss
@@ -1717,6 +1756,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         transfuser_lidar_bev=transfuser_lidar_bev,
                     )
                     pred_x0 = poses_reg.detach()  # (B, M, T, 2)
+                    route_context = route_for_guidance if route_for_guidance is not None else self.route_norm_to_abs(route_pred.detach())
                     route_pred_norm = route_pred.detach().unsqueeze(1)  # (B, 1, T_route, 2)
 
                 # Pass 2: re-embed pred_x0 as a trajectory-level energy-eval sample.
@@ -1724,28 +1764,55 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
                 with torch.enable_grad():
                     pred_x0_abs = self.norm_to_abs(pred_x0_for_grad)  # differentiable: z-denorm + cumsum
-                    energy_scores, _ = self.model.forward_energy_eval(
-                        x_t=pred_x0_for_grad,
-                        x_t_abs=pred_x0_abs,
-                        transfuser_bev_feature=transfuser_bev_feature,
-                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                        ego_status=ego_status,
-                        traj_for_energy=pred_x0_abs,  # abs space for spatial energy evaluation
-                        bev_proj_cached=bev_proj,
+                    front_route_scores = None
+                    needs_legacy_energy = (
+                        (not self.use_front_route_risk_energy and w_front_cfg != 0)
+                        or w_left_cfg != 0
+                        or w_right_cfg != 0
+                        or w_ped_cfg != 0
+                        or (w_off_cfg != 0 and w_off > 0)
                     )
+                    if needs_legacy_energy:
+                        energy_scores, _ = self.model.forward_energy_eval(
+                            x_t=pred_x0_for_grad,
+                            x_t_abs=pred_x0_abs,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            traj_for_energy=pred_x0_abs,  # abs space for spatial energy evaluation
+                            bev_proj_cached=bev_proj,
+                            route_points=route_context,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                        )
+                    else:
+                        energy_scores = None
+                    if self.use_front_route_risk_energy and w_front_cfg != 0:
+                        front_route_scores, _ = self.model.forward_front_route_risk_eval(
+                            x_t=pred_x0_for_grad,
+                            x_t_abs=pred_x0_abs,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            traj_for_energy=pred_x0_abs,
+                            bev_proj_cached=bev_proj,
+                            route_points=route_context,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                        )
 
                     # Compute total energy
                     total_energy = torch.zeros(1, device=device)
                     if energy_scores is not None:
                         total_energy = (
                             w_veh * (
-                                w_front_cfg * energy_scores['front'].sum()
+                                ((0.0 if self.use_front_route_risk_energy else w_front_cfg) * energy_scores['front'].sum())
                                 + w_left_cfg  * energy_scores['left'].sum()
                                 + w_right_cfg * energy_scores['right'].sum()
                                 + w_ped_cfg   * energy_scores['pedestrian'].sum()
                             )
                             + w_off_cfg * w_off * energy_scores['offroad'].sum()
                         )
+                    if front_route_scores is not None:
+                        total_energy = total_energy + w_veh * w_front_cfg * front_route_scores.sum()
 
                     # Gradient w.r.t. pred_x0 with clipping
                     if total_energy.requires_grad and pred_x0_for_grad.requires_grad:

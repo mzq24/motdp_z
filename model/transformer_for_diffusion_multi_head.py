@@ -1067,6 +1067,14 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                 lidar_max_x=32.0,
                 lidar_max_y=32.0
             )
+            self.traj_lidar_spatial_attn = GridSampleCrossBEVAttention(
+                embed_dims=d_model,
+                num_heads=nhead,
+                in_bev_dims=64,
+                num_points=horizon,
+                lidar_max_x=32.0,
+                lidar_max_y=32.0
+            )
 
         # Position embeddings for cross-attention sources (BEV tokens only now)
         # Total tokens: 64 (bev)
@@ -1465,8 +1473,37 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                         transfuser_bev_feature_upsample,
                     )
             else:
-                x_traj = self.bev_spatial_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
+                x_traj_base = self.bev_spatial_attn(x_traj, traj_points, transfuser_bev_feature_upsample)
+                detail_gate = self._detail_gate(timesteps, B, x_traj.device, x_traj.dtype)
+                detail_residual = torch.zeros_like(x_traj)
+                if route_points is not None:
+                    if route_points.dim() != 3:
+                        raise ValueError(f"Anchor route_points must be (B, T_route, 2), got {route_points.shape}")
+                    route_detail_points = self._build_route_detail_points(route_points)
+                    route_detail_flat = route_detail_points.view(B, -1, 2)
+                    route_far_points = self._build_route_far_detail_points(route_points)
+                    route_far_flat = route_far_points.view(B, -1, 2)
+                    detail_residual = detail_residual + (
+                        self.route_detail_attn(x_traj, route_detail_flat, transfuser_bev_feature_upsample) - x_traj
+                    )
+                    detail_residual = detail_residual + (
+                        self.route_far_detail_attn(x_traj, route_far_flat, transfuser_bev_feature_upsample) - x_traj
+                    )
+                if self.use_lidar_bev_detail and transfuser_lidar_bev is not None:
+                    lidar_feat = self.lidar_bev_encoder(transfuser_lidar_bev)
+                    detail_residual = detail_residual + (
+                        self.traj_lidar_spatial_attn(x_traj, traj_points, lidar_feat) - x_traj
+                    )
+                x_traj = x_traj_base + detail_gate * detail_residual
                 x_route = x[:, T_traj:, :]
+                if route_points is not None:
+                    if route_points.dim() != 3:
+                        raise ValueError(f"Anchor route_points must be (B, T_route, 2), got {route_points.shape}")
+                    x_route = self.route_point_attn(
+                        x_route,
+                        route_points.unsqueeze(2),
+                        transfuser_bev_feature_upsample,
+                    )
             x = torch.cat([x_traj, x_route], dim=1)
 
         # Decoder layers with multi-source attention
@@ -1550,6 +1587,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         energy_heads: bool = False,  # Route B: energy evaluator heads for gradient guidance
         ego_detail_activation_t: int = 400,  # Timestep threshold for detail gate
         use_lidar_bev_detail: bool = False,
+        use_condition_group_dropout: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1570,6 +1608,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.output_dim = output_dim
         self.ego_joint_horizon = horizon + num_waypoints
         self.use_lidar_bev_detail = use_lidar_bev_detail
+        self.use_condition_group_dropout = use_condition_group_dropout
         
         # ========== Anchor Embedding ==========
         # Encode full noisy trajectory shape per mode (not just mean point) to preserve
@@ -1682,6 +1721,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.energy_pedestrian_head = _make_energy_head()  # pedestrian collision    (label 4)
             self.energy_offroad_head    = _make_energy_head()  # off_road/sidewalk       (label 5-6)
             self.energy_route_head      = _make_energy_head()  # route deviation (continuous, computed in policy)
+            self.front_route_risk_head  = _make_energy_head()  # route-conditioned front risk (GT/pred_x0 path)
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -1813,12 +1853,41 @@ class TransformerForDiffusion(ModuleAttrMixin):
         timesteps = timestep.expand(B)
 
         time_emb = self.time_emb(timesteps).to(dtype=model_dtype)
-        current_status = ego_status[:, -1, :]
+        ego_status_for_cond = self._apply_condition_group_dropout(ego_status)
+        current_status = ego_status_for_cond[:, -1, :]
         status_emb = self.ego_status_proj(current_status)
-        hist_global_emb = self.history_encoder(ego_status)
+        hist_global_emb = self.history_encoder(ego_status_for_cond)
         conditioning = time_emb + status_emb + hist_global_emb
         route_conditioning = self.route_status_proj(current_status)
         return conditioning, current_status, route_conditioning
+
+    def _apply_condition_group_dropout(self, ego_status: torch.Tensor) -> torch.Tensor:
+        """Drop one condition group per sample to reduce shortcut reliance in ego_status."""
+        if not (self.training and self.use_condition_group_dropout):
+            return ego_status
+        if ego_status.shape[-1] < 14:
+            raise ValueError(
+                "Condition group dropout expects ego_status layout "
+                "[speed, theta, command(6), target_point(2), target_point_next(2), waypoints(2)]."
+            )
+
+        dropped = ego_status.clone()
+        B = dropped.shape[0]
+        probs = torch.tensor([0.7, 0.1, 0.1, 0.1], device=dropped.device)
+        group_ids = torch.multinomial(probs, num_samples=B, replacement=True)
+
+        speed_theta_mask = group_ids == 1
+        target_mask = group_ids == 2
+        waypoints_mask = group_ids == 3
+
+        if speed_theta_mask.any():
+            dropped[speed_theta_mask, :, 0:2] = 0.0
+        if target_mask.any():
+            dropped[target_mask, :, 8:12] = 0.0
+        if waypoints_mask.any():
+            dropped[waypoints_mask, :, 12:14] = 0.0
+
+        return dropped
 
     def _embed_trajectory(self, traj_abs: torch.Tensor) -> torch.Tensor:
         """Trajectory-level embedding: (B, M, T, 2) -> (B, M, n_emb)."""
@@ -1853,6 +1922,95 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if include_route and hasattr(self, 'energy_route_head'):
             energy_scores['route'] = self.energy_route_head(energy_input).squeeze(-1)
         return energy_scores
+
+    def _forward_traj_energy_context(
+        self,
+        x_t: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        x_t_abs: Optional[torch.Tensor] = None,
+        traj_for_energy: Optional[torch.Tensor] = None,
+        behavior_labels: Optional[torch.Tensor] = None,
+        allowed_flags: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+        route_points: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Shared trajectory-context builder for energy-style heads."""
+        model_dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
+
+        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
+        ego_status = ego_status.to(device=device, dtype=model_dtype)
+        if route_points is not None:
+            route_points = route_points.contiguous().to(device=device, dtype=model_dtype)
+        if transfuser_lidar_bev is not None:
+            transfuser_lidar_bev = transfuser_lidar_bev.contiguous().to(device=device, dtype=model_dtype)
+        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
+
+        B, M, _, _ = bev_traj_points.shape
+        conditioning, _, route_conditioning = self._compute_conditioning(
+            timestep, ego_status, device, model_dtype
+        )
+
+        traj_emb = self._embed_trajectory(bev_traj_points)
+        if M == 1:
+            mode_queries = self.diff_mode_query.expand(B, -1, -1)
+        elif M <= self.mode_queries.shape[1]:
+            mode_queries = self.mode_queries[:, :M, :].expand(B, -1, -1)
+        elif M == self.mode_queries.shape[1] + 1:
+            anchor_queries = self.mode_queries.expand(B, -1, -1)
+            gt_queries = self.gt_mode_query.expand(B, -1, -1)
+            mode_queries = torch.cat([anchor_queries, gt_queries], dim=1)
+        else:
+            raise ValueError(f"Unsupported energy mode count M={M}, expected <= {self.mode_queries.shape[1] + 1}")
+
+        mode_emb = traj_emb + mode_queries + conditioning.unsqueeze(1)
+        if self.num_behaviors > 0 and behavior_labels is not None and allowed_flags is not None:
+            behavior_emb = self.behavior_emb(behavior_labels.to(device))
+            allowed_emb = self.allowed_emb(allowed_flags.long().to(device))
+            mode_emb = mode_emb + behavior_emb + allowed_emb
+
+        mode_emb = self.pre_decoder_norm(self.drop(mode_emb))
+        route_emb = None
+        if route_points is not None:
+            if route_points.dim() != 3:
+                raise ValueError(
+                    f"_forward_traj_energy_context expects route_points as (B, T_route, 2), got {route_points.shape}"
+                )
+            if route_points.shape[1] != self.num_waypoints:
+                raise ValueError(
+                    f"_forward_traj_energy_context expects T_route={self.num_waypoints}, got {route_points.shape[1]}"
+                )
+            route_wp_emb = self._embed_route_waypoint_tokens(route_points)
+            route_diff_query = self.route_diff_query.expand(B, route_points.shape[1], -1)
+            route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
+            route_emb = self.pre_decoder_norm(self.drop(route_emb))
+
+        mode_out, _ = self.decoder(
+            traj_emb=mode_emb,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            conditioning=conditioning,
+            traj_points=bev_traj_points,
+            route_emb=route_emb,
+            route_points=route_points,
+            timesteps=timestep,
+            route_conditioning=route_conditioning,
+            bev_proj_cached=bev_proj_cached,
+            route_pos_offset=M,
+            spatial_mode="anchor",
+            transfuser_lidar_bev=transfuser_lidar_bev,
+        )
+
+        eval_traj = traj_for_energy if traj_for_energy is not None else bev_traj_points
+        eval_traj_flat = eval_traj.flatten(-2)
+        energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)
+        return energy_input, mode_out
 
     def forward_ego(
         self,
@@ -1961,63 +2119,56 @@ class TransformerForDiffusion(ModuleAttrMixin):
         behavior_labels: Optional[torch.Tensor] = None,
         allowed_flags: Optional[torch.Tensor] = None,
         bev_proj_cached: Optional[torch.Tensor] = None,
+        route_points: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
     ) -> Tuple[dict, torch.Tensor]:
         """
         Trajectory-level energy path. Anchors/GT remain 1 token per trajectory.
         Route is context only; route-token energies are not produced here.
         """
-        model_dtype = next(self.parameters()).dtype
-        device = next(self.parameters()).device
-
-        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
-        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
-        ego_status = ego_status.to(device=device, dtype=model_dtype)
-        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
-
-        B, M, _, _ = bev_traj_points.shape
-        conditioning, _, route_conditioning = self._compute_conditioning(
-            timestep, ego_status, device, model_dtype
-        )
-
-        traj_emb = self._embed_trajectory(bev_traj_points)
-        if M == 1:
-            mode_queries = self.diff_mode_query.expand(B, -1, -1)
-        elif M <= self.mode_queries.shape[1]:
-            mode_queries = self.mode_queries[:, :M, :].expand(B, -1, -1)
-        elif M == self.mode_queries.shape[1] + 1:
-            # Build anchor/GT queries directly instead of slicing from a concatenated
-            # temporary buffer; this keeps self.mode_queries gradients in the parameter's
-            # native layout and avoids DDP grad-stride mismatch warnings.
-            anchor_queries = self.mode_queries.expand(B, -1, -1)
-            gt_queries = self.gt_mode_query.expand(B, -1, -1)
-            mode_queries = torch.cat([anchor_queries, gt_queries], dim=1)
-        else:
-            raise ValueError(f"Unsupported energy mode count M={M}, expected <= {self.mode_queries.shape[1] + 1}")
-
-        mode_emb = traj_emb + mode_queries + conditioning.unsqueeze(1)
-        if self.num_behaviors > 0 and behavior_labels is not None and allowed_flags is not None:
-            behavior_emb = self.behavior_emb(behavior_labels.to(device))
-            allowed_emb = self.allowed_emb(allowed_flags.long().to(device))
-            mode_emb = mode_emb + behavior_emb + allowed_emb
-
-        mode_emb = self.pre_decoder_norm(self.drop(mode_emb))
-        mode_out, _ = self.decoder(
-            traj_emb=mode_emb,
+        energy_input, mode_out = self._forward_traj_energy_context(
+            x_t=x_t,
+            x_t_abs=x_t_abs,
+            timestep=timestep,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            conditioning=conditioning,
-            traj_points=bev_traj_points,
-            route_conditioning=route_conditioning,
+            ego_status=ego_status,
+            traj_for_energy=traj_for_energy,
+            behavior_labels=behavior_labels,
+            allowed_flags=allowed_flags,
             bev_proj_cached=bev_proj_cached,
-            route_pos_offset=M,
-            spatial_mode="anchor",
+            route_points=route_points,
+            transfuser_lidar_bev=transfuser_lidar_bev,
         )
-
-        eval_traj = traj_for_energy if traj_for_energy is not None else bev_traj_points
-        eval_traj_flat = eval_traj.flatten(-2)
-        energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)
         return self._compute_energy_scores(energy_input, include_route=False), mode_out
+
+    def forward_front_route_risk(
+        self,
+        x_t: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        x_t_abs: Optional[torch.Tensor] = None,
+        traj_for_energy: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+        route_points: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Independent route-conditioned front-risk path for GT/pred_x0 evaluation."""
+        energy_input, mode_out = self._forward_traj_energy_context(
+            x_t=x_t,
+            x_t_abs=x_t_abs,
+            timestep=timestep,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            traj_for_energy=traj_for_energy,
+            bev_proj_cached=bev_proj_cached,
+            route_points=route_points,
+            transfuser_lidar_bev=transfuser_lidar_bev,
+        )
+        return self.front_route_risk_head(energy_input).squeeze(-1), mode_out
 
     def forward_energy_eval(
         self,
@@ -2028,6 +2179,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         x_t_abs: Optional[torch.Tensor] = None,
         traj_for_energy: Optional[torch.Tensor] = None,
         bev_proj_cached: Optional[torch.Tensor] = None,
+        route_points: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
     ) -> Tuple[dict, torch.Tensor]:
         """
         Guidance/alignment energy evaluation on a single predicted trajectory.
@@ -2043,6 +2196,36 @@ class TransformerForDiffusion(ModuleAttrMixin):
             ego_status=ego_status,
             traj_for_energy=traj_for_energy,
             bev_proj_cached=bev_proj_cached,
+            route_points=route_points,
+            transfuser_lidar_bev=transfuser_lidar_bev,
+        )
+
+    def forward_front_route_risk_eval(
+        self,
+        x_t: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        x_t_abs: Optional[torch.Tensor] = None,
+        traj_for_energy: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+        route_points: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Guidance/alignment evaluation for the independent front-route-risk head."""
+        B = x_t.shape[0]
+        timestep = torch.zeros(B, dtype=torch.long, device=x_t.device)
+        return self.forward_front_route_risk(
+            x_t=x_t,
+            x_t_abs=x_t_abs,
+            timestep=timestep,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            traj_for_energy=traj_for_energy,
+            bev_proj_cached=bev_proj_cached,
+            route_points=route_points,
+            transfuser_lidar_bev=transfuser_lidar_bev,
         )
     
     def forward(
@@ -2105,18 +2288,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         timesteps = timestep.expand(B)
         
         # ========== Conditioning ==========
-        # 1. Timestep embedding
-        time_emb = self.time_emb(timesteps).to(dtype=model_dtype)  # (B, n_emb)
-        
-        # 2. Current status embedding (last frame only)
-        current_status = ego_status[:, -1, :]  # (B, status_dim)
-        status_emb = self.ego_status_proj(current_status)  # (B, n_emb)
-        
-        # 3. GRU-encoded global history
-        hist_global_emb = self.history_encoder(ego_status)  # (B, n_emb)
-        
-        # Combined conditioning
-        conditioning = time_emb + status_emb + hist_global_emb  # (B, n_emb)
+        conditioning, current_status, route_conditioning = self._compute_conditioning(
+            timestep, ego_status, device, model_dtype
+        )
         
         # ========== Anchor Embedding ==========
         # Encode full trajectory geometry for each mode:
@@ -2161,9 +2335,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         mode_emb = self.drop(mode_emb)
         mode_emb = self.pre_decoder_norm(mode_emb)
-
-        # Route-specific conditioning
-        route_conditioning = self.route_status_proj(current_status)  # (B, n_emb)
 
         # ========== UnifiedDecoderOnlyTransformer ==========
         # traj_emb = mode_emb (B, num_modes, n_emb) - each mode is one "trajectory query"

@@ -156,7 +156,11 @@ training:
   early_stopping_patience: 15
   checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_annealed_energy/
 validation:
-  max_batches: 0
+  enabled: true
+  use_memmap: true
+  preload_to_ram: false
+  subset_size: 4096
+  max_batches: 32
 logging:
   use_wandb: true
   wandb_project: route_b_annealed_energy

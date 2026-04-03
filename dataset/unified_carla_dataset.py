@@ -91,6 +91,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._use_per_frame = use_per_frame  # Local SSD mode: read individual .pt files
         self._use_vqa_anchor = use_vqa_anchor  # Load VLM anchor from dp_vl_feature
         self._load_transfuser_lidar_bev = load_transfuser_lidar_bev
+        self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
+        self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -106,6 +108,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._gps_noise_enabled = gps_cfg.get('enabled', False)
         self._gps_noise_sigma = gps_cfg.get('sigma', 0.4)
         self._gps_noise_prob = gps_cfg.get('probability', 0.8)
+        self._gps_noise_apply_to_route = gps_cfg.get('apply_to_route', True)
 
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
@@ -289,6 +292,26 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
                   f"Using LRU fallback (slow). Run: python scripts/data_tools/build_feature_cache_fp16.py")
 
+        # ===== Load LiDAR BEV memmap (if enabled and available) =====
+        if self._load_transfuser_lidar_bev and not skip_memmap:
+            lidar_bin = os.path.join(cache_dir, 'lidar_bev_fp16.bin')
+            lidar_idx = os.path.join(cache_dir, 'lidar_bev_index.pkl')
+            if os.path.exists(lidar_bin) and os.path.exists(lidar_idx):
+                with open(lidar_idx, 'rb') as f:
+                    lidar_meta = pickle.load(f)
+                self._lidar_bev_index = lidar_meta['index']
+                self._lidar_bev_mmap = np.memmap(
+                    lidar_bin, dtype=np.float16, mode='r',
+                    shape=tuple(lidar_meta['shape']))
+                print(f"[Rank {rank}] LiDAR BEV memmap loaded: "
+                      f"{len(self._lidar_bev_index)} routes, "
+                      f"{lidar_meta['total_frames']} frames "
+                      f"(inverted={lidar_meta.get('inverted', False)}).")
+            else:
+                print(f"[Rank {rank}] WARNING: LiDAR BEV memmap not found. "
+                      f"Falling back to per-frame .npy loading. "
+                      f"Run: python scripts/data_tools/build_lidar_bev_cache.py")
+
         # ===== Pre-load VQA anchors into RAM (tiny: ~48 bytes each) =====
         self._vqa_anchor_cache = {}  # sample_idx -> tensor (6, 2)
         if self._use_vqa_anchor:
@@ -317,7 +340,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sample_files)
 
-    def inject_ram_features(self, train_dataset, rank=0, world_size=1, max_val_samples=None):
+    def inject_ram_features(self, train_dataset, rank=0, world_size=1, max_val_samples=None, sample_indices=None):
         """Pre-load val features into RAM using train dataset's memmap.
         Only loads the samples this rank will access via DistributedSampler(shuffle=False).
         Two-pass: first collect needed abs_idx, then read sorted (sequential IO).
@@ -326,6 +349,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             rank: DDP rank (determines which sample indices this rank gets)
             world_size: total DDP ranks
             max_val_samples: max samples per rank (max_batches * batch_size), None = all
+            sample_indices: optional explicit dataset indices to preload for this rank.
+                When provided, bypasses the default rank/world_size slicing logic.
         """
         if train_dataset._feat_mmap is None or train_dataset._feat_index is None:
             print(f"[Rank {rank}] inject_ram_features: train has no memmap, skipping.")
@@ -333,8 +358,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         # Compute which sample indices this rank will access
         # DistributedSampler(shuffle=False): rank k gets indices [k, k+W, k+2W, ...]
-        n_dataset = len(self.sample_files)
-        my_indices = list(range(rank, n_dataset, world_size))
+        if sample_indices is not None:
+            my_indices = list(sample_indices)
+        else:
+            n_dataset = len(self.sample_files)
+            my_indices = list(range(rank, n_dataset, world_size))
         if max_val_samples is not None:
             my_indices = my_indices[:max_val_samples]
 
@@ -549,21 +577,36 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             final_sample['transfuser_bev_feature_upsample'] = torch.zeros(64, 64, 64, dtype=torch.float16)
 
         # --- Load TransFuser LiDAR BEV histogram (2, 256, 256) ---
-        # Derive path: .../transfuser_feature/{fid}_feature.pt → .../transfuser_lidar_bev/{fid}.npy
         transfuser_lidar_bev = None
         if self._load_transfuser_lidar_bev and 'transfuser_bev_feature' in sample:
             feat_rel = sample['transfuser_bev_feature']
+            # Derive route_rel and frame_id from feat_rel
             # e.g. "Accident/Town12_.../transfuser_feature/0006_feature.pt"
-            #    → "Accident/Town12_.../transfuser_lidar_bev/0006.npy"
-            lidar_bev_rel = feat_rel.replace(
-                'transfuser_feature/', 'transfuser_lidar_bev/').replace(
-                '_feature.pt', '.npy')
-            lidar_bev_path = os.path.join(self.image_data_root, lidar_bev_rel)
-            if os.path.exists(lidar_bev_path):
-                raw = np.load(lidar_bev_path)  # (2, 256, 256) float16
-                # Invert: 1.0 - value  →  obstacles become high-valued
-                transfuser_lidar_bev = torch.from_numpy(
-                    (1.0 - raw.astype(np.float32))).half()  # (2, 256, 256)
+            #   route_rel = "Accident/Town12_..."
+            #   frame_id  = 6
+            route_rel = os.path.dirname(os.path.dirname(feat_rel))
+            frame_id = sample.get('frame_id')
+
+            if self._lidar_bev_mmap is not None and self._lidar_bev_index is not None:
+                # Fast path: memmap (already inverted at pack time)
+                route_info = self._lidar_bev_index.get(route_rel)
+                if route_info is not None and frame_id is not None:
+                    local_idx = route_info.get('fid_to_local', {}).get(frame_id)
+                    if local_idx is not None:
+                        abs_idx = route_info['offset'] + local_idx
+                        transfuser_lidar_bev = torch.from_numpy(
+                            self._lidar_bev_mmap[abs_idx].copy())  # (2, 256, 256) fp16
+            else:
+                # Slow fallback: per-frame .npy
+                lidar_bev_rel = feat_rel.replace(
+                    'transfuser_feature/', 'transfuser_lidar_bev/').replace(
+                    '_feature.pt', '.npy')
+                lidar_bev_path = os.path.join(self.image_data_root, lidar_bev_rel)
+                if os.path.exists(lidar_bev_path):
+                    raw = np.load(lidar_bev_path)  # (2, 256, 256) float16
+                    # Invert: 1.0 - value → obstacles become high-valued
+                    transfuser_lidar_bev = torch.from_numpy(
+                        (1.0 - raw.astype(np.float32))).half()
         if transfuser_lidar_bev is not None:
             final_sample['transfuser_lidar_bev'] = transfuser_lidar_bev
         else:
@@ -697,6 +740,12 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 # noise = epsilon_t - epsilon_current (current frame cancels to 0)
                 current_noise = frame_noise[-1:]  # (1, 2)
                 final_sample['waypoints_hist'] = final_sample['waypoints_hist'] + (frame_noise - current_noise)
+
+                # route is expressed in the current ego frame, so under the current
+                # target-point noise convention it should receive the same current-frame
+                # offset as the latest target point.
+                if self._gps_noise_apply_to_route and 'route' in final_sample:
+                    final_sample['route'] = final_sample['route'] + current_noise
                 gps_noise_applied = True
 
         # Build or update ego_status: [speed | theta | command | tp | tp_next | waypoints]

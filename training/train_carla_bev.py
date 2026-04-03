@@ -396,11 +396,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
 
     feature_suffix = config.get('dataset', {}).get('feature_suffix', '')
-    validation_enabled = config.get('validation', {}).get('enabled', True)
+    validation_cfg = config.get('validation', {})
+    validation_enabled = validation_cfg.get('enabled', True)
+    validation_use_memmap = validation_cfg.get('use_memmap', True)
+    validation_preload_to_ram = validation_cfg.get('preload_to_ram', not validation_use_memmap)
     build_validation = validation_enabled or val_only
 
     train_dataset = CARLAImageDataset(
         dataset_path=train_dataset_path, image_data_root=image_data_root,
+        mode='train',
         use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
         anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
         cache_dir=cache_dir, feature_suffix=feature_suffix,
@@ -410,16 +414,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     val_dataset_orig = None
     val_dataset = None
     if build_validation:
-        # Val dataset: skip memmap, will inject RAM features after config is parsed
         val_dataset_orig = CARLAImageDataset(
             dataset_path=val_dataset_path, image_data_root=image_data_root,
-            skip_memmap=True, use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
+            mode='val',
+            skip_memmap=not validation_use_memmap,
+            use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
             anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+            cache_dir=cache_dir, feature_suffix=feature_suffix,
             load_transfuser_lidar_bev=use_lidar_bev_detail,
         )
-        # if val_only:
-        #     val_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_orig])
-        # else:
         val_dataset = val_dataset_orig
 
     if rank == 0:
@@ -433,8 +436,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     dataloader_cfg = config.get('dataloader', {})
     training_cfg = config.get('training', {})
-    validation_cfg = config.get('validation', {})
-
     train_batch_size = dataloader_cfg.get('batch_size', 32)
     val_batch_size = dataloader_cfg.get('val_batch_size', train_batch_size)
 
@@ -462,10 +463,39 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if val_max_batches <= 0:
             val_max_batches = None
 
-    # Inject val features from train's memmap into RAM (only this rank's samples)
+    val_subset_indices = None
+    raw_val_subset_size = validation_cfg.get('subset_size', None)
+    if val_dataset_orig is not None and raw_val_subset_size not in (None, 0, "0"):
+        val_subset_size = int(raw_val_subset_size)
+        if val_subset_size > 0 and val_subset_size < len(val_dataset_orig):
+            val_subset_indices = np.linspace(
+                0, len(val_dataset_orig) - 1, num=val_subset_size, dtype=np.int64
+            ).tolist()
+            val_dataset = torch.utils.data.Subset(val_dataset_orig, val_subset_indices)
+            if rank == 0:
+                print(
+                    f"Validation subset enabled: {len(val_subset_indices)}/{len(val_dataset_orig)} "
+                    f"samples (deterministic evenly spaced selection)"
+                )
+
+    # Optionally inject val features from train's memmap into RAM (old-HPC path).
     _max_val_per_rank = val_max_batches * val_batch_size if val_max_batches else None
-    if not use_per_frame and val_dataset_orig is not None:
-        val_dataset_orig.inject_ram_features(train_dataset, rank=rank, world_size=world_size, max_val_samples=_max_val_per_rank)
+    if not use_per_frame and val_dataset_orig is not None and validation_preload_to_ram:
+        preload_indices = None
+        if val_subset_indices is not None:
+            preload_indices = val_subset_indices[rank::world_size] if world_size > 1 else val_subset_indices
+        val_dataset_orig.inject_ram_features(
+            train_dataset,
+            rank=rank,
+            world_size=world_size,
+            max_val_samples=_max_val_per_rank,
+            sample_indices=preload_indices,
+        )
+    elif rank == 0 and val_dataset_orig is not None:
+        if validation_use_memmap and not use_per_frame:
+            print("Validation features: using packed samples + memmap directly.")
+        elif use_per_frame:
+            print("Validation features: using per-frame loading.")
 
     def safe_collate(batch):
         try:
@@ -627,7 +657,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             if anchor_path.endswith('.npy'):
                 anchor_centers = np.load(anchor_path)  # (M, T, 2)
             else:
-                import pickle
                 with open(anchor_path, 'rb') as f:
                     anchor_data = pickle.load(f)
                 anchor_centers = anchor_data['centers']  # (M, T, 2)
