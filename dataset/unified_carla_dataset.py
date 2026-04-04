@@ -542,6 +542,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     'energy_active_mask',
                     dtype=None,
                 ).bool()
+            elif key == 'speed_sample_valid_mask':
+                final_sample['speed_sample_valid_mask'] = _from_numpy(value, 'speed_sample_valid_mask')
+            elif key == 'speed_sample_exp_index':
+                if isinstance(value, np.ndarray):
+                    final_sample['speed_sample_exp_index'] = torch.from_numpy(value).long()
+                else:
+                    final_sample['speed_sample_exp_index'] = torch.tensor(value).long()
+            elif key in {
+                'speed_sample_values',
+                'speed_risk_chase_values',
+                'speed_risk_meet_values',
+                'speed_risk_ped_values',
+            }:
+                final_sample[key] = _from_numpy(value, key)
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
                 continue
