@@ -107,6 +107,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  gps_noise_cfg: dict = None,  # GPS noise augmentation config
                  load_transfuser_lidar_bev: bool = False,  # Load LiDAR BEV detail input
                  lidar_history_frames: int = 1,
+                 filter_bad_routes: bool = True,
+                 retain_bad_routes_for_energy: bool = False,
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -124,6 +126,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._use_vqa_anchor = use_vqa_anchor  # Load VLM anchor from dp_vl_feature
         self._load_transfuser_lidar_bev = load_transfuser_lidar_bev
         self._lidar_history_frames = max(int(lidar_history_frames), 1)
+        self._filter_bad_routes = bool(filter_bad_routes)
+        self._retain_bad_routes_for_energy = bool(retain_bad_routes_for_energy)
         self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
 
@@ -255,10 +259,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 missing_routes.add(route)
                 continue
 
-            # Skip bad routes (collisions, crashes, etc.)
+            # Skip or retain bad routes depending on training objective.
             if route in bad_routes_set:
-                bad_route_dropped += 1
-                continue
+                if self._retain_bad_routes_for_energy:
+                    s = dict(s)
+                    s['is_bad_route'] = True
+                elif self._filter_bad_routes:
+                    bad_route_dropped += 1
+                    continue
+
+            if 'is_bad_route' not in s:
+                s = dict(s)
+                s['is_bad_route'] = False
 
             # Derive transfuser_bev_feature path if missing
             if not s.get('transfuser_bev_feature', ''):
@@ -581,6 +593,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         for key, value in sample.items():
             if key == 'rgb_hist_jpg':
                 continue
+            elif key == 'is_bad_route':
+                final_sample['is_bad_route'] = torch.tensor(bool(value), dtype=torch.bool)
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
                 final_sample['speed'] = _from_numpy(speed_data, 'speed')

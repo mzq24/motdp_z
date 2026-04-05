@@ -363,6 +363,10 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     use_per_frame = config.get('dataset', {}).get('use_per_frame', False)
     cache_dir = config.get('dataset', {}).get('cache_dir', None)  # e.g. /tmp/tmp_data for tmpfs
+    train_filter_bad_routes = config.get('dataset', {}).get('train_filter_bad_routes', True)
+    val_filter_bad_routes = config.get('dataset', {}).get('val_filter_bad_routes', True)
+    train_retain_bad_routes_for_energy = config.get('dataset', {}).get('train_retain_bad_routes_for_energy', False)
+    val_retain_bad_routes_for_energy = config.get('dataset', {}).get('val_retain_bad_routes_for_energy', False)
     use_vqa_anchor = config.get('use_vqa_anchor', False)
     use_lidar_bev_detail = config.get('route_b', {}).get('use_lidar_bev_detail', False)
 
@@ -413,6 +417,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         gps_noise_cfg=gps_noise_cfg,
         load_transfuser_lidar_bev=use_lidar_bev_detail,
         lidar_history_frames=lidar_history_frames,
+        filter_bad_routes=train_filter_bad_routes,
+        retain_bad_routes_for_energy=train_retain_bad_routes_for_energy,
     )
     val_dataset_orig = None
     val_dataset = None
@@ -426,6 +432,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             cache_dir=cache_dir, feature_suffix=feature_suffix,
             load_transfuser_lidar_bev=use_lidar_bev_detail,
             lidar_history_frames=lidar_history_frames,
+            filter_bad_routes=val_filter_bad_routes,
+            retain_bad_routes_for_energy=val_retain_bad_routes_for_energy,
         )
         val_dataset = val_dataset_orig
 

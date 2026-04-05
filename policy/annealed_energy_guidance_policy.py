@@ -362,6 +362,27 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         return F.smooth_l1_loss(pred[valid_mask], target[valid_mask])
 
     @staticmethod
+    def _reduce_per_sample(loss_tensor: torch.Tensor) -> torch.Tensor:
+        if loss_tensor.dim() <= 1:
+            return loss_tensor
+        return loss_tensor.reshape(loss_tensor.shape[0], -1).mean(dim=1)
+
+    @staticmethod
+    def _masked_batch_mean(loss_per_sample: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
+        active_mask = active_mask.to(dtype=torch.bool, device=loss_per_sample.device)
+        if active_mask.numel() == 0 or active_mask.sum() <= 0:
+            return loss_per_sample.new_tensor(0.0)
+        return loss_per_sample[active_mask].mean()
+
+    def _get_good_route_mask(self, batch: Dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
+        bad_mask = batch.get('is_bad_route', None)
+        if bad_mask is None:
+            return torch.ones(batch['agent_pos'].shape[0], device=device, dtype=torch.bool)
+        if not isinstance(bad_mask, torch.Tensor):
+            bad_mask = torch.as_tensor(bad_mask, device=device)
+        return ~bad_mask.to(device=device, dtype=torch.bool)
+
+    @staticmethod
     def decode_speed_two_hot(speed_logits, speed_classes):
         """Decode speed logits to scalar m/s via softmax weighted sum.
 
@@ -768,6 +789,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
         B, T, D = trajectory.shape
         M_anchor = self.num_energy_modes
+        good_route_mask = self._get_good_route_mask(batch, device)
 
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
@@ -818,20 +840,32 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         poses_reg_abs = self.norm_to_abs(poses_reg)
         route_pred_abs = self.route_norm_to_abs(route_pred)
         traj_target = trajectory.unsqueeze(1)
-        loss_reg = F.l1_loss(poses_reg_abs, traj_target, reduction='mean')
+        reg_per_sample = self._reduce_per_sample(
+            F.l1_loss(poses_reg_abs, traj_target, reduction='none')
+        )
+        loss_reg = self._masked_batch_mean(reg_per_sample, good_route_mask)
 
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if route_pred is not None:
-            route_loss = F.l1_loss(route_pred_abs, route_gt, reduction='mean')
-            # FDE: extra weight on final route point
-            route_loss = route_loss + F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='mean')
+            route_recon = self._reduce_per_sample(
+                F.l1_loss(route_pred_abs, route_gt, reduction='none')
+            )
+            route_fde = self._reduce_per_sample(
+                F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='none')
+            )
+            route_loss = self._masked_batch_mean(route_recon + route_fde, good_route_mask)
 
         # Speed loss: two-hot cross-entropy
         speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if speed_pred is not None:
             speed_target = self._compute_speed_target(trajectory, device)
             if speed_target is not None:
-                speed_loss = F.cross_entropy(speed_pred.float(), speed_target)
+                speed_per_sample = F.cross_entropy(
+                    speed_pred.float(),
+                    speed_target,
+                    reduction='none',
+                )
+                speed_loss = self._masked_batch_mean(speed_per_sample, good_route_mask)
 
         # ===== Forward 2: Energy training (anchors + GT) =====
         zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
