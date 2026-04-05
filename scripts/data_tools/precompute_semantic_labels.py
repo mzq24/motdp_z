@@ -126,6 +126,17 @@ def _has_all_fast_fields(sample):
     return all(field in sample for field in FAST_FIELDS)
 
 
+def _infer_num_future_points(samples, default_num_points=6):
+    for sample in samples:
+        ego_waypoints = sample.get('ego_waypoints')
+        if ego_waypoints is None:
+            continue
+        ego_waypoints = np.asarray(ego_waypoints, dtype=np.float32)
+        if ego_waypoints.ndim == 2 and ego_waypoints.shape[0] >= 2:
+            return max(int(ego_waypoints.shape[0] - 1), 1)
+    return int(default_num_points)
+
+
 def _set_semantic_fallback(sample, num_modes):
     sample['behavior_labels'] = np.zeros(num_modes, dtype=np.int64)
     sample['allowed_flags'] = np.ones(num_modes, dtype=np.float32)
@@ -1354,6 +1365,7 @@ def _build_speed_curve_targets(
     ped_safe_ttc_s=3.0,
     junction_left_conflict_len_scale=1.5,
     cross_safe_gap_s=1.0,
+    return_debug=False,
 ):
     speed = float((current_meas or {}).get("speed", 0.0))
     sample_speeds = _speed_risk_samples_fixed(speed)
@@ -1367,10 +1379,58 @@ def _build_speed_curve_targets(
     left_junction_conflict_len_m = _left_junction_conflict_len_m(
         current_meas, current_boxes, scale=junction_left_conflict_len_scale, event_name=event_name
     )
+    chase_info = {
+        "valid": 0.0,
+        "gap_m": np.nan,
+        "lead_speed_mps": np.nan,
+        "safe_gap_cur_m": np.nan,
+    }
+    meet_info = {
+        "valid": 0.0,
+        "d_ego_m": np.nan,
+        "d_bg_m": np.nan,
+        "conflict_len_m": np.nan,
+        "context_conflict_len_m": float(left_junction_conflict_len_m),
+        "borrow_conflict_len_m": np.nan,
+        "bg_speed_mps": np.nan,
+        "t_bg_s": np.nan,
+        "t_bg_exit_s": np.nan,
+        "t_bg_clear_s": np.nan,
+        "safe_gap_bg_m": np.nan,
+        "rear_gap_m": np.nan,
+        "v_equal_mps": np.nan,
+        "v_go_min_mps": np.nan,
+        "v_behind_min_mps": np.nan,
+        "v_go_need_mps": np.nan,
+        "v_yield_max_mps": np.nan,
+        "subtype": "none",
+        "cover_case": "none",
+    }
+
+    def _return_values():
+        if not return_debug:
+            return sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, ped_risks
+        total_risks = np.maximum(np.maximum(chase_risks, meet_risks), ped_risks)
+        debug_payload = {
+            "sample_speeds_mps": sample_speeds.astype(np.float32),
+            "total_risks": total_risks.astype(np.float32),
+            "chase_risks": chase_risks.astype(np.float32),
+            "meet_risks": meet_risks.astype(np.float32),
+            "ped_risks": ped_risks.astype(np.float32),
+            "chase_debug": dict(chase_info),
+            "meet_debug": dict(meet_info),
+        }
+        return sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, ped_risks, debug_payload
 
     if int(current_cover.get("exists", 0.0)) > 0 and str(current_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES:
         ped_distance = max(float(current_cover.get("distance", np.nan)), 0.0)
         if np.isfinite(ped_distance):
+            meet_info.update({
+                "valid": 1.0,
+                "d_ego_m": float(ped_distance),
+                "subtype": "ped_cross",
+                "cover_case": "current",
+            })
             for idx, candidate_speed in enumerate(sample_speeds):
                 v = float(candidate_speed)
                 if v <= 1e-6:
@@ -1378,7 +1438,7 @@ def _build_speed_curve_targets(
                     continue
                 t_cover = ped_distance / max(v, 1e-6)
                 ped_risks[idx] = float(np.clip((float(ped_safe_ttc_s) - t_cover) / max(float(ped_safe_ttc_s) - float(ped_hard_ttc_s), 1e-6), 0.0, 1.0))
-            return sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, ped_risks
+            return _return_values()
 
     if int(future_cover.get("exists", 0.0)) > 0 and str(future_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES:
         d_ego = float(future_cover.get("d_ego", np.nan))
@@ -1386,6 +1446,12 @@ def _build_speed_curve_targets(
             d_ego = float(future_cover.get("distance", np.nan))
         ped_distance = max(d_ego, 0.0)
         if np.isfinite(ped_distance):
+            meet_info.update({
+                "valid": 1.0,
+                "d_ego_m": float(ped_distance),
+                "subtype": "ped_cross",
+                "cover_case": "future",
+            })
             for idx, candidate_speed in enumerate(sample_speeds):
                 v = float(candidate_speed)
                 if v <= 1e-6:
@@ -1393,12 +1459,18 @@ def _build_speed_curve_targets(
                     continue
                 t_cover = ped_distance / max(v, 1e-6)
                 ped_risks[idx] = float(np.clip((float(ped_safe_ttc_s) - t_cover) / max(float(ped_safe_ttc_s) - float(ped_hard_ttc_s), 1e-6), 0.0, 1.0))
-            return sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, ped_risks
+            return _return_values()
 
     if int(current_cover.get("exists", 0.0)) > 0 and current_cover["interaction"]["name"] == "chase":
         gap_m = float(current_cover.get("distance", np.nan))
         lead_speed_mps = float(current_cover.get("other_speed", np.nan))
         if np.isfinite(gap_m) and np.isfinite(lead_speed_mps):
+            chase_info = {
+                "valid": 1.0,
+                "gap_m": float(gap_m),
+                "lead_speed_mps": float(lead_speed_mps),
+                "safe_gap_cur_m": float(chase_follow_base_gap_m + chase_follow_headway_s * max(speed, 0.0)),
+            }
             for idx, candidate_speed in enumerate(sample_speeds):
                 v = float(candidate_speed)
                 closing = v - lead_speed_mps
@@ -1434,6 +1506,17 @@ def _build_speed_curve_targets(
                 current_cover_dist_horizon_m = 15.0
             occupancy_floor = float(np.clip((current_cover_dist_horizon_m - float(d_ego_entry_m)) / max(current_cover_dist_horizon_m, 1e-6), 0.02, 1.0))
             current_cover_time_horizon_s = float(max(float(cross_safe_gap_s), 3.0))
+            meet_info.update({
+                "valid": 1.0,
+                "d_ego_m": float(d_ego_entry_m),
+                "d_bg_m": 0.0,
+                "conflict_len_m": float(conflict_len_m),
+                "bg_speed_mps": float(bg_speed),
+                "t_bg_s": 0.0,
+                "t_bg_exit_s": float(conflict_len_m / max(bg_speed, 1e-6)) if np.isfinite(conflict_len_m) and np.isfinite(bg_speed) and bg_speed > 1e-6 else np.nan,
+                "subtype": meet_subtype,
+                "cover_case": "current",
+            })
             for idx, candidate_speed in enumerate(sample_speeds):
                 v = float(candidate_speed)
                 if v <= 1e-6:
@@ -1445,7 +1528,7 @@ def _build_speed_curve_targets(
                 else:
                     risk = float(np.clip((current_cover_time_horizon_s - t_ego_in) / max(current_cover_time_horizon_s, 1e-6), 0.0, 1.0))
                 meet_risks[idx] = float(max(risk, occupancy_floor))
-            return sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, ped_risks
+            return _return_values()
 
     if int(future_cover.get("exists", 0.0)) > 0 and future_cover["interaction"]["name"] == "meet":
         d_ego = float(future_cover.get("d_ego", np.nan))
@@ -1478,6 +1561,33 @@ def _build_speed_curve_targets(
                     v_go_min = np.inf if go_denom <= 1e-6 else d_ego / max(go_denom, 1e-6)
                     v_go_need = max(float(v_go_min), float(v_behind_min))
                     v_yield_max = d_ego / max(t_bg + float(merge_tau_s), 1e-6)
+                debug_v_equal = float(v_equal)
+                debug_v_go_min = float(v_go_min)
+                if (
+                    d_ego <= float(MERGE_DEBUG_MIN_DEGO_M) or
+                    (np.isfinite(t_bg) and (t_bg - float(merge_tau_s)) <= float(MERGE_DEBUG_MIN_GO_DENOM_S))
+                ):
+                    debug_v_equal = np.nan
+                    debug_v_go_min = np.nan
+                meet_info.update({
+                    "valid": 1.0,
+                    "d_ego_m": float(risk_d_ego),
+                    "d_bg_m": float(risk_d_bg),
+                    "conflict_len_m": float(conflict_len_m),
+                    "bg_speed_mps": float(bg_speed),
+                    "t_bg_s": float(t_bg),
+                    "t_bg_exit_s": float(t_bg_exit),
+                    "t_bg_clear_s": np.nan,
+                    "safe_gap_bg_m": float(safe_gap_bg),
+                    "rear_gap_m": float(rear_gap_m),
+                    "v_equal_mps": float(debug_v_equal),
+                    "v_go_min_mps": float(debug_v_go_min),
+                    "v_behind_min_mps": float(v_behind_min),
+                    "v_go_need_mps": float(v_go_need),
+                    "v_yield_max_mps": float(v_yield_max),
+                    "subtype": meet_subtype,
+                    "cover_case": "future",
+                })
                 for idx, candidate_speed in enumerate(sample_speeds):
                     v = float(candidate_speed)
                     if v <= 1e-6:
@@ -1528,8 +1638,64 @@ def _build_speed_curve_targets(
                         delta_t = abs(t_ego_in - t_bg)
                         risk = _risk_from_time_gap(delta_t, merge_tau_s)
                     meet_risks[idx] = float(np.clip(np.nan_to_num(risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
+            if meet_subtype != "merge_meet":
+                meet_info.update({
+                    "valid": 1.0,
+                    "d_ego_m": float(risk_d_ego),
+                    "d_bg_m": float(risk_d_bg),
+                    "conflict_len_m": float(conflict_len_m),
+                    "bg_speed_mps": float(bg_speed),
+                    "t_bg_s": float(t_bg),
+                    "t_bg_exit_s": float(t_bg_exit),
+                    "t_bg_clear_s": np.nan,
+                    "safe_gap_bg_m": np.nan,
+                    "rear_gap_m": float(rear_gap_m),
+                    "v_equal_mps": np.nan,
+                    "v_go_min_mps": np.nan,
+                    "v_behind_min_mps": np.nan,
+                    "v_go_need_mps": np.nan,
+                    "v_yield_max_mps": np.nan,
+                    "subtype": meet_subtype,
+                    "cover_case": "future",
+                })
 
-    return sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, ped_risks
+    return _return_values()
+
+
+def _to_stage1_debug_python(value):
+    if isinstance(value, dict):
+        return {str(k): _to_stage1_debug_python(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_stage1_debug_python(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.astype(float).tolist()
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def _build_stage1_speed_debug_payload(
+    current_cover,
+    future_cover,
+    ped_current_cover,
+    ped_future_cover,
+    speed_curve_future_cover,
+    speed_curve_future_persisted,
+    speed_curve_debug,
+):
+    return _to_stage1_debug_python({
+        "current_cover": dict(current_cover),
+        "future_cover": dict(future_cover),
+        "ped_current_cover": dict(ped_current_cover),
+        "ped_future_cover": dict(ped_future_cover),
+        "speed_curve_future_cover": dict(speed_curve_future_cover),
+        "speed_curve_future_persisted": bool(speed_curve_future_persisted),
+        "speed_curve": dict(speed_curve_debug),
+    })
 
 
 def _has_stage1_speed_fields(sample):
@@ -1559,6 +1725,23 @@ def _set_stage1_speed_fallback(sample):
     sample['speed_risk_chase_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
     sample['speed_risk_meet_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
     sample['speed_risk_ped_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
+    sample['stage1_speed_debug'] = _build_stage1_speed_debug_payload(
+        current_cover=_cover_candidate_summary(0, None, {}),
+        future_cover=_cover_candidate_summary(0, None, {}),
+        ped_current_cover=_cover_candidate_summary(0, None, {}),
+        ped_future_cover=_cover_candidate_summary(0, None, {}),
+        speed_curve_future_cover=_cover_candidate_summary(0, None, {}),
+        speed_curve_future_persisted=False,
+        speed_curve_debug={
+            'sample_speeds_mps': sample_speeds.astype(np.float32),
+            'total_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
+            'chase_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
+            'meet_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
+            'ped_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
+            'chase_debug': {'valid': 0.0},
+            'meet_debug': {'valid': 0.0},
+        },
+    )
 
 
 def _build_future_frames_data(image_data_root, base_dir, frame_str, num_future):
@@ -1609,16 +1792,22 @@ def precompute(
     front_max_ttc_s=10.0,
     front_block_safe_distance_m=30.0,
     checkpoint_every_minutes=20.0,
+    stage1_only=False,
 ):
-    # Load anchors
-    if anchor_path.endswith('.npy'):
-        anchor_centers_abs = np.load(anchor_path)
-    else:
-        with open(anchor_path, 'rb') as f:
-            anchor_centers_abs = pickle.load(f)['centers']
-    num_modes = anchor_centers_abs.shape[0]
-    num_points = anchor_centers_abs.shape[1]
-    print(f"Anchor: {anchor_centers_abs.shape} from {anchor_path}")
+    anchor_centers_abs = None
+    num_modes = None
+    num_points = None
+    if not stage1_only:
+        if anchor_path is None:
+            raise ValueError("anchor_path is required unless --stage1_only is used")
+        if anchor_path.endswith('.npy'):
+            anchor_centers_abs = np.load(anchor_path)
+        else:
+            with open(anchor_path, 'rb') as f:
+                anchor_centers_abs = pickle.load(f)['centers']
+        num_modes = anchor_centers_abs.shape[0]
+        num_points = anchor_centers_abs.shape[1]
+        print(f"Anchor: {anchor_centers_abs.shape} from {anchor_path}")
 
     # Load packed samples
     packed_path = _ensure_packed_samples(dataset_path)
@@ -1628,21 +1817,31 @@ def precompute(
         samples = pickle.load(f)
     print(f"Loaded {len(samples)} samples")
 
-    complete_fast_fields = sum(1 for s in samples if _has_all_fast_fields(s))
     already_semantic = sum(1 for s in samples if 'behavior_labels' in s and 'allowed_flags' in s and 'scene_buckets' in s)
     already_energy = sum(1 for s in samples if 'energy_targets' in s and 'energy_active_mask' in s)
     already_ego_status = sum(1 for s in samples if 'ego_status' in s)
     already_stage1_speed = sum(1 for s in samples if _has_stage1_speed_fields(s))
-    print(
-        f"Existing fields: semantic={already_semantic}/{len(samples)}, "
-        f"energy={already_energy}/{len(samples)}, "
-        f"ego_status={already_ego_status}/{len(samples)}, "
-        f"stage1_speed={already_stage1_speed}/{len(samples)}, "
-        f"complete={complete_fast_fields}/{len(samples)}"
-    )
-    if complete_fast_fields == len(samples) and not force:
-        print(f"All {len(samples)} samples already have all fast fields. Use --force to re-compute.")
-        return
+    if stage1_only:
+        num_points = _infer_num_future_points(samples)
+        print(
+            f"Existing fields (stage1-only): stage1_speed={already_stage1_speed}/{len(samples)}, "
+            f"inferred_num_future={num_points}"
+        )
+        if already_stage1_speed == len(samples) and not force:
+            print(f"All {len(samples)} samples already have stage1 speed fields. Use --force to re-compute.")
+            return
+    else:
+        complete_fast_fields = sum(1 for s in samples if _has_all_fast_fields(s))
+        print(
+            f"Existing fields: semantic={already_semantic}/{len(samples)}, "
+            f"energy={already_energy}/{len(samples)}, "
+            f"ego_status={already_ego_status}/{len(samples)}, "
+            f"stage1_speed={already_stage1_speed}/{len(samples)}, "
+            f"complete={complete_fast_fields}/{len(samples)}"
+        )
+        if complete_fast_fields == len(samples) and not force:
+            print(f"All {len(samples)} samples already have all fast fields. Use --force to re-compute.")
+            return
 
     image_data_root = os.path.realpath(image_data_root)
     semantic_computed = 0
@@ -1704,215 +1903,216 @@ def precompute(
         _save_checkpoint(phase=phase, reason='periodic')
 
     try:
-        for sample in tqdm(samples, desc="Labeling"):
-            labeling_processed += 1
-            needs_semantic = force or any(
-                field not in sample for field in ('behavior_labels', 'allowed_flags', 'scene_buckets')
-            )
-            needs_energy = force or any(
-                field not in sample for field in ('energy_targets', 'energy_active_mask')
-            )
-            needs_ego_status = force or ('ego_status' not in sample)
-            needs_front_route = force or any(
-                field not in sample for field in (
-                    'front_route_distance',
-                    'front_route_ttc',
-                    'front_route_risk',
-                    'front_route_block_risk',
-                    'front_route_case',
-                    'front_route_has_lead',
-                    'front_route_actor_class',
-                    'front_route_actor_weight',
-                    'front_route_block_bin',
-                    'front_route_ttc_bin',
-                    'front_route_hazard_bin',
+        if not stage1_only:
+            for sample in tqdm(samples, desc="Labeling"):
+                labeling_processed += 1
+                needs_semantic = force or any(
+                    field not in sample for field in ('behavior_labels', 'allowed_flags', 'scene_buckets')
                 )
-            )
+                needs_energy = force or any(
+                    field not in sample for field in ('energy_targets', 'energy_active_mask')
+                )
+                needs_ego_status = force or ('ego_status' not in sample)
+                needs_front_route = force or any(
+                    field not in sample for field in (
+                        'front_route_distance',
+                        'front_route_ttc',
+                        'front_route_risk',
+                        'front_route_block_risk',
+                        'front_route_case',
+                        'front_route_has_lead',
+                        'front_route_actor_class',
+                        'front_route_actor_weight',
+                        'front_route_block_bin',
+                        'front_route_ttc_bin',
+                        'front_route_hazard_bin',
+                    )
+                )
 
-            if not (needs_semantic or needs_energy or needs_ego_status or needs_front_route):
-                skipped += 1
-                _maybe_checkpoint(phase='labeling')
-                continue
+                if not (needs_semantic or needs_energy or needs_ego_status or needs_front_route):
+                    skipped += 1
+                    _maybe_checkpoint(phase='labeling')
+                    continue
 
-            dirty_since_checkpoint = True
-            base_dir = None
-            frame_str = None
-            current_boxes = None
-            current_measurements = None
-            ego_matrix_current = None
-            future_frames_data = None
+                dirty_since_checkpoint = True
+                base_dir = None
+                frame_str = None
+                current_boxes = None
+                current_measurements = None
+                ego_matrix_current = None
+                future_frames_data = None
 
-            if needs_semantic:
-                base_dir, frame_str = _resolve_feature_frame_info(sample)
-                if base_dir is None or frame_str is None:
-                    _set_semantic_fallback(sample, num_modes)
-                    fallback += 1
-                else:
-                    bev_rel = os.path.join(base_dir, 'bev_semantics', f'{frame_str}.png')
-                    bev_path = os.path.join(image_data_root, bev_rel)
-
-                    if not os.path.exists(bev_path):
+                if needs_semantic:
+                    base_dir, frame_str = _resolve_feature_frame_info(sample)
+                    if base_dir is None or frame_str is None:
                         _set_semantic_fallback(sample, num_modes)
                         fallback += 1
                     else:
-                        bev_semantic = np.array(Image.open(bev_path))
+                        bev_rel = os.path.join(base_dir, 'bev_semantics', f'{frame_str}.png')
+                        bev_path = os.path.join(image_data_root, bev_rel)
 
-                        boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
-                        boxes_path = os.path.join(image_data_root, boxes_rel)
-                        current_boxes = _load_json_gz_if_exists(boxes_path)
+                        if not os.path.exists(bev_path):
+                            _set_semantic_fallback(sample, num_modes)
+                            fallback += 1
+                        else:
+                            bev_semantic = np.array(Image.open(bev_path))
 
-                        meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
-                        meas_path = os.path.join(image_data_root, meas_rel)
-                        current_measurements = _load_json_gz_if_exists(meas_path)
+                            boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
+                            boxes_path = os.path.join(image_data_root, boxes_rel)
+                            current_boxes = _load_json_gz_if_exists(boxes_path)
 
-                        if current_measurements is not None:
-                            ego_matrix_current = current_measurements.get('ego_matrix', None)
+                            meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
+                            meas_path = os.path.join(image_data_root, meas_rel)
+                            current_measurements = _load_json_gz_if_exists(meas_path)
 
-                        if ego_matrix_current is not None:
-                            frame_id = int(frame_str)
-                            future_frames_data = []
-                            for k in range(1, num_points + 1):
-                                future_frame_str = f"{frame_id + k:04d}"
-                                fut_boxes_path = os.path.join(
-                                    image_data_root, base_dir,
-                                    'boxes', f'{future_frame_str}.json.gz')
-                                fut_meas_path = os.path.join(
-                                    image_data_root, base_dir,
-                                    'measurements', f'{future_frame_str}.json.gz')
-                                if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
-                                    try:
-                                        fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
-                                        fut_meas = _load_json_gz_if_exists(fut_meas_path)
-                                        if fut_boxes is None or fut_meas is None:
+                            if current_measurements is not None:
+                                ego_matrix_current = current_measurements.get('ego_matrix', None)
+
+                            if ego_matrix_current is not None:
+                                frame_id = int(frame_str)
+                                future_frames_data = []
+                                for k in range(1, num_points + 1):
+                                    future_frame_str = f"{frame_id + k:04d}"
+                                    fut_boxes_path = os.path.join(
+                                        image_data_root, base_dir,
+                                        'boxes', f'{future_frame_str}.json.gz')
+                                    fut_meas_path = os.path.join(
+                                        image_data_root, base_dir,
+                                        'measurements', f'{future_frame_str}.json.gz')
+                                    if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
+                                        try:
+                                            fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
+                                            fut_meas = _load_json_gz_if_exists(fut_meas_path)
+                                            if fut_boxes is None or fut_meas is None:
+                                                future_frames_data.append(None)
+                                                continue
+                                            fut_ego_matrix = fut_meas.get('ego_matrix', None)
+                                            if fut_ego_matrix is not None:
+                                                future_frames_data.append((fut_boxes, fut_ego_matrix))
+                                            else:
+                                                future_frames_data.append(None)
+                                        except Exception:
                                             future_frames_data.append(None)
-                                            continue
-                                        fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                                        if fut_ego_matrix is not None:
-                                            future_frames_data.append((fut_boxes, fut_ego_matrix))
-                                        else:
-                                            future_frames_data.append(None)
-                                    except Exception:
+                                    else:
                                         future_frames_data.append(None)
+                            gt_traj = sample.get('ego_waypoints', None)
+                            if gt_traj is not None:
+                                if isinstance(gt_traj, np.ndarray):
+                                    gt_traj = gt_traj[1:]
                                 else:
-                                    future_frames_data.append(None)
-                        gt_traj = sample.get('ego_waypoints', None)
-                        if gt_traj is not None:
-                            if isinstance(gt_traj, np.ndarray):
-                                gt_traj = gt_traj[1:]
-                            else:
-                                gt_traj = np.array(gt_traj)[1:]
+                                    gt_traj = np.array(gt_traj)[1:]
 
-                        behavior_labels, allowed_flags, _ = label_anchors_semantic(
-                            anchor_centers_abs, bev_semantic,
-                            ppm=bev_ppm, bev_size=bev_size,
-                            boxes=current_boxes,
-                            measurements=current_measurements,
-                            ego_matrix_current=ego_matrix_current,
-                            future_frames_data=future_frames_data,
-                            gt_trajectory=gt_traj,
-                        )
+                            behavior_labels, allowed_flags, _ = label_anchors_semantic(
+                                anchor_centers_abs, bev_semantic,
+                                ppm=bev_ppm, bev_size=bev_size,
+                                boxes=current_boxes,
+                                measurements=current_measurements,
+                                ego_matrix_current=ego_matrix_current,
+                                future_frames_data=future_frames_data,
+                                gt_trajectory=gt_traj,
+                            )
 
-                        bucket_flags = classify_scene_buckets(
-                            measurements=current_measurements,
-                            boxes=current_boxes,
-                            ego_waypoints=gt_traj,
-                        )
+                            bucket_flags = classify_scene_buckets(
+                                measurements=current_measurements,
+                                boxes=current_boxes,
+                                ego_waypoints=gt_traj,
+                            )
 
-                        sample['behavior_labels'] = behavior_labels
-                        sample['allowed_flags'] = allowed_flags.astype(np.float32)
-                        sample['scene_buckets'] = bucket_flags.astype(np.float32)
-                        semantic_computed += 1
+                            sample['behavior_labels'] = behavior_labels
+                            sample['allowed_flags'] = allowed_flags.astype(np.float32)
+                            sample['scene_buckets'] = bucket_flags.astype(np.float32)
+                            semantic_computed += 1
 
-            if needs_front_route:
-                if base_dir is None or frame_str is None:
-                    base_dir, frame_str = _resolve_feature_frame_info(sample)
-                if base_dir is None or frame_str is None:
-                    _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
-                    fallback += 1
-                else:
-                    if current_boxes is None:
-                        boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
-                        boxes_path = os.path.join(image_data_root, boxes_rel)
-                        current_boxes = _load_json_gz_if_exists(boxes_path)
-                    if current_measurements is None:
-                        meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
-                        meas_path = os.path.join(image_data_root, meas_rel)
-                        current_measurements = _load_json_gz_if_exists(meas_path)
-                    if ego_matrix_current is None and current_measurements is not None:
-                        ego_matrix_current = current_measurements.get('ego_matrix', None)
-                    if future_frames_data is None and ego_matrix_current is not None:
-                        frame_id = int(frame_str)
-                        future_frames_data = []
-                        for k in range(1, num_points + 1):
-                            future_frame_str = f'{frame_id + k:04d}'
-                            fut_boxes_path = os.path.join(image_data_root, base_dir, 'boxes', f'{future_frame_str}.json.gz')
-                            fut_meas_path = os.path.join(image_data_root, base_dir, 'measurements', f'{future_frame_str}.json.gz')
-                            fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
-                            fut_meas = _load_json_gz_if_exists(fut_meas_path)
-                            if fut_boxes is None or fut_meas is None:
-                                future_frames_data.append(None)
-                                continue
-                            fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                            if fut_ego_matrix is not None:
-                                future_frames_data.append((fut_boxes, fut_ego_matrix))
-                            else:
-                                future_frames_data.append(None)
-
-                    route = sample.get('route', None)
-                    ego_speed = 0.0
-                    if current_measurements is not None:
-                        ego_speed = float(current_measurements.get('speed', 0.0))
-                    elif sample.get('speed_hist', None) is not None:
-                        ego_speed = float(np.asarray(sample['speed_hist'], dtype=np.float32)[-1])
-
-                    if route is None or current_boxes is None:
+                if needs_front_route:
+                    if base_dir is None or frame_str is None:
+                        base_dir, frame_str = _resolve_feature_frame_info(sample)
+                    if base_dir is None or frame_str is None:
                         _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
                         fallback += 1
                     else:
-                        front_label = _compute_front_route_label(
-                            route=route,
-                            current_boxes=current_boxes,
-                            ego_speed=ego_speed,
-                            ego_matrix_current=ego_matrix_current,
-                            future_frames_data=future_frames_data,
-                            corridor_margin_m=front_corridor_margin_m,
-                            route_step_m=front_route_step_m,
-                            max_distance_m=front_max_distance_m,
-                            safe_ttc_s=front_safe_ttc_s,
-                            max_ttc_s=front_max_ttc_s,
-                            block_safe_distance_m=front_block_safe_distance_m,
-                        )
-                        sample['front_route_distance'] = np.float32(front_label['distance'])
-                        sample['front_route_ttc'] = np.float32(front_label['ttc'])
-                        sample['front_route_risk'] = np.float32(front_label['risk'])
-                        sample['front_route_block_risk'] = np.float32(front_label['block_risk'])
-                        sample['front_route_case'] = np.int64(front_label['case'])
-                        sample['front_route_has_lead'] = np.float32(front_label['has_lead'])
-                        sample['front_route_actor_class'] = np.int64(front_label['actor_class'])
-                        sample['front_route_actor_weight'] = np.float32(front_label['actor_weight'])
-                        sample['front_route_block_bin'] = np.int64(front_label['block_bin'])
-                        sample['front_route_ttc_bin'] = np.int64(front_label['ttc_bin'])
-                        sample['front_route_hazard_bin'] = np.int64(front_label['hazard_bin'])
-                        front_route_built += 1
+                        if current_boxes is None:
+                            boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
+                            boxes_path = os.path.join(image_data_root, boxes_rel)
+                            current_boxes = _load_json_gz_if_exists(boxes_path)
+                        if current_measurements is None:
+                            meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
+                            meas_path = os.path.join(image_data_root, meas_rel)
+                            current_measurements = _load_json_gz_if_exists(meas_path)
+                        if ego_matrix_current is None and current_measurements is not None:
+                            ego_matrix_current = current_measurements.get('ego_matrix', None)
+                        if future_frames_data is None and ego_matrix_current is not None:
+                            frame_id = int(frame_str)
+                            future_frames_data = []
+                            for k in range(1, num_points + 1):
+                                future_frame_str = f'{frame_id + k:04d}'
+                                fut_boxes_path = os.path.join(image_data_root, base_dir, 'boxes', f'{future_frame_str}.json.gz')
+                                fut_meas_path = os.path.join(image_data_root, base_dir, 'measurements', f'{future_frame_str}.json.gz')
+                                fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
+                                fut_meas = _load_json_gz_if_exists(fut_meas_path)
+                                if fut_boxes is None or fut_meas is None:
+                                    future_frames_data.append(None)
+                                    continue
+                                fut_ego_matrix = fut_meas.get('ego_matrix', None)
+                                if fut_ego_matrix is not None:
+                                    future_frames_data.append((fut_boxes, fut_ego_matrix))
+                                else:
+                                    future_frames_data.append(None)
 
-            if needs_energy:
-                if 'behavior_labels' not in sample or 'allowed_flags' not in sample:
-                    _set_semantic_fallback(sample, num_modes)
-                energy_targets, energy_active_mask = _build_energy_targets(
-                    sample['behavior_labels'],
-                    sample['allowed_flags'],
-                )
-                sample['energy_targets'] = energy_targets
-                sample['energy_active_mask'] = energy_active_mask
-                energy_built += 1
+                        route = sample.get('route', None)
+                        ego_speed = 0.0
+                        if current_measurements is not None:
+                            ego_speed = float(current_measurements.get('speed', 0.0))
+                        elif sample.get('speed_hist', None) is not None:
+                            ego_speed = float(np.asarray(sample['speed_hist'], dtype=np.float32)[-1])
 
-            if needs_ego_status:
-                sample['ego_status'] = _build_ego_status(sample)
-                ego_status_built += 1
+                        if route is None or current_boxes is None:
+                            _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
+                            fallback += 1
+                        else:
+                            front_label = _compute_front_route_label(
+                                route=route,
+                                current_boxes=current_boxes,
+                                ego_speed=ego_speed,
+                                ego_matrix_current=ego_matrix_current,
+                                future_frames_data=future_frames_data,
+                                corridor_margin_m=front_corridor_margin_m,
+                                route_step_m=front_route_step_m,
+                                max_distance_m=front_max_distance_m,
+                                safe_ttc_s=front_safe_ttc_s,
+                                max_ttc_s=front_max_ttc_s,
+                                block_safe_distance_m=front_block_safe_distance_m,
+                            )
+                            sample['front_route_distance'] = np.float32(front_label['distance'])
+                            sample['front_route_ttc'] = np.float32(front_label['ttc'])
+                            sample['front_route_risk'] = np.float32(front_label['risk'])
+                            sample['front_route_block_risk'] = np.float32(front_label['block_risk'])
+                            sample['front_route_case'] = np.int64(front_label['case'])
+                            sample['front_route_has_lead'] = np.float32(front_label['has_lead'])
+                            sample['front_route_actor_class'] = np.int64(front_label['actor_class'])
+                            sample['front_route_actor_weight'] = np.float32(front_label['actor_weight'])
+                            sample['front_route_block_bin'] = np.int64(front_label['block_bin'])
+                            sample['front_route_ttc_bin'] = np.int64(front_label['ttc_bin'])
+                            sample['front_route_hazard_bin'] = np.int64(front_label['hazard_bin'])
+                            front_route_built += 1
 
-            _maybe_checkpoint(phase='labeling')
+                if needs_energy:
+                    if 'behavior_labels' not in sample or 'allowed_flags' not in sample:
+                        _set_semantic_fallback(sample, num_modes)
+                    energy_targets, energy_active_mask = _build_energy_targets(
+                        sample['behavior_labels'],
+                        sample['allowed_flags'],
+                    )
+                    sample['energy_targets'] = energy_targets
+                    sample['energy_active_mask'] = energy_active_mask
+                    energy_built += 1
 
-        _maybe_checkpoint(phase='labeling', force_reason='phase_complete')
+                if needs_ego_status:
+                    sample['ego_status'] = _build_ego_status(sample)
+                    ego_status_built += 1
+
+                _maybe_checkpoint(phase='labeling')
+
+            _maybe_checkpoint(phase='labeling', force_reason='phase_complete')
 
         route_groups = defaultdict(list)
         for sample_idx, sample in enumerate(samples):
@@ -2018,6 +2218,7 @@ def precompute(
                 current_cover = _cover_candidate_summary(1, front_debug.get('best_current'), front_debug, current_meas=current_measurements, event_name=event_name)
                 future_cover = _cover_candidate_summary(2, front_debug.get('best_future'), front_debug, current_meas=current_measurements, event_name=event_name)
                 speed_curve_future_cover = dict(future_cover)
+                speed_curve_future_persisted = False
 
                 if int(future_cover.get('exists', 0.0)) > 0 and future_cover['interaction']['name'] == 'meet':
                     persisted_meet = dict(future_cover)
@@ -2050,6 +2251,7 @@ def precompute(
                     if keep_persisted:
                         pseudo['other_speed'] = float(bg_speed_now)
                         speed_curve_future_cover = pseudo
+                        speed_curve_future_persisted = True
                         persisted_meet = dict(pseudo)
                         persisted_meet_frames_left -= 1
                     else:
@@ -2076,12 +2278,13 @@ def precompute(
                 ped_current_cover = _cover_candidate_summary(1, ped_debug.get('best_current'), ped_debug, current_meas=current_measurements, event_name=event_name)
                 ped_future_cover = _cover_candidate_summary(2, ped_debug.get('best_future'), ped_debug, current_meas=current_measurements, event_name=event_name)
 
-                sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, _ = _build_speed_curve_targets(
+                sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, _, speed_curve_debug = _build_speed_curve_targets(
                     current_cover=current_cover,
                     future_cover=speed_curve_future_cover,
                     current_meas=current_measurements,
                     current_boxes=current_boxes_dynamic,
                     event_name=event_name,
+                    return_debug=True,
                 )
                 ped_sample_speeds, _, _, _, _, ped_risks = _build_speed_curve_targets(
                     current_cover=ped_current_cover,
@@ -2099,6 +2302,20 @@ def precompute(
                 sample['speed_risk_chase_values'] = chase_risks.astype(np.float32)
                 sample['speed_risk_meet_values'] = meet_risks.astype(np.float32)
                 sample['speed_risk_ped_values'] = ped_risks.astype(np.float32)
+                speed_curve_debug['ped_risks'] = np.asarray(ped_risks, dtype=np.float32)
+                speed_curve_debug['total_risks'] = np.maximum(
+                    np.maximum(np.asarray(chase_risks, dtype=np.float32), np.asarray(meet_risks, dtype=np.float32)),
+                    np.asarray(ped_risks, dtype=np.float32),
+                ).astype(np.float32)
+                sample['stage1_speed_debug'] = _build_stage1_speed_debug_payload(
+                    current_cover=current_cover,
+                    future_cover=future_cover,
+                    ped_current_cover=ped_current_cover,
+                    ped_future_cover=ped_future_cover,
+                    speed_curve_future_cover=speed_curve_future_cover,
+                    speed_curve_future_persisted=speed_curve_future_persisted,
+                    speed_curve_debug=speed_curve_debug,
+                )
                 stage1_speed_built += 1
                 _maybe_checkpoint(phase='stage1_speed')
 
@@ -2126,8 +2343,8 @@ if __name__ == '__main__':
                         help='Path to dataset split (e.g. /media/z/data/dataset/pdm_lite_mini/train)')
     parser.add_argument('--image_data_root', type=str, required=True,
                         help='Root of image data (e.g. /media/z/data/dataset/pdm_lite_mini)')
-    parser.add_argument('--anchor_path', type=str, required=True,
-                        help='Path to anchor file (.npy or .pkl)')
+    parser.add_argument('--anchor_path', type=str, default=None,
+                        help='Path to anchor file (.npy or .pkl). Required unless --stage1_only is used.')
     parser.add_argument('--bev_ppm', type=float, default=2.0)
     parser.add_argument('--bev_size', type=int, default=256)
     parser.add_argument('--front_corridor_margin_m', type=float, default=0.5)
@@ -2138,8 +2355,13 @@ if __name__ == '__main__':
     parser.add_argument('--front_block_safe_distance_m', type=float, default=30.0)
     parser.add_argument('--checkpoint_every_minutes', type=float, default=20.0,
                         help='Periodically atomically save updated samples_packed.pkl to make long runs resumable. Set <=0 to disable.')
+    parser.add_argument('--stage1_only', action='store_true',
+                        help='Skip old semantic/energy/ego/front_route labeling and only (re)compute stage1 speed-energy labels.')
     parser.add_argument('--force', action='store_true', help='Re-compute even if labels exist')
     args = parser.parse_args()
+
+    if not args.stage1_only and not args.anchor_path:
+        parser.error('--anchor_path is required unless --stage1_only is used')
 
     precompute(args.dataset_path, args.image_data_root, args.anchor_path,
                bev_ppm=args.bev_ppm,
@@ -2151,4 +2373,5 @@ if __name__ == '__main__':
                front_safe_ttc_s=args.front_safe_ttc_s,
                front_max_ttc_s=args.front_max_ttc_s,
                front_block_safe_distance_m=args.front_block_safe_distance_m,
-               checkpoint_every_minutes=args.checkpoint_every_minutes)
+               checkpoint_every_minutes=args.checkpoint_every_minutes,
+               stage1_only=args.stage1_only)
