@@ -2,6 +2,7 @@
 import os
 import sys
 import torch
+import json
 try:
     from torch.amp import autocast as torch_autocast, GradScaler
 
@@ -32,6 +33,32 @@ sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
+
+
+CURRENT_ADAPTIVE_WEIGHTS = {
+    'startup': [0.50, 0.35, 0.15],
+    'low': [0.29, 0.30, 0.41],
+    'medium': [0.36, 0.34, 0.30],
+    'high': [0.30, 0.37, 0.33],
+}
+REGIME_ORDER = ['startup', 'low', 'medium', 'high']
+
+
+def _speed_regime_masks(median3, current_speed, rough_threshold=2.5, high_threshold=10.0, startup_speed_threshold=0.2):
+    startup_mask = (median3 < rough_threshold) & (current_speed < startup_speed_threshold)
+    low_mask = (median3 < rough_threshold) & (~startup_mask)
+    medium_mask = (median3 >= rough_threshold) & (median3 < high_threshold)
+    high_mask = median3 >= high_threshold
+    return {
+        'startup': startup_mask,
+        'low': low_mask,
+        'medium': medium_mask,
+        'high': high_mask,
+    }
+
+
+def _mae(pred, target):
+    return float(np.mean(np.abs(pred - target)))
 
 def load_config(config_path=None):
     if config_path is None:
@@ -114,7 +141,17 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return metrics
 
-def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=False, amp_dtype=torch.float16, max_batches=None):
+def validate_model(
+    policy,
+    val_loader,
+    device,
+    rank=0,
+    world_size=1,
+    use_amp=False,
+    amp_dtype=torch.float16,
+    max_batches=None,
+    speed_adaptive_json_path=None,
+):
     """
     Validation function for distributed training
     Only rank 0 will compute and log metrics
@@ -129,6 +166,7 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
     route_b_phase = 'split' if route_b_cfg.get('use_split_forward', False) else 'unified'
 
     val_metrics = defaultdict(list)
+    speed_adaptive_cache = defaultdict(list)
 
     # All ranks perform validation to avoid NCCL timeout
     # (rank 0 logs metrics, others just run forward to stay in sync)
@@ -197,6 +235,50 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
 
+                    target_speed = result.get('target_speed', None)
+                    if target_speed is not None and target_actions_eval.shape[1] >= 3:
+                        gt_speed = torch.norm(
+                            target_actions_eval[:, 2] - target_actions_eval[:, 0], dim=-1
+                        ).detach().cpu().numpy()
+                        current_speed_hist = batch.get('speed', None)
+                        if current_speed_hist is not None:
+                            current_speed = current_speed_hist[:, -1].detach().cpu().numpy()
+                        else:
+                            current_speed = np.zeros_like(gt_speed)
+
+                        pred_traj_np = predicted_actions.detach().cpu().numpy()
+                        traj_1s = np.linalg.norm(pred_traj_np[:, 2] - pred_traj_np[:, 0], axis=-1)
+                        traj_05 = np.linalg.norm(pred_traj_np[:, 1] - pred_traj_np[:, 0], axis=-1) * 2.0
+                        speed_head = np.asarray(target_speed).reshape(-1)
+                        stacked = np.stack([speed_head, traj_1s, traj_05], axis=1)
+                        mean3 = stacked.mean(axis=1)
+                        median3 = np.median(stacked, axis=1)
+
+                        masks = _speed_regime_masks(median3, current_speed)
+                        adaptive_current = np.empty_like(mean3)
+                        for regime in REGIME_ORDER:
+                            if np.any(masks[regime]):
+                                adaptive_current[masks[regime]] = stacked[masks[regime]] @ np.asarray(
+                                    CURRENT_ADAPTIVE_WEIGHTS[regime], dtype=np.float32
+                                )
+
+                        valid = np.isfinite(gt_speed)
+                        valid &= np.isfinite(speed_head)
+                        valid &= np.isfinite(traj_1s)
+                        valid &= np.isfinite(traj_05)
+                        valid &= np.isfinite(mean3)
+                        valid &= np.isfinite(median3)
+                        valid &= np.isfinite(adaptive_current)
+                        if np.any(valid):
+                            speed_adaptive_cache['gt_speed'].append(gt_speed[valid])
+                            speed_adaptive_cache['current_speed'].append(current_speed[valid])
+                            speed_adaptive_cache['speed_head'].append(speed_head[valid])
+                            speed_adaptive_cache['traj_1s'].append(traj_1s[valid])
+                            speed_adaptive_cache['traj_05'].append(traj_05[valid])
+                            speed_adaptive_cache['mean3'].append(mean3[valid])
+                            speed_adaptive_cache['median3'].append(median3[valid])
+                            speed_adaptive_cache['adaptive_current'].append(adaptive_current[valid])
+
                     # Also log 1-step DDIM L2 metrics for direct comparison
                     # Support both Route A (num_diffusion_steps) and Route B (num_inference_steps)
                     steps_attr = None
@@ -258,6 +340,63 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1, use_amp=Fal
 
     # Compute averaged metrics
     averaged_metrics = {f'val_{k}': np.mean(v) for k, v in val_metrics.items() if v}
+
+    if rank == 0 and speed_adaptive_cache.get('gt_speed'):
+        gt_all = np.concatenate(speed_adaptive_cache['gt_speed'])
+        current_speed_all = np.concatenate(speed_adaptive_cache['current_speed'])
+        speed_head_all = np.concatenate(speed_adaptive_cache['speed_head'])
+        traj_1s_all = np.concatenate(speed_adaptive_cache['traj_1s'])
+        traj_05_all = np.concatenate(speed_adaptive_cache['traj_05'])
+        mean3_all = np.concatenate(speed_adaptive_cache['mean3'])
+        median3_all = np.concatenate(speed_adaptive_cache['median3'])
+        adaptive_current_all = np.concatenate(speed_adaptive_cache['adaptive_current'])
+
+        sources = {
+            'speed_head': speed_head_all,
+            'traj_1s': traj_1s_all,
+            'traj_05': traj_05_all,
+            'mean3': mean3_all,
+            'median3': median3_all,
+            'adaptive_current': adaptive_current_all,
+        }
+        regime_masks = _speed_regime_masks(median3_all, current_speed_all)
+
+        for key, value in sources.items():
+            averaged_metrics[f'val_speed_mae_{key}'] = _mae(value, gt_all)
+            averaged_metrics[f'val_speed_bias_{key}'] = float(np.mean(value - gt_all))
+
+        summary = {
+            'num_samples': int(gt_all.shape[0]),
+            'source_order': ['speed_head', 'traj_1s', 'traj_05'],
+            'current_adaptive_weights': CURRENT_ADAPTIVE_WEIGHTS,
+            'regime_thresholds': {
+                'rough_threshold': 2.5,
+                'high_threshold': 10.0,
+                'startup_speed_threshold': 0.2,
+            },
+            'overall_mae': {key: _mae(value, gt_all) for key, value in sources.items()},
+            'overall_bias': {key: float(np.mean(value - gt_all)) for key, value in sources.items()},
+            'regimes': {},
+        }
+
+        for regime in REGIME_ORDER:
+            mask = regime_masks[regime]
+            count = int(mask.sum())
+            averaged_metrics[f'val_speed_count_{regime}'] = float(count)
+            item = {'count': count, 'current_weights': CURRENT_ADAPTIVE_WEIGHTS[regime]}
+            if count > 0:
+                item['source_mae'] = {key: _mae(value[mask], gt_all[mask]) for key, value in sources.items()}
+                for key, value in sources.items():
+                    averaged_metrics[f'val_speed_mae_{key}_{regime}'] = _mae(value[mask], gt_all[mask])
+            else:
+                item['source_mae'] = {}
+            summary['regimes'][regime] = item
+
+        if speed_adaptive_json_path:
+            os.makedirs(os.path.dirname(speed_adaptive_json_path), exist_ok=True)
+            with open(speed_adaptive_json_path, 'w') as f:
+                json.dump(summary, f, indent=2)
+
     return averaged_metrics
 
 @record  # Records error and tracebacks in case of failure
@@ -891,6 +1030,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit")
+    speed_adaptive_json_path = os.path.join(checkpoint_dir, "speed_stats_val_latest.json")
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"✓ Checkpoint directory: {checkpoint_dir}")
@@ -914,7 +1054,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             ema_model.copy_to(model_for_ema.parameters())
             val_metrics = validate_model(
                 policy, val_loader, device, rank=rank, world_size=world_size,
-                use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches
+                use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches,
+                speed_adaptive_json_path=speed_adaptive_json_path,
             )
             if rank == 0:
                 print(f"\n✓ Validation completed")
@@ -1180,7 +1321,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             try:
                 val_metrics = validate_model(
                     policy, val_loader, device, rank=rank, world_size=world_size,
-                    use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches
+                    use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches,
+                    speed_adaptive_json_path=speed_adaptive_json_path,
                 )
             except Exception as e:
                 if rank == 0:
