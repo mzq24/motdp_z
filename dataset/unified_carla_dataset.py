@@ -20,6 +20,36 @@ import matplotlib.pyplot as plt
 import textwrap
 
 
+def _apply_stage1_near_zero_speed_snap(final_sample, eps_mps=0.1):
+    required = (
+        'speed_sample_values',
+        'speed_risk_chase_values',
+        'speed_risk_meet_values',
+        'speed_risk_ped_values',
+    )
+    if not all(k in final_sample for k in required):
+        return
+
+    speed_samples = final_sample['speed_sample_values']
+    if not isinstance(speed_samples, torch.Tensor) or speed_samples.numel() == 0:
+        return
+
+    near_zero_mask = torch.abs(speed_samples) <= float(eps_mps)
+    if not torch.any(near_zero_mask):
+        return
+
+    speed_samples = speed_samples.clone()
+    speed_samples[near_zero_mask] = 0.0
+    final_sample['speed_sample_values'] = speed_samples
+
+    for key in ('speed_risk_chase_values', 'speed_risk_meet_values', 'speed_risk_ped_values'):
+        value = final_sample.get(key)
+        if isinstance(value, torch.Tensor) and value.shape == speed_samples.shape:
+            value = value.clone()
+            value[near_zero_mask] = 0.0
+            final_sample[key] = value
+
+
 class RouteBatchSampler:
     """Batch sampler that groups samples by route to maximize route_features.pt cache hits.
 
@@ -621,6 +651,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample['vqa_anchor'] = vqa_anchor_cached.clone()
             elif 'vqa_anchor' not in final_sample:
                 final_sample['vqa_anchor'] = torch.zeros(6, 2)
+
+        _apply_stage1_near_zero_speed_snap(final_sample)
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample

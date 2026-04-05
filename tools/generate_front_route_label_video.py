@@ -2386,19 +2386,11 @@ def _render_world_panel(sample, current_boxes, current_meas, label, debug, event
 
 def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, interaction, proceed, wait_info, release_info):
     occ = _occupancy_signal_from_label(label, interaction)
-    debug = sample.get("_debug", {})
     event_name = sample.get("_event_name")
-    current_cover = _cover_candidate_summary(1, debug.get("best_current"), debug, current_meas=current_meas, event_name=event_name)
-    future_cover = _cover_candidate_summary(2, debug.get("best_future"), debug, current_meas=current_meas, event_name=event_name)
-    speed_curve_future_cover = sample.get("_speed_curve_future_cover", future_cover)
-    speed_curve = _build_speed_curve_debug(
-        current_cover,
-        speed_curve_future_cover,
-        current_meas,
-        current_boxes=current_boxes,
-        event_name=event_name,
-        release_info=release_info,
-    )
+    stage1_label = _stage1_label_payload(sample, current_meas, current_boxes=current_boxes)
+    current_cover = stage1_label.get("current_cover", _cover_candidate_summary(0, None, {}))
+    future_cover = stage1_label.get("future_cover", _cover_candidate_summary(0, None, {}))
+    speed_curve = stage1_label["speed_curve"]
     rgb_h, rgb_w = rgb.shape[:2]
     panel_h, panel_w = panel.shape[:2]
     target_h = max(rgb_h, panel_h)
@@ -2464,58 +2456,67 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
             _fmt_sample_pairs(speed_curve["sample_speeds_mps"], speed_curve["meet_risks"]),
         ), (150, 220, 255), 0.48),
     ]
+    if np.any(np.asarray(speed_curve.get("ped_risks", []), dtype=np.float32) > 1e-4):
+        left_lines.append(
+            ("E_ped={}".format(
+                _fmt_sample_pairs(speed_curve["sample_speeds_mps"], speed_curve["ped_risks"]),
+            ), (150, 220, 255), 0.48)
+        )
 
-    if float(speed_curve["meet"]["valid"]) > 0.5:
-        meet_subtype = str(speed_curve["meet"].get("subtype", "meet"))
+    meet_debug = speed_curve.get("meet_debug", {})
+    chase_debug = speed_curve.get("chase_debug", {})
+
+    if float(meet_debug.get("valid", 0.0)) > 0.5:
+        meet_subtype = str(meet_debug.get("subtype", "meet"))
         if "cross" in meet_subtype:
             left_lines.append(
                 ("{} dbg: dE={} dB={} vB={} tBin={} tBout={} cLen={}".format(
                     meet_subtype,
-                    _fmt_val(speed_curve["meet"]["d_ego_m"]),
-                    _fmt_val(speed_curve["meet"]["d_bg_m"]),
-                    _fmt_val(speed_curve["meet"]["bg_speed_mps"]),
-                    _fmt_val(speed_curve["meet"]["t_bg_s"]),
-                    _fmt_val(speed_curve["meet"].get("t_bg_exit_s", np.nan)),
-                    _fmt_val(speed_curve["meet"].get("conflict_len_m", np.nan)),
+                    _fmt_val(meet_debug.get("d_ego_m", np.nan)),
+                    _fmt_val(meet_debug.get("d_bg_m", np.nan)),
+                    _fmt_val(meet_debug.get("bg_speed_mps", np.nan)),
+                    _fmt_val(meet_debug.get("t_bg_s", np.nan)),
+                    _fmt_val(meet_debug.get("t_bg_exit_s", np.nan)),
+                    _fmt_val(meet_debug.get("conflict_len_m", np.nan)),
                 ), (120, 200, 255), 0.50)
             )
         else:
             left_lines.append(
                 ("{} dbg: dE={} dB={} vB={} tB={} gapB={} cLen={}".format(
                     meet_subtype,
-                    _fmt_val(speed_curve["meet"]["d_ego_m"]),
-                    _fmt_val(speed_curve["meet"]["d_bg_m"]),
-                    _fmt_val(speed_curve["meet"]["bg_speed_mps"]),
-                    _fmt_val(speed_curve["meet"]["t_bg_s"]),
-                    _fmt_val(speed_curve["meet"]["safe_gap_bg_m"]),
-                    _fmt_val(speed_curve["meet"].get("conflict_len_m", np.nan)),
+                    _fmt_val(meet_debug.get("d_ego_m", np.nan)),
+                    _fmt_val(meet_debug.get("d_bg_m", np.nan)),
+                    _fmt_val(meet_debug.get("bg_speed_mps", np.nan)),
+                    _fmt_val(meet_debug.get("t_bg_s", np.nan)),
+                    _fmt_val(meet_debug.get("safe_gap_bg_m", np.nan)),
+                    _fmt_val(meet_debug.get("conflict_len_m", np.nan)),
                 ), (120, 200, 255), 0.50)
             )
             left_lines.append(
                 ("v_eq={}  v_go={}  v_bmin={}  v_need={}  v_yld={}".format(
-                    _fmt_val(speed_curve["meet"]["v_equal_mps"]),
-                    _fmt_val(speed_curve["meet"]["v_go_min_mps"]),
-                    _fmt_val(speed_curve["meet"]["v_behind_min_mps"]),
-                    _fmt_val(speed_curve["meet"]["v_go_need_mps"]),
-                    _fmt_val(speed_curve["meet"]["v_yield_max_mps"]),
+                    _fmt_val(meet_debug.get("v_equal_mps", np.nan)),
+                    _fmt_val(meet_debug.get("v_go_min_mps", np.nan)),
+                    _fmt_val(meet_debug.get("v_behind_min_mps", np.nan)),
+                    _fmt_val(meet_debug.get("v_go_need_mps", np.nan)),
+                    _fmt_val(meet_debug.get("v_yield_max_mps", np.nan)),
                 ), (120, 200, 255), 0.50)
             )
-        if bool(sample.get("_speed_curve_future_persisted", False)):
+        if bool(stage1_label.get("speed_curve_future_persisted", False)):
             left_lines.append(
                 ("{} source=persisted_after_merge".format(meet_subtype), (120, 200, 255), 0.48)
             )
-    if float(speed_curve["meet"]["valid"]) <= 0.5 and np.isfinite(float(speed_curve["meet"].get("context_conflict_len_m", np.nan))):
+    if float(meet_debug.get("valid", 0.0)) <= 0.5 and np.isfinite(float(meet_debug.get("context_conflict_len_m", np.nan))):
         left_lines.append(
             ("left-junction corridor: cLen={}".format(
-                _fmt_val(speed_curve["meet"].get("context_conflict_len_m", np.nan)),
+                _fmt_val(meet_debug.get("context_conflict_len_m", np.nan)),
             ), (120, 200, 255), 0.50)
         )
-    if float(speed_curve["chase"]["valid"]) > 0.5:
+    if float(chase_debug.get("valid", 0.0)) > 0.5:
         left_lines.append(
             ("chase dbg: gap={} gapS={} lead_v={}".format(
-                _fmt_val(speed_curve["chase"]["gap_m"]),
-                _fmt_val(speed_curve["chase"]["safe_gap_cur_m"]),
-                _fmt_val(speed_curve["chase"]["lead_speed_mps"]),
+                _fmt_val(chase_debug.get("gap_m", np.nan)),
+                _fmt_val(chase_debug.get("safe_gap_cur_m", np.nan)),
+                _fmt_val(chase_debug.get("lead_speed_mps", np.nan)),
             ), (120, 200, 255), 0.50)
         )
 
@@ -2561,6 +2562,26 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
 
 
 def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
+    precomputed = sample_vis.get("stage1_speed_debug")
+    if isinstance(precomputed, dict) and "speed_curve" in precomputed:
+        return {
+            "current_cover": dict(precomputed.get("current_cover", {})),
+            "future_cover": dict(precomputed.get("future_cover", {})),
+            "ped_current_cover": dict(precomputed.get("ped_current_cover", {})),
+            "ped_future_cover": dict(precomputed.get("ped_future_cover", {})),
+            "speed_curve_future_cover": dict(precomputed.get("speed_curve_future_cover", {})),
+            "speed_curve_future_persisted": bool(precomputed.get("speed_curve_future_persisted", False)),
+            "speed_curve": {
+                "sample_speeds_mps": np.asarray(precomputed.get("speed_curve", {}).get("sample_speeds_mps", []), dtype=np.float32).astype(float).tolist(),
+                "total_risks": np.asarray(precomputed.get("speed_curve", {}).get("total_risks", []), dtype=np.float32).astype(float).tolist(),
+                "chase_risks": np.asarray(precomputed.get("speed_curve", {}).get("chase_risks", []), dtype=np.float32).astype(float).tolist(),
+                "meet_risks": np.asarray(precomputed.get("speed_curve", {}).get("meet_risks", []), dtype=np.float32).astype(float).tolist(),
+                "ped_risks": np.asarray(precomputed.get("speed_curve", {}).get("ped_risks", []), dtype=np.float32).astype(float).tolist(),
+                "chase_debug": dict(precomputed.get("speed_curve", {}).get("chase_debug", {})),
+                "meet_debug": dict(precomputed.get("speed_curve", {}).get("meet_debug", {})),
+            },
+        }
+
     debug = sample_vis.get("_debug", {})
     event_name = sample_vis.get("_event_name")
     current_cover = _cover_candidate_summary(1, debug.get("best_current"), debug, current_meas=current_meas, event_name=event_name)
@@ -2574,16 +2595,34 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
         event_name=event_name,
         release_info=sample_vis.get("_release_info"),
     )
+    sample_speeds = np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32)
+    chase_risks = np.asarray(speed_curve["chase_risks"], dtype=np.float32)
+    meet_risks = np.asarray(speed_curve["meet_risks"], dtype=np.float32)
+    ped_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    if all(k in sample_vis for k in ("speed_sample_values", "speed_risk_chase_values", "speed_risk_meet_values", "speed_risk_ped_values")):
+        pre_speeds = np.asarray(sample_vis.get("speed_sample_values", []), dtype=np.float32)
+        pre_chase = np.asarray(sample_vis.get("speed_risk_chase_values", []), dtype=np.float32)
+        pre_meet = np.asarray(sample_vis.get("speed_risk_meet_values", []), dtype=np.float32)
+        pre_ped = np.asarray(sample_vis.get("speed_risk_ped_values", []), dtype=np.float32)
+        if pre_speeds.shape == sample_speeds.shape == pre_chase.shape == pre_meet.shape == pre_ped.shape:
+            sample_speeds = pre_speeds
+            chase_risks = pre_chase
+            meet_risks = pre_meet
+            ped_risks = pre_ped
+    total_risks = np.maximum(np.maximum(chase_risks, meet_risks), ped_risks)
     return {
         "current_cover": current_cover,
         "future_cover": future_cover,
+        "ped_current_cover": _cover_candidate_summary(0, None, {}),
+        "ped_future_cover": _cover_candidate_summary(0, None, {}),
         "speed_curve_future_cover": speed_curve_future_cover,
         "speed_curve_future_persisted": bool(sample_vis.get("_speed_curve_future_persisted", False)),
         "speed_curve": {
-            "sample_speeds_mps": np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32).astype(float).tolist(),
-            "total_risks": np.asarray(speed_curve["total_risks"], dtype=np.float32).astype(float).tolist(),
-            "chase_risks": np.asarray(speed_curve["chase_risks"], dtype=np.float32).astype(float).tolist(),
-            "meet_risks": np.asarray(speed_curve["meet_risks"], dtype=np.float32).astype(float).tolist(),
+            "sample_speeds_mps": sample_speeds.astype(np.float32).astype(float).tolist(),
+            "total_risks": total_risks.astype(np.float32).astype(float).tolist(),
+            "chase_risks": chase_risks.astype(np.float32).astype(float).tolist(),
+            "meet_risks": meet_risks.astype(np.float32).astype(float).tolist(),
+            "ped_risks": ped_risks.astype(np.float32).astype(float).tolist(),
             "chase_debug": dict(speed_curve["chase"]),
             "meet_debug": dict(speed_curve["meet"]),
         },

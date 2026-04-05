@@ -1532,6 +1532,249 @@ Adoption rule:
 - if the correction improves the local checks, keep it
 - if it does not help, skip it for today and continue with the base label set
 
+#### 13.12 Current Stage1 Implementation Status
+
+As of the current `stage1` implementation, the codebase has already been wired
+for a three-head speed-energy setup:
+
+- `E_chase`
+- `E_meet`
+- `E_pedestrian`
+
+The packed per-frame supervision written by
+[`scripts/data_tools/precompute_semantic_labels.py`](/media/z/data/mzq/others/MoT-DP/scripts/data_tools/precompute_semantic_labels.py)
+is now:
+
+- `speed_sample_values`
+- `speed_sample_valid_mask`
+- `speed_sample_exp_index`
+- `speed_risk_chase_values`
+- `speed_risk_meet_values`
+- `speed_risk_ped_values`
+
+Important precompute/runtime notes:
+
+- long full-dataset precompute now supports periodic atomic checkpointing via:
+  - `--checkpoint_every_minutes`
+- the script periodically overwrites `samples_packed.pkl` safely
+- it also writes a sidecar progress file:
+  - `samples_packed.pkl.progress.json`
+- if the job crashes after several hours, rerunning the same command should skip
+  samples that already have the new stage1 speed fields
+
+Dataset/model/policy wiring that is already implemented:
+
+- dataset LiDAR is no longer limited to the current frame only
+- [`dataset/unified_carla_dataset.py`](/media/z/data/mzq/others/MoT-DP/dataset/unified_carla_dataset.py)
+  now supports `lidar_history_frames`
+- the returned LiDAR tensor is history-shaped:
+  - `(H_hist, 2, 256, 256)`
+- model-side LiDAR encoding is updated to consume the stacked history channels
+- [`model/transformer_for_diffusion_multi_head.py`](/media/z/data/mzq/others/MoT-DP/model/transformer_for_diffusion_multi_head.py)
+  exposes:
+  - `forward_speed_energy`
+  - `forward_speed_energy_eval`
+- the model now contains three explicit speed-energy heads:
+  - `speed_energy_chase_head`
+  - `speed_energy_meet_head`
+  - `speed_energy_pedestrian_head`
+
+Current train/infer contract:
+
+- training uses GT trajectory + GT route for the stage1 speed-energy loss
+- inference uses predicted trajectory + predicted route when evaluating the
+  speed-energy heads
+- the current policy-side wiring lives in
+  [`policy/annealed_energy_guidance_policy.py`](/media/z/data/mzq/others/MoT-DP/policy/annealed_energy_guidance_policy.py)
+
+Current scope decision:
+
+- keep the main backbone/shared context simple for now
+- do **not** add extra chase/meet-specific BEV or LiDAR attention samplers in
+  this stage
+- do **not** add scene-family conditioning yet
+- first get the three speed-energy heads trained and sanity-checked
+
+In short:
+
+- semantic/stage1 energy labels are now defined and implemented
+- dataset/model/policy plumbing for the three-head speed-energy path is already
+  in place
+- next major step is running the full-dataset precompute and then training the
+  stage1 speed-energy heads
+
+#### 13.13 Expert-Speed Calibration Notes
+
+We also ran a simple sanity check on the completed `train` split after the new
+stage1 energy labels were written.
+
+Statistic definition:
+
+- use the expert-speed sample:
+  - `speed_sample_values[speed_sample_exp_index]`
+- evaluate the three expert-speed heads:
+  - `E_chase`
+  - `E_meet`
+  - `E_pedestrian`
+- define:
+  - `E_total = max(E_chase, E_meet, E_pedestrian)`
+
+Recommended calibration subset:
+
+- prefer **successful routes** for infer-time calibration
+- current success definition:
+  - `status == Completed`
+  - and no:
+    - `collisions_vehicle`
+    - `collisions_pedestrian`
+    - `collisions_layout`
+
+Why this matters:
+
+- the full train split mixes successful and failed routes
+- failed routes are useful as hard negatives
+- but infer-time speed-energy thresholds should be calibrated primarily from the
+  successful-route distribution
+
+Meaning of the reported fields:
+
+- `speed_mean`
+  - mean expert speed for that event family
+- `speed_p50`
+  - median expert speed for that event family
+- `speed_p90`
+  - 90th percentile expert speed for that event family
+- `Ec_mean`
+  - mean expert-speed `E_chase`
+- `Em_mean`
+  - mean expert-speed `E_meet`
+- `Ep_mean`
+  - mean expert-speed `E_pedestrian`
+- `Et_mean`
+  - mean expert-speed `E_total`
+- `Et_p90`
+  - 90th percentile expert-speed `E_total`
+
+Interpretation:
+
+- `speed_p50` / `speed_p90` describe what expert speed typically looks like in
+  that family
+- `Ec_mean` / `Em_mean` / `Ep_mean` tell which head is usually active at expert speed
+- `Et_mean` is the average "expert-speed risk floor"
+- `Et_p90` is a conservative upper reference for infer-time threshold tuning
+
+Current qualitative conclusion from the successful-route subset:
+
+- wait-heavy families have small expert-speed medians:
+  - `AccidentTwoWays`
+  - `Accident`
+  - `PedestrianCrossing`
+  - `ParkingCrossingPedestrian`
+  - `NonSignalizedJunctionLeftTurn`
+  - `NonSignalizedJunctionRightTurn`
+- merge / highway families keep much larger expert speeds:
+  - `HighwayExit`
+  - `MergerIntoSlowTraffic`
+  - `HazardAtSideLane`
+- in successful routes, expert-speed risk is usually moderate rather than near-1
+- when failed routes are mixed back in, `Et_mean` and especially `Et_p90` rise
+  noticeably, which is exactly why bad routes remain useful as hard negatives
+
+Representative successful-route references:
+
+- `AccidentTwoWays`
+  - `speed_mean ~= 4.64`
+  - `speed_p50 ~= 0.42`
+  - `Et_mean ~= 0.156`
+  - `Em_mean ~= 0.114`
+- `Accident`
+  - `speed_mean ~= 4.41`
+  - `speed_p50 ~= 0.30`
+  - `Et_mean ~= 0.076`
+- `PedestrianCrossing`
+  - `speed_mean ~= 2.08`
+  - `speed_p50 ~= 0`
+  - `Et_mean ~= 0.057`
+  - `Ep_mean ~= 0.030`
+- `ParkingCrossingPedestrian`
+  - `speed_mean ~= 2.28`
+  - `speed_p50 ~= 0`
+  - `Et_mean ~= 0.112`
+  - `Ep_mean ~= 0.039`
+- `NonSignalizedJunctionLeftTurn`
+  - `speed_mean ~= 2.99`
+  - `speed_p50 ~= 0.01`
+  - `Et_mean ~= 0.157`
+  - `Em_mean ~= 0.137`
+- `NonSignalizedJunctionRightTurn`
+  - `speed_mean ~= 0.58`
+  - `speed_p50 ~= 0`
+  - `Et_mean ~= 0.231`
+- `HighwayExit`
+  - `speed_mean ~= 9.49`
+  - `speed_p50 ~= 9.60`
+  - `Et_mean ~= 0.152`
+  - `Ec_mean ~= 0.147`
+- `MergerIntoSlowTraffic`
+  - `speed_mean ~= 7.20`
+  - `speed_p50 ~= 7.30`
+  - `Et_mean ~= 0.091`
+
+Current recommendation for infer-time tuning:
+
+- start from the successful-route distribution, not the mixed all-route distribution
+- use family-aware priors if needed later, but in the first pass:
+  - treat `Et_mean` as a soft typical reference
+  - treat `Et_p90` as a conservative upper reference
+- if the deployed inference policy looks over-conservative, compare its chosen
+  speed-energy range against these successful-route expert references first
+
+Additional note after checking expert-speed maxima on the successful-route subset:
+
+- `Et_max` is usually **too sensitive** to use directly as an infer-time threshold
+- even in successful routes, many families still contain isolated hard frames
+  whose expert-speed `E_total` reaches or nearly reaches `1.0`
+- this means:
+  - `Et_max` is useful as a sanity/debug ceiling
+  - but not as the main deployment calibration target
+- for practical infer-time tuning, prefer:
+  - `Et_mean` as a soft central reference
+  - `Et_p90` or `Et_p95` as the conservative family-specific reference
+
+Examples from the successful-route subset:
+
+- `AccidentTwoWays`
+  - `Et_max ~= 0.985`
+  - `Et_p95 ~= 0.754`
+- `HazardAtSideLaneTwoWays`
+  - `Et_max ~= 0.984`
+  - `Et_p95 ~= 0.379`
+- `MergerIntoSlowTraffic`
+  - `Et_max ~= 0.774`
+  - `Et_p95 ~= 0.414`
+- `StaticCutIn`
+  - `Et_max ~= 0.797`
+  - `Et_p95 ~= 0.446`
+- `HighwayExit`
+  - `Et_max = 1.0`
+  - `Et_p95 ~= 0.328`
+- `PedestrianCrossing`
+  - `Et_max = 1.0`
+  - `Et_p95 ~= 0.510`
+- `NonSignalizedJunctionLeftTurn`
+  - `Et_max = 1.0`
+  - `Et_p95 ~= 0.863`
+
+Interpretation:
+
+- successful routes can still contain brief frames where the expert is right at
+  the boundary of a high-risk maneuver
+- therefore:
+  - seeing `Et_max = 1.0` in successful routes is **not** by itself a labeling bug
+  - it mainly means the label system is capable of saturating on rare but valid
+    expert frames
+- infer-time calibration should therefore avoid using raw maxima as thresholds
+
 So the current ego path does not just sample more points. It also runs multiple full-BEV projections per batch:
 
 - old ego path: roughly one `value_proj(bev_upsample)`

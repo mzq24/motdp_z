@@ -1054,6 +1054,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             # Output: (B, 64, 64, 64) matching bev_feature_upsample spatial layout
             lidar_bev_in_channels = 2 * self.lidar_bev_history_frames
             self.lidar_bev_in_channels = lidar_bev_in_channels
+            # Learned temporal embedding per history frame so stacked LiDAR channels carry
+            # explicit frame order instead of relying only on channel position.
+            self.lidar_history_pos_emb = nn.Parameter(
+                torch.zeros(1, self.lidar_bev_history_frames, 2, 1, 1)
+            )
             self.lidar_bev_encoder = nn.Sequential(
                 nn.Conv2d(lidar_bev_in_channels, 32, kernel_size=5, stride=2, padding=2),  # → 128
                 nn.GroupNorm(8, 32),
@@ -1139,10 +1144,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Allows the model to learn different position importance
         self.traj_pos_scale = nn.Parameter(torch.ones(1, 1, d_model))
         self.route_pos_scale = nn.Parameter(torch.ones(1, 1, d_model))
-        
+
         # Segment embeddings to distinguish query types (trajectory vs route)
         self.traj_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
         self.route_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.speed_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
         
         # Decoder blocks - using new MultiSourceAttentionBlock
         self.layers = nn.ModuleList([
@@ -1172,12 +1178,27 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             return None
         if transfuser_lidar_bev.dim() == 5:
             B, H_hist, C, H, W = transfuser_lidar_bev.shape
+            if C != 2:
+                raise ValueError(
+                    f"Expected LiDAR history with 2 channels per frame, got {transfuser_lidar_bev.shape}"
+                )
+            pos_emb = self.lidar_history_pos_emb[:, :H_hist].to(
+                device=transfuser_lidar_bev.device,
+                dtype=transfuser_lidar_bev.dtype,
+            )
+            transfuser_lidar_bev = transfuser_lidar_bev + pos_emb
             transfuser_lidar_bev = transfuser_lidar_bev.reshape(B, H_hist * C, H, W)
         elif transfuser_lidar_bev.dim() != 4:
             raise ValueError(
                 f"Expected transfuser_lidar_bev as (B, H_hist, 2, 256, 256) or (B, 2, 256, 256), "
                 f"got {transfuser_lidar_bev.shape}"
             )
+        elif transfuser_lidar_bev.shape[1] == self.lidar_bev_in_channels:
+            pos_emb = self.lidar_history_pos_emb.to(
+                device=transfuser_lidar_bev.device,
+                dtype=transfuser_lidar_bev.dtype,
+            ).reshape(1, self.lidar_bev_in_channels, 1, 1)
+            transfuser_lidar_bev = transfuser_lidar_bev + pos_emb
         if transfuser_lidar_bev.shape[1] != self.lidar_bev_in_channels:
             raise ValueError(
                 f"Expected LiDAR history channels={self.lidar_bev_in_channels}, got {transfuser_lidar_bev.shape[1]}"
@@ -1284,6 +1305,38 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         mask[T_traj:, :T_traj] = float('-inf')
         return mask
 
+    def _create_ego_speed_mask(
+        self,
+        T_traj: int,
+        T_route: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Ego-path mask for [speed | traj_wp | route].
+
+        - Speed token can attend to all tokens.
+        - Trajectory/route tokens cannot attend to speed token, to avoid
+          perturbing the existing traj/route interaction pattern.
+        - Trajectory and route tokens preserve the original ego mask semantics.
+        """
+        T_speed = 1
+        T_total = T_speed + T_traj + T_route
+        mask = torch.zeros((T_total, T_total), device=device, dtype=dtype)
+
+        # Trajectory/route tokens do not attend to the prepended speed token.
+        mask[T_speed:, :T_speed] = float('-inf')
+
+        traj_start = T_speed
+        route_start = T_speed + T_traj
+
+        if not self.traj_can_attend_route:
+            mask[traj_start:route_start, route_start:] = float('-inf')
+
+        # Route tokens cannot attend back to trajectory tokens.
+        mask[route_start:, traj_start:route_start] = float('-inf')
+        return mask
+
     def _build_traj_detail_points(self, traj_points: torch.Tensor) -> torch.Tensor:
         """Expand each traj waypoint with ego detail offsets. (B, T, 2) -> (B, T, 14, 2)"""
         offsets = self.ego_detail_offsets.to(device=traj_points.device, dtype=traj_points.dtype)
@@ -1378,6 +1431,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         transfuser_bev_feature: torch.Tensor,       # (B, 1512, 8, 8)
         transfuser_bev_feature_upsample: torch.Tensor,  # (B, 64, 64, 64)
         conditioning: torch.Tensor,                 # (B, d_model)
+        speed_emb: Optional[torch.Tensor] = None,   # (B, 1, d_model) - optional speed token embedding
         traj_points: Optional[torch.Tensor] = None,  # (B, T_traj, 2) or (B, T_traj, horizon, 2) for GridSampleCrossBEVAttention
         route_emb: Optional[torch.Tensor] = None,   # (B, T_route, d_model) - route query embeddings for ego diffusion
         route_points: Optional[torch.Tensor] = None,  # (B, T_route, 2) absolute route points for BEV sampling
@@ -1388,7 +1442,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         route_pos_offset: int = 0,
         spatial_mode: str = "anchor",
         transfuser_lidar_bev: Optional[torch.Tensor] = None,  # (B, 2, 256, 256) inverted LiDAR BEV
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass with unified queries and multi-source attention (DiffusionDriveV2 style).
         
@@ -1419,11 +1473,13 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         Returns:
             traj_out: (B, horizon, d_model) - trajectory output
             route_out: (B, num_waypoints, d_model) - route output
+            speed_out: (B, 1, d_model) or None - speed token output
         """
         B = traj_emb.shape[0]
         T_traj = traj_emb.shape[1]
         T_route = self.num_waypoints
-        
+        T_speed = 1 if speed_emb is not None else 0
+
         # ========== Unified Position Encoding ==========
         # Get sinusoidal position encoding for trajectory
         traj_pos = self.unified_pos_encoding[:, :T_traj, :] * self.traj_pos_scale
@@ -1437,14 +1493,25 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         if route_emb is None:
             route_emb = self.route_queries.expand(B, -1, -1)
         route_emb = route_emb + route_pos + self.route_segment_emb
-        
-        # Concatenate queries: [trajectory | route]
-        x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
-        
+
+        if speed_emb is not None:
+            speed_emb = speed_emb + self.speed_segment_emb
+
+        # Concatenate queries: [speed | trajectory | route]
+        if speed_emb is not None:
+            x = torch.cat([speed_emb, traj_emb, route_emb], dim=1)
+        else:
+            x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
+
         if self_attn_mask is None:
-            self_attn_mask = self._create_block_diagonal_mask(
-                T_traj, T_route, device=x.device, dtype=x.dtype
-            )
+            if speed_emb is not None:
+                self_attn_mask = self._create_ego_speed_mask(
+                    T_traj, T_route, device=x.device, dtype=x.dtype
+                )
+            else:
+                self_attn_mask = self._create_block_diagonal_mask(
+                    T_traj, T_route, device=x.device, dtype=x.dtype
+                )
         
         # ========== Process Transfuser Features (DiffusionDriveV2 style) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, 1512) -> (B, 64, d_model)
@@ -1461,7 +1528,8 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             lidar_feat = self.lidar_bev_encoder(transfuser_lidar_bev)  # (B, 64, 64, 64)
 
         if traj_points is not None:
-            x_traj = x[:, :T_traj, :]  # (B, T_traj, d_model)
+            x_speed = x[:, :T_speed, :] if T_speed > 0 else None
+            x_traj = x[:, T_speed:T_speed + T_traj, :]  # (B, T_traj, d_model)
             if spatial_mode == "ego":
                 if traj_points.dim() != 3:
                     raise ValueError(f"Ego traj_points must be (B, T, 2), got {traj_points.shape}")
@@ -1487,7 +1555,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                 if lidar_feat is not None:
                     traj_lidar_detail = self.traj_lidar_detail_attn(x_traj, traj_detail_points, lidar_feat) - x_traj
                 x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail + traj_route_far + traj_lidar_detail)
-                x_route = x[:, T_traj:, :]
+                x_route = x[:, T_speed + T_traj:, :]
                 if route_points is not None:
                     if route_points.dim() != 3:
                         raise ValueError(f"Ego route_points must be (B, T_route, 2), got {route_points.shape}")
@@ -1518,7 +1586,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                         self.traj_lidar_spatial_attn(x_traj, traj_points, lidar_feat) - x_traj
                     )
                 x_traj = x_traj_base + detail_gate * detail_residual
-                x_route = x[:, T_traj:, :]
+                x_route = x[:, T_speed + T_traj:, :]
                 if route_points is not None:
                     if route_points.dim() != 3:
                         raise ValueError(f"Anchor route_points must be (B, T_route, 2), got {route_points.shape}")
@@ -1527,7 +1595,10 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                         route_points.unsqueeze(2),
                         transfuser_bev_feature_upsample,
                     )
-            x = torch.cat([x_traj, x_route], dim=1)
+            if x_speed is not None:
+                x = torch.cat([x_speed, x_traj, x_route], dim=1)
+            else:
+                x = torch.cat([x_traj, x_route], dim=1)
 
         # Decoder layers with multi-source attention
         # Pass separate feature tokens and T_traj for route-specific processing
@@ -1543,10 +1614,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             )
         
         x = self.final_norm(x)
-        
+
         # Split outputs
-        traj_out = x[:, :T_traj, :]
-        route_out = x[:, T_traj:, :]
+        speed_out = x[:, :T_speed, :] if T_speed > 0 else None
+        traj_out = x[:, T_speed:T_speed + T_traj, :]
+        route_out = x[:, T_speed + T_traj:, :]
         
         # ========== Route Residual Path (Stability Enhancement) ==========
         # Add route-specific residual from initial queries (bypasses shared decoder)
@@ -1555,7 +1627,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         route_residual = self.route_residual_path(route_emb)
         route_out = route_out + torch.sigmoid(self.route_residual_gate) * route_residual
         
-        return traj_out, route_out
+        return traj_out, route_out, speed_out
 
 
 # =============================================================================
@@ -1785,10 +1857,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Input: global-pooled fine BEV (full scene, incl. behind/sides) + conditioning (ego state + route intent)
         # Decoupled from traj decoder output so it can provide complementary speed signal
         self.speed_classes = [0.0, 4.0, 8.0, 10.0, 13.89, 16.0, 17.78, 20.0]
-        bev_upsample_channels = 64  # bev_feature_upsample: (B, 64, 64, 64)
-        self.speed_bev_proj = nn.Linear(bev_upsample_channels, n_emb)
+        self.speed_query = nn.Parameter(torch.randn(1, 1, n_emb))
         self.speed_head = nn.Sequential(
-            nn.Linear(n_emb * 3, n_emb // 2),  # concat(bev_proj, conditioning, traj_out)
+            nn.Linear(n_emb * 2, n_emb // 2),  # concat(speed_token, conditioning)
             nn.ReLU(inplace=True),
             nn.Linear(n_emb // 2, len(self.speed_classes)),
         )
@@ -1839,7 +1910,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         for name in param_dict:
             if 'pos_emb' in name or '_dummy_variable' in name or 'segment_emb' in name:
                 no_decay.add(name)
-            elif 'route_queries' in name or 'pool_query' in name or 'mode_queries' in name or 'route_diff_query' in name:
+            elif 'route_queries' in name or 'pool_query' in name or 'mode_queries' in name or 'route_diff_query' in name or 'speed_query' in name:
                 no_decay.add(name)
             elif 'gating_factor' in name:
                 no_decay.add(name)
@@ -2059,7 +2130,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
             route_emb = self.pre_decoder_norm(self.drop(route_emb))
 
-        mode_out, route_out = self.decoder(
+        mode_out, route_out, _ = self.decoder(
             traj_emb=mode_emb,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -2135,18 +2206,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_emb = wp_emb + diff_query + conditioning.unsqueeze(1)
         traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
 
+        speed_emb = self.speed_query.expand(B, -1, -1) + conditioning.unsqueeze(1)
+        speed_emb = self.pre_decoder_norm(self.drop(speed_emb))
+
         route_wp_emb = self._embed_route_waypoint_tokens(route_points)
         route_diff_query = self.route_diff_query.expand(B, T_route, -1)
         route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
         route_emb = self.pre_decoder_norm(self.drop(route_emb))
 
-        ego_mask = self.decoder._create_ego_mask(
+        ego_mask = self.decoder._create_ego_speed_mask(
             T_traj=T_traj,
             T_route=T_route,
             device=traj_emb.device,
             dtype=traj_emb.dtype,
         )
-        traj_out, route_out = self.decoder(
+        traj_out, route_out, speed_out = self.decoder(
+            speed_emb=speed_emb,
             traj_emb=traj_emb,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
@@ -2162,16 +2237,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
             spatial_mode="ego",
             transfuser_lidar_bev=transfuser_lidar_bev,
         )
+        if speed_out is None:
+            raise RuntimeError("Decoder ego path expected a speed token output")
 
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
         poses_reg = traj_pred.unsqueeze(1)
         route_pred = self.route_norm_head(route_out, conditioning, current_status)
-        bev_global = transfuser_bev_feature_upsample.mean(dim=[-2, -1])  # (B, 64)
         speed_input = torch.cat([
-            self.speed_bev_proj(bev_global),  # full scene (behind/sides/front)
-            conditioning,                      # ego state + route intent
-            traj_out.mean(dim=1),              # trajectory-path perception
-        ], dim=-1)  # (B, n_emb*3)
+            speed_out.squeeze(1),  # shared token after interacting with traj/route context
+            conditioning,
+        ], dim=-1)
         speed_pred = self.speed_head(speed_input)  # (B, num_speed_classes)
         return poses_reg, route_pred, traj_out, conditioning, speed_pred
 
