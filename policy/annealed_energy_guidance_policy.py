@@ -135,9 +135,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
         self.train_energy = route_b_cfg.get('train_energy', True)
         self.use_front_route_risk_energy = route_b_cfg.get('use_front_route_risk_energy', False)
+        self.use_stage1_speed_energy = route_b_cfg.get('use_stage1_speed_energy', True)
         self._current_epoch = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
         self.use_lidar_bev_detail = route_b_cfg.get('use_lidar_bev_detail', False)
+        self.lidar_history_frames = max(int(route_b_cfg.get('lidar_history_frames', self.n_obs_steps)), 1)
+
+        self.energy_chase_weight = route_b_cfg.get('energy_chase_weight', route_b_cfg.get('energy_front_weight', 1.0))
+        self.energy_meet_weight = route_b_cfg.get('energy_meet_weight', route_b_cfg.get('energy_left_weight', 1.0))
+        self.energy_ped_weight = route_b_cfg.get('energy_ped_weight', route_b_cfg.get('energy_pedestrian_weight', 1.0))
+        self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -171,6 +178,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             energy_heads=True,
             ego_detail_activation_t=policy_cfg.get('ego_detail_activation_t', 400),
             use_lidar_bev_detail=self.use_lidar_bev_detail,
+            lidar_bev_history_frames=self.lidar_history_frames,
             use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
         )
         self.model = model
@@ -323,6 +331,35 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 two_hot[mask, i] = 1.0 - ratio
                 two_hot[mask, i + 1] = ratio
         return two_hot
+
+    def _has_stage1_speed_energy_labels(self, batch: Dict[str, torch.Tensor]) -> bool:
+        return self.use_stage1_speed_energy and all(
+            key in batch for key in (
+                'speed_sample_values',
+                'speed_sample_valid_mask',
+                'speed_sample_exp_index',
+                'speed_risk_chase_values',
+                'speed_risk_meet_values',
+                'speed_risk_ped_values',
+            )
+        )
+
+    def _build_stage1_speed_samples(
+        self,
+        center_speed: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        offsets = self.stage1_speed_offsets.to(device=device, dtype=model_dtype)
+        speed_samples = center_speed.unsqueeze(-1).to(dtype=model_dtype) + offsets.unsqueeze(0)
+        return speed_samples.clamp_(0.0, 20.0)
+
+    @staticmethod
+    def _masked_smooth_l1(pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        valid_mask = valid_mask.to(dtype=torch.bool)
+        if valid_mask.sum() <= 0:
+            return pred.new_tensor(0.0)
+        return F.smooth_l1_loss(pred[valid_mask], target[valid_mask])
 
     @staticmethod
     def decode_speed_two_hot(speed_logits, speed_classes):
@@ -646,6 +683,52 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         x = F.linear(x, head[2].weight.detach(), head[2].bias.detach())
         return x
 
+    def _compute_stage1_speed_energy_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        trajectory: torch.Tensor,
+        route_gt: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        transfuser_lidar_bev: Optional[torch.Tensor],
+        ego_status: torch.Tensor,
+        bev_proj: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ):
+        gt_abs = trajectory.unsqueeze(1)  # (B, 1, T, 2)
+        gt_normed = self.abs_to_norm(gt_abs)
+
+        speed_sample_values = batch['speed_sample_values'].to(device=device, dtype=model_dtype)
+        speed_sample_valid_mask = batch['speed_sample_valid_mask'].to(device=device) > 0.5
+        speed_risk_chase = batch['speed_risk_chase_values'].to(device=device, dtype=model_dtype)
+        speed_risk_meet = batch['speed_risk_meet_values'].to(device=device, dtype=model_dtype)
+        speed_risk_ped = batch['speed_risk_ped_values'].to(device=device, dtype=model_dtype)
+
+        stage1_scores, _ = self.model.forward_speed_energy(
+            x_t=gt_normed,
+            x_t_abs=gt_abs,
+            timestep=torch.zeros(gt_abs.shape[0], device=device, dtype=torch.long),
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            speed_samples=speed_sample_values,
+            traj_for_energy=gt_abs,
+            bev_proj_cached=bev_proj,
+            route_points=route_gt,
+            transfuser_lidar_bev=transfuser_lidar_bev,
+        )
+
+        loss_chase = self._masked_smooth_l1(stage1_scores['chase'], speed_risk_chase, speed_sample_valid_mask)
+        loss_meet = self._masked_smooth_l1(stage1_scores['meet'], speed_risk_meet, speed_sample_valid_mask)
+        loss_ped = self._masked_smooth_l1(stage1_scores['pedestrian'], speed_risk_ped, speed_sample_valid_mask)
+        energy_loss = (
+            self.energy_chase_weight * loss_chase
+            + self.energy_meet_weight * loss_meet
+            + self.energy_ped_weight * loss_ped
+        )
+        return energy_loss, loss_chase, loss_meet, loss_ped
+
     # ========== Forward (DDP-compatible) ==========
     def forward(self, batch: Dict[str, torch.Tensor],
                 return_loss_dict: bool = False,
@@ -701,6 +784,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         allowed_flags = batch.get('allowed_flags', None)
         energy_targets = batch.get('energy_targets', None)
         energy_active_mask = batch.get('energy_active_mask', None)
+        has_stage1_speed_energy = self._has_stage1_speed_energy_labels(batch)
         has_energy = (self.anchor_centers_abs is not None
                       and behavior_labels is not None
                       and allowed_flags is not None)
@@ -755,7 +839,25 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_front = loss_left = loss_right = loss_ped = loss_off = zero_t
         loss_route = zero_t
 
-        if has_energy and self.train_energy:
+        if has_stage1_speed_energy and self.train_energy:
+            energy_loss, loss_chase_stage1, loss_meet_stage1, loss_ped_stage1 = self._compute_stage1_speed_energy_loss(
+                batch=batch,
+                trajectory=trajectory,
+                route_gt=route_gt,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+                ego_status=ego_status,
+                bev_proj=bev_proj,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            loss_front = loss_chase_stage1
+            loss_left = loss_meet_stage1
+            loss_right = zero_t
+            loss_ped = loss_ped_stage1
+            loss_off = zero_t
+        elif has_energy and self.train_energy:
             (
                 M_anchor,
                 anchor_subset,
@@ -873,7 +975,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
             energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
 
-        if self.use_front_route_risk_energy:
+        if (not has_stage1_speed_energy) and self.use_front_route_risk_energy:
             gt_abs = trajectory.unsqueeze(1)
             gt_normed = self.abs_to_norm(gt_abs)
             front_route_logits, _ = self.model.forward_front_route_risk(
@@ -899,7 +1001,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and alignment_active:
+        if self.alignment_loss_weight > 0 and alignment_active and not has_stage1_speed_energy:
             if self.use_front_route_risk_energy:
                 _, mode_out_front = self.model.forward_front_route_risk_eval(
                     x_t=poses_reg,
@@ -1870,11 +1972,34 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 speed_pred, self.model.speed_classes
             )  # (B,)
 
+        speed_energy_scores = None
+        speed_energy_samples = None
+        if self.use_stage1_speed_energy:
+            center_speed = target_speed_pred
+            if center_speed is None:
+                center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+            speed_energy_samples = self._build_stage1_speed_samples(center_speed, device, model_dtype)
+            best_traj_norm = self.abs_to_norm(best_trajectory.unsqueeze(1))
+            speed_energy_scores, _ = self.model.forward_speed_energy_eval(
+                x_t=best_traj_norm,
+                x_t_abs=best_trajectory.unsqueeze(1),
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                speed_samples=speed_energy_samples,
+                traj_for_energy=best_trajectory.unsqueeze(1),
+                bev_proj_cached=bev_proj,
+                route_points=route_pred.detach(),
+                transfuser_lidar_bev=transfuser_lidar_bev,
+            )
+
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
             'route_pred': route_pred,                 # (B, 20, 2)
             'all_trajectories': final_traj_abs,       # (B, 1, T, 2)
             'energy_scores': energy_scores,           # dict of (B, 1)
+            'speed_energy_scores': speed_energy_scores,
+            'speed_energy_samples': speed_energy_samples,
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
             'target_speed': target_speed_pred,        # (B,) m/s
@@ -1934,5 +2059,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             for key in ('front', 'left', 'right', 'pedestrian', 'offroad', 'route'):
                 if key in es:
                     result[f'energy_{key}'] = es[key].detach().float().cpu().numpy()
+
+        if sample_result.get('speed_energy_scores') is not None:
+            ses = sample_result['speed_energy_scores']
+            if sample_result.get('speed_energy_samples') is not None:
+                result['speed_energy_samples'] = sample_result['speed_energy_samples'].detach().float().cpu().numpy()
+            for key in ('chase', 'meet', 'pedestrian'):
+                if key in ses:
+                    result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
 
         return result

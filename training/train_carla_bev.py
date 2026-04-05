@@ -394,6 +394,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             semantic_behavior_cfg = {}
 
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
+    route_b_cfg = config.get('route_b', {})
+    lidar_history_frames = max(int(route_b_cfg.get('lidar_history_frames', policy_cfg.get('ego_status_seq_len', config.get('obs_horizon', 1)))), 1)
 
     feature_suffix = config.get('dataset', {}).get('feature_suffix', '')
     validation_cfg = config.get('validation', {})
@@ -410,6 +412,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         cache_dir=cache_dir, feature_suffix=feature_suffix,
         gps_noise_cfg=gps_noise_cfg,
         load_transfuser_lidar_bev=use_lidar_bev_detail,
+        lidar_history_frames=lidar_history_frames,
     )
     val_dataset_orig = None
     val_dataset = None
@@ -422,6 +425,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
             cache_dir=cache_dir, feature_suffix=feature_suffix,
             load_transfuser_lidar_bev=use_lidar_bev_detail,
+            lidar_history_frames=lidar_history_frames,
         )
         val_dataset = val_dataset_orig
 
@@ -763,10 +767,23 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # Separate energy head params from decoder params
         energy_param_ids = set()
         energy_params = []
-        for head_name in ['energy_front_head', 'energy_left_head', 'energy_right_head',
-                          'energy_pedestrian_head', 'energy_offroad_head', 'energy_route_head']:
-            head = getattr(policy_for_params.model, head_name)
-            for p in head.parameters():
+        for module_name in [
+            'energy_front_head',
+            'energy_left_head',
+            'energy_right_head',
+            'energy_pedestrian_head',
+            'energy_offroad_head',
+            'energy_route_head',
+            'front_route_risk_head',
+            'speed_energy_speed_proj',
+            'speed_energy_chase_head',
+            'speed_energy_meet_head',
+            'speed_energy_pedestrian_head',
+        ]:
+            module = getattr(policy_for_params.model, module_name, None)
+            if module is None:
+                continue
+            for p in module.parameters():
                 energy_param_ids.add(id(p))
                 energy_params.append(p)
 

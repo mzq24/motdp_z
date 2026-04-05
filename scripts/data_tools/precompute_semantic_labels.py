@@ -44,6 +44,7 @@ import numpy as np
 import json
 import gzip
 import glob
+import time
 from collections import defaultdict
 from tqdm import tqdm
 from PIL import Image
@@ -731,6 +732,13 @@ def _ego_length_m(current_boxes, default_length_m=4.5):
         return float(max(2.0 * float(extent[0]), 1.0))
     except Exception:
         return float(default_length_m)
+
+
+def _left_junction_conflict_len_m(current_meas, current_boxes, scale=1.5, event_name=None):
+    if not _is_left_turn_scene_context(current_meas, event_name=event_name):
+        return np.nan
+    ego_length_m = _ego_length_m(current_boxes)
+    return float(max(float(scale) * ego_length_m, ego_length_m))
 
 
 def _wrap_to_pi(angle_rad):
@@ -1573,6 +1581,20 @@ def _build_future_frames_data(image_data_root, base_dir, frame_str, num_future):
     return future_frames_data
 
 
+def _atomic_pickle_save(obj, target_path):
+    tmp_path = target_path + f'.tmp.{os.getpid()}'
+    with open(tmp_path, 'wb') as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, target_path)
+
+
+def _atomic_json_save(payload, target_path):
+    tmp_path = target_path + f'.tmp.{os.getpid()}'
+    with open(tmp_path, 'w') as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, target_path)
+
+
 def precompute(
     dataset_path,
     image_data_root,
@@ -1586,6 +1608,7 @@ def precompute(
     front_safe_ttc_s=3.0,
     front_max_ttc_s=10.0,
     front_block_safe_distance_m=30.0,
+    checkpoint_every_minutes=20.0,
 ):
     # Load anchors
     if anchor_path.endswith('.npy'):
@@ -1629,388 +1652,463 @@ def precompute(
     stage1_speed_built = 0
     skipped = 0
     fallback = 0
+    labeling_processed = 0
+    stage1_processed = 0
+    checkpoint_every_seconds = None
+    if checkpoint_every_minutes is not None and float(checkpoint_every_minutes) > 0:
+        checkpoint_every_seconds = float(checkpoint_every_minutes) * 60.0
+    checkpoint_progress_path = packed_path + '.progress.json'
+    last_checkpoint_time = time.time()
+    dirty_since_checkpoint = False
 
-    for sample in tqdm(samples, desc="Labeling"):
-        needs_semantic = force or any(
-            field not in sample for field in ('behavior_labels', 'allowed_flags', 'scene_buckets')
-        )
-        needs_energy = force or any(
-            field not in sample for field in ('energy_targets', 'energy_active_mask')
-        )
-        needs_ego_status = force or ('ego_status' not in sample)
-        needs_front_route = force or any(
-            field not in sample for field in (
-                'front_route_distance',
-                'front_route_ttc',
-                'front_route_risk',
-                'front_route_block_risk',
-                'front_route_case',
-                'front_route_has_lead',
-                'front_route_actor_class',
-                'front_route_actor_weight',
-                'front_route_block_bin',
-                'front_route_ttc_bin',
-                'front_route_hazard_bin',
+    def _checkpoint_payload(phase, reason):
+        return {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+            'phase': phase,
+            'reason': reason,
+            'dataset_path': os.path.realpath(dataset_path),
+            'packed_path': packed_path,
+            'num_samples': len(samples),
+            'semantic_computed': semantic_computed,
+            'energy_built': energy_built,
+            'ego_status_built': ego_status_built,
+            'front_route_built': front_route_built,
+            'stage1_speed_built': stage1_speed_built,
+            'labeling_processed': labeling_processed,
+            'stage1_processed': stage1_processed,
+            'skipped': skipped,
+            'fallback': fallback,
+        }
+
+    def _save_checkpoint(phase, reason):
+        nonlocal last_checkpoint_time, dirty_since_checkpoint
+        print(f"\n[checkpoint] {phase}: {reason} -> saving {packed_path} ...")
+        _atomic_pickle_save(samples, packed_path)
+        size_mb = os.path.getsize(packed_path) / 1e6
+        payload = _checkpoint_payload(phase=phase, reason=reason)
+        payload['packed_size_mb'] = round(size_mb, 3)
+        _atomic_json_save(payload, checkpoint_progress_path)
+        last_checkpoint_time = time.time()
+        dirty_since_checkpoint = False
+        print(f"[checkpoint] saved ({size_mb:.1f} MB)")
+
+    def _maybe_checkpoint(phase, force_reason=None):
+        if force_reason is not None:
+            if dirty_since_checkpoint:
+                _save_checkpoint(phase=phase, reason=force_reason)
+            return
+        if checkpoint_every_seconds is None or not dirty_since_checkpoint:
+            return
+        if (time.time() - last_checkpoint_time) < checkpoint_every_seconds:
+            return
+        _save_checkpoint(phase=phase, reason='periodic')
+
+    try:
+        for sample in tqdm(samples, desc="Labeling"):
+            labeling_processed += 1
+            needs_semantic = force or any(
+                field not in sample for field in ('behavior_labels', 'allowed_flags', 'scene_buckets')
             )
-        )
+            needs_energy = force or any(
+                field not in sample for field in ('energy_targets', 'energy_active_mask')
+            )
+            needs_ego_status = force or ('ego_status' not in sample)
+            needs_front_route = force or any(
+                field not in sample for field in (
+                    'front_route_distance',
+                    'front_route_ttc',
+                    'front_route_risk',
+                    'front_route_block_risk',
+                    'front_route_case',
+                    'front_route_has_lead',
+                    'front_route_actor_class',
+                    'front_route_actor_weight',
+                    'front_route_block_bin',
+                    'front_route_ttc_bin',
+                    'front_route_hazard_bin',
+                )
+            )
 
-        if not (needs_semantic or needs_energy or needs_ego_status or needs_front_route):
-            skipped += 1
-            continue
+            if not (needs_semantic or needs_energy or needs_ego_status or needs_front_route):
+                skipped += 1
+                _maybe_checkpoint(phase='labeling')
+                continue
 
-        base_dir = None
-        frame_str = None
-        current_boxes = None
-        current_measurements = None
-        ego_matrix_current = None
-        future_frames_data = None
+            dirty_since_checkpoint = True
+            base_dir = None
+            frame_str = None
+            current_boxes = None
+            current_measurements = None
+            ego_matrix_current = None
+            future_frames_data = None
 
-        if needs_semantic:
-            base_dir, frame_str = _resolve_feature_frame_info(sample)
-            if base_dir is None or frame_str is None:
-                _set_semantic_fallback(sample, num_modes)
-                fallback += 1
-            else:
-                bev_rel = os.path.join(base_dir, 'bev_semantics', f'{frame_str}.png')
-                bev_path = os.path.join(image_data_root, bev_rel)
-
-                if not os.path.exists(bev_path):
+            if needs_semantic:
+                base_dir, frame_str = _resolve_feature_frame_info(sample)
+                if base_dir is None or frame_str is None:
                     _set_semantic_fallback(sample, num_modes)
                     fallback += 1
                 else:
-                    bev_semantic = np.array(Image.open(bev_path))
+                    bev_rel = os.path.join(base_dir, 'bev_semantics', f'{frame_str}.png')
+                    bev_path = os.path.join(image_data_root, bev_rel)
 
-                    boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
-                    boxes_path = os.path.join(image_data_root, boxes_rel)
-                    current_boxes = _load_json_gz_if_exists(boxes_path)
+                    if not os.path.exists(bev_path):
+                        _set_semantic_fallback(sample, num_modes)
+                        fallback += 1
+                    else:
+                        bev_semantic = np.array(Image.open(bev_path))
 
-                    meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
-                    meas_path = os.path.join(image_data_root, meas_rel)
-                    current_measurements = _load_json_gz_if_exists(meas_path)
+                        boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
+                        boxes_path = os.path.join(image_data_root, boxes_rel)
+                        current_boxes = _load_json_gz_if_exists(boxes_path)
 
-                    if current_measurements is not None:
-                        ego_matrix_current = current_measurements.get('ego_matrix', None)
+                        meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
+                        meas_path = os.path.join(image_data_root, meas_rel)
+                        current_measurements = _load_json_gz_if_exists(meas_path)
 
-                    if ego_matrix_current is not None:
-                        frame_id = int(frame_str)
-                        future_frames_data = []
-                        for k in range(1, num_points + 1):
-                            future_frame_str = f"{frame_id + k:04d}"
-                            fut_boxes_path = os.path.join(
-                                image_data_root, base_dir,
-                                'boxes', f'{future_frame_str}.json.gz')
-                            fut_meas_path = os.path.join(
-                                image_data_root, base_dir,
-                                'measurements', f'{future_frame_str}.json.gz')
-                            if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
-                                try:
-                                    fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
-                                    fut_meas = _load_json_gz_if_exists(fut_meas_path)
-                                    if fut_boxes is None or fut_meas is None:
+                        if current_measurements is not None:
+                            ego_matrix_current = current_measurements.get('ego_matrix', None)
+
+                        if ego_matrix_current is not None:
+                            frame_id = int(frame_str)
+                            future_frames_data = []
+                            for k in range(1, num_points + 1):
+                                future_frame_str = f"{frame_id + k:04d}"
+                                fut_boxes_path = os.path.join(
+                                    image_data_root, base_dir,
+                                    'boxes', f'{future_frame_str}.json.gz')
+                                fut_meas_path = os.path.join(
+                                    image_data_root, base_dir,
+                                    'measurements', f'{future_frame_str}.json.gz')
+                                if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
+                                    try:
+                                        fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
+                                        fut_meas = _load_json_gz_if_exists(fut_meas_path)
+                                        if fut_boxes is None or fut_meas is None:
+                                            future_frames_data.append(None)
+                                            continue
+                                        fut_ego_matrix = fut_meas.get('ego_matrix', None)
+                                        if fut_ego_matrix is not None:
+                                            future_frames_data.append((fut_boxes, fut_ego_matrix))
+                                        else:
+                                            future_frames_data.append(None)
+                                    except Exception:
                                         future_frames_data.append(None)
-                                        continue
-                                    fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                                    if fut_ego_matrix is not None:
-                                        future_frames_data.append((fut_boxes, fut_ego_matrix))
-                                    else:
-                                        future_frames_data.append(None)
-                                except Exception:
+                                else:
                                     future_frames_data.append(None)
+                        gt_traj = sample.get('ego_waypoints', None)
+                        if gt_traj is not None:
+                            if isinstance(gt_traj, np.ndarray):
+                                gt_traj = gt_traj[1:]
                             else:
-                                future_frames_data.append(None)
+                                gt_traj = np.array(gt_traj)[1:]
 
-                    gt_traj = sample.get('ego_waypoints', None)
-                    if gt_traj is not None:
-                        if isinstance(gt_traj, np.ndarray):
-                            gt_traj = gt_traj[1:]
-                        else:
-                            gt_traj = np.array(gt_traj)[1:]
+                        behavior_labels, allowed_flags, _ = label_anchors_semantic(
+                            anchor_centers_abs, bev_semantic,
+                            ppm=bev_ppm, bev_size=bev_size,
+                            boxes=current_boxes,
+                            measurements=current_measurements,
+                            ego_matrix_current=ego_matrix_current,
+                            future_frames_data=future_frames_data,
+                            gt_trajectory=gt_traj,
+                        )
 
-                    behavior_labels, allowed_flags, _ = label_anchors_semantic(
-                        anchor_centers_abs, bev_semantic,
-                        ppm=bev_ppm, bev_size=bev_size,
-                        boxes=current_boxes,
-                        measurements=current_measurements,
-                        ego_matrix_current=ego_matrix_current,
-                        future_frames_data=future_frames_data,
-                        gt_trajectory=gt_traj,
-                    )
+                        bucket_flags = classify_scene_buckets(
+                            measurements=current_measurements,
+                            boxes=current_boxes,
+                            ego_waypoints=gt_traj,
+                        )
 
-                    bucket_flags = classify_scene_buckets(
-                        measurements=current_measurements,
-                        boxes=current_boxes,
-                        ego_waypoints=gt_traj,
-                    )
+                        sample['behavior_labels'] = behavior_labels
+                        sample['allowed_flags'] = allowed_flags.astype(np.float32)
+                        sample['scene_buckets'] = bucket_flags.astype(np.float32)
+                        semantic_computed += 1
 
-                    sample['behavior_labels'] = behavior_labels
-                    sample['allowed_flags'] = allowed_flags.astype(np.float32)
-                    sample['scene_buckets'] = bucket_flags.astype(np.float32)
-                    semantic_computed += 1
-
-        if needs_front_route:
-            if base_dir is None or frame_str is None:
-                base_dir, frame_str = _resolve_feature_frame_info(sample)
-            if base_dir is None or frame_str is None:
-                _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
-                fallback += 1
-            else:
-                if current_boxes is None:
-                    boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
-                    boxes_path = os.path.join(image_data_root, boxes_rel)
-                    current_boxes = _load_json_gz_if_exists(boxes_path)
-                if current_measurements is None:
-                    meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
-                    meas_path = os.path.join(image_data_root, meas_rel)
-                    current_measurements = _load_json_gz_if_exists(meas_path)
-                if ego_matrix_current is None and current_measurements is not None:
-                    ego_matrix_current = current_measurements.get('ego_matrix', None)
-                if future_frames_data is None and ego_matrix_current is not None:
-                    frame_id = int(frame_str)
-                    future_frames_data = []
-                    for k in range(1, num_points + 1):
-                        future_frame_str = f'{frame_id + k:04d}'
-                        fut_boxes_path = os.path.join(image_data_root, base_dir, 'boxes', f'{future_frame_str}.json.gz')
-                        fut_meas_path = os.path.join(image_data_root, base_dir, 'measurements', f'{future_frame_str}.json.gz')
-                        fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
-                        fut_meas = _load_json_gz_if_exists(fut_meas_path)
-                        if fut_boxes is None or fut_meas is None:
-                            future_frames_data.append(None)
-                            continue
-                        fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                        if fut_ego_matrix is not None:
-                            future_frames_data.append((fut_boxes, fut_ego_matrix))
-                        else:
-                            future_frames_data.append(None)
-
-                route = sample.get('route', None)
-                ego_speed = 0.0
-                if current_measurements is not None:
-                    ego_speed = float(current_measurements.get('speed', 0.0))
-                elif sample.get('speed_hist', None) is not None:
-                    ego_speed = float(np.asarray(sample['speed_hist'], dtype=np.float32)[-1])
-
-                if route is None or current_boxes is None:
+            if needs_front_route:
+                if base_dir is None or frame_str is None:
+                    base_dir, frame_str = _resolve_feature_frame_info(sample)
+                if base_dir is None or frame_str is None:
                     _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
                     fallback += 1
                 else:
-                    front_label = _compute_front_route_label(
-                        route=route,
-                        current_boxes=current_boxes,
-                        ego_speed=ego_speed,
-                        ego_matrix_current=ego_matrix_current,
-                        future_frames_data=future_frames_data,
-                        corridor_margin_m=front_corridor_margin_m,
-                        route_step_m=front_route_step_m,
-                        max_distance_m=front_max_distance_m,
-                        safe_ttc_s=front_safe_ttc_s,
-                        max_ttc_s=front_max_ttc_s,
-                        block_safe_distance_m=front_block_safe_distance_m,
-                    )
-                    sample['front_route_distance'] = np.float32(front_label['distance'])
-                    sample['front_route_ttc'] = np.float32(front_label['ttc'])
-                    sample['front_route_risk'] = np.float32(front_label['risk'])
-                    sample['front_route_block_risk'] = np.float32(front_label['block_risk'])
-                    sample['front_route_case'] = np.int64(front_label['case'])
-                    sample['front_route_has_lead'] = np.float32(front_label['has_lead'])
-                    sample['front_route_actor_class'] = np.int64(front_label['actor_class'])
-                    sample['front_route_actor_weight'] = np.float32(front_label['actor_weight'])
-                    sample['front_route_block_bin'] = np.int64(front_label['block_bin'])
-                    sample['front_route_ttc_bin'] = np.int64(front_label['ttc_bin'])
-                    sample['front_route_hazard_bin'] = np.int64(front_label['hazard_bin'])
-                    front_route_built += 1
+                    if current_boxes is None:
+                        boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
+                        boxes_path = os.path.join(image_data_root, boxes_rel)
+                        current_boxes = _load_json_gz_if_exists(boxes_path)
+                    if current_measurements is None:
+                        meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
+                        meas_path = os.path.join(image_data_root, meas_rel)
+                        current_measurements = _load_json_gz_if_exists(meas_path)
+                    if ego_matrix_current is None and current_measurements is not None:
+                        ego_matrix_current = current_measurements.get('ego_matrix', None)
+                    if future_frames_data is None and ego_matrix_current is not None:
+                        frame_id = int(frame_str)
+                        future_frames_data = []
+                        for k in range(1, num_points + 1):
+                            future_frame_str = f'{frame_id + k:04d}'
+                            fut_boxes_path = os.path.join(image_data_root, base_dir, 'boxes', f'{future_frame_str}.json.gz')
+                            fut_meas_path = os.path.join(image_data_root, base_dir, 'measurements', f'{future_frame_str}.json.gz')
+                            fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
+                            fut_meas = _load_json_gz_if_exists(fut_meas_path)
+                            if fut_boxes is None or fut_meas is None:
+                                future_frames_data.append(None)
+                                continue
+                            fut_ego_matrix = fut_meas.get('ego_matrix', None)
+                            if fut_ego_matrix is not None:
+                                future_frames_data.append((fut_boxes, fut_ego_matrix))
+                            else:
+                                future_frames_data.append(None)
 
-        if needs_energy:
-            if 'behavior_labels' not in sample or 'allowed_flags' not in sample:
-                _set_semantic_fallback(sample, num_modes)
-            energy_targets, energy_active_mask = _build_energy_targets(
-                sample['behavior_labels'],
-                sample['allowed_flags'],
-            )
-            sample['energy_targets'] = energy_targets
-            sample['energy_active_mask'] = energy_active_mask
-            energy_built += 1
+                    route = sample.get('route', None)
+                    ego_speed = 0.0
+                    if current_measurements is not None:
+                        ego_speed = float(current_measurements.get('speed', 0.0))
+                    elif sample.get('speed_hist', None) is not None:
+                        ego_speed = float(np.asarray(sample['speed_hist'], dtype=np.float32)[-1])
 
-        if needs_ego_status:
-            sample['ego_status'] = _build_ego_status(sample)
-            ego_status_built += 1
+                    if route is None or current_boxes is None:
+                        _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
+                        fallback += 1
+                    else:
+                        front_label = _compute_front_route_label(
+                            route=route,
+                            current_boxes=current_boxes,
+                            ego_speed=ego_speed,
+                            ego_matrix_current=ego_matrix_current,
+                            future_frames_data=future_frames_data,
+                            corridor_margin_m=front_corridor_margin_m,
+                            route_step_m=front_route_step_m,
+                            max_distance_m=front_max_distance_m,
+                            safe_ttc_s=front_safe_ttc_s,
+                            max_ttc_s=front_max_ttc_s,
+                            block_safe_distance_m=front_block_safe_distance_m,
+                        )
+                        sample['front_route_distance'] = np.float32(front_label['distance'])
+                        sample['front_route_ttc'] = np.float32(front_label['ttc'])
+                        sample['front_route_risk'] = np.float32(front_label['risk'])
+                        sample['front_route_block_risk'] = np.float32(front_label['block_risk'])
+                        sample['front_route_case'] = np.int64(front_label['case'])
+                        sample['front_route_has_lead'] = np.float32(front_label['has_lead'])
+                        sample['front_route_actor_class'] = np.int64(front_label['actor_class'])
+                        sample['front_route_actor_weight'] = np.float32(front_label['actor_weight'])
+                        sample['front_route_block_bin'] = np.int64(front_label['block_bin'])
+                        sample['front_route_ttc_bin'] = np.int64(front_label['ttc_bin'])
+                        sample['front_route_hazard_bin'] = np.int64(front_label['hazard_bin'])
+                        front_route_built += 1
 
-    route_groups = defaultdict(list)
-    for sample_idx, sample in enumerate(samples):
-        if not force and _has_stage1_speed_fields(sample):
-            continue
-        base_dir, frame_str = _resolve_feature_frame_info(sample)
-        if base_dir is None or frame_str is None:
-            route_groups[None].append(sample_idx)
-            continue
-        route_groups[base_dir].append(sample_idx)
-
-    for base_dir, route_sample_indices in tqdm(route_groups.items(), desc="Stage1 speed", leave=False):
-        if base_dir is None:
-            for sample_idx in route_sample_indices:
-                _set_stage1_speed_fallback(samples[sample_idx])
-                stage1_speed_built += 1
-                fallback += 1
-            continue
-
-        route_sample_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
-        route_samples = [samples[i] for i in route_sample_indices]
-        event_name = _scene_name_from_base_dir(base_dir)
-        scene_nonstatic_actor_ids = _collect_scene_nonstatic_actor_ids(route_samples, image_data_root)
-        scene_route_polyline_world, scene_route_anchor_s = _build_scene_route_polyline_world(route_samples, image_data_root)
-
-        persisted_meet = None
-        persisted_meet_frames_left = 0
-        persist_dt_s = 0.25
-
-        for sample_idx in route_sample_indices:
-            sample = samples[sample_idx]
-            base_dir_cur, frame_str = _resolve_feature_frame_info(sample)
-            if base_dir_cur is None or frame_str is None:
-                _set_stage1_speed_fallback(sample)
-                stage1_speed_built += 1
-                fallback += 1
-                continue
-
-            boxes_path = os.path.join(image_data_root, base_dir_cur, 'boxes', f'{frame_str}.json.gz')
-            meas_path = os.path.join(image_data_root, base_dir_cur, 'measurements', f'{frame_str}.json.gz')
-            current_boxes = _load_json_gz_if_exists(boxes_path)
-            current_measurements = _load_json_gz_if_exists(meas_path)
-            if current_boxes is None or current_measurements is None:
-                _set_stage1_speed_fallback(sample)
-                stage1_speed_built += 1
-                fallback += 1
-                continue
-
-            ego_matrix_current = current_measurements.get('ego_matrix', None)
-            if ego_matrix_current is None:
-                _set_stage1_speed_fallback(sample)
-                stage1_speed_built += 1
-                fallback += 1
-                continue
-
-            route_local = np.asarray(sample.get('route', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
-            if route_local.ndim != 2 or route_local.shape[0] == 0 or route_local.shape[1] != 2:
-                _set_stage1_speed_fallback(sample)
-                stage1_speed_built += 1
-                fallback += 1
-                continue
-            if event_name not in NO_ROUTE_EXTENSION_SCENES and base_dir_cur in scene_route_polyline_world:
-                anchor_s = scene_route_anchor_s.get(base_dir_cur, {}).get(int(sample.get('frame_id', -1)))
-                route_input = _extend_local_route_with_scene_polyline(
-                    route_local,
-                    ego_matrix_current,
-                    scene_route_polyline_world[base_dir_cur],
-                    anchor_s=anchor_s,
-                    extension_step_m=1.0,
-                    extension_points=12,
+            if needs_energy:
+                if 'behavior_labels' not in sample or 'allowed_flags' not in sample:
+                    _set_semantic_fallback(sample, num_modes)
+                energy_targets, energy_active_mask = _build_energy_targets(
+                    sample['behavior_labels'],
+                    sample['allowed_flags'],
                 )
-            else:
-                route_input = route_local.astype(np.float32)
+                sample['energy_targets'] = energy_targets
+                sample['energy_active_mask'] = energy_active_mask
+                energy_built += 1
 
-            ego_speed = float(current_measurements.get('speed', 0.0))
-            future_frames_data = _build_future_frames_data(image_data_root, base_dir_cur, frame_str, num_points)
+            if needs_ego_status:
+                sample['ego_status'] = _build_ego_status(sample)
+                ego_status_built += 1
 
-            current_boxes_dynamic = _filter_current_boxes_dynamic(current_boxes, scene_nonstatic_actor_ids)
-            future_frames_dynamic = _filter_future_frames_dynamic(future_frames_data, scene_nonstatic_actor_ids)
-            _, front_debug = _compute_front_route_label(
-                route=route_input,
-                current_boxes=current_boxes_dynamic,
-                ego_speed=ego_speed,
-                ego_matrix_current=ego_matrix_current,
-                future_frames_data=future_frames_dynamic,
-                corridor_margin_m=front_corridor_margin_m,
-                route_step_m=front_route_step_m,
-                max_distance_m=front_max_distance_m,
-                safe_ttc_s=front_safe_ttc_s,
-                max_ttc_s=front_max_ttc_s,
-                block_safe_distance_m=front_block_safe_distance_m,
-                return_debug=True,
-            )
-            current_cover = _cover_candidate_summary(1, front_debug.get('best_current'), front_debug, current_meas=current_measurements, event_name=event_name)
-            future_cover = _cover_candidate_summary(2, front_debug.get('best_future'), front_debug, current_meas=current_measurements, event_name=event_name)
-            speed_curve_future_cover = dict(future_cover)
+            _maybe_checkpoint(phase='labeling')
 
-            if int(future_cover.get('exists', 0.0)) > 0 and future_cover['interaction']['name'] == 'meet':
-                persisted_meet = dict(future_cover)
-                persisted_meet['actor_id'] = int(future_cover.get('actor_id', -1))
-                persisted_meet_frames_left = 4
-            elif persisted_meet is not None and persisted_meet_frames_left > 0:
-                actor_id = int(persisted_meet.get('actor_id', -1))
-                actor_box = _find_box_by_id(current_boxes_dynamic, actor_id)
-                ego_box = _find_ego_box(current_boxes_dynamic)
-                ego_speed_now = float(current_measurements.get('speed', 0.0))
-                bg_speed_now = float(persisted_meet.get('other_speed', np.nan))
-                if actor_box is not None:
-                    bg_speed_now = float(abs(actor_box.get('speed', bg_speed_now)))
-                pseudo = dict(persisted_meet)
-                keep_persisted = False
-                if actor_box is not None:
-                    pos = np.asarray(actor_box.get('position', [np.nan, np.nan])[:2], dtype=np.float32)
-                    if pos.shape == (2,) and np.all(np.isfinite(pos)):
-                        if float(pos[0]) < 1.0 and float(np.linalg.norm(pos)) < 12.0:
-                            pseudo['d_ego'] = 0.0
-                            pseudo['d_bg'] = float(max(np.linalg.norm(pos), 1e-3))
-                            pseudo['rear_gap_m'] = float(_approx_box_clearance_gap_m(actor_box, ego_box))
-                            keep_persisted = True
-                if not keep_persisted:
-                    if np.isfinite(float(pseudo.get('d_ego', np.nan))):
-                        pseudo['d_ego'] = float(max(float(pseudo['d_ego']) - ego_speed_now * persist_dt_s, 0.0))
-                    if np.isfinite(float(pseudo.get('d_bg', np.nan))):
-                        pseudo['d_bg'] = float(max(float(pseudo['d_bg']) - bg_speed_now * persist_dt_s, 0.0))
-                    keep_persisted = bool(np.isfinite(float(pseudo.get('d_bg', np.nan))) and float(pseudo.get('d_bg', 0.0)) > 0.25)
-                if keep_persisted:
-                    pseudo['other_speed'] = float(bg_speed_now)
-                    speed_curve_future_cover = pseudo
-                    persisted_meet = dict(pseudo)
-                    persisted_meet_frames_left -= 1
+        _maybe_checkpoint(phase='labeling', force_reason='phase_complete')
+
+        route_groups = defaultdict(list)
+        for sample_idx, sample in enumerate(samples):
+            if not force and _has_stage1_speed_fields(sample):
+                continue
+            base_dir, frame_str = _resolve_feature_frame_info(sample)
+            if base_dir is None or frame_str is None:
+                route_groups[None].append(sample_idx)
+                continue
+            route_groups[base_dir].append(sample_idx)
+
+        for base_dir, route_sample_indices in tqdm(route_groups.items(), desc="Stage1 speed", leave=False):
+            if base_dir is None:
+                for sample_idx in route_sample_indices:
+                    stage1_processed += 1
+                    dirty_since_checkpoint = True
+                    _set_stage1_speed_fallback(samples[sample_idx])
+                    stage1_speed_built += 1
+                    fallback += 1
+                    _maybe_checkpoint(phase='stage1_speed')
+                continue
+
+            route_sample_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
+            route_samples = [samples[i] for i in route_sample_indices]
+            event_name = _scene_name_from_base_dir(base_dir)
+            scene_nonstatic_actor_ids = _collect_scene_nonstatic_actor_ids(route_samples, image_data_root)
+            scene_route_polyline_world, scene_route_anchor_s = _build_scene_route_polyline_world(route_samples, image_data_root)
+
+            persisted_meet = None
+            persisted_meet_frames_left = 0
+            persist_dt_s = 0.25
+
+            for sample_idx in route_sample_indices:
+                stage1_processed += 1
+                dirty_since_checkpoint = True
+                sample = samples[sample_idx]
+                base_dir_cur, frame_str = _resolve_feature_frame_info(sample)
+                if base_dir_cur is None or frame_str is None:
+                    _set_stage1_speed_fallback(sample)
+                    stage1_speed_built += 1
+                    fallback += 1
+                    _maybe_checkpoint(phase='stage1_speed')
+                    continue
+
+                boxes_path = os.path.join(image_data_root, base_dir_cur, 'boxes', f'{frame_str}.json.gz')
+                meas_path = os.path.join(image_data_root, base_dir_cur, 'measurements', f'{frame_str}.json.gz')
+                current_boxes = _load_json_gz_if_exists(boxes_path)
+                current_measurements = _load_json_gz_if_exists(meas_path)
+                if current_boxes is None or current_measurements is None:
+                    _set_stage1_speed_fallback(sample)
+                    stage1_speed_built += 1
+                    fallback += 1
+                    _maybe_checkpoint(phase='stage1_speed')
+                    continue
+
+                ego_matrix_current = current_measurements.get('ego_matrix', None)
+                if ego_matrix_current is None:
+                    _set_stage1_speed_fallback(sample)
+                    stage1_speed_built += 1
+                    fallback += 1
+                    _maybe_checkpoint(phase='stage1_speed')
+                    continue
+
+                route_local = np.asarray(sample.get('route', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+                if route_local.ndim != 2 or route_local.shape[0] == 0 or route_local.shape[1] != 2:
+                    _set_stage1_speed_fallback(sample)
+                    stage1_speed_built += 1
+                    fallback += 1
+                    _maybe_checkpoint(phase='stage1_speed')
+                    continue
+                if event_name not in NO_ROUTE_EXTENSION_SCENES and base_dir_cur in scene_route_polyline_world:
+                    anchor_s = scene_route_anchor_s.get(base_dir_cur, {}).get(int(sample.get('frame_id', -1)))
+                    route_input = _extend_local_route_with_scene_polyline(
+                        route_local,
+                        ego_matrix_current,
+                        scene_route_polyline_world[base_dir_cur],
+                        anchor_s=anchor_s,
+                        extension_step_m=1.0,
+                        extension_points=12,
+                    )
                 else:
-                    persisted_meet = None
-                    persisted_meet_frames_left = 0
+                    route_input = route_local.astype(np.float32)
 
-            ped_margin_m = _pedestrian_corridor_margin_m(current_boxes)
-            ped_current_boxes = _filter_current_boxes_pedestrian(current_boxes)
-            ped_future_frames = _filter_future_frames_pedestrian(future_frames_data)
-            _, ped_debug = _compute_front_route_label(
-                route=route_input,
-                current_boxes=ped_current_boxes,
-                ego_speed=ego_speed,
-                ego_matrix_current=ego_matrix_current,
-                future_frames_data=ped_future_frames,
-                corridor_margin_m=ped_margin_m,
-                route_step_m=front_route_step_m,
-                max_distance_m=front_max_distance_m,
-                safe_ttc_s=front_safe_ttc_s,
-                max_ttc_s=front_max_ttc_s,
-                block_safe_distance_m=front_block_safe_distance_m,
-                return_debug=True,
-            )
-            ped_current_cover = _cover_candidate_summary(1, ped_debug.get('best_current'), ped_debug, current_meas=current_measurements, event_name=event_name)
-            ped_future_cover = _cover_candidate_summary(2, ped_debug.get('best_future'), ped_debug, current_meas=current_measurements, event_name=event_name)
+                ego_speed = float(current_measurements.get('speed', 0.0))
+                future_frames_data = _build_future_frames_data(image_data_root, base_dir_cur, frame_str, num_points)
 
-            sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, _ = _build_speed_curve_targets(
-                current_cover=current_cover,
-                future_cover=speed_curve_future_cover,
-                current_meas=current_measurements,
-                current_boxes=current_boxes_dynamic,
-                event_name=event_name,
-            )
-            ped_sample_speeds, _, _, _, _, ped_risks = _build_speed_curve_targets(
-                current_cover=ped_current_cover,
-                future_cover=ped_future_cover,
-                current_meas=current_measurements,
-                current_boxes=current_boxes,
-                event_name=event_name,
-            )
-            if ped_sample_speeds.shape != sample_speeds.shape or not np.allclose(ped_sample_speeds, sample_speeds):
-                ped_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+                current_boxes_dynamic = _filter_current_boxes_dynamic(current_boxes, scene_nonstatic_actor_ids)
+                future_frames_dynamic = _filter_future_frames_dynamic(future_frames_data, scene_nonstatic_actor_ids)
+                _, front_debug = _compute_front_route_label(
+                    route=route_input,
+                    current_boxes=current_boxes_dynamic,
+                    ego_speed=ego_speed,
+                    ego_matrix_current=ego_matrix_current,
+                    future_frames_data=future_frames_dynamic,
+                    corridor_margin_m=front_corridor_margin_m,
+                    route_step_m=front_route_step_m,
+                    max_distance_m=front_max_distance_m,
+                    safe_ttc_s=front_safe_ttc_s,
+                    max_ttc_s=front_max_ttc_s,
+                    block_safe_distance_m=front_block_safe_distance_m,
+                    return_debug=True,
+                )
+                current_cover = _cover_candidate_summary(1, front_debug.get('best_current'), front_debug, current_meas=current_measurements, event_name=event_name)
+                future_cover = _cover_candidate_summary(2, front_debug.get('best_future'), front_debug, current_meas=current_measurements, event_name=event_name)
+                speed_curve_future_cover = dict(future_cover)
 
-            sample['speed_sample_values'] = sample_speeds.astype(np.float32)
-            sample['speed_sample_valid_mask'] = valid_mask.astype(np.float32)
-            sample['speed_sample_exp_index'] = np.int64(exp_index)
-            sample['speed_risk_chase_values'] = chase_risks.astype(np.float32)
-            sample['speed_risk_meet_values'] = meet_risks.astype(np.float32)
-            sample['speed_risk_ped_values'] = ped_risks.astype(np.float32)
-            stage1_speed_built += 1
+                if int(future_cover.get('exists', 0.0)) > 0 and future_cover['interaction']['name'] == 'meet':
+                    persisted_meet = dict(future_cover)
+                    persisted_meet['actor_id'] = int(future_cover.get('actor_id', -1))
+                    persisted_meet_frames_left = 4
+                elif persisted_meet is not None and persisted_meet_frames_left > 0:
+                    actor_id = int(persisted_meet.get('actor_id', -1))
+                    actor_box = _find_box_by_id(current_boxes_dynamic, actor_id)
+                    ego_box = _find_ego_box(current_boxes_dynamic)
+                    ego_speed_now = float(current_measurements.get('speed', 0.0))
+                    bg_speed_now = float(persisted_meet.get('other_speed', np.nan))
+                    if actor_box is not None:
+                        bg_speed_now = float(abs(actor_box.get('speed', bg_speed_now)))
+                    pseudo = dict(persisted_meet)
+                    keep_persisted = False
+                    if actor_box is not None:
+                        pos = np.asarray(actor_box.get('position', [np.nan, np.nan])[:2], dtype=np.float32)
+                        if pos.shape == (2,) and np.all(np.isfinite(pos)):
+                            if float(pos[0]) < 1.0 and float(np.linalg.norm(pos)) < 12.0:
+                                pseudo['d_ego'] = 0.0
+                                pseudo['d_bg'] = float(max(np.linalg.norm(pos), 1e-3))
+                                pseudo['rear_gap_m'] = float(_approx_box_clearance_gap_m(actor_box, ego_box))
+                                keep_persisted = True
+                    if not keep_persisted:
+                        if np.isfinite(float(pseudo.get('d_ego', np.nan))):
+                            pseudo['d_ego'] = float(max(float(pseudo['d_ego']) - ego_speed_now * persist_dt_s, 0.0))
+                        if np.isfinite(float(pseudo.get('d_bg', np.nan))):
+                            pseudo['d_bg'] = float(max(float(pseudo['d_bg']) - bg_speed_now * persist_dt_s, 0.0))
+                        keep_persisted = bool(np.isfinite(float(pseudo.get('d_bg', np.nan))) and float(pseudo.get('d_bg', 0.0)) > 0.25)
+                    if keep_persisted:
+                        pseudo['other_speed'] = float(bg_speed_now)
+                        speed_curve_future_cover = pseudo
+                        persisted_meet = dict(pseudo)
+                        persisted_meet_frames_left -= 1
+                    else:
+                        persisted_meet = None
+                        persisted_meet_frames_left = 0
+
+                ped_margin_m = _pedestrian_corridor_margin_m(current_boxes)
+                ped_current_boxes = _filter_current_boxes_pedestrian(current_boxes)
+                ped_future_frames = _filter_future_frames_pedestrian(future_frames_data)
+                _, ped_debug = _compute_front_route_label(
+                    route=route_input,
+                    current_boxes=ped_current_boxes,
+                    ego_speed=ego_speed,
+                    ego_matrix_current=ego_matrix_current,
+                    future_frames_data=ped_future_frames,
+                    corridor_margin_m=ped_margin_m,
+                    route_step_m=front_route_step_m,
+                    max_distance_m=front_max_distance_m,
+                    safe_ttc_s=front_safe_ttc_s,
+                    max_ttc_s=front_max_ttc_s,
+                    block_safe_distance_m=front_block_safe_distance_m,
+                    return_debug=True,
+                )
+                ped_current_cover = _cover_candidate_summary(1, ped_debug.get('best_current'), ped_debug, current_meas=current_measurements, event_name=event_name)
+                ped_future_cover = _cover_candidate_summary(2, ped_debug.get('best_future'), ped_debug, current_meas=current_measurements, event_name=event_name)
+
+                sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, _ = _build_speed_curve_targets(
+                    current_cover=current_cover,
+                    future_cover=speed_curve_future_cover,
+                    current_meas=current_measurements,
+                    current_boxes=current_boxes_dynamic,
+                    event_name=event_name,
+                )
+                ped_sample_speeds, _, _, _, _, ped_risks = _build_speed_curve_targets(
+                    current_cover=ped_current_cover,
+                    future_cover=ped_future_cover,
+                    current_meas=current_measurements,
+                    current_boxes=current_boxes,
+                    event_name=event_name,
+                )
+                if ped_sample_speeds.shape != sample_speeds.shape or not np.allclose(ped_sample_speeds, sample_speeds):
+                    ped_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+
+                sample['speed_sample_values'] = sample_speeds.astype(np.float32)
+                sample['speed_sample_valid_mask'] = valid_mask.astype(np.float32)
+                sample['speed_sample_exp_index'] = np.int64(exp_index)
+                sample['speed_risk_chase_values'] = chase_risks.astype(np.float32)
+                sample['speed_risk_meet_values'] = meet_risks.astype(np.float32)
+                sample['speed_risk_ped_values'] = ped_risks.astype(np.float32)
+                stage1_speed_built += 1
+                _maybe_checkpoint(phase='stage1_speed')
+
+        _maybe_checkpoint(phase='stage1_speed', force_reason='phase_complete')
+    except BaseException as exc:
+        try:
+            _maybe_checkpoint(phase='exception', force_reason=f'exception_{type(exc).__name__}')
+        except Exception as checkpoint_exc:
+            print(f"[checkpoint] failed during exception handling: {checkpoint_exc}")
+        raise
 
     print(
         f"\nDone: semantic={semantic_computed}, energy={energy_built}, "
@@ -2019,14 +2117,7 @@ def precompute(
         f"skipped={skipped}, fallback={fallback}"
     )
 
-    # Save back (atomic write)
-    tmp_path = packed_path + f'.tmp.{os.getpid()}'
-    print(f"Saving to {packed_path}...")
-    with open(tmp_path, 'wb') as f:
-        pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.rename(tmp_path, packed_path)
-    size_mb = os.path.getsize(packed_path) / 1e6
-    print(f"Saved ({size_mb:.1f} MB)")
+    _save_checkpoint(phase='final', reason='complete')
 
 
 if __name__ == '__main__':
@@ -2045,6 +2136,8 @@ if __name__ == '__main__':
     parser.add_argument('--front_safe_ttc_s', type=float, default=3.0)
     parser.add_argument('--front_max_ttc_s', type=float, default=10.0)
     parser.add_argument('--front_block_safe_distance_m', type=float, default=30.0)
+    parser.add_argument('--checkpoint_every_minutes', type=float, default=20.0,
+                        help='Periodically atomically save updated samples_packed.pkl to make long runs resumable. Set <=0 to disable.')
     parser.add_argument('--force', action='store_true', help='Re-compute even if labels exist')
     args = parser.parse_args()
 
@@ -2057,4 +2150,5 @@ if __name__ == '__main__':
                front_max_distance_m=args.front_max_distance_m,
                front_safe_ttc_s=args.front_safe_ttc_s,
                front_max_ttc_s=args.front_max_ttc_s,
-               front_block_safe_distance_m=args.front_block_safe_distance_m)
+               front_block_safe_distance_m=args.front_block_safe_distance_m,
+               checkpoint_every_minutes=args.checkpoint_every_minutes)

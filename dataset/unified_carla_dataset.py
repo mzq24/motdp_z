@@ -9,6 +9,7 @@ import glob
 import random
 import time
 from collections import defaultdict
+from typing import Optional
 from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
@@ -75,6 +76,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  feature_suffix: str = '',    # Suffix for feature files (e.g. 'ensemble' → bev_features_fp16_ensemble.bin)
                  gps_noise_cfg: dict = None,  # GPS noise augmentation config
                  load_transfuser_lidar_bev: bool = False,  # Load LiDAR BEV detail input
+                 lidar_history_frames: int = 1,
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -91,6 +93,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._use_per_frame = use_per_frame  # Local SSD mode: read individual .pt files
         self._use_vqa_anchor = use_vqa_anchor  # Load VLM anchor from dp_vl_feature
         self._load_transfuser_lidar_bev = load_transfuser_lidar_bev
+        self._lidar_history_frames = max(int(lidar_history_frames), 1)
         self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
 
@@ -414,6 +417,47 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             }
         return self._route_pack_cache[packed_path]
 
+    def _load_single_lidar_bev_frame(self, route_rel: str, frame_id: int, feat_rel: str) -> Optional[torch.Tensor]:
+        if frame_id is None:
+            return None
+
+        if self._lidar_bev_mmap is not None and self._lidar_bev_index is not None:
+            route_info = self._lidar_bev_index.get(route_rel)
+            if route_info is not None:
+                local_idx = route_info.get('fid_to_local', {}).get(int(frame_id))
+                if local_idx is not None:
+                    abs_idx = route_info['offset'] + local_idx
+                    return torch.from_numpy(self._lidar_bev_mmap[abs_idx].copy())  # (2, 256, 256) fp16
+            return None
+
+        lidar_bev_rel = feat_rel.replace(
+            'transfuser_feature/', 'transfuser_lidar_bev/').replace(
+            '_feature.pt', '.npy')
+        cur_frame = os.path.basename(lidar_bev_rel).replace('.npy', '')
+        hist_frame = f'{int(frame_id):04d}'
+        lidar_bev_rel = lidar_bev_rel.replace(f'/{cur_frame}.npy', f'/{hist_frame}.npy')
+        lidar_bev_path = os.path.join(self.image_data_root, lidar_bev_rel)
+        if not os.path.exists(lidar_bev_path):
+            return None
+        raw = np.load(lidar_bev_path)  # (2, 256, 256) float16
+        return torch.from_numpy((1.0 - raw.astype(np.float32))).half()
+
+    def _load_lidar_bev_history(self, feat_rel: str, route_rel: str, frame_id: int) -> Optional[torch.Tensor]:
+        if frame_id is None:
+            return None
+
+        frames = []
+        start_frame = int(frame_id) - (self._lidar_history_frames - 1)
+        for hist_frame_id in range(start_frame, int(frame_id) + 1):
+            frame_tensor = self._load_single_lidar_bev_frame(route_rel, hist_frame_id, feat_rel)
+            if frame_tensor is None:
+                frame_tensor = torch.zeros(2, 256, 256, dtype=torch.float16)
+            frames.append(frame_tensor)
+
+        if not frames:
+            return None
+        return torch.stack(frames, dim=0)  # (H_hist, 2, 256, 256)
+
     def __getitem__(self, idx):
         sample = self._sample_cache[idx]
         clone_keys = set()
@@ -590,7 +634,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         else:
             final_sample['transfuser_bev_feature_upsample'] = torch.zeros(64, 64, 64, dtype=torch.float16)
 
-        # --- Load TransFuser LiDAR BEV histogram (2, 256, 256) ---
+        # --- Load TransFuser LiDAR BEV histogram history (H_hist, 2, 256, 256) ---
         transfuser_lidar_bev = None
         if self._load_transfuser_lidar_bev and 'transfuser_bev_feature' in sample:
             feat_rel = sample['transfuser_bev_feature']
@@ -600,31 +644,12 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             #   frame_id  = 6
             route_rel = os.path.dirname(os.path.dirname(feat_rel))
             frame_id = sample.get('frame_id')
-
-            if self._lidar_bev_mmap is not None and self._lidar_bev_index is not None:
-                # Fast path: memmap (already inverted at pack time)
-                route_info = self._lidar_bev_index.get(route_rel)
-                if route_info is not None and frame_id is not None:
-                    local_idx = route_info.get('fid_to_local', {}).get(frame_id)
-                    if local_idx is not None:
-                        abs_idx = route_info['offset'] + local_idx
-                        transfuser_lidar_bev = torch.from_numpy(
-                            self._lidar_bev_mmap[abs_idx].copy())  # (2, 256, 256) fp16
-            else:
-                # Slow fallback: per-frame .npy
-                lidar_bev_rel = feat_rel.replace(
-                    'transfuser_feature/', 'transfuser_lidar_bev/').replace(
-                    '_feature.pt', '.npy')
-                lidar_bev_path = os.path.join(self.image_data_root, lidar_bev_rel)
-                if os.path.exists(lidar_bev_path):
-                    raw = np.load(lidar_bev_path)  # (2, 256, 256) float16
-                    # Invert: 1.0 - value → obstacles become high-valued
-                    transfuser_lidar_bev = torch.from_numpy(
-                        (1.0 - raw.astype(np.float32))).half()
+            transfuser_lidar_bev = self._load_lidar_bev_history(feat_rel, route_rel, frame_id)
         if transfuser_lidar_bev is not None:
             final_sample['transfuser_lidar_bev'] = transfuser_lidar_bev
         else:
-            final_sample['transfuser_lidar_bev'] = torch.zeros(2, 256, 256, dtype=torch.float16)
+            final_sample['transfuser_lidar_bev'] = torch.zeros(
+                self._lidar_history_frames, 2, 256, 256, dtype=torch.float16)
 
         # ========== Semantic Behavior Labeling ==========
         if self.semantic_behavior_enabled:
