@@ -593,6 +593,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         for key, value in sample.items():
             if key == 'rgb_hist_jpg':
                 continue
+            elif key == 'stage1_speed_debug':
+                # Debug payload has variable nested keys across frames/routes and is
+                # only meant for inspection/video replay, not training batches.
+                continue
             elif key == 'is_bad_route':
                 final_sample['is_bad_route'] = torch.tensor(bool(value), dtype=torch.bool)
             elif key == 'speed_hist':
