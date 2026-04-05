@@ -538,7 +538,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
     route_b_cfg = config.get('route_b', {})
-    lidar_history_frames = max(int(route_b_cfg.get('lidar_history_frames', policy_cfg.get('ego_status_seq_len', config.get('obs_horizon', 1)))), 1)
+    policy_cfg = config.get('policy', {})
+    lidar_history_frames = max(
+        int(route_b_cfg.get('lidar_history_frames', policy_cfg.get('ego_status_seq_len', config.get('obs_horizon', 1)))),
+        1,
+    )
 
     feature_suffix = config.get('dataset', {}).get('feature_suffix', '')
     validation_cfg = config.get('validation', {})
