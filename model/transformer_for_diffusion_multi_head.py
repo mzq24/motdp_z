@@ -1821,16 +1821,27 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.energy_route_head      = _make_energy_head()  # route deviation (continuous, computed in policy)
             self.front_route_risk_head  = _make_energy_head()  # route-conditioned front risk (GT/pred_x0 path)
 
-            stage1_energy_in_dim = energy_in_dim + n_emb + n_emb
-            self.speed_energy_speed_proj = nn.Sequential(
+            self.speed_energy_route_proj = nn.Sequential(
+                nn.Linear(self.num_waypoints * self.output_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.speed_energy_speed_query_proj = nn.Sequential(
                 nn.Linear(1, n_emb),
                 nn.SiLU(),
                 nn.Linear(n_emb, n_emb),
             )
+            self.speed_energy_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.speed_energy_query_attn = nn.MultiheadAttention(
+                embed_dim=n_emb,
+                num_heads=n_head,
+                batch_first=True,
+            )
+            self.speed_energy_query_norm = nn.LayerNorm(n_emb)
 
             def _make_speed_energy_head():
                 return nn.Sequential(
-                    nn.Linear(stage1_energy_in_dim, n_emb // 2), nn.SiLU(),
+                    nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
                     nn.Linear(n_emb // 2, 1),
                 )
 
@@ -2039,23 +2050,32 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
     def _compute_speed_energy_scores(
         self,
-        energy_input: torch.Tensor,
-        route_out: torch.Tensor,
+        mode_out: torch.Tensor,
+        route_points: torch.Tensor,
         speed_samples: torch.Tensor,
     ) -> dict:
         if speed_samples.dim() != 2:
             raise ValueError(f"speed_samples must be (B, K), got {speed_samples.shape}")
-        if energy_input.shape[1] != 1:
+        if mode_out.shape[1] != 1:
             raise ValueError(
-                f"stage1 speed-energy expects a single trajectory mode, got energy_input shape {energy_input.shape}"
+                f"stage1 speed-energy expects a single trajectory mode, got mode_out shape {mode_out.shape}"
             )
+        if route_points.dim() != 3:
+            raise ValueError(f"route_points must be (B, T_route, 2), got {route_points.shape}")
 
         B, K = speed_samples.shape
-        base_ctx = energy_input[:, :1, :].expand(-1, K, -1)
-        route_ctx = route_out.mean(dim=1, keepdim=True).expand(-1, K, -1)
+        route_geom = self.speed_energy_route_proj(route_points.reshape(B, -1)).unsqueeze(1)
+        scene_memory = torch.cat([mode_out[:, :1, :], route_geom], dim=1)
         speed_norm = (speed_samples / 20.0).unsqueeze(-1)
-        speed_ctx = self.speed_energy_speed_proj(speed_norm)
-        head_input = torch.cat([base_ctx, route_ctx, speed_ctx], dim=-1)
+        speed_queries = self.speed_energy_speed_query_proj(speed_norm)
+        speed_queries = speed_queries + self.speed_energy_query_token.expand(B, K, -1)
+        attn_out, _ = self.speed_energy_query_attn(
+            query=speed_queries,
+            key=scene_memory,
+            value=scene_memory,
+            need_weights=False,
+        )
+        head_input = self.speed_energy_query_norm(speed_queries + attn_out)
         return {
             'chase': self.speed_energy_chase_head(head_input).squeeze(-1),
             'meet': self.speed_energy_meet_head(head_input).squeeze(-1),
@@ -2329,7 +2349,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
     ) -> Tuple[dict, torch.Tensor]:
         if route_points is None:
             raise ValueError("forward_speed_energy requires route_points")
-        energy_input, mode_out, route_out = self._forward_traj_energy_context(
+        _, mode_out, _ = self._forward_traj_energy_context(
             x_t=x_t,
             x_t_abs=x_t_abs,
             timestep=timestep,
@@ -2341,7 +2361,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_points=route_points,
             transfuser_lidar_bev=transfuser_lidar_bev,
         )
-        return self._compute_speed_energy_scores(energy_input, route_out, speed_samples), mode_out
+        return self._compute_speed_energy_scores(mode_out, route_points, speed_samples), mode_out
 
     def forward_speed_energy_eval(
         self,
