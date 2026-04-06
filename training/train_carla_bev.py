@@ -199,6 +199,21 @@ def validate_model(
                 if 'energy_loss' in loss_dict:
                     val_metrics['energy_loss'].append(loss_dict['energy_loss'].item())
                     val_metrics['alignment_loss'].append(loss_dict['alignment_loss'].item())
+                if 'energy_front_loss' in loss_dict:
+                    val_metrics['energy_front_loss'].append(loss_dict['energy_front_loss'].item())
+                    val_metrics['energy_chase_loss'].append(loss_dict['energy_front_loss'].item())
+                if 'energy_left_loss' in loss_dict:
+                    val_metrics['energy_left_loss'].append(loss_dict['energy_left_loss'].item())
+                    val_metrics['energy_meet_loss'].append(loss_dict['energy_left_loss'].item())
+                if 'energy_ped_loss' in loss_dict:
+                    val_metrics['energy_ped_loss'].append(loss_dict['energy_ped_loss'].item())
+                    val_metrics['energy_pedestrian_loss'].append(loss_dict['energy_ped_loss'].item())
+                if 'energy_right_loss' in loss_dict:
+                    val_metrics['energy_right_loss'].append(loss_dict['energy_right_loss'].item())
+                if 'energy_off_loss' in loss_dict:
+                    val_metrics['energy_off_loss'].append(loss_dict['energy_off_loss'].item())
+                if 'energy_route_loss' in loss_dict:
+                    val_metrics['energy_route_loss'].append(loss_dict['energy_route_loss'].item())
                 if 'speed_loss' in loss_dict:
                     val_metrics['speed_loss'].append(loss_dict['speed_loss'].item())
                 
@@ -398,6 +413,25 @@ def validate_model(
                 json.dump(summary, f, indent=2)
 
     return averaged_metrics
+
+
+def _print_validation_metrics(val_metrics, show_speed_metrics=False):
+    print(f"Validation metrics: (total {len(val_metrics)} metrics)")
+    l2_keys = [
+        'val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
+        'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step'
+    ]
+    for key in l2_keys:
+        if key in val_metrics:
+            tag = " (1-step)" if "_1step" in key else ""
+            print(f"  >>> {key}: {val_metrics[key]:.4f}{tag}")
+
+    for key, value in val_metrics.items():
+        if key in l2_keys:
+            continue
+        if (not show_speed_metrics) and key.startswith('val_speed_'):
+            continue
+        print(f"  {key}: {value:.4f}")
 
 @record  # Records error and tracebacks in case of failure
 def train_pdm_policy(config_path, resume_path=None, val_only=False):
@@ -1118,16 +1152,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             )
             if rank == 0:
                 print(f"\n✓ Validation completed")
-                print(f"Validation metrics: (total {len(val_metrics)} metrics)")
-                l2_keys = ['val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
-                            'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
-                for key in l2_keys:
-                    if key in val_metrics:
-                        tag = " (1-step)" if "_1step" in key else ""
-                        print(f"  >>> {key}: {val_metrics[key]:.4f}{tag}")
-                for key, value in val_metrics.items():
-                    if key not in l2_keys:
-                        print(f"  {key}: {value:.4f}")
+                _print_validation_metrics(val_metrics, show_speed_metrics=False)
         except Exception as e:
             if rank == 0:
                 print(f"✗ Error during validation: {e}")
@@ -1403,16 +1428,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     log_dict[f"val/{key.removeprefix('val_')}"] = value
                 safe_wandb_log(log_dict, use_wandb)
 
-                print(f"Validation metrics: (total {len(val_metrics)} metrics)")
-                l2_keys = ['val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
-                            'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step']
-                for key in l2_keys:
-                    if key in val_metrics:
-                        tag = " (1-step)" if "_1step" in key else ""
-                        print(f"  >>> {key}: {val_metrics[key]:.4f}{tag}")
-                for key, value in val_metrics.items():
-                    if key not in l2_keys:
-                        print(f"  {key}: {value:.4f}")
+                _print_validation_metrics(val_metrics, show_speed_metrics=False)
 
                 val_loss = val_metrics.get('val_loss', float('inf'))
                 l2_avg = val_metrics.get('val_L2_avg', float('inf'))
