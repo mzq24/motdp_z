@@ -992,9 +992,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     use_lr_scheduler = config.get('training', {}).get('use_lr_scheduler', True)
 
     if use_lr_scheduler:
-        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, ConstantLR
 
         total_epochs = int(config.get('training', {}).get('num_epochs', 50))
+        scheduler_total_epochs = int(config.get('training', {}).get('scheduler_total_epochs', total_epochs))
+        scheduler_total_epochs = max(scheduler_total_epochs, warmup_epochs + 1)
 
         warmup_scheduler = LinearLR(
             optimizer,
@@ -1004,24 +1006,60 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         )
         cosine_scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=total_epochs - warmup_epochs,
+            T_max=scheduler_total_epochs - warmup_epochs,
             eta_min=lr_final
         )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs]
-        )
+        if scheduler_total_epochs < total_epochs:
+            hold_scheduler = ConstantLR(
+                optimizer,
+                factor=1.0,
+                total_iters=total_epochs - scheduler_total_epochs,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler, hold_scheduler],
+                milestones=[warmup_epochs, scheduler_total_epochs],
+            )
+        else:
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
 
         # Energy optimizer also gets a scheduler (Route B+)
         scheduler_energy = None
         if optimizer_energy is not None:
             warmup_energy = LinearLR(optimizer_energy, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
-            cosine_energy = CosineAnnealingLR(optimizer_energy, T_max=total_epochs - warmup_epochs, eta_min=lr_final)
-            scheduler_energy = SequentialLR(optimizer_energy, schedulers=[warmup_energy, cosine_energy], milestones=[warmup_epochs])
+            cosine_energy = CosineAnnealingLR(
+                optimizer_energy,
+                T_max=scheduler_total_epochs - warmup_epochs,
+                eta_min=lr_final,
+            )
+            if scheduler_total_epochs < total_epochs:
+                hold_energy = ConstantLR(
+                    optimizer_energy,
+                    factor=1.0,
+                    total_iters=total_epochs - scheduler_total_epochs,
+                )
+                scheduler_energy = SequentialLR(
+                    optimizer_energy,
+                    schedulers=[warmup_energy, cosine_energy, hold_energy],
+                    milestones=[warmup_epochs, scheduler_total_epochs],
+                )
+            else:
+                scheduler_energy = SequentialLR(
+                    optimizer_energy,
+                    schedulers=[warmup_energy, cosine_energy],
+                    milestones=[warmup_epochs],
+                )
 
         if rank == 0:
-            print(f"✓ Learning rate scheduler: {warmup_epochs} epochs warmup + cosine annealing to {lr_final}")
+            print(
+                f"✓ Learning rate scheduler: {warmup_epochs} epochs warmup + "
+                f"cosine annealing over {scheduler_total_epochs} epochs to {lr_final}"
+                + (f", then hold to epoch {total_epochs}" if scheduler_total_epochs < total_epochs else "")
+            )
     else:
         scheduler = None
         scheduler_energy = None

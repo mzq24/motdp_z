@@ -48,9 +48,12 @@ from model.transfuser_extractor.config import GlobalConfig as TransfuserConfig
 import model.transfuser_extractor.transfuser_utils as transfuser_t_u
 
 # mot dependencies
+# This agent file now lives inside the MoT-DP repo itself, so the repo root is
+# simply the parent directory of team_code/. Do not reconstruct a sibling
+# "MoT-DP" path from a Bench2Drive-style layout.
 project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
-mot_dp_path = str(os.path.join(os.path.dirname(os.path.dirname(project_root)), 'MoT-DP'))
+mot_dp_path = project_root
 mot_path = str(os.path.join(mot_dp_path, 'mot'))
 sys.path.append(mot_dp_path)
 sys.path.append(mot_path)
