@@ -1277,6 +1277,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		obs_horizon = self.config.get('obs_horizon', 4)   
 		self.obs_horizon = obs_horizon
+		self.transfuser_lidar_history_frames = int(
+			self.config.get('route_b', {}).get('lidar_history_frames', 1)
+		)
+		self.transfuser_lidar_bev_detail_history = deque(
+			maxlen=max(self.transfuser_lidar_history_frames, 1)
+		)
 		self.lidar_bev_history = deque(maxlen=obs_horizon*10) 
 		self.rgb_history = deque(maxlen=obs_horizon*10)
 		self.speed_history = deque(maxlen=obs_horizon*10)
@@ -2476,6 +2482,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					transfuser_lidar_bev_detail = torch.zeros_like(
 						transfuser_lidar_bev_detail
 					)
+				current_lidar_detail = transfuser_lidar_bev_detail
+				if current_lidar_detail.dim() == 4 and current_lidar_detail.shape[0] == 1:
+					current_lidar_detail = current_lidar_detail.squeeze(0)
+				self.transfuser_lidar_bev_detail_history.append(
+					current_lidar_detail.detach()
+				)
+				lidar_detail_history = list(self.transfuser_lidar_bev_detail_history)
+				hist_len = max(int(self.transfuser_lidar_history_frames), 1)
+				while len(lidar_detail_history) < hist_len:
+					lidar_detail_history.insert(0, torch.zeros_like(current_lidar_detail))
+				lidar_detail_history = lidar_detail_history[-hist_len:]
+				transfuser_lidar_bev_detail = torch.stack(
+					lidar_detail_history, dim=0
+				).unsqueeze(0)
 
 				def _tensor_debug_stats(value):
 					if value is None:

@@ -1874,6 +1874,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.ReLU(inplace=True),
             nn.Linear(n_emb // 2, len(self.speed_classes)),
         )
+        self.speed_profile_head = nn.Sequential(
+            nn.Linear(n_emb * 3, n_emb),
+            nn.ReLU(inplace=True),
+            nn.Linear(n_emb, horizon),
+        )
 
         self.apply(self._init_weights)
         
@@ -2181,7 +2186,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         x_t_abs: Optional[torch.Tensor] = None,
         bev_proj_cached: Optional[torch.Tensor] = None,
         transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Ego denoising path with joint trajectory+route waypoint diffusion.
 
@@ -2191,6 +2196,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             traj_out: (B, T, n_emb) ego trajectory tokens after decoder
             conditioning: (B, n_emb)
             speed_pred: (B, num_speed_classes) logits over speed bins
+            speed_profile_pred: (B, T) direct short-horizon speed profile in m/s
         """
         model_dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
@@ -2268,7 +2274,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
             conditioning,
         ], dim=-1)
         speed_pred = self.speed_head(speed_input)  # (B, num_speed_classes)
-        return poses_reg, route_pred, traj_out, conditioning, speed_pred
+        speed_profile_input = torch.cat([
+            speed_out.squeeze(1),
+            traj_out.mean(dim=1),
+            conditioning,
+        ], dim=-1)
+        speed_profile_pred = self.speed_profile_head(speed_profile_input)
+        return poses_reg, route_pred, traj_out, conditioning, speed_pred, speed_profile_pred
 
     def forward_energy(
         self,

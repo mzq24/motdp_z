@@ -216,6 +216,11 @@ def validate_model(
                     val_metrics['energy_route_loss'].append(loss_dict['energy_route_loss'].item())
                 if 'speed_loss' in loss_dict:
                     val_metrics['speed_loss'].append(loss_dict['speed_loss'].item())
+                if 'speed_profile_loss' in loss_dict:
+                    val_metrics['speed_profile_loss'].append(loss_dict['speed_profile_loss'].item())
+                for key, value in loss_dict.items():
+                    if key.startswith('speed_profile_step') and key.endswith('_loss'):
+                        val_metrics[key].append(value.item() if isinstance(value, torch.Tensor) else value)
                 
                 # Multimodal model: only needs bev_feature, bev_feature_upsample, ego_status
                 # No more reasoning_query_tokens or anchor needed (anchor is loaded from wp_tokens.pkl)
@@ -429,7 +434,7 @@ def _print_validation_metrics(val_metrics, show_speed_metrics=False):
     for key, value in val_metrics.items():
         if key in l2_keys:
             continue
-        if (not show_speed_metrics) and key.startswith('val_speed_'):
+        if (not show_speed_metrics) and key.startswith('val_speed_') and (not key.endswith('_loss')):
             continue
         print(f"  {key}: {value:.4f}")
 
@@ -1297,6 +1302,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     postfix['align'] = f'{loss_dict["alignment_loss"].item():.3f}'
                 if 'speed_loss' in loss_dict:
                     postfix['spd'] = f'{loss_dict["speed_loss"].item():.3f}'
+                if 'speed_profile_loss' in loss_dict:
+                    postfix['spf'] = f'{loss_dict["speed_profile_loss"].item():.3f}'
                 pbar.set_postfix(postfix)
 
             # Log to wandb less frequently to reduce overhead
@@ -1314,12 +1321,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0,
                 }
                 # Individual losses
-                for lk in ('cls_loss', 'reg_loss', 'route_loss', 'speed_loss',
+                for lk in ('cls_loss', 'reg_loss', 'route_loss', 'speed_loss', 'speed_profile_loss',
                            'energy_loss', 'alignment_loss',
                            'energy_front_loss', 'energy_left_loss', 'energy_right_loss',
                            'energy_ped_loss', 'energy_off_loss', 'energy_route_loss'):
                     if lk in loss_dict:
                         val = loss_dict[lk]
+                        log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
+                for lk, val in loss_dict.items():
+                    if lk.startswith('speed_profile_step') and lk.endswith('_loss'):
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
                 # Weighted losses (Route A only)
                 for wk in ('cls_loss_weighted', 'reg_loss_weighted', 'route_loss_weighted'):

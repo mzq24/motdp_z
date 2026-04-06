@@ -1464,6 +1464,83 @@ Current family plan:
 - expected behavior:
   - the curve should be mainly driven by conflict-point timing rather than following distance
 
+#### 13.11 Current Stage1 Implementation Notes
+
+Current implementation is now slightly more specific than the original v1
+spec above.
+
+1. Stage1 speed-energy heads
+
+- the current model predicts three heads:
+  - `E_chase`
+  - `E_meet`
+  - `E_pedestrian`
+- total energy is interpreted at inference as:
+  - `E_total(v) = max(E_chase(v), E_meet(v), E_pedestrian(v))`
+
+2. Current direct inputs to stage1 speed energy
+
+- explicit geometry:
+  - full `route_points`
+- implicit scene context:
+  - `mode_out`
+- speed condition:
+  - `speed query`
+
+This means stage1 speed energy no longer uses a short `route prefix` as a fake
+trajectory proxy.
+
+3. Speed query instead of speed concatenation
+
+- each candidate speed is embedded as its own query
+- these speed queries attend to a small scene memory built from:
+  - `mode_out`
+  - a projected full-route geometry token
+- this is more natural than the previous "concat one speed embedding at the
+  end" design because the model directly answers:
+  - "what is the energy of this queried speed in the current scene?"
+
+Operationally:
+
+- training still uses a fixed `K=7` sampled speed set
+- inference can later evaluate:
+  - one queried speed, such as `current_speed`
+  - or many queried speeds for a full speed-energy curve
+
+4. Train/infer route convention
+
+- training:
+  - stage1 speed energy uses `GT route`
+- inference:
+  - route is predicted first by `forward_ego`
+  - then stage1 speed energy is evaluated on `pred route`
+
+So stage1 speed energy is currently a post-route evaluation branch, not part of
+the inner diffusion guidance loop.
+
+5. Speed token and trajectory/route ordering
+
+- in the ego decoder, token order is:
+  - `[speed | traj | route]`
+- however, this does **not** change how trajectory and route points are sliced
+  from `joint_points`
+- the code still first extracts:
+  - `traj_points = joint_points[:, :self.horizon, :]`
+  - `route_points = joint_points[:, self.horizon:self.ego_joint_horizon, :]`
+- only after that are the decoder tokens concatenated as:
+  - `[speed | traj | route]`
+
+So adding the speed token does not shift the trajectory/route split itself.
+
+6. History LiDAR status
+
+- history LiDAR is no longer current-frame only
+- it is loaded as multiple frames and passed through a temporal position
+  embedding before BEV encoding
+- route does not have a separate direct LiDAR branch
+- instead, route benefits indirectly through the shared decoder context, which
+  is currently intentional
+
 Current local special cases for validated intersection-like families:
 
 - `junction + RIGHT`
@@ -1603,7 +1680,69 @@ In short:
 - next major step is running the full-dataset precompute and then training the
   stage1 speed-energy heads
 
-#### 13.13 Expert-Speed Calibration Notes
+#### 13.13 Stage1 Full-Dataset Training Progress
+
+Stage1 three-head energy training has now started on the full train split with
+full validation.
+
+Current HPC launcher:
+
+- [`scripts/hpc_new/train_route_b_lidar_stage1_fulltrain_val.sh`](/media/z/data/mzq/others/MoT-DP/scripts/hpc_new/train_route_b_lidar_stage1_fulltrain_val.sh)
+
+Current validation numbers:
+
+- `val_energy_loss: 0.0049`
+- `val_alignment_loss: 0.0000`
+- `val_energy_front_loss: 0.0015`
+- `val_energy_chase_loss: 0.0015`
+- `val_energy_left_loss: 0.0033`
+- `val_energy_meet_loss: 0.0033`
+- `val_energy_ped_loss: 0.0001`
+- `val_energy_pedestrian_loss: 0.0001`
+- `val_energy_right_loss: 0.0000`
+- `val_energy_off_loss: 0.0000`
+- `val_energy_route_loss: 0.0000`
+
+How to read these numbers:
+
+- `front == chase`
+  - the logging still exposes the old Route-B slot names
+  - in the current stage1 setup, `front` is the same supervised quantity as
+    `chase`
+- `left == meet`
+  - same reason: `left` is the old log alias for the stage1 `meet` head
+- `ped == pedestrian`
+  - same quantity, just both old/new names are still visible in logging
+- `alignment_loss = 0`
+  - expected for the current stage1 path
+  - the current stage1 speed-energy setup does not use the old alignment term
+- `right/off/route = 0`
+  - also expected
+  - the current stage1 run only supervises:
+    - `E_chase`
+    - `E_meet`
+    - `E_pedestrian`
+
+Current interpretation:
+
+- the three active heads are training stably
+- `E_chase` validation loss is already quite low
+- `E_meet` is the hardest of the three, which matches intuition because
+  merge / cross / borrow timing is more diverse than pure chase
+- `E_pedestrian` is extremely low, which suggests the current pedestrian labels
+  are comparatively easy for the model to fit
+
+Practical conclusion:
+
+- these losses are good enough to say the model is fitting the stage1 labels
+  rather than obviously collapsing or diverging
+- however, low validation loss alone does **not** prove closed-loop benefit yet
+- the real next checks are still:
+  - expert-speed calibration
+  - good-route `E_max` sanity checks
+  - infer-time speed-energy parameter tuning on successful routes
+
+#### 13.14 Expert-Speed Calibration Notes
 
 We also ran a simple sanity check on the completed `train` split after the new
 stage1 energy labels were written.

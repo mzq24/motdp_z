@@ -136,6 +136,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.train_energy = route_b_cfg.get('train_energy', True)
         self.use_front_route_risk_energy = route_b_cfg.get('use_front_route_risk_energy', False)
         self.use_stage1_speed_energy = route_b_cfg.get('use_stage1_speed_energy', True)
+        self.use_speed_profile_head = route_b_cfg.get('use_speed_profile_head', False)
         self._current_epoch = 0
         self._current_batch_idx = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
@@ -153,6 +154,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.train_speed_head_after_update_every = route_b_cfg.get(
             'train_speed_head_after_update_every', None
         )
+        self.speed_profile_dt = float(route_b_cfg.get('speed_profile_dt', 0.5))
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
@@ -219,6 +221,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
         self.energy_loss_weight = route_b_cfg.get('energy_loss_weight', 1.0)
         self.speed_loss_weight = route_b_cfg.get('speed_loss_weight', 1.0)
+        self.speed_profile_loss_weight = route_b_cfg.get('speed_profile_loss_weight', 1.0)
 
         # DDIM Scheduler
         self.diffusion_scheduler = DDIMScheduler(
@@ -231,6 +234,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.action_dim = action_dim
         self.horizon = policy_cfg.get('horizon', 6)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
+        default_profile_weights = [1.0, 0.7, 0.5, 0.35, 0.25, 0.2]
+        if self.horizon <= len(default_profile_weights):
+            speed_profile_weights = default_profile_weights[:self.horizon]
+        else:
+            speed_profile_weights = default_profile_weights + [default_profile_weights[-1]] * (self.horizon - len(default_profile_weights))
+        self.register_buffer(
+            'speed_profile_step_weights',
+            torch.tensor(speed_profile_weights, dtype=torch.float32),
+        )
 
         # Anchor buffer (registered externally before DDP wrapping)
         self.register_buffer('anchor_centers_abs', None)
@@ -340,6 +352,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 two_hot[mask, i] = 1.0 - ratio
                 two_hot[mask, i + 1] = ratio
         return two_hot
+
+    def _compute_speed_profile_target(self, trajectory, device, model_dtype):
+        """Compute per-step short-horizon speed profile from GT trajectory."""
+        if trajectory.shape[1] < 1:
+            return None
+        first_disp = trajectory[:, :1, :]
+        if trajectory.shape[1] > 1:
+            future_delta = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+            displacements = torch.cat([first_disp, future_delta], dim=1)
+        else:
+            displacements = first_disp
+        speed_profile = displacements.norm(dim=-1) / max(self.speed_profile_dt, 1e-6)
+        return speed_profile.to(device=device, dtype=model_dtype).clamp(min=0.0, max=20.0)
 
     def _has_stage1_speed_energy_labels(self, batch: Dict[str, torch.Tensor]) -> bool:
         return self.use_stage1_speed_energy and all(
@@ -870,7 +895,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         noisy_joint = noisy_flat.unsqueeze(1)  # (B, 1, T_joint, 2)
         noisy_joint_abs = self.joint_norm_to_abs(noisy_joint)
 
-        poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
+        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
             x_t=noisy_joint,
             x_t_abs=noisy_joint_abs,
             timestep=diff_timesteps,
@@ -900,6 +925,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Speed loss: two-hot cross-entropy
         speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        speed_profile_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        speed_profile_step_losses = []
         if speed_pred is not None and train_speed_head_active:
             speed_target = self._compute_speed_target(trajectory, device)
             if speed_target is not None:
@@ -909,6 +936,25 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     reduction='none',
                 )
                 speed_loss = self._masked_batch_mean(speed_per_sample, good_route_mask)
+        if self.use_speed_profile_head and speed_profile_pred is not None and train_speed_head_active:
+            speed_profile_target = self._compute_speed_profile_target(trajectory, device, model_dtype)
+            if speed_profile_target is not None:
+                step_weights = self.speed_profile_step_weights[:speed_profile_pred.shape[1]].to(
+                    device=device, dtype=model_dtype
+                )
+                profile_per_step = F.smooth_l1_loss(
+                    speed_profile_pred,
+                    speed_profile_target,
+                    reduction='none',
+                )
+                speed_profile_step_losses = [
+                    self._masked_batch_mean(profile_per_step[:, step_idx], good_route_mask)
+                    for step_idx in range(profile_per_step.shape[1])
+                ]
+                profile_per_sample = (
+                    profile_per_step * step_weights.unsqueeze(0)
+                ).sum(dim=-1) / step_weights.sum().clamp(min=1e-6)
+                speed_profile_loss = self._masked_batch_mean(profile_per_sample, good_route_mask)
 
         # ===== Forward 2: Energy training (anchors + GT) =====
         zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -1131,9 +1177,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.route_loss_weight * route_loss
             + self.alignment_loss_weight * alignment_loss
             + self.speed_loss_weight * speed_loss
+            + self.speed_profile_loss_weight * speed_profile_loss
         )
 
-        return {
+        loss_dict = {
             'total_loss': total_loss,
             'energy_loss': energy_loss,
             'energy_front_loss': loss_front,
@@ -1148,6 +1195,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_loss': speed_loss,
             'alignment_loss': alignment_loss,
         }
+        if self.use_speed_profile_head:
+            loss_dict['speed_profile_loss'] = speed_profile_loss
+            for step_idx, step_loss in enumerate(speed_profile_step_losses):
+                loss_dict[f'speed_profile_step{step_idx}_loss'] = step_loss
+        return loss_dict
 
     # ========== Unified Training: Single Forward Pass ==========
     def compute_unified_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1762,6 +1814,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_loss': torch.tensor(0.0, device=device),
             'alignment_loss': alignment_loss,
         }
+        if self.use_speed_profile_head:
+            loss_dict['speed_profile_loss'] = torch.tensor(0.0, device=device)
         return loss_dict
 
     # ========== Legacy compute_loss (backward compatible) ==========
@@ -1905,6 +1959,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_pred = None
         energy_scores = None
         speed_pred = None
+        speed_profile_pred = None
 
         for step_i, k in enumerate(roll_timesteps):
             t_cur = k.item()
@@ -1924,7 +1979,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if use_guidance:
                 # Pass 1: get pred_x0 from denoising (no energy eval yet)
                 with torch.no_grad():
-                    poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
+                    poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
                         x_t=x_input,
                         x_t_abs=x_t_abs,
                         timestep=t_tensor,
@@ -2013,7 +2068,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 poses_cls = None
             else:
                 with torch.no_grad():
-                    poses_reg, route_pred, _, _, speed_pred = self.model.forward_ego(
+                    poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
                         x_t=x_input,
                         x_t_abs=x_t_abs,
                         timestep=t_tensor,
@@ -2079,6 +2134,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
             'target_speed': target_speed_pred,        # (B,) m/s
+            'target_speed_profile': speed_profile_pred if self.use_speed_profile_head else None,
         }
 
     # ========== Predict Action (standard interface) ==========
@@ -2128,6 +2184,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # Add predicted target speed (scalar m/s)
         if sample_result.get('target_speed') is not None:
             result['target_speed'] = sample_result['target_speed'].detach().float().cpu().numpy()
+        if sample_result.get('target_speed_profile') is not None:
+            result['target_speed_profile'] = sample_result['target_speed_profile'].detach().float().cpu().numpy()
 
         # Add energy scores if available
         if sample_result['energy_scores'] is not None:

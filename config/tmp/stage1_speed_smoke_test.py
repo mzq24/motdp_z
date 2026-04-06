@@ -73,12 +73,15 @@ def _build_policy(config, device):
     anchor_path = config.get('anchor_path', None)
     if anchor_path:
         anchor_path = _resolve_repo_path(anchor_path)
-        if anchor_path.endswith('.npy'):
-            anchor_centers = np.load(anchor_path)
+        if os.path.exists(anchor_path):
+            if anchor_path.endswith('.npy'):
+                anchor_centers = np.load(anchor_path)
+            else:
+                with open(anchor_path, 'rb') as f:
+                    anchor_centers = pickle.load(f)['centers']
+            policy.register_anchor_centers(anchor_centers)
         else:
-            with open(anchor_path, 'rb') as f:
-                anchor_centers = pickle.load(f)['centers']
-        policy.register_anchor_centers(anchor_centers)
+            print(f"[smoke] anchor_path missing, skip anchor registration: {anchor_path}")
 
     policy.eval()
     return policy
@@ -105,7 +108,10 @@ def main():
     print(f"[smoke] batch keys={sorted(batch.keys())}")
     print(f"[smoke] lidar shape={tuple(batch['transfuser_lidar_bev'].shape)}")
     print(f"[smoke] route shape={tuple(batch['route'].shape)}")
-    print(f"[smoke] stage1 speed shape={tuple(batch['speed_sample_values'].shape)}")
+    if 'speed_sample_values' in batch:
+        print(f"[smoke] stage1 speed shape={tuple(batch['speed_sample_values'].shape)}")
+    else:
+        print("[smoke] stage1 speed shape=<not present>")
 
     policy = _build_policy(config, device)
     for key, value in batch.items():
