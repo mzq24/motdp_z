@@ -144,6 +144,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.energy_chase_weight = route_b_cfg.get('energy_chase_weight', route_b_cfg.get('energy_front_weight', 1.0))
         self.energy_meet_weight = route_b_cfg.get('energy_meet_weight', route_b_cfg.get('energy_left_weight', 1.0))
         self.energy_ped_weight = route_b_cfg.get('energy_ped_weight', route_b_cfg.get('energy_pedestrian_weight', 1.0))
+        self.train_stage1_speed_energy_until_epoch = route_b_cfg.get('train_stage1_speed_energy_until_epoch', None)
+        self.train_speed_head_until_epoch = route_b_cfg.get('train_speed_head_until_epoch', None)
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
@@ -749,6 +751,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         return energy_loss, loss_chase, loss_meet, loss_ped
 
+    def _train_branch_enabled_until_epoch(self, until_epoch) -> bool:
+        """Interpret until-epoch config in the same 1-based convention as training logs."""
+        if until_epoch is None:
+            return True
+        try:
+            until_epoch = int(until_epoch)
+        except (TypeError, ValueError):
+            return True
+        if until_epoch <= 0:
+            return True
+        return (self._current_epoch + 1) <= until_epoch
+
     # ========== Forward (DDP-compatible) ==========
     def forward(self, batch: Dict[str, torch.Tensor],
                 return_loss_dict: bool = False,
@@ -809,6 +823,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         has_energy = (self.anchor_centers_abs is not None
                       and behavior_labels is not None
                       and allowed_flags is not None)
+        train_speed_head_active = self._train_branch_enabled_until_epoch(
+            self.train_speed_head_until_epoch
+        )
+        train_stage1_speed_energy_active = (
+            has_stage1_speed_energy
+            and self.train_energy
+            and self._train_branch_enabled_until_epoch(self.train_stage1_speed_energy_until_epoch)
+        )
 
         bev_proj = self.model.decoder.compute_bev_proj(transfuser_bev_feature)
 
@@ -856,7 +878,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         # Speed loss: two-hot cross-entropy
         speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        if speed_pred is not None:
+        if speed_pred is not None and train_speed_head_active:
             speed_target = self._compute_speed_target(trajectory, device)
             if speed_target is not None:
                 speed_per_sample = F.cross_entropy(
@@ -872,7 +894,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_front = loss_left = loss_right = loss_ped = loss_off = zero_t
         loss_route = zero_t
 
-        if has_stage1_speed_energy and self.train_energy:
+        if train_stage1_speed_energy_active:
             energy_loss, loss_chase_stage1, loss_meet_stage1, loss_ped_stage1 = self._compute_stage1_speed_energy_loss(
                 batch=batch,
                 trajectory=trajectory,
@@ -890,7 +912,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             loss_right = zero_t
             loss_ped = loss_ped_stage1
             loss_off = zero_t
-        elif has_energy and self.train_energy:
+        elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
             (
                 M_anchor,
                 anchor_subset,
