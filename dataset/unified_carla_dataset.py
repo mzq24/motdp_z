@@ -111,6 +111,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  lidar_history_frames: int = 1,
                  filter_bad_routes: bool = True,
                  retain_bad_routes_for_energy: bool = False,
+                 load_exact_next_speed_online: bool = False,
                  next_speed_frame_offset: int = 2,
                  ):
 
@@ -131,6 +132,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._lidar_history_frames = max(int(lidar_history_frames), 1)
         self._filter_bad_routes = bool(filter_bad_routes)
         self._retain_bad_routes_for_energy = bool(retain_bad_routes_for_energy)
+        self._load_exact_next_speed_online = bool(load_exact_next_speed_online)
         self._next_speed_frame_offset = max(int(next_speed_frame_offset), 1)
         self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
@@ -651,7 +653,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         # Convert sample data
         final_sample = dict()
-        next_speed_target_mps = self._get_exact_next_speed_target(sample)
+        next_speed_target_mps = sample.get('next_speed_target_mps')
+        if next_speed_target_mps is None and self._load_exact_next_speed_online:
+            next_speed_target_mps = self._get_exact_next_speed_target(sample)
         for key, value in sample.items():
             if key == 'rgb_hist_jpg':
                 continue
@@ -659,6 +663,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 # Debug payload has variable nested keys across frames/routes and is
                 # only meant for inspection/video replay, not training batches.
                 continue
+            elif key == 'next_speed_target_mps':
+                if value is not None:
+                    final_sample['next_speed_target_mps'] = torch.tensor(float(value), dtype=torch.float32)
             elif key == 'is_bad_route':
                 final_sample['is_bad_route'] = torch.tensor(bool(value), dtype=torch.bool)
             elif key == 'speed_hist':
@@ -721,7 +728,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 final_sample[key] = value
 
-        if next_speed_target_mps is not None:
+        if next_speed_target_mps is not None and 'next_speed_target_mps' not in final_sample:
             final_sample['next_speed_target_mps'] = torch.tensor(next_speed_target_mps, dtype=torch.float32)
 
         # Ensure target_point_next_hist always exists (fallback to target_point_hist)
