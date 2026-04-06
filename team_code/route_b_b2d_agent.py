@@ -127,7 +127,7 @@ TERMINAL_ROUTE_ACTIVE_POINTS_MAX = int(os.environ.get('TERMINAL_ROUTE_ACTIVE_POI
 TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTANCE_M', '3.0'))
 TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
 TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
-SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'fuse', 'fuse_traj', 'fuse3_median', 'fuse3_adaptive'
+SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'traj_05s', 'fuse', 'fuse_traj', 'fuse3_median', 'fuse3_adaptive'
 SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
     '1', 'true', 'yes', 'on'
 )
@@ -2101,6 +2101,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		if SPEED_SOURCE == 'traj':
 			desired_speed = traj_speed
+		elif SPEED_SOURCE in ('traj_05s', 'traj05'):
+			desired_speed = traj_speed_05s
 		elif SPEED_SOURCE == 'fuse' and speed_head_speed is not None:
 			# speed head primary, traj lower bound
 			desired_speed = speed_head_speed

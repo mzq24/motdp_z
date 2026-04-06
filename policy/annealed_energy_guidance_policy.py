@@ -137,6 +137,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_front_route_risk_energy = route_b_cfg.get('use_front_route_risk_energy', False)
         self.use_stage1_speed_energy = route_b_cfg.get('use_stage1_speed_energy', True)
         self._current_epoch = 0
+        self._current_batch_idx = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
         self.use_lidar_bev_detail = route_b_cfg.get('use_lidar_bev_detail', False)
         self.lidar_history_frames = max(int(route_b_cfg.get('lidar_history_frames', self.n_obs_steps)), 1)
@@ -146,6 +147,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.energy_ped_weight = route_b_cfg.get('energy_ped_weight', route_b_cfg.get('energy_pedestrian_weight', 1.0))
         self.train_stage1_speed_energy_until_epoch = route_b_cfg.get('train_stage1_speed_energy_until_epoch', None)
         self.train_speed_head_until_epoch = route_b_cfg.get('train_speed_head_until_epoch', None)
+        self.train_stage1_speed_energy_after_update_every = route_b_cfg.get(
+            'train_stage1_speed_energy_after_update_every', None
+        )
+        self.train_speed_head_after_update_every = route_b_cfg.get(
+            'train_speed_head_after_update_every', None
+        )
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
@@ -751,8 +758,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         return energy_loss, loss_chase, loss_meet, loss_ped
 
-    def _train_branch_enabled_until_epoch(self, until_epoch) -> bool:
-        """Interpret until-epoch config in the same 1-based convention as training logs."""
+    def _train_branch_enabled_with_schedule(self, until_epoch, after_update_every) -> bool:
+        """1-based epoch cutoff with optional lower-frequency updates after the cutoff."""
         if until_epoch is None:
             return True
         try:
@@ -761,7 +768,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             return True
         if until_epoch <= 0:
             return True
-        return (self._current_epoch + 1) <= until_epoch
+        current_epoch_1based = self._current_epoch + 1
+        if current_epoch_1based <= until_epoch:
+            return True
+        if after_update_every is None:
+            return False
+        try:
+            after_update_every = int(after_update_every)
+        except (TypeError, ValueError):
+            return False
+        if after_update_every <= 1:
+            return True
+        return (self._current_batch_idx % after_update_every) == 0
 
     # ========== Forward (DDP-compatible) ==========
     def forward(self, batch: Dict[str, torch.Tensor],
@@ -823,13 +841,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         has_energy = (self.anchor_centers_abs is not None
                       and behavior_labels is not None
                       and allowed_flags is not None)
-        train_speed_head_active = self._train_branch_enabled_until_epoch(
-            self.train_speed_head_until_epoch
+        train_speed_head_active = self._train_branch_enabled_with_schedule(
+            self.train_speed_head_until_epoch,
+            self.train_speed_head_after_update_every,
         )
         train_stage1_speed_energy_active = (
             has_stage1_speed_energy
             and self.train_energy
-            and self._train_branch_enabled_until_epoch(self.train_stage1_speed_energy_until_epoch)
+            and self._train_branch_enabled_with_schedule(
+                self.train_stage1_speed_energy_until_epoch,
+                self.train_stage1_speed_energy_after_update_every,
+            )
         )
 
         bev_proj = self.model.decoder.compute_bev_proj(transfuser_bev_feature)

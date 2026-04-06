@@ -1170,6 +1170,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             pbar = train_loader
             
         for batch_idx, batch in enumerate(pbar):
+            if hasattr(policy_unwrapped, '_current_batch_idx'):
+                policy_unwrapped._current_batch_idx = batch_idx
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
