@@ -989,6 +989,24 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print("✓ No learning rate scheduler used")
 
+    def _set_optimizer_lr(optim, lr_value: float):
+        if optim is None:
+            return
+        for group in optim.param_groups:
+            group['lr'] = float(lr_value)
+            group['initial_lr'] = float(lr_value)
+
+    def _set_scheduler_base_lrs(sched, lr_value: float):
+        if sched is None:
+            return
+        if hasattr(sched, 'base_lrs'):
+            sched.base_lrs = [float(lr_value) for _ in sched.base_lrs]
+        if hasattr(sched, '_last_lr'):
+            sched._last_lr = [float(lr_value) for _ in sched._last_lr]
+        if hasattr(sched, '_schedulers'):
+            for sub_sched in sched._schedulers:
+                _set_scheduler_base_lrs(sub_sched, lr_value)
+
     # EMA (Exponential Moving Average) for stable inference
     ema_cfg = config.get('ema', {})
     model_for_ema = policy.module if world_size > 1 else policy
@@ -1031,6 +1049,43 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             except Exception:
                 if rank == 0:
                     print("  ⚠ Could not restore energy optimizer state")
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if rank == 0:
+                    print("  ✓ Scheduler state restored")
+            except Exception:
+                if rank == 0:
+                    print("  ⚠ Could not restore scheduler state")
+        if scheduler_energy is not None and 'scheduler_energy_state_dict' in checkpoint and checkpoint['scheduler_energy_state_dict'] is not None:
+            try:
+                scheduler_energy.load_state_dict(checkpoint['scheduler_energy_state_dict'])
+                if rank == 0:
+                    print("  ✓ Energy scheduler state restored")
+            except Exception:
+                if rank == 0:
+                    print("  ⚠ Could not restore energy scheduler state")
+
+        resume_override_lr = config.get('optimizer', {}).get('resume_override_lr', None)
+        resume_override_lr_energy = config.get('optimizer', {}).get('resume_override_lr_energy', resume_override_lr)
+
+        if resume_override_lr is not None:
+            resume_override_lr = float(resume_override_lr)
+            if scale_lr and world_size > 1:
+                resume_override_lr *= world_size
+            _set_optimizer_lr(optimizer, resume_override_lr)
+            _set_scheduler_base_lrs(scheduler, resume_override_lr)
+            if rank == 0:
+                print(f"  ✓ Resume override decoder lr -> {resume_override_lr:.2e}")
+
+        if optimizer_energy is not None and resume_override_lr_energy is not None:
+            resume_override_lr_energy = float(resume_override_lr_energy)
+            if scale_lr and world_size > 1:
+                resume_override_lr_energy *= world_size
+            _set_optimizer_lr(optimizer_energy, resume_override_lr_energy)
+            _set_scheduler_base_lrs(scheduler_energy, resume_override_lr_energy)
+            if rank == 0:
+                print(f"  ✓ Resume override energy lr -> {resume_override_lr_energy:.2e}")
 
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit")
