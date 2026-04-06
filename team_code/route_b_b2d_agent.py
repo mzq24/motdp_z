@@ -469,6 +469,47 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self._rotate_bev_ego_up(vehicle_vis),
 		)
 
+	def _jsonify_debug_value(self, value):
+		if isinstance(value, np.ndarray):
+			return value.tolist()
+		if isinstance(value, torch.Tensor):
+			return value.detach().cpu().tolist()
+		if isinstance(value, (np.floating,)):
+			return float(value)
+		if isinstance(value, (np.integer,)):
+			return int(value)
+		if isinstance(value, (list, tuple)):
+			return [self._jsonify_debug_value(v) for v in value]
+		if isinstance(value, dict):
+			return {k: self._jsonify_debug_value(v) for k, v in value.items()}
+		return value
+
+	def _format_debug_curve(self, values, fmt='.2f', max_items=7):
+		if values is None:
+			return 'NA'
+		if isinstance(values, torch.Tensor):
+			arr = values.detach().cpu().float().reshape(-1).tolist()
+		else:
+			arr = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+		if len(arr) == 0:
+			return '[]'
+		arr = arr[:max_items]
+		parts = [format(float(v), fmt) for v in arr]
+		return '[' + ', '.join(parts) + ']'
+
+	def _format_debug_speed_curve_kmh(self, values, fmt='.1f', max_items=7):
+		if values is None:
+			return 'NA'
+		if isinstance(values, torch.Tensor):
+			arr = values.detach().cpu().float().reshape(-1).tolist()
+		else:
+			arr = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+		if len(arr) == 0:
+			return '[]'
+		arr = arr[:max_items]
+		parts = [format(float(v) * 3.6, fmt) for v in arr]
+		return '[' + ', '.join(parts) + ']'
+
 	def _bev_roi_bounds(self, bev_classes, x_min_m, x_max_m, y_min_m, y_max_m):
 		if isinstance(bev_classes, (list, tuple)):
 			if len(bev_classes) == 0:
@@ -2563,6 +2604,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			self.last_energy_debug = {}
+			target_speed_profile_list = None
 			for energy_key in ['energy_front', 'energy_left', 'energy_right',
 								'energy_pedestrian', 'energy_offroad', 'energy_route']:
 				energy_value = dp_pred_traj.get(energy_key)
@@ -2571,6 +2613,33 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				energy_array = np.asarray(energy_value).reshape(-1)
 				if energy_array.size > 0:
 					self.last_energy_debug[energy_key] = float(energy_array[0])
+			speed_energy_samples = dp_pred_traj.get('speed_energy_samples')
+			if speed_energy_samples is not None:
+				speed_energy_samples = np.asarray(speed_energy_samples).reshape(-1)
+				if speed_energy_samples.size > 0:
+					self.last_energy_debug['speed_energy_samples'] = speed_energy_samples.astype(np.float32).tolist()
+			speed_energy_query_center = dp_pred_traj.get('speed_energy_query_center')
+			if speed_energy_query_center is not None:
+				speed_energy_query_center = np.asarray(speed_energy_query_center).reshape(-1)
+				if speed_energy_query_center.size > 0:
+					self.last_energy_debug['speed_energy_query_center'] = float(speed_energy_query_center[0])
+			speed_energy_curves = {}
+			for speed_energy_key in ['chase', 'meet', 'pedestrian']:
+				speed_energy_value = dp_pred_traj.get(f'speed_energy_{speed_energy_key}')
+				if speed_energy_value is None:
+					continue
+				speed_energy_array = np.asarray(speed_energy_value).reshape(-1)
+				if speed_energy_array.size > 0:
+					speed_energy_curves[speed_energy_key] = speed_energy_array.astype(np.float32)
+					self.last_energy_debug[f'speed_energy_{speed_energy_key}'] = speed_energy_array.astype(np.float32).tolist()
+			if len(speed_energy_curves) > 0:
+				total_curve = None
+				for curve in speed_energy_curves.values():
+					total_curve = curve.copy() if total_curve is None else np.maximum(total_curve, curve)
+				if total_curve is not None:
+					self.last_energy_debug['speed_energy_total'] = total_curve.astype(np.float32).tolist()
+					self.last_energy_debug['speed_energy_max'] = float(np.max(total_curve))
+					self.last_energy_debug['speed_energy_argmax'] = int(np.argmax(total_curve))
 			front_route_risk_score = self._compute_front_route_risk_debug(
 				dp_pred_traj=dp_pred_traj,
 				transfuser_bev_feature=transfuser_bev_feature,
@@ -2598,6 +2667,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.last_energy_debug['front_route_risk_score'] = front_route_risk_score
 				self.last_energy_debug['front_route_risk_sigmoid'] = front_route_risk_sigmoid
 				self.last_energy_debug['front_route_risk_ema'] = float(self.front_route_risk_ema)
+			target_speed_profile = dp_pred_traj.get('target_speed_profile')
+			if target_speed_profile is not None:
+				target_speed_profile = np.asarray(target_speed_profile).reshape(-1)
+				if target_speed_profile.size > 0:
+					target_speed_profile_list = target_speed_profile.astype(np.float32).tolist()
 			
 			# route_pred is 20 waypoints with equal intervals for lateral control
 			route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
@@ -2634,6 +2708,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
 				front_route_risk_cap_ms=front_route_risk_cap_debug.get('speed_cap_ms'),
 			)
+			if target_speed_profile_list is not None:
+				self.last_speed_debug['target_speed_profile'] = target_speed_profile_list
 			throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
 				ego_speed=gt_velocity,
 				desired_speed_capped=self.last_speed_debug.get('desired_speed_capped'),
@@ -2802,11 +2878,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.pid_metadata['model_dp_traj_first'] = self.last_dp_pred_traj[0].tolist()
 				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
 			for energy_key, energy_value in self.last_energy_debug.items():
-				self.pid_metadata[energy_key] = float(energy_value)
+				self.pid_metadata[energy_key] = self._jsonify_debug_value(energy_value)
 			for input_key, input_value in self.last_model_input_debug.items():
-				self.pid_metadata[input_key] = input_value
+				self.pid_metadata[input_key] = self._jsonify_debug_value(input_value)
 			for speed_key, speed_value in self.last_speed_debug.items():
-				self.pid_metadata[speed_key] = speed_value
+				self.pid_metadata[speed_key] = self._jsonify_debug_value(speed_value)
 			self.prev_debug_planner_xy = planner_xy.copy()
 			self.prev_debug_filtered_xy = filtered_xy.copy()
 			self.prev_debug_raw_xy = raw_xy.copy()
@@ -2994,13 +3070,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		left_status_lines = [
 			f"frm: {self.step}",
-			f"v: {speed_kmh:.2f} km/h",
+			f"v_act: {speed_kmh:.2f} km/h",
 			f"src: {self.pid_metadata.get('speed_source', 'N/A')}",
 			f"fus: {self.pid_metadata.get('fusion_regime', 'N/A')}",
-			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
-			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
-			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')}",
-			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')}",
+			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')} m/s",
+			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')} m/s",
+			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')} m/s",
+			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')} m/s",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
 			f"thr/brk: {float(self.pid_metadata.get('throttle', 0.0)):.3f} / {float(self.pid_metadata.get('brake', 0.0)):.3f}",
 		]
@@ -3025,22 +3101,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 
 		right_status_lines = [
-			f"v_h/1s/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.2f')}",
-			f"frisk r/s/e: {self._format_debug_value(self.pid_metadata.get('front_route_risk_score'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_sigmoid'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_ema'), '.3f')}",
-			f"fr thr m/h/e: {self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_med_sigmoid_threshold'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_high_sigmoid_threshold'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_high_ema_threshold'), '.3f')}",
-			f"fr cap/a/rmx: {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')}/{int(bool(self.pid_metadata.get('front_route_risk_speed_cap_applied', False)))}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_recent_max_sigmoid'), '.3f')}",
-			f"fr gate/g/h: {int(bool(self.pid_metadata.get('front_route_risk_gate_active', False)))}/{int(bool(self.pid_metadata.get('front_route_risk_geometry_active', False)))}/{int(self.pid_metadata.get('front_route_risk_cap_hold_frames_remaining', 0))}",
-			f"fr sbias: {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_bias_ratio'), '.2f')}",
-			f"raw nz/mx: {self._format_debug_value(self.pid_metadata.get('lidar_bev_raw_nonzero_ratio'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('lidar_bev_raw_max'), '.2f')}",
-			f"det nz/mx: {self._format_debug_value(self.pid_metadata.get('lidar_bev_detail_nonzero_ratio'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('lidar_bev_detail_max'), '.2f')}",
-			f"det_in: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('use_front_route_risk_energy', False)))} fb:{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
+			f"qE ctr: {self._format_debug_value(self.pid_metadata.get('speed_energy_query_center'), '.1f')} m/s",
+			f"pred h/1/.5 m/s: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')}",
+			f"pred h/1/.5 km/h: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f') if self.pid_metadata.get('speed_head_speed') is None else format(float(self.pid_metadata.get('speed_head_speed')) * 3.6, '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f') if self.pid_metadata.get('traj_speed_1s') is None else format(float(self.pid_metadata.get('traj_speed_1s')) * 3.6, '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f') if self.pid_metadata.get('traj_speed_05s') is None else format(float(self.pid_metadata.get('traj_speed_05s')) * 3.6, '.1f')}",
+			f"prof km/h: {self._format_debug_speed_curve_kmh(self.pid_metadata.get('target_speed_profile'), fmt='.1f', max_items=4)}",
+			f"vs km/h: {self._format_debug_speed_curve_kmh(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=5)}",
+			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.2f', max_items=5)}",
+			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.2f', max_items=5)}",
+			f"Em: {self._format_debug_curve(self.pid_metadata.get('speed_energy_meet'), fmt='.2f', max_items=5)}",
+			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.2f', max_items=5)}",
+			f"E*: {self._format_debug_value(self.pid_metadata.get('speed_energy_max'), '.2f')}@{self.pid_metadata.get('speed_energy_argmax', 'NA')}",
+			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
-		line_gap = 21
-		font_scale = 0.49
+		line_gap = 20
+		font_scale = 0.43
 		col1_x = 35
-		col2_x = 290
-		col3_x = 545
+		col2_x = 275
+		col3_x = 485
 		start_y = panel_top + 28
 
 		for idx, line in enumerate(left_status_lines):
@@ -3062,21 +3140,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			cv2.putText(
 				right, line, (col3_x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
 				(255, 255, 255), 1, cv2.LINE_AA
-			)
-
-		risk_cap_active = bool(self.pid_metadata.get('front_route_risk_speed_cap_active', False))
-		risk_cap_applied = bool(self.pid_metadata.get('front_route_risk_speed_cap_applied', False))
-		if risk_cap_active:
-			banner_color = (0, 140, 255) if risk_cap_applied else (90, 90, 90)
-			banner_text = (
-				f"RISK CAP APPLIED {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')} m/s"
-				if risk_cap_applied else
-				f"RISK CAP ACTIVE {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')} m/s"
-			)
-			cv2.rectangle(right, (24, 238), (476, 268), banner_color, -1)
-			cv2.putText(
-				right, banner_text, (36, 259), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
-				(255, 255, 255), 2, cv2.LINE_AA
 			)
 
 		legend_items = [

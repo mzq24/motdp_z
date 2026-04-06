@@ -314,24 +314,23 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
 
     # ========== Speed Target Computation ==========
-    def _compute_speed_target(self, trajectory, device):
-        """Compute two-hot speed target from GT trajectory for speed head training.
+    def _compute_speed_target(self, trajectory, device, batch: Optional[Dict[str, torch.Tensor]] = None):
+        """Compute two-hot speed target for scalar speed head training.
 
-        Target speed = displacement magnitude over 1 second (waypoints 0→2 at 0.5s interval).
-        Encoded as two-hot distribution over speed bins for cross-entropy loss.
-
-        Args:
-            trajectory: (B, T, 2) absolute GT trajectory
-            device: torch device
-
-        Returns:
-            two_hot: (B, num_classes) soft labels, or None if trajectory too short
+        Preferred target is the exact next-step future speed read from raw measurements
+        (`next_speed_target_mps`, t+0.5s). When unavailable, fall back to the first
+        0.5s average speed derived from GT trajectory.
         """
-        if trajectory.shape[1] < 3:
-            return None
-        # Speed = ||wp[2] - wp[0]|| / 1.0s  (2 steps × 0.5s)
-        displacement = trajectory[:, 2] - trajectory[:, 0]  # (B, 2)
-        target_speed = displacement.norm(dim=-1)  # (B,) in m/s
+        target_speed = None
+        if batch is not None:
+            next_speed_target = batch.get('next_speed_target_mps')
+            if next_speed_target is not None:
+                target_speed = next_speed_target.to(device=device, dtype=trajectory.dtype).reshape(-1)
+
+        if target_speed is None:
+            if trajectory.shape[1] < 1:
+                return None
+            target_speed = trajectory[:, 0].norm(dim=-1) / max(self.speed_profile_dt, 1e-6)
 
         speed_classes = self.model.speed_classes
         num_classes = len(speed_classes)
@@ -928,7 +927,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         speed_profile_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         speed_profile_step_losses = []
         if speed_pred is not None and train_speed_head_active:
-            speed_target = self._compute_speed_target(trajectory, device)
+            speed_target = self._compute_speed_target(trajectory, device, batch=batch)
             if speed_target is not None:
                 speed_per_sample = F.cross_entropy(
                     speed_pred.float(),
@@ -2106,10 +2105,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         speed_energy_scores = None
         speed_energy_samples = None
+        speed_energy_query_center = None
         if self.use_stage1_speed_energy:
-            center_speed = target_speed_pred
-            if center_speed is None:
-                center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+            # Query stage1 speed energy around the current feasible ego speed rather than
+            # around the nominal speed-head output. This keeps the queried bucket locally
+            # reachable during closed-loop control, especially when the speed head wants to
+            # stop but the vehicle is still moving quickly.
+            center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+            speed_energy_query_center = center_speed
             speed_energy_samples = self._build_stage1_speed_samples(center_speed, device, model_dtype)
             best_traj_norm = self.abs_to_norm(best_trajectory.unsqueeze(1))
             speed_energy_scores, _ = self.model.forward_speed_energy_eval(
@@ -2131,6 +2134,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'energy_scores': energy_scores,           # dict of (B, 1)
             'speed_energy_scores': speed_energy_scores,
             'speed_energy_samples': speed_energy_samples,
+            'speed_energy_query_center': speed_energy_query_center,
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
             'target_speed': target_speed_pred,        # (B,) m/s
@@ -2198,6 +2202,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ses = sample_result['speed_energy_scores']
             if sample_result.get('speed_energy_samples') is not None:
                 result['speed_energy_samples'] = sample_result['speed_energy_samples'].detach().float().cpu().numpy()
+            if sample_result.get('speed_energy_query_center') is not None:
+                result['speed_energy_query_center'] = sample_result['speed_energy_query_center'].detach().float().cpu().numpy()
             for key in ('chase', 'meet', 'pedestrian'):
                 if key in ses:
                     result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()

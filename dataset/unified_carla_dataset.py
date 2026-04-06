@@ -1,6 +1,8 @@
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import gzip
+import json
 import os
 import io
 import sys
@@ -109,6 +111,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  lidar_history_frames: int = 1,
                  filter_bad_routes: bool = True,
                  retain_bad_routes_for_energy: bool = False,
+                 next_speed_frame_offset: int = 2,
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -128,8 +131,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._lidar_history_frames = max(int(lidar_history_frames), 1)
         self._filter_bad_routes = bool(filter_bad_routes)
         self._retain_bad_routes_for_energy = bool(retain_bad_routes_for_energy)
+        self._next_speed_frame_offset = max(int(next_speed_frame_offset), 1)
         self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
+        self._route_speed_cache = {}
+        self._route_speed_cache_maxsize = 64
 
         # Semantic behavior labeling
         self.anchor_centers_abs = anchor_centers_abs
@@ -500,6 +506,61 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             return None
         return torch.stack(frames, dim=0)  # (H_hist, 2, 256, 256)
 
+    def _get_route_rel_from_sample(self, sample: dict) -> Optional[str]:
+        feat_rel = sample.get('transfuser_bev_feature', '')
+        if isinstance(feat_rel, str) and feat_rel:
+            return os.path.dirname(os.path.dirname(feat_rel))
+        route_name = sample.get('route_name')
+        town_name = sample.get('town_name')
+        if route_name and town_name:
+            return os.path.join(str(town_name), str(route_name))
+        return None
+
+    def _get_route_speed_map(self, route_rel: str) -> dict:
+        cached = self._route_speed_cache.get(route_rel)
+        if cached is not None:
+            return cached
+
+        if len(self._route_speed_cache) >= self._route_speed_cache_maxsize:
+            self._route_speed_cache.pop(next(iter(self._route_speed_cache)))
+
+        measurements_dir = os.path.join(self.image_data_root, route_rel, 'measurements')
+        speed_map = {}
+        if os.path.isdir(measurements_dir):
+            try:
+                for fname in sorted(os.listdir(measurements_dir)):
+                    if not fname.endswith('.json.gz'):
+                        continue
+                    try:
+                        frame_id = int(fname.split('.')[0])
+                    except ValueError:
+                        continue
+                    try:
+                        with gzip.open(os.path.join(measurements_dir, fname), 'rt', encoding='utf-8') as gz_file:
+                            measurement = json.load(gz_file)
+                        speed_map[frame_id] = float(measurement.get('speed', 0.0))
+                    except Exception:
+                        continue
+            except Exception:
+                speed_map = {}
+
+        self._route_speed_cache[route_rel] = speed_map
+        return speed_map
+
+    def _get_exact_next_speed_target(self, sample: dict) -> Optional[float]:
+        frame_id = sample.get('frame_id')
+        if frame_id is None:
+            return None
+        route_rel = self._get_route_rel_from_sample(sample)
+        if not route_rel:
+            return None
+        speed_map = self._get_route_speed_map(route_rel)
+        target_frame_id = int(frame_id) + self._next_speed_frame_offset
+        target_speed = speed_map.get(target_frame_id)
+        if target_speed is None:
+            return None
+        return float(target_speed)
+
     def __getitem__(self, idx):
         sample = self._sample_cache[idx]
         clone_keys = set()
@@ -590,6 +651,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         # Convert sample data
         final_sample = dict()
+        next_speed_target_mps = self._get_exact_next_speed_target(sample)
         for key, value in sample.items():
             if key == 'rgb_hist_jpg':
                 continue
@@ -658,6 +720,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample[key] = _from_numpy(value, key)
             else:
                 final_sample[key] = value
+
+        if next_speed_target_mps is not None:
+            final_sample['next_speed_target_mps'] = torch.tensor(next_speed_target_mps, dtype=torch.float32)
 
         # Ensure target_point_next_hist always exists (fallback to target_point_hist)
         if 'target_point_next_hist' not in final_sample:
