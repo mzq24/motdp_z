@@ -18,7 +18,7 @@ import random
 from filterpy.kalman import MerweScaledSigmaPoints
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 
-project_root = str(pathlib.Path(__file__).parent.parent.parent)
+project_root = str(pathlib.Path(__file__).resolve().parent.parent)
 leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
 scenario_runner_root = str(os.path.join(project_root, 'scenario_runner'))
 mot_dp_root = str(os.path.join(project_root, 'MoT-DP'))
@@ -102,6 +102,7 @@ if USE_MOT:
         parse_decision_sequence, split_prompt
     )
 from team_code.lidar_utils import lidar_to_ego_coordinate, algin_lidar
+from team_code.ego_localizer import EgoLocalizer
 from team_code.ukf_utils import (
     bicycle_model_forward, measurement_function_hx,
     state_mean, measurement_mean,
@@ -120,6 +121,9 @@ PLANNER_TYPE = os.environ.get('PLANNER_TYPE', None)
 EARTH_RADIUS_EQUA = 6378137.0
 USE_UKF = True  # Enable Unscented Kalman Filter for GPS/compass smoothing
 TARGET_POSE_SOURCE = os.environ.get('TARGET_POSE_SOURCE', 'filtered').lower()
+LOCALIZER_STRATEGY = os.environ.get('LOCALIZER_STRATEGY', 'complementary').lower()
+LOCALIZER_ALPHA = float(os.environ.get('LOCALIZER_ALPHA', '0.5'))
+LIDAR_POSE_SOURCE = os.environ.get('LIDAR_POSE_SOURCE', 'ukf').lower()
 STEER_SIGN_SCALE = float(os.environ.get('STEER_SIGN_SCALE', '1.0'))
 TARGET_YAW_SIGN = float(os.environ.get('TARGET_YAW_SIGN', '1.0'))
 TARGET_GEOM_YAW_SIGN = float(os.environ.get('TARGET_GEOM_YAW_SIGN', '1.0'))
@@ -169,6 +173,10 @@ STAGE1_ENERGY_CAP_PEAK_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_PEAK_WARN'
 STAGE1_ENERGY_CAP_PEAK_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_PEAK_HIGH', '0.55'))
 STAGE1_ENERGY_CAP_SAFE_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_SAFE_WARN', '0.15'))
 STAGE1_ENERGY_CAP_SAFE_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_SAFE_HIGH', '0.08'))
+STAGE1_ENERGY_CAP_TARGET_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_TARGET_WARN', '0.35'))
+STAGE1_ENERGY_CAP_TARGET_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_TARGET_HIGH', '0.55'))
+STAGE1_ENERGY_CAP_TREND_MARGIN = float(os.environ.get('STAGE1_ENERGY_CAP_TREND_MARGIN', '0.05'))
+STAGE1_ENERGY_CAP_SPEED_EPS = float(os.environ.get('STAGE1_ENERGY_CAP_SPEED_EPS', '0.20'))
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -1029,9 +1037,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'reason': None,
 			'speed_cap_ms': None,
 			'current_score': None,
+			'target_score': None,
 			'local_peak_score': None,
 			'query_center_ms': None,
 			'current_index': None,
+			'target_index': None,
+			'target_speed_ms': None,
+			'target_source': None,
 			'lookahead_bins': int(STAGE1_ENERGY_CAP_LOOKAHEAD_BINS),
 			'safe_threshold': None,
 			'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
@@ -1075,19 +1087,79 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'local_peak_score': local_peak_score,
 		})
 
+		target_speed = center_speed
+		target_score = current_score
+		target_idx = current_idx
+		target_source = 'query_center'
+		ref_speeds = self.last_energy_debug.get('speed_energy_ref_speeds')
+		ref_totals = self.last_energy_debug.get('speed_energy_ref_total')
+		if ref_speeds is not None:
+			ref_speeds = np.asarray(ref_speeds, dtype=np.float32).reshape(-1)
+			ref_totals = np.asarray(ref_totals if ref_totals is not None else [], dtype=np.float32).reshape(-1)
+			speed_source_to_idx = {
+				'speed_head': 0,
+				'traj': 1,
+				'traj_05s': 2,
+				'traj05': 2,
+			}
+			ref_idx = speed_source_to_idx.get(SPEED_SOURCE)
+			if ref_idx is not None and ref_idx < ref_speeds.size and np.isfinite(ref_speeds[ref_idx]):
+				target_speed = max(0.0, float(ref_speeds[ref_idx]))
+				target_idx = int(np.argmin(np.abs(samples - target_speed)))
+				if ref_idx < ref_totals.size and np.isfinite(ref_totals[ref_idx]):
+					target_score = float(ref_totals[ref_idx])
+				else:
+					target_score = float(total_curve[target_idx])
+				target_source = SPEED_SOURCE
+		debug.update({
+			'target_index': int(target_idx),
+			'target_speed_ms': float(target_speed),
+			'target_score': float(target_score),
+			'target_source': target_source,
+		})
+
+		path_lo = min(current_idx, target_idx)
+		path_hi = max(current_idx, target_idx) + 1
+		path_peak_score = float(np.max(total_curve[path_lo:path_hi]))
+		debug['local_peak_score'] = path_peak_score
+
+		speed_delta = float(target_speed - center_speed)
+		moving_toward_danger = (
+			target_score >= current_score + STAGE1_ENERGY_CAP_TREND_MARGIN
+			or path_peak_score >= current_score + STAGE1_ENERGY_CAP_TREND_MARGIN
+		)
+
 		level = None
-		if current_score >= STAGE1_ENERGY_CAP_CUR_HIGH or local_peak_score >= STAGE1_ENERGY_CAP_PEAK_HIGH:
-			level = 'high'
-			safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_HIGH)
-		elif current_score >= STAGE1_ENERGY_CAP_CUR_WARN or local_peak_score >= STAGE1_ENERGY_CAP_PEAK_WARN:
-			level = 'warn'
-			safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_WARN)
+		if speed_delta >= STAGE1_ENERGY_CAP_SPEED_EPS and moving_toward_danger:
+			if target_score >= STAGE1_ENERGY_CAP_TARGET_HIGH or path_peak_score >= STAGE1_ENERGY_CAP_PEAK_HIGH:
+				level = 'high'
+				safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_HIGH)
+			elif target_score >= STAGE1_ENERGY_CAP_TARGET_WARN or path_peak_score >= STAGE1_ENERGY_CAP_TARGET_WARN:
+				level = 'warn'
+				safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_WARN)
+			else:
+				safe_threshold = None
+		elif speed_delta <= -STAGE1_ENERGY_CAP_SPEED_EPS:
+			# If the chosen target speed is already safer than the current speed,
+			# do not add extra intervention on top of the nominal slowdown.
+			if target_score >= current_score - STAGE1_ENERGY_CAP_TREND_MARGIN:
+				if target_score >= STAGE1_ENERGY_CAP_TARGET_HIGH:
+					level = 'high'
+					safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_HIGH)
+				elif target_score >= STAGE1_ENERGY_CAP_TARGET_WARN:
+					level = 'warn'
+					safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_WARN)
+				else:
+					safe_threshold = None
+			else:
+				safe_threshold = None
 		else:
 			safe_threshold = None
 		debug['safe_threshold'] = safe_threshold
 
 		if level is not None:
-			decel_indices = np.where(samples <= center_speed + 1e-3)[0]
+			speed_ceiling = max(0.0, target_speed)
+			decel_indices = np.where(samples <= speed_ceiling + 1e-3)[0]
 			if decel_indices.size == 0:
 				decel_indices = np.arange(samples.size)
 			safe_indices = [int(i) for i in decel_indices if float(total_curve[i]) <= safe_threshold]
@@ -1106,6 +1178,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'speed_cap_ms': candidate_cap_ms,
 				'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
 			})
+			return debug
+
+		if (
+			speed_delta <= -STAGE1_ENERGY_CAP_SPEED_EPS
+			and target_score < current_score - STAGE1_ENERGY_CAP_TREND_MARGIN
+		):
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
 			return debug
 
 		if self.stage1_energy_cap_hold_frames > 0 and self.stage1_energy_cap_value_ms is not None:
@@ -1384,6 +1464,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Initialize Unscented Kalman Filter 
 		self.carla_frame_rate = 1.0 / 20.0  # CARLA frame rate
+		self.localizer = EgoLocalizer(
+			strategy=LOCALIZER_STRATEGY,
+			dt=self.carla_frame_rate,
+			gps_alpha=LOCALIZER_ALPHA,
+			latency_compensation=False,
+		)
+		print(
+			f"[EgoLocalizer] strategy={LOCALIZER_STRATEGY}, "
+			f"alpha={LOCALIZER_ALPHA}, lidar_pose={LIDAR_POSE_SOURCE}"
+		)
 		if USE_UKF:
 			self.points = MerweScaledSigmaPoints(n=4, alpha=0.00001, beta=2, kappa=0, subtract=residual_state_x)
 			self.ukf = UKF(dim_x=4,
@@ -1790,11 +1880,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Preprocess compass to CARLA coordinate system
 		compass = t_u.preprocess_compass(compass_raw)
 		
-		# Get speed for UKF
+		# Get speed
 		speed = input_data['SPEED'][1]['speed']
 		
-		# Apply Unscented Kalman Filter 
-		if USE_UKF:
+		# ---- Localizer pose: used for target point / planner pose when requested ----
+		gps_raw_xy = np.array([gps_pos[0], gps_pos[1]], dtype=np.float64)
+		if hasattr(self, 'localizer') and self.localizer is not None:
+			localized_pos, localized_yaw = self.localizer.update(
+				gps_xy=gps_raw_xy,
+				compass=compass,
+				speed=speed,
+				steer=self.control.steer,
+				throttle=self.control.throttle,
+				brake=float(self.control.brake > 0.5),
+				imu_data=input_data['IMU'][1],
+			)
+			gps_filtered = np.asarray(localized_pos, dtype=np.float64)
+			compass_filtered = float(localized_yaw)
+		elif USE_UKF:
 			if not self.filter_initialized:
 				self.ukf.x = np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed])
 				self.filter_initialized = True
@@ -1810,6 +1913,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			gps_filtered = np.array([gps_pos[0], gps_pos[1]])
 			compass_filtered = compass
 
+		# ---- Lidar alignment pose: keep the old controllable split between ukf/localizer ----
+		if LIDAR_POSE_SOURCE == 'ukf' and USE_UKF:
+			if not self.filter_initialized:
+				self.ukf.x = np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed])
+				self.filter_initialized = True
+
+			self.ukf.predict(steer=self.control.steer, throttle=self.control.throttle, brake=self.control.brake)
+			self.ukf.update(np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed]))
+			lidar_state = self.ukf.x
+			self.state_log.append(lidar_state)
+			gps_lidar = np.asarray(lidar_state[0:2], dtype=np.float64)
+			compass_lidar = float(lidar_state[2])
+		else:
+			gps_lidar = np.asarray(gps_filtered, dtype=np.float64)
+			compass_lidar = float(compass_filtered)
+
 		gps_target_pose, compass_target_pose, target_pose_source = self._resolve_target_pose(
 			gps_raw=np.array([gps_pos[0], gps_pos[1]], dtype=np.float32),
 			gps_filtered=gps_filtered,
@@ -1817,16 +1936,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			compass_filtered=compass_filtered,
 		)
 
-		# Combine two frames of lidar data using algin_lidar
-		# Use filtered GPS for lidar alignment
+		# Combine two frames of lidar data using the selected lidar pose.
 		if self.last_lidar is not None and self.last_ego_transform is not None:
 			# Calculate relative transformation between current and last frame
-			current_pos = np.array([gps_filtered[0], gps_filtered[1], 0.0])
+			current_pos = np.array([gps_lidar[0], gps_lidar[1], 0.0])
 			last_pos = np.array([self.last_ego_transform['gps'][0], self.last_ego_transform['gps'][1], 0.0])
 			relative_translation = current_pos - last_pos
 			
-			# Calculate relative rotation using filtered compass
-			current_yaw = compass_filtered
+			# Calculate relative rotation using lidar-alignment yaw
+			current_yaw = compass_lidar
 			last_yaw = self.last_ego_transform['compass']
 			relative_rotation = current_yaw - last_yaw
 			
@@ -1843,9 +1961,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			lidar_combined = lidar_ego
 		
-		# Store current frame for next iteration (use filtered values)
+		# Store current frame for next iteration (use lidar-alignment pose)
 		self.last_lidar = lidar_ego
-		self.last_ego_transform = {'gps': gps_filtered, 'compass': compass_filtered}
+		self.last_ego_transform = {'gps': gps_lidar, 'compass': compass_lidar}
 		
 		# Generate lidar BEV image from combined lidar data
 		lidar_bev_img = generate_lidar_bev_images(
@@ -1874,7 +1992,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		transfuser_lidar = transfuser_t_u.lidar_to_ego_coordinate(self.transfuser_config, input_data['LIDAR'])
 		
 		# Store state for lidar alignment
-		self.transfuser_state_log.append([gps_filtered[0], gps_filtered[1], compass_filtered, speed])
+		self.transfuser_state_log.append([gps_lidar[0], gps_lidar[1], compass_lidar, speed])
 		
 		# We only get half a LiDAR at every time step. Align the last half into the current frame.
 		if self.transfuser_lidar_last is not None and len(self.transfuser_state_log) >= 2:
@@ -1932,6 +2050,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'bev': bev,
 				'gps_filtered': gps_filtered,
 				'compass_filtered': compass_filtered,
+				'gps_lidar': gps_lidar,
+				'compass_lidar': compass_lidar,
 				'target_pose_source': target_pose_source,
 				# TransFuser processed data for DP
 				'transfuser_rgb': transfuser_rgb_tensor,  # (1, 3, H, W) on GPU
@@ -3003,9 +3123,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stage1_energy_speed_cap_ms': stage1_energy_cap_debug.get('speed_cap_ms'),
 				'stage1_energy_speed_cap_applied': bool(self.last_speed_debug.get('stage1_energy_cap_applied', False)),
 				'stage1_energy_current_score': stage1_energy_cap_debug.get('current_score'),
+				'stage1_energy_target_score': stage1_energy_cap_debug.get('target_score'),
 				'stage1_energy_local_peak_score': stage1_energy_cap_debug.get('local_peak_score'),
 				'stage1_energy_current_index': stage1_energy_cap_debug.get('current_index'),
+				'stage1_energy_target_index': stage1_energy_cap_debug.get('target_index'),
 				'stage1_energy_query_center_ms': stage1_energy_cap_debug.get('query_center_ms'),
+				'stage1_energy_target_speed_ms': stage1_energy_cap_debug.get('target_speed_ms'),
+				'stage1_energy_target_source': stage1_energy_cap_debug.get('target_source'),
 				'stage1_energy_safe_threshold': stage1_energy_cap_debug.get('safe_threshold'),
 				'stage1_energy_cap_hold_frames_remaining': int(stage1_energy_cap_debug.get('hold_frames_remaining', 0)),
 				'stuck_detector': int(self.stuck_detector),
@@ -3304,26 +3428,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		left_status_lines = [
 			f"frm: {self.step}",
-			f"v_act: {speed_mps:.2f} m/s",
+			f"v: {speed_mps:.2f} m/s",
 			f"src: {self.pid_metadata.get('speed_source', 'N/A')}",
 			f"fus: {self.pid_metadata.get('fusion_regime', 'N/A')}",
-			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')} m/s",
-			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')} m/s",
-			f"Ecap: {int(bool(self.pid_metadata.get('stage1_energy_speed_cap_active', False)))}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')} m/s",
-			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')} m/s",
-			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')} m/s",
-			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
-			f"thr/brk: {float(self.pid_metadata.get('throttle', 0.0)):.3f} / {float(self.pid_metadata.get('brake', 0.0)):.3f}",
+			f"vd0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
+			f"vd: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
+			f"Ecap: {int(bool(self.pid_metadata.get('stage1_energy_speed_cap_active', False)))}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')}",
+			f"st: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
+			f"tb: {float(self.pid_metadata.get('throttle', 0.0)):.2f}/{float(self.pid_metadata.get('brake', 0.0)):.2f}",
 		]
 
 		mid_status_lines = [
 			f"cmd: {command_text} ({command_value})",
 			f"pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
-			f"tp_ang: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.2f}",
+			f"ang: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.1f}",
 			f"tp_L/R/B: {int(bool(self.pid_metadata.get('target_is_left', False)))}/{int(bool(self.pid_metadata.get('target_is_right', False)))}/{int(bool(self.pid_metadata.get('target_is_behind', False)))}",
-			f"hdg_err: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.2f}",
-			f"st_idx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
-			f"st_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
+			f"herr: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.1f}",
+			f"sidx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
+			f"sctl: {float(self.pid_metadata.get('steer_controller', 0.0)):.2f}",
 		]
 
 		if self.last_target_point is not None:
@@ -3337,24 +3459,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		right_status_lines = [
 			f"qE ctr: {self._format_debug_value(self.pid_metadata.get('speed_energy_query_center'), '.1f')} m/s",
-			f"Et c/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.2f')}",
+			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
+			f"v_tgt: {self._format_debug_value(self.pid_metadata.get('stage1_energy_target_speed_ms'), '.1f')} ({self.pid_metadata.get('stage1_energy_target_source', 'NA')})",
 			f"pred h/1/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')} m/s",
 			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=5)}",
 			f"v@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_speeds'), fmt='.1f', max_items=3)} m/s",
-			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.2f', max_items=3)}",
-			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.2f', max_items=5)}",
-			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.2f', max_items=5)}",
-			f"Em: {self._format_debug_curve(self.pid_metadata.get('speed_energy_meet'), fmt='.2f', max_items=5)}",
-			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.2f', max_items=5)}",
-			f"E*: {self._format_debug_value(self.pid_metadata.get('speed_energy_max'), '.2f')}@{self.pid_metadata.get('speed_energy_argmax', 'NA')}",
+			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.1f', max_items=3)}",
+			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.1f', max_items=5)}",
+			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.1f', max_items=5)}",
+			f"Em: {self._format_debug_curve(self.pid_metadata.get('speed_energy_meet'), fmt='.1f', max_items=5)}",
+			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.1f', max_items=5)}",
+			f"E*: {self._format_debug_value(self.pid_metadata.get('speed_energy_max'), '.1f')}@{self.pid_metadata.get('speed_energy_argmax', 'NA')}",
 			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
-		line_gap = 20
-		font_scale = 0.43
-		col1_x = 35
-		col2_x = 275
-		col3_x = 485
+		line_gap = 18
+		font_scale = 0.39
+		col1_x = 26
+		col2_x = 220
+		col3_x = 415
 		start_y = panel_top + 28
 
 		for idx, line in enumerate(left_status_lines):
