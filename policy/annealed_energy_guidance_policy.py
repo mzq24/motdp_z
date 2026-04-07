@@ -155,6 +155,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'train_speed_head_after_update_every', None
         )
         self.speed_profile_dt = float(route_b_cfg.get('speed_profile_dt', 0.5))
+        self.stage1_query_dt = float(route_b_cfg.get('stage1_query_dt', 1.0))
+        self.stage1_query_brake_mps2 = float(route_b_cfg.get('stage1_query_brake_mps2', 6.0))
+        self.stage1_query_accel_mps2 = float(route_b_cfg.get('stage1_query_accel_mps2', 2.5))
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
@@ -384,9 +387,39 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         device: torch.device,
         model_dtype: torch.dtype,
     ) -> torch.Tensor:
-        offsets = self.stage1_speed_offsets.to(device=device, dtype=model_dtype)
-        speed_samples = center_speed.unsqueeze(-1).to(dtype=model_dtype) + offsets.unsqueeze(0)
-        return speed_samples.clamp_(0.0, 20.0)
+        center_speed = center_speed.to(device=device, dtype=model_dtype)
+        brake_span = center_speed.new_tensor(self.stage1_query_brake_mps2 * self.stage1_query_dt)
+        accel_span = center_speed.new_tensor(self.stage1_query_accel_mps2 * self.stage1_query_dt)
+        samples = torch.stack([
+            center_speed - brake_span,
+            center_speed - brake_span * (2.0 / 3.0),
+            center_speed - brake_span * (1.0 / 3.0),
+            center_speed,
+            center_speed + accel_span * (1.0 / 3.0),
+            center_speed + accel_span * (2.0 / 3.0),
+            center_speed + accel_span,
+        ], dim=-1)
+        return samples.clamp_(0.0, 20.0)
+
+    def _compute_inference_traj_speed_refs(
+        self,
+        trajectory: torch.Tensor,
+        model_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the same short-horizon trajectory speed refs used by the local PID agent."""
+        traj = trajectory.to(dtype=model_dtype)
+        if traj.shape[1] >= 3:
+            traj_speed_1s = (traj[:, 2] - traj[:, 0]).norm(dim=-1)
+        elif traj.shape[1] >= 2:
+            traj_speed_1s = (traj[:, 1] - traj[:, 0]).norm(dim=-1) * 2.0
+        else:
+            traj_speed_1s = traj[:, 0].norm(dim=-1) * 2.0
+
+        if traj.shape[1] >= 2:
+            traj_speed_05s = (traj[:, 1] - traj[:, 0]).norm(dim=-1) * 2.0
+        else:
+            traj_speed_05s = traj[:, 0].norm(dim=-1) * 2.0
+        return traj_speed_1s.clamp(0.0, 20.0), traj_speed_05s.clamp(0.0, 20.0)
 
     @staticmethod
     def _masked_smooth_l1(pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
@@ -2106,10 +2139,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         speed_energy_scores = None
         speed_energy_samples = None
+        speed_energy_query_center = None
+        speed_energy_ref_speeds = None
+        speed_energy_ref_scores = None
         if self.use_stage1_speed_energy:
-            center_speed = target_speed_pred
-            if center_speed is None:
-                center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+            # Query stage1 speed energy around the current feasible ego speed rather than
+            # around the nominal speed-head output. This keeps the queried bucket locally
+            # reachable during closed-loop control, especially when the speed head wants to
+            # stop but the vehicle is still moving quickly.
+            center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+            speed_energy_query_center = center_speed
             speed_energy_samples = self._build_stage1_speed_samples(center_speed, device, model_dtype)
             best_traj_norm = self.abs_to_norm(best_trajectory.unsqueeze(1))
             speed_energy_scores, _ = self.model.forward_speed_energy_eval(
@@ -2123,6 +2162,24 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 route_points=route_pred.detach(),
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
+            traj_speed_1s_ref, traj_speed_05s_ref = self._compute_inference_traj_speed_refs(
+                best_trajectory, model_dtype
+            )
+            head_speed_ref = target_speed_pred if target_speed_pred is not None else center_speed
+            speed_energy_ref_speeds = torch.stack(
+                [head_speed_ref, traj_speed_1s_ref, traj_speed_05s_ref], dim=-1
+            ).clamp_(0.0, 20.0)
+            speed_energy_ref_scores, _ = self.model.forward_speed_energy_eval(
+                x_t=best_traj_norm,
+                x_t_abs=best_trajectory.unsqueeze(1),
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                speed_samples=speed_energy_ref_speeds,
+                bev_proj_cached=bev_proj,
+                route_points=route_pred.detach(),
+                transfuser_lidar_bev=transfuser_lidar_bev,
+            )
 
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
@@ -2131,6 +2188,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'energy_scores': energy_scores,           # dict of (B, 1)
             'speed_energy_scores': speed_energy_scores,
             'speed_energy_samples': speed_energy_samples,
+            'speed_energy_query_center': speed_energy_query_center,
+            'speed_energy_ref_speeds': speed_energy_ref_speeds,
+            'speed_energy_ref_scores': speed_energy_ref_scores,
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
             'target_speed': target_speed_pred,        # (B,) m/s
@@ -2198,8 +2258,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ses = sample_result['speed_energy_scores']
             if sample_result.get('speed_energy_samples') is not None:
                 result['speed_energy_samples'] = sample_result['speed_energy_samples'].detach().float().cpu().numpy()
+            if sample_result.get('speed_energy_query_center') is not None:
+                result['speed_energy_query_center'] = sample_result['speed_energy_query_center'].detach().float().cpu().numpy()
             for key in ('chase', 'meet', 'pedestrian'):
                 if key in ses:
                     result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
+        if sample_result.get('speed_energy_ref_scores') is not None:
+            ref = sample_result['speed_energy_ref_scores']
+            if sample_result.get('speed_energy_ref_speeds') is not None:
+                result['speed_energy_ref_speeds'] = sample_result['speed_energy_ref_speeds'].detach().float().cpu().numpy()
+            for key in ('chase', 'meet', 'pedestrian'):
+                if key in ref:
+                    result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
 
         return result

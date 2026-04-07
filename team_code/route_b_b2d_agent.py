@@ -48,9 +48,12 @@ from model.transfuser_extractor.config import GlobalConfig as TransfuserConfig
 import model.transfuser_extractor.transfuser_utils as transfuser_t_u
 
 # mot dependencies
+# This agent file now lives inside the MoT-DP repo itself, so the repo root is
+# simply the parent directory of team_code/. Do not reconstruct a sibling
+# "MoT-DP" path from a Bench2Drive-style layout.
 project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
-mot_dp_path = str(os.path.join(os.path.dirname(os.path.dirname(project_root)), 'MoT-DP'))
+mot_dp_path = project_root
 mot_path = str(os.path.join(mot_dp_path, 'mot'))
 sys.path.append(mot_dp_path)
 sys.path.append(mot_path)
@@ -154,6 +157,18 @@ FRONT_ROUTE_RISK_HIGH_SIGMOID_MIN = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_
 FRONT_ROUTE_RISK_HIGH_EMA_MIN = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_EMA_MIN', '0.80'))
 FRONT_ROUTE_RISK_RAW_OVERRIDE_SPEED_MS = float(os.environ.get('FRONT_ROUTE_RISK_RAW_OVERRIDE_SPEED_MS', '8.0'))
 FRONT_ROUTE_RISK_RAW_OVERRIDE_SCORE = float(os.environ.get('FRONT_ROUTE_RISK_RAW_OVERRIDE_SCORE', '1.6'))
+STAGE1_ENERGY_SPEED_CAP_ENABLE = os.environ.get('STAGE1_ENERGY_SPEED_CAP_ENABLE', '1').lower() in (
+	'1', 'true', 'yes', 'on'
+)
+STAGE1_ENERGY_CAP_HOLD_FRAMES = max(0, int(os.environ.get('STAGE1_ENERGY_CAP_HOLD_FRAMES', '6')))
+STAGE1_ENERGY_CAP_MIN_SPEED_MS = float(os.environ.get('STAGE1_ENERGY_CAP_MIN_SPEED_MS', '1.0'))
+STAGE1_ENERGY_CAP_LOOKAHEAD_BINS = max(0, int(os.environ.get('STAGE1_ENERGY_CAP_LOOKAHEAD_BINS', '2')))
+STAGE1_ENERGY_CAP_CUR_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_CUR_WARN', '0.20'))
+STAGE1_ENERGY_CAP_CUR_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_CUR_HIGH', '0.40'))
+STAGE1_ENERGY_CAP_PEAK_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_PEAK_WARN', '0.35'))
+STAGE1_ENERGY_CAP_PEAK_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_PEAK_HIGH', '0.55'))
+STAGE1_ENERGY_CAP_SAFE_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_SAFE_WARN', '0.15'))
+STAGE1_ENERGY_CAP_SAFE_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_SAFE_HIGH', '0.08'))
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -465,6 +480,47 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self._rotate_bev_ego_up(semantic_vis),
 			self._rotate_bev_ego_up(vehicle_vis),
 		)
+
+	def _jsonify_debug_value(self, value):
+		if isinstance(value, np.ndarray):
+			return value.tolist()
+		if isinstance(value, torch.Tensor):
+			return value.detach().cpu().tolist()
+		if isinstance(value, (np.floating,)):
+			return float(value)
+		if isinstance(value, (np.integer,)):
+			return int(value)
+		if isinstance(value, (list, tuple)):
+			return [self._jsonify_debug_value(v) for v in value]
+		if isinstance(value, dict):
+			return {k: self._jsonify_debug_value(v) for k, v in value.items()}
+		return value
+
+	def _format_debug_curve(self, values, fmt='.2f', max_items=7):
+		if values is None:
+			return 'NA'
+		if isinstance(values, torch.Tensor):
+			arr = values.detach().cpu().float().reshape(-1).tolist()
+		else:
+			arr = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+		if len(arr) == 0:
+			return '[]'
+		arr = arr[:max_items]
+		parts = [format(float(v), fmt) for v in arr]
+		return '[' + ', '.join(parts) + ']'
+
+	def _format_debug_speed_curve_kmh(self, values, fmt='.1f', max_items=7):
+		if values is None:
+			return 'NA'
+		if isinstance(values, torch.Tensor):
+			arr = values.detach().cpu().float().reshape(-1).tolist()
+		else:
+			arr = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+		if len(arr) == 0:
+			return '[]'
+		arr = arr[:max_items]
+		parts = [format(float(v) * 3.6, fmt) for v in arr]
+		return '[' + ', '.join(parts) + ']'
 
 	def _bev_roi_bounds(self, bev_classes, x_min_m, x_max_m, y_min_m, y_max_m):
 		if isinstance(bev_classes, (list, tuple)):
@@ -967,6 +1023,105 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.front_route_risk_cap_value_ms = None
 		return debug
 
+	def _get_stage1_energy_speed_cap(self, tick_data, ego_speed):
+		debug = {
+			'active': False,
+			'reason': None,
+			'speed_cap_ms': None,
+			'current_score': None,
+			'local_peak_score': None,
+			'query_center_ms': None,
+			'current_index': None,
+			'lookahead_bins': int(STAGE1_ENERGY_CAP_LOOKAHEAD_BINS),
+			'safe_threshold': None,
+			'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
+		}
+
+		if not STAGE1_ENERGY_SPEED_CAP_ENABLE:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		samples = self.last_energy_debug.get('speed_energy_samples')
+		total_curve = self.last_energy_debug.get('speed_energy_total')
+		query_center = self.last_energy_debug.get('speed_energy_query_center')
+		if samples is None or total_curve is None:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+		total_curve = np.asarray(total_curve, dtype=np.float32).reshape(-1)
+		if samples.size == 0 or total_curve.size == 0 or samples.size != total_curve.size:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		center_speed = float(query_center) if query_center is not None else float(ego_speed)
+		center_speed = max(0.0, center_speed)
+		debug['query_center_ms'] = center_speed
+		if center_speed < STAGE1_ENERGY_CAP_MIN_SPEED_MS:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		current_idx = int(np.argmin(np.abs(samples - center_speed)))
+		peak_end = min(total_curve.size, current_idx + 1 + STAGE1_ENERGY_CAP_LOOKAHEAD_BINS)
+		current_score = float(total_curve[current_idx])
+		local_peak_score = float(np.max(total_curve[current_idx:peak_end]))
+		debug.update({
+			'current_index': current_idx,
+			'current_score': current_score,
+			'local_peak_score': local_peak_score,
+		})
+
+		level = None
+		if current_score >= STAGE1_ENERGY_CAP_CUR_HIGH or local_peak_score >= STAGE1_ENERGY_CAP_PEAK_HIGH:
+			level = 'high'
+			safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_HIGH)
+		elif current_score >= STAGE1_ENERGY_CAP_CUR_WARN or local_peak_score >= STAGE1_ENERGY_CAP_PEAK_WARN:
+			level = 'warn'
+			safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_WARN)
+		else:
+			safe_threshold = None
+		debug['safe_threshold'] = safe_threshold
+
+		if level is not None:
+			decel_indices = np.where(samples <= center_speed + 1e-3)[0]
+			if decel_indices.size == 0:
+				decel_indices = np.arange(samples.size)
+			safe_indices = [int(i) for i in decel_indices if float(total_curve[i]) <= safe_threshold]
+			if len(safe_indices) > 0:
+				chosen_idx = max(safe_indices, key=lambda i: float(samples[i]))
+				reason = f'stage1_energy_{level}'
+			else:
+				chosen_idx = int(decel_indices[np.argmin(total_curve[decel_indices])])
+				reason = f'stage1_energy_{level}_fallback'
+			candidate_cap_ms = float(samples[chosen_idx])
+			self.stage1_energy_cap_value_ms = candidate_cap_ms
+			self.stage1_energy_cap_hold_frames = int(STAGE1_ENERGY_CAP_HOLD_FRAMES)
+			debug.update({
+				'active': True,
+				'reason': reason,
+				'speed_cap_ms': candidate_cap_ms,
+				'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
+			})
+			return debug
+
+		if self.stage1_energy_cap_hold_frames > 0 and self.stage1_energy_cap_value_ms is not None:
+			self.stage1_energy_cap_hold_frames -= 1
+			debug.update({
+				'active': True,
+				'reason': 'stage1_energy_hold',
+				'speed_cap_ms': float(self.stage1_energy_cap_value_ms),
+				'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
+			})
+			return debug
+
+		self.stage1_energy_cap_hold_frames = 0
+		self.stage1_energy_cap_value_ms = None
+		return debug
+
 	def get_default_config_path(self):
 		return "/media/z/data/mzq/others/MoT-DP/config/pdm_local_route_b.yaml"
 
@@ -1311,6 +1466,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.front_route_risk_cap_hold_frames = 0
 		self.front_route_risk_cap_value_ms = None
 		self.last_front_route_risk_cap_debug = {}
+		self.stage1_energy_cap_hold_frames = 0
+		self.stage1_energy_cap_value_ms = None
+		self.last_stage1_energy_cap_debug = {}
 		self.last_terminal_route_debug = {}
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
@@ -2059,6 +2217,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		target_point=None,
 		terminal_speed_cap_ms=None,
 		front_route_risk_cap_ms=None,
+		stage1_energy_cap_ms=None,
 	):
 		"""
 		Predicts vehicle control with a PID controller.
@@ -2186,7 +2345,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				desired_speed_after_front_route_risk_cap,
 				front_route_risk_cap_ms,
 			)
-		desired_speed = float(desired_speed_after_front_route_risk_cap)
+		desired_speed_after_stage1_energy_cap = float(desired_speed_after_front_route_risk_cap)
+		stage1_energy_cap_applied = False
+		if stage1_energy_cap_ms is not None and stage1_energy_cap_ms > 0.0:
+			stage1_energy_cap_applied = (
+				desired_speed_after_stage1_energy_cap > float(stage1_energy_cap_ms)
+			)
+			desired_speed_after_stage1_energy_cap = min(
+				desired_speed_after_stage1_energy_cap,
+				stage1_energy_cap_ms,
+			)
+		desired_speed = float(desired_speed_after_stage1_energy_cap)
 		self.last_speed_debug = {
 			'speed_source': SPEED_SOURCE,
 			'speed_head_speed': speed_head_speed,
@@ -2200,11 +2369,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'desired_speed_after_soft_cap': float(desired_speed_after_soft_cap),
 			'desired_speed_after_terminal_cap': float(desired_speed_after_terminal_cap),
 			'desired_speed_after_front_route_risk_cap': float(desired_speed_after_front_route_risk_cap),
+			'desired_speed_after_stage1_energy_cap': float(desired_speed_after_stage1_energy_cap),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
 			'terminal_speed_cap_ms': float(terminal_speed_cap_ms) if terminal_speed_cap_ms is not None else None,
 			'terminal_speed_cap_applied': bool(terminal_speed_cap_applied),
 			'front_route_risk_cap_ms': float(front_route_risk_cap_ms) if front_route_risk_cap_ms is not None else None,
 			'front_route_risk_cap_applied': bool(front_route_risk_cap_applied),
+			'stage1_energy_cap_ms': float(stage1_energy_cap_ms) if stage1_energy_cap_ms is not None else None,
+			'stage1_energy_cap_applied': bool(stage1_energy_cap_applied),
 			'hard_speed_limit_ms': float(HARD_SPEED_LIMIT_MS),
 		}
 
@@ -2560,6 +2732,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			self.last_energy_debug = {}
+			target_speed_profile_list = None
 			for energy_key in ['energy_front', 'energy_left', 'energy_right',
 								'energy_pedestrian', 'energy_offroad', 'energy_route']:
 				energy_value = dp_pred_traj.get(energy_key)
@@ -2568,6 +2741,123 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				energy_array = np.asarray(energy_value).reshape(-1)
 				if energy_array.size > 0:
 					self.last_energy_debug[energy_key] = float(energy_array[0])
+			speed_energy_samples = dp_pred_traj.get('speed_energy_samples')
+			if speed_energy_samples is not None:
+				speed_energy_samples = np.asarray(speed_energy_samples).reshape(-1)
+				if speed_energy_samples.size > 0:
+					self.last_energy_debug['speed_energy_samples'] = speed_energy_samples.astype(np.float32).tolist()
+			speed_energy_query_center = dp_pred_traj.get('speed_energy_query_center')
+			if speed_energy_query_center is not None:
+				speed_energy_query_center = np.asarray(speed_energy_query_center).reshape(-1)
+				if speed_energy_query_center.size > 0:
+					self.last_energy_debug['speed_energy_query_center'] = float(speed_energy_query_center[0])
+			speed_energy_ref_speeds = dp_pred_traj.get('speed_energy_ref_speeds')
+			if speed_energy_ref_speeds is not None:
+				speed_energy_ref_speeds = np.asarray(speed_energy_ref_speeds).reshape(-1)
+				if speed_energy_ref_speeds.size > 0:
+					self.last_energy_debug['speed_energy_ref_speeds'] = speed_energy_ref_speeds.astype(np.float32).tolist()
+			if speed_energy_ref_speeds is None or speed_energy_ref_speeds.size == 0:
+				ref_speed_values = []
+				for speed_key in ['speed_head_speed', 'traj_speed_1s', 'traj_speed_05s']:
+					speed_value = self.last_speed_debug.get(speed_key)
+					if speed_value is None:
+						ref_speed_values.append(np.nan)
+					else:
+						ref_speed_values.append(float(speed_value))
+				speed_energy_ref_speeds = np.asarray(ref_speed_values, dtype=np.float32)
+				self.last_energy_debug['speed_energy_ref_speeds'] = speed_energy_ref_speeds.tolist()
+			speed_energy_curves = {}
+			speed_energy_total_curve = None
+			for speed_energy_key in ['chase', 'meet', 'pedestrian']:
+				speed_energy_value = dp_pred_traj.get(f'speed_energy_{speed_energy_key}')
+				if speed_energy_value is None:
+					continue
+				speed_energy_array = np.asarray(speed_energy_value).reshape(-1)
+				if speed_energy_array.size > 0:
+					speed_energy_curves[speed_energy_key] = speed_energy_array.astype(np.float32)
+					self.last_energy_debug[f'speed_energy_{speed_energy_key}'] = speed_energy_array.astype(np.float32).tolist()
+			if len(speed_energy_curves) > 0:
+				total_curve = None
+				for curve in speed_energy_curves.values():
+					total_curve = curve.copy() if total_curve is None else np.maximum(total_curve, curve)
+				if total_curve is not None:
+					speed_energy_total_curve = total_curve.astype(np.float32)
+					self.last_energy_debug['speed_energy_total'] = total_curve.astype(np.float32).tolist()
+					self.last_energy_debug['speed_energy_max'] = float(np.max(total_curve))
+					self.last_energy_debug['speed_energy_argmax'] = int(np.argmax(total_curve))
+					if speed_energy_samples is not None and speed_energy_samples.size == total_curve.size:
+						samples_np = speed_energy_samples.astype(np.float32)
+						global_min_idx = int(np.argmin(total_curve))
+						self.last_energy_debug['speed_energy_global_min_index'] = global_min_idx
+						self.last_energy_debug['speed_energy_global_min_speed'] = float(samples_np[global_min_idx])
+						self.last_energy_debug['speed_energy_global_min_value'] = float(total_curve[global_min_idx])
+
+						local_min_indices = []
+						for idx in range(total_curve.size):
+							left_ok = idx == 0 or total_curve[idx] <= total_curve[idx - 1]
+							right_ok = idx == total_curve.size - 1 or total_curve[idx] <= total_curve[idx + 1]
+							if left_ok and right_ok:
+								local_min_indices.append(idx)
+						self.last_energy_debug['speed_energy_local_min_indices'] = [int(i) for i in local_min_indices]
+						self.last_energy_debug['speed_energy_local_min_speeds'] = [float(samples_np[i]) for i in local_min_indices]
+						self.last_energy_debug['speed_energy_local_min_values'] = [float(total_curve[i]) for i in local_min_indices]
+
+						if len(local_min_indices) > 0:
+							center_speed_value = None
+							if speed_energy_query_center is not None and speed_energy_query_center.size > 0:
+								center_speed_value = float(speed_energy_query_center[0])
+							if center_speed_value is None:
+								center_speed_value = float(samples_np[global_min_idx])
+							local_choice_idx = min(
+								local_min_indices,
+								key=lambda i: (abs(float(samples_np[i]) - center_speed_value), float(total_curve[i]))
+							)
+						else:
+							local_choice_idx = global_min_idx
+						self.last_energy_debug['speed_energy_local_choice_index'] = int(local_choice_idx)
+						self.last_energy_debug['speed_energy_local_choice_speed'] = float(samples_np[local_choice_idx])
+						self.last_energy_debug['speed_energy_local_choice_value'] = float(total_curve[local_choice_idx])
+			speed_energy_ref_curves = {}
+			for speed_energy_key in ['chase', 'meet', 'pedestrian']:
+				speed_energy_value = dp_pred_traj.get(f'speed_energy_ref_{speed_energy_key}')
+				if speed_energy_value is None:
+					continue
+				speed_energy_array = np.asarray(speed_energy_value).reshape(-1)
+				if speed_energy_array.size > 0:
+					speed_energy_ref_curves[speed_energy_key] = speed_energy_array.astype(np.float32)
+					self.last_energy_debug[f'speed_energy_ref_{speed_energy_key}'] = speed_energy_array.astype(np.float32).tolist()
+			if len(speed_energy_ref_curves) > 0:
+				total_curve = None
+				for curve in speed_energy_ref_curves.values():
+					total_curve = curve.copy() if total_curve is None else np.maximum(total_curve, curve)
+				if total_curve is not None:
+					self.last_energy_debug['speed_energy_ref_total'] = total_curve.astype(np.float32).tolist()
+			elif (
+				speed_energy_ref_speeds is not None
+				and speed_energy_ref_speeds.size > 0
+				and speed_energy_samples is not None
+				and speed_energy_samples.size > 0
+				and speed_energy_total_curve is not None
+				and speed_energy_samples.size == speed_energy_total_curve.size
+			):
+				samples_np = speed_energy_samples.astype(np.float32)
+				for speed_energy_key, curve in speed_energy_curves.items():
+					ref_lookup = []
+					for ref_speed in speed_energy_ref_speeds.astype(np.float32):
+						if not np.isfinite(ref_speed):
+							ref_lookup.append(np.nan)
+							continue
+						ref_idx = int(np.argmin(np.abs(samples_np - float(ref_speed))))
+						ref_lookup.append(float(curve[ref_idx]))
+					self.last_energy_debug[f'speed_energy_ref_{speed_energy_key}'] = ref_lookup
+				ref_total_lookup = []
+				for ref_speed in speed_energy_ref_speeds.astype(np.float32):
+					if not np.isfinite(ref_speed):
+						ref_total_lookup.append(np.nan)
+						continue
+					ref_idx = int(np.argmin(np.abs(samples_np - float(ref_speed))))
+					ref_total_lookup.append(float(speed_energy_total_curve[ref_idx]))
+				self.last_energy_debug['speed_energy_ref_total'] = ref_total_lookup
 			front_route_risk_score = self._compute_front_route_risk_debug(
 				dp_pred_traj=dp_pred_traj,
 				transfuser_bev_feature=transfuser_bev_feature,
@@ -2595,6 +2885,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.last_energy_debug['front_route_risk_score'] = front_route_risk_score
 				self.last_energy_debug['front_route_risk_sigmoid'] = front_route_risk_sigmoid
 				self.last_energy_debug['front_route_risk_ema'] = float(self.front_route_risk_ema)
+			target_speed_profile = dp_pred_traj.get('target_speed_profile')
+			if target_speed_profile is not None:
+				target_speed_profile = np.asarray(target_speed_profile).reshape(-1)
+				if target_speed_profile.size > 0:
+					target_speed_profile_list = target_speed_profile.astype(np.float32).tolist()
 			
 			# route_pred is 20 waypoints with equal intervals for lateral control
 			route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
@@ -2621,6 +2916,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				gt_velocity,
 			)
 			self.last_front_route_risk_cap_debug = front_route_risk_cap_debug
+			stage1_energy_cap_debug = self._get_stage1_energy_speed_cap(
+				tick_data,
+				gt_velocity,
+			)
+			self.last_stage1_energy_cap_debug = stage1_energy_cap_debug
 
 			# Use target_point to truncate route for lateral control
 			steer, throttle, brake = self.control_pid(
@@ -2630,7 +2930,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				target_point=target_point,
 				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
 				front_route_risk_cap_ms=front_route_risk_cap_debug.get('speed_cap_ms'),
+				stage1_energy_cap_ms=stage1_energy_cap_debug.get('speed_cap_ms'),
 			)
+			if target_speed_profile_list is not None:
+				self.last_speed_debug['target_speed_profile'] = target_speed_profile_list
 			throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
 				ego_speed=gt_velocity,
 				desired_speed_capped=self.last_speed_debug.get('desired_speed_capped'),
@@ -2695,6 +2998,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'front_route_risk_effective_high_sigmoid_threshold': front_route_risk_cap_debug.get('effective_high_sigmoid_threshold'),
 				'front_route_risk_effective_high_ema_threshold': front_route_risk_cap_debug.get('effective_high_ema_threshold'),
 				'front_route_risk_cap_hold_frames_remaining': int(front_route_risk_cap_debug.get('hold_frames_remaining', 0)),
+				'stage1_energy_speed_cap_active': bool(stage1_energy_cap_debug.get('active', False)),
+				'stage1_energy_speed_cap_reason': stage1_energy_cap_debug.get('reason'),
+				'stage1_energy_speed_cap_ms': stage1_energy_cap_debug.get('speed_cap_ms'),
+				'stage1_energy_speed_cap_applied': bool(self.last_speed_debug.get('stage1_energy_cap_applied', False)),
+				'stage1_energy_current_score': stage1_energy_cap_debug.get('current_score'),
+				'stage1_energy_local_peak_score': stage1_energy_cap_debug.get('local_peak_score'),
+				'stage1_energy_current_index': stage1_energy_cap_debug.get('current_index'),
+				'stage1_energy_query_center_ms': stage1_energy_cap_debug.get('query_center_ms'),
+				'stage1_energy_safe_threshold': stage1_energy_cap_debug.get('safe_threshold'),
+				'stage1_energy_cap_hold_frames_remaining': int(stage1_energy_cap_debug.get('hold_frames_remaining', 0)),
 				'stuck_detector': int(self.stuck_detector),
 				'force_move': int(self.force_move),
 				'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
@@ -2799,11 +3112,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.pid_metadata['model_dp_traj_first'] = self.last_dp_pred_traj[0].tolist()
 				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
 			for energy_key, energy_value in self.last_energy_debug.items():
-				self.pid_metadata[energy_key] = float(energy_value)
+				self.pid_metadata[energy_key] = self._jsonify_debug_value(energy_value)
 			for input_key, input_value in self.last_model_input_debug.items():
-				self.pid_metadata[input_key] = input_value
+				self.pid_metadata[input_key] = self._jsonify_debug_value(input_value)
 			for speed_key, speed_value in self.last_speed_debug.items():
-				self.pid_metadata[speed_key] = speed_value
+				self.pid_metadata[speed_key] = self._jsonify_debug_value(speed_value)
 			self.prev_debug_planner_xy = planner_xy.copy()
 			self.prev_debug_filtered_xy = filtered_xy.copy()
 			self.prev_debug_raw_xy = raw_xy.copy()
@@ -2985,19 +3298,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cv2.rectangle(overlay, (20, panel_top), (780, 580), (20, 20, 20), -1)
 		right = cv2.addWeighted(overlay, 0.45, right, 0.55, 0.0)
 
-		speed_kmh = float(self.pid_metadata.get('speed', 0.0)) * 3.6
+		speed_mps = float(self.pid_metadata.get('speed', 0.0))
 		command_value = self.pid_metadata.get('command_value', 'N/A')
 		command_text = self.pid_metadata.get('command_text', 'unknown')
 
 		left_status_lines = [
 			f"frm: {self.step}",
-			f"v: {speed_kmh:.2f} km/h",
+			f"v_act: {speed_mps:.2f} m/s",
 			f"src: {self.pid_metadata.get('speed_source', 'N/A')}",
 			f"fus: {self.pid_metadata.get('fusion_regime', 'N/A')}",
-			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
-			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
-			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')}",
-			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')}",
+			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')} m/s",
+			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')} m/s",
+			f"Ecap: {int(bool(self.pid_metadata.get('stage1_energy_speed_cap_active', False)))}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')} m/s",
+			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')} m/s",
+			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')} m/s",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
 			f"thr/brk: {float(self.pid_metadata.get('throttle', 0.0)):.3f} / {float(self.pid_metadata.get('brake', 0.0)):.3f}",
 		]
@@ -3022,22 +3336,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 
 		right_status_lines = [
-			f"v_h/1s/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.2f')}",
-			f"frisk r/s/e: {self._format_debug_value(self.pid_metadata.get('front_route_risk_score'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_sigmoid'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_ema'), '.3f')}",
-			f"fr thr m/h/e: {self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_med_sigmoid_threshold'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_high_sigmoid_threshold'), '.3f')}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_effective_high_ema_threshold'), '.3f')}",
-			f"fr cap/a/rmx: {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')}/{int(bool(self.pid_metadata.get('front_route_risk_speed_cap_applied', False)))}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_recent_max_sigmoid'), '.3f')}",
-			f"fr gate/g/h: {int(bool(self.pid_metadata.get('front_route_risk_gate_active', False)))}/{int(bool(self.pid_metadata.get('front_route_risk_geometry_active', False)))}/{int(self.pid_metadata.get('front_route_risk_cap_hold_frames_remaining', 0))}",
-			f"fr sbias: {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_bias_ratio'), '.2f')}",
-			f"raw nz/mx: {self._format_debug_value(self.pid_metadata.get('lidar_bev_raw_nonzero_ratio'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('lidar_bev_raw_max'), '.2f')}",
-			f"det nz/mx: {self._format_debug_value(self.pid_metadata.get('lidar_bev_detail_nonzero_ratio'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('lidar_bev_detail_max'), '.2f')}",
-			f"det_in: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('use_front_route_risk_energy', False)))} fb:{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
+			f"qE ctr: {self._format_debug_value(self.pid_metadata.get('speed_energy_query_center'), '.1f')} m/s",
+			f"Et c/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.2f')}",
+			f"pred h/1/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')} m/s",
+			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=5)}",
+			f"v@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_speeds'), fmt='.1f', max_items=3)} m/s",
+			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.2f', max_items=3)}",
+			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.2f', max_items=5)}",
+			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.2f', max_items=5)}",
+			f"Em: {self._format_debug_curve(self.pid_metadata.get('speed_energy_meet'), fmt='.2f', max_items=5)}",
+			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.2f', max_items=5)}",
+			f"E*: {self._format_debug_value(self.pid_metadata.get('speed_energy_max'), '.2f')}@{self.pid_metadata.get('speed_energy_argmax', 'NA')}",
+			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
-		line_gap = 21
-		font_scale = 0.49
+		line_gap = 20
+		font_scale = 0.43
 		col1_x = 35
-		col2_x = 290
-		col3_x = 545
+		col2_x = 275
+		col3_x = 485
 		start_y = panel_top + 28
 
 		for idx, line in enumerate(left_status_lines):
@@ -3059,21 +3376,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			cv2.putText(
 				right, line, (col3_x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
 				(255, 255, 255), 1, cv2.LINE_AA
-			)
-
-		risk_cap_active = bool(self.pid_metadata.get('front_route_risk_speed_cap_active', False))
-		risk_cap_applied = bool(self.pid_metadata.get('front_route_risk_speed_cap_applied', False))
-		if risk_cap_active:
-			banner_color = (0, 140, 255) if risk_cap_applied else (90, 90, 90)
-			banner_text = (
-				f"RISK CAP APPLIED {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')} m/s"
-				if risk_cap_applied else
-				f"RISK CAP ACTIVE {self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.2f')} m/s"
-			)
-			cv2.rectangle(right, (24, 238), (476, 268), banner_color, -1)
-			cv2.putText(
-				right, banner_text, (36, 259), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
-				(255, 255, 255), 2, cv2.LINE_AA
 			)
 
 		legend_items = [
