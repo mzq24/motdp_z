@@ -30,7 +30,7 @@ DPAUTO_BIN=/home/users/ntu/m240117/miniconda3/envs/dpauto/bin
 DATE=${DATE:-0407_epoch145_nscc}
 PLANNER_TYPE=${PLANNER_TYPE:-epoch145_stage1}
 ALGO=${ALGO:-route_b}
-SAVE_PATH=${SAVE_PATH:-${B2D_ROOT}/${ALGO}_b2d_${DATE}}
+SAVE_PATH=${SAVE_PATH:-${B2D_ROOT}/eval_M_${ALGO}_${DATE}}
 FULL_ROUTES_XML=${FULL_ROUTES_XML:-${B2D_ROOT}/leaderboard/data/bench2drive220.xml}
 ROUTES_SUBSET_LIST=${ROUTES_SUBSET_LIST:-17569 17563}
 
