@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODE_DIR="${CODE_DIR:-/workspace1/z_project/code/motdp_z-stage1-test}"
+B2D_ROOT="${B2D_ROOT:-/workspace1/z_project/code/Bench2Drive}"
+CARLA_ROOT="${CARLA_ROOT:-/workspace1/z_project/carla}"
+CONDA_SH="${CONDA_SH:-/workspace1/miniconda/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-z_dpauto}"
+
+TEAM_AGENT="${TEAM_AGENT:-${CODE_DIR}/team_code/route_b_b2d_agent.py}"
+TEAM_CONFIG="${TEAM_CONFIG:-${CODE_DIR}/config/tmp/pdm_hpc_route_b_lidar_bev_stage1_fulltrain_val.yaml}"
+CHECKPOINT_PATH_OVERRIDE="${CHECKPOINT_PATH_OVERRIDE:-}"
+
+BASE_PORT="${BASE_PORT:-30000}"
+BASE_TM_PORT="${BASE_TM_PORT:-50000}"
+IS_BENCH2DRIVE=True
+BASE_ROUTES="${BASE_ROUTES:-${B2D_ROOT}/leaderboard/data/bench2drive220}"
+FULL_ROUTES_XML="${FULL_ROUTES_XML:-${BASE_ROUTES}.xml}"
+PLANNER_TYPE="${PLANNER_TYPE:-stage1_best}"
+ALGO="${ALGO:-route_b}"
+DATE="${DATE:-$(date +%m%d)_stage1_best_raw}"
+SAVE_PATH="${SAVE_PATH:-${B2D_ROOT}/eval_M_${ALGO}_${DATE}}"
+RESULT_DIR="${RESULT_DIR:-${B2D_ROOT}/${ALGO}_b2d_${DATE}}"
+LOG_DIR="${LOG_DIR:-${B2D_ROOT}/leaderboard/data}"
+
+TARGET_POSE_SOURCE="${TARGET_POSE_SOURCE:-filtered}"
+LOCALIZER_STRATEGY="${LOCALIZER_STRATEGY:-complementary}"
+LOCALIZER_ALPHA="${LOCALIZER_ALPHA:-0.5}"
+LIDAR_POSE_SOURCE="${LIDAR_POSE_SOURCE:-ukf}"
+STEER_SIGN_SCALE="${STEER_SIGN_SCALE:-1}"
+TARGET_YAW_SIGN="${TARGET_YAW_SIGN:-1}"
+TARGET_GEOM_YAW_SIGN="${TARGET_GEOM_YAW_SIGN:-1}"
+SOFT_SPEED_LIMIT_MS="${SOFT_SPEED_LIMIT_MS:-0}"
+HARD_SPEED_LIMIT_MS="${HARD_SPEED_LIMIT_MS:-0}"
+NUM_INFERENCE_STEPS_OVERRIDE="${NUM_INFERENCE_STEPS_OVERRIDE:-}"
+SPEED_SOURCE="${SPEED_SOURCE:-speed_head}"
+STAGE1_ENERGY_SPEED_CAP_ENABLE="${STAGE1_ENERGY_SPEED_CAP_ENABLE:-0}"
+STAGE1_ENERGY_SPEED_CONTROL_MODE="${STAGE1_ENERGY_SPEED_CONTROL_MODE:-cap}"
+STAGE1_ENERGY_GRADIENT_GAIN="${STAGE1_ENERGY_GRADIENT_GAIN:-2.0}"
+STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS="${STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS:-1.5}"
+STAGE1_ENERGY_GRADIENT_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_MIN_SCORE:-0.15}"
+STAGE1_ENERGY_GRADIENT_SLOPE_EPS="${STAGE1_ENERGY_GRADIENT_SLOPE_EPS:-0.03}"
+STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT="${STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT:-0.10}"
+STAGE1_ENERGY_GRADIENT_MEET_WEIGHT="${STAGE1_ENERGY_GRADIENT_MEET_WEIGHT:-1.00}"
+STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT="${STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT:-2.00}"
+STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE:-0.25}"
+STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE:-0.15}"
+STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE:-0.08}"
+STUCK_HELPER_TARGET_INSERT_ENABLE="${STUCK_HELPER_TARGET_INSERT_ENABLE:-1}"
+STUCK_HELPER_TARGET_1_FORWARD_M="${STUCK_HELPER_TARGET_1_FORWARD_M:-1.63}"
+STUCK_HELPER_TARGET_2_FORWARD_M="${STUCK_HELPER_TARGET_2_FORWARD_M:-2.63}"
+STUCK_HELPER_TARGET_LATERAL_M="${STUCK_HELPER_TARGET_LATERAL_M:--3.145}"
+SAVE_TRANSFUSER_BEV_DEBUG="${SAVE_TRANSFUSER_BEV_DEBUG:-0}"
+ROUTES_SUBSET_LIST="${ROUTES_SUBSET_LIST:-}"
+DRY_RUN="${DRY_RUN:-0}"
+
+GPU_RANK_LIST=(${GPU_RANK_LIST:-0})
+TASK_LIST=()
+if [[ -n "${TASK_LIST:-}" ]]; then
+  TASK_LIST=(${TASK_LIST})
+else
+  for ((i=0; i<${#GPU_RANK_LIST[@]}; i++)); do
+    TASK_LIST+=("${i}")
+  done
+fi
+
+ROUTES_SUBSET_ARR=()
+if [[ -n "${ROUTES_SUBSET_LIST}" ]]; then
+  read -r -a ROUTES_SUBSET_ARR <<< "${ROUTES_SUBSET_LIST}"
+fi
+
+if [[ ! -f "${CONDA_SH}" ]]; then
+  echo "[ERROR] conda init script not found: ${CONDA_SH}"
+  exit 1
+fi
+if [[ ! -d "${CODE_DIR}" ]]; then
+  echo "[ERROR] CODE_DIR not found: ${CODE_DIR}"
+  exit 1
+fi
+if [[ ! -d "${B2D_ROOT}" ]]; then
+  echo "[ERROR] B2D_ROOT not found: ${B2D_ROOT}"
+  exit 1
+fi
+if [[ ! -d "${CARLA_ROOT}" ]]; then
+  echo "[ERROR] CARLA_ROOT not found: ${CARLA_ROOT}"
+  exit 1
+fi
+if [[ ! -f "${TEAM_AGENT}" ]]; then
+  echo "[ERROR] TEAM_AGENT not found: ${TEAM_AGENT}"
+  exit 1
+fi
+if [[ ! -f "${TEAM_CONFIG}" ]]; then
+  echo "[ERROR] TEAM_CONFIG not found: ${TEAM_CONFIG}"
+  exit 1
+fi
+if [[ ${#GPU_RANK_LIST[@]} -ne ${#TASK_LIST[@]} ]]; then
+  echo "[ERROR] GPU_RANK_LIST and TASK_LIST must have the same length"
+  exit 1
+fi
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+
+cd "${B2D_ROOT}"
+
+export CARLA_ROOT
+export PYTHONPATH="${B2D_ROOT}/leaderboard:${B2D_ROOT}/scenario_runner:${CARLA_ROOT}/PythonAPI:${CARLA_ROOT}/PythonAPI/carla:${CODE_DIR}:${PYTHONPATH:-}"
+
+mkdir -p "${SAVE_PATH}" "${RESULT_DIR}" "${LOG_DIR}"
+
+if [[ ${#ROUTES_SUBSET_ARR[@]} -eq 0 ]]; then
+  SPLIT_FLAG="${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_${#GPU_RANK_LIST[@]}tasks_split_done.flag"
+  if [[ ! -f "${SPLIT_FLAG}" ]]; then
+    echo "[INFO] Splitting routes into ${#GPU_RANK_LIST[@]} tasks..."
+    python tools/split_xml.py "${BASE_ROUTES}" "${#GPU_RANK_LIST[@]}" "${ALGO}" "${PLANNER_TYPE}"
+    touch "${SPLIT_FLAG}"
+  fi
+fi
+
+echo "========================================"
+echo "  Route B stage1 close-loop on new_hpc"
+echo "  CODE_DIR:       ${CODE_DIR}"
+echo "  B2D_ROOT:       ${B2D_ROOT}"
+echo "  CARLA_ROOT:     ${CARLA_ROOT}"
+echo "  TEAM_AGENT:     ${TEAM_AGENT}"
+echo "  TEAM_CONFIG:    ${TEAM_CONFIG}"
+echo "  RESULT_DIR:     ${RESULT_DIR}"
+echo "  SAVE_PATH:      ${SAVE_PATH}"
+echo "  PLANNER_TYPE:   ${PLANNER_TYPE}"
+echo "  SPEED_SOURCE:   ${SPEED_SOURCE}"
+echo "  SOFT CAP:       ${SOFT_SPEED_LIMIT_MS}"
+echo "  HARD CAP:       ${HARD_SPEED_LIMIT_MS}"
+echo "  STAGE1 CAP:     ${STAGE1_ENERGY_SPEED_CAP_ENABLE}"
+echo "  STAGE1 MODE:    ${STAGE1_ENERGY_SPEED_CONTROL_MODE}"
+echo "  INF STEPS:      ${NUM_INFERENCE_STEPS_OVERRIDE}"
+echo "  GPU_RANK_LIST:  ${GPU_RANK_LIST[*]}"
+echo "  TASK_LIST:      ${TASK_LIST[*]}"
+if [[ -n "${CHECKPOINT_PATH_OVERRIDE}" ]]; then
+  echo "  CKPT OVERRIDE:  ${CHECKPOINT_PATH_OVERRIDE}"
+fi
+if [[ ${#ROUTES_SUBSET_ARR[@]} -gt 0 ]]; then
+  echo "  ROUTE IDS:      ${ROUTES_SUBSET_ARR[*]}"
+fi
+echo "========================================"
+
+for ((i=0; i<${#GPU_RANK_LIST[@]}; i++)); do
+  PORT=$((BASE_PORT + i * 150))
+  TM_PORT=$((BASE_TM_PORT + i * 150))
+  GPU_RANK="${GPU_RANK_LIST[$i]}"
+  ROUTES_SUBSET=""
+
+  if [[ ${#ROUTES_SUBSET_ARR[@]} -gt 0 ]]; then
+    ROUTES="${FULL_ROUTES_XML}"
+    ROUTES_SUBSET="${ROUTES_SUBSET_ARR[$i]:-}"
+    ROUTE_TAG="${ROUTES_SUBSET:-task${TASK_LIST[$i]}}"
+  else
+    ROUTES="${BASE_ROUTES}_${TASK_LIST[$i]}_${ALGO}_${PLANNER_TYPE}.xml"
+    ROUTE_TAG="${TASK_LIST[$i]}"
+  fi
+
+  CHECKPOINT_ENDPOINT="${RESULT_DIR}/eval_${ROUTE_TAG}.json"
+  LOG_PATH="${LOG_DIR}/bench2drive220_${ROUTE_TAG}_${ALGO}_${PLANNER_TYPE}.log"
+
+  CMD=(
+    python leaderboard/leaderboard/leaderboard_evaluator.py
+    "--routes=${ROUTES}"
+    "--repetitions=1"
+    "--track=SENSORS"
+    "--checkpoint=${CHECKPOINT_ENDPOINT}"
+    "--agent=${TEAM_AGENT}"
+    "--agent-config=${TEAM_CONFIG}"
+    "--debug=0"
+    "--resume=True"
+    "--port=${PORT}"
+    "--traffic-manager-port=${TM_PORT}"
+    "--gpu-rank=${GPU_RANK}"
+  )
+
+  if [[ -n "${ROUTES_SUBSET}" ]]; then
+    CMD+=("--routes-subset=${ROUTES_SUBSET}")
+  fi
+
+  echo "[TASK ${i}] GPU=${GPU_RANK} PORT=${PORT} TM_PORT=${TM_PORT}"
+  echo "[TASK ${i}] ROUTES=${ROUTES}"
+  if [[ -n "${ROUTES_SUBSET}" ]]; then
+    echo "[TASK ${i}] ROUTES_SUBSET=${ROUTES_SUBSET}"
+  fi
+  echo "[TASK ${i}] CHECKPOINT_ENDPOINT=${CHECKPOINT_ENDPOINT}"
+  echo "[TASK ${i}] LOG=${LOG_PATH}"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '[TASK %s] DRY RUN CMD: ' "${i}"
+    printf '%q ' "${CMD[@]}"
+    printf '\n'
+    continue
+  fi
+
+  (
+    export SAVE_PATH="${SAVE_PATH}"
+    export IS_BENCH2DRIVE="${IS_BENCH2DRIVE}"
+    export PLANNER_TYPE="${PLANNER_TYPE}"
+    export TARGET_POSE_SOURCE="${TARGET_POSE_SOURCE}"
+    export LOCALIZER_STRATEGY="${LOCALIZER_STRATEGY}"
+    export LOCALIZER_ALPHA="${LOCALIZER_ALPHA}"
+    export LIDAR_POSE_SOURCE="${LIDAR_POSE_SOURCE}"
+    export STEER_SIGN_SCALE="${STEER_SIGN_SCALE}"
+    export TARGET_YAW_SIGN="${TARGET_YAW_SIGN}"
+    export TARGET_GEOM_YAW_SIGN="${TARGET_GEOM_YAW_SIGN}"
+    export SOFT_SPEED_LIMIT_MS="${SOFT_SPEED_LIMIT_MS}"
+    export HARD_SPEED_LIMIT_MS="${HARD_SPEED_LIMIT_MS}"
+    export NUM_INFERENCE_STEPS_OVERRIDE="${NUM_INFERENCE_STEPS_OVERRIDE}"
+    export SPEED_SOURCE="${SPEED_SOURCE}"
+    export STAGE1_ENERGY_SPEED_CAP_ENABLE="${STAGE1_ENERGY_SPEED_CAP_ENABLE}"
+    export STAGE1_ENERGY_SPEED_CONTROL_MODE="${STAGE1_ENERGY_SPEED_CONTROL_MODE}"
+    export STAGE1_ENERGY_GRADIENT_GAIN="${STAGE1_ENERGY_GRADIENT_GAIN}"
+    export STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS="${STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS}"
+    export STAGE1_ENERGY_GRADIENT_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_MIN_SCORE}"
+    export STAGE1_ENERGY_GRADIENT_SLOPE_EPS="${STAGE1_ENERGY_GRADIENT_SLOPE_EPS}"
+    export STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT="${STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT}"
+    export STAGE1_ENERGY_GRADIENT_MEET_WEIGHT="${STAGE1_ENERGY_GRADIENT_MEET_WEIGHT}"
+    export STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT="${STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT}"
+    export STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE}"
+    export STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE}"
+    export STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE}"
+    export STUCK_HELPER_TARGET_INSERT_ENABLE="${STUCK_HELPER_TARGET_INSERT_ENABLE}"
+    export STUCK_HELPER_TARGET_1_FORWARD_M="${STUCK_HELPER_TARGET_1_FORWARD_M}"
+    export STUCK_HELPER_TARGET_2_FORWARD_M="${STUCK_HELPER_TARGET_2_FORWARD_M}"
+    export STUCK_HELPER_TARGET_LATERAL_M="${STUCK_HELPER_TARGET_LATERAL_M}"
+    export SAVE_TRANSFUSER_BEV_DEBUG="${SAVE_TRANSFUSER_BEV_DEBUG}"
+    export CHECKPOINT_PATH_OVERRIDE="${CHECKPOINT_PATH_OVERRIDE}"
+    CUDA_VISIBLE_DEVICES="${GPU_RANK}" "${CMD[@]}"
+  ) > "${LOG_PATH}" 2>&1 &
+
+  sleep 10
+done
+
+if [[ "${DRY_RUN}" != "1" ]]; then
+  wait
+fi

@@ -1,0 +1,198 @@
+policy_type: anchor_free
+anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
+abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/abs_stats.npz
+route_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/route_abs_stats.npz
+
+device:
+  gpu_ids:
+  - 0
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  persistent_workers: false
+  pin_memory: false
+  prefetch_factor: 2
+  train_num_workers: 4
+  val_num_workers: 1
+  train_persistent_workers: false
+  val_persistent_workers: false
+  train_prefetch_factor: 2
+  val_prefetch_factor: 1
+  val_batch_size: 32
+  shuffle: true
+
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+  update_interval: 10
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 5.0e-05
+  resume_override_lr: 4e-07
+  weight_decay: 1.0e-04
+
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+
+enable_action_normalization: true
+
+bev_encoder:
+  state_dim: 14
+
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  n_obs_steps: 4
+  cond_dim: 256
+  obs_as_global_cond: true
+  n_layer: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 6
+  action_horizon: 6
+  traj_can_attend_route: true
+  use_condition_group_dropout: true
+
+route_b:
+  num_samples: 1
+  num_energy_modes: 32
+  num_inference_steps: 10
+  use_split_forward: true
+  use_lidar_bev_detail: true
+  lidar_history_frames: 4
+  train_energy: true
+  use_stage1_speed_energy: true
+  use_front_route_risk_energy: false
+  use_speed_profile_head: true
+  guidance_scale: 0.0
+  energy_loss_weight: 1.0
+  speed_loss_weight: 0.2
+  speed_profile_loss_weight: 0.1
+  speed_profile_dt: 0.5
+  stage1_query_dt: 1.0
+  stage1_query_brake_mps2: 6.0
+  stage1_query_accel_mps2: 2.5
+  energy_chase_weight: 1.0
+  energy_meet_weight: 1.0
+  energy_ped_weight: 1.0
+  train_max_timesteps: 1000
+  alignment_loss_weight: 0.0
+  num_gt_augmentations: 0
+  use_safe_anchors: false
+  energy_noisy_training: false
+  alignment_warmup_epochs: 50
+  energy_grad_clip_norm: 1.0
+  train_stage1_speed_energy_until_epoch: 70
+  train_stage1_speed_energy_after_update_every: 50
+  train_speed_head_until_epoch: 70
+  train_speed_head_after_update_every: 50
+
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 1000
+  train_trunc_timesteps: 1000
+  num_diffusion_steps: 10
+  eta: 0.0
+  prediction_type: "sample"
+  route_loss_weight: 4.0
+
+num_modes: 32
+cls_loss_weight: 0.0
+reg_loss_weight: 4.0
+
+dataset:
+  use_per_frame: false
+  feature_suffix: ensemble
+  cache_dir: null
+  train_filter_bad_routes: false
+  val_filter_bad_routes: true
+  train_retain_bad_routes_for_energy: true
+  val_retain_bad_routes_for_energy: false
+
+training:
+  num_epochs: 150
+  max_grad_norm: 1.0
+  warmup_epochs: 10
+  use_lr_scheduler: true
+  scheduler_total_epochs: 100
+  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data
+  image_data_root: /workspace1/z_project/dataset/pdm_lite
+  sample_interval: 1
+  lr_final: 1e-8
+  validation_freq: 5
+  save_freq: 5
+  max_keep_ckpts: 20
+  early_stopping_patience: 15
+  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_next05_fulltrain_val
+  checkpoint_path: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_next05_fulltrain_val/dit_policy_best.pt
+
+validation:
+  enabled: true
+  use_memmap: true
+  preload_to_ram: false
+  subset_size: 0
+  max_batches: 0
+
+logging:
+  use_wandb: false
+  wandb_project: route_b_lidar_bev
+  run_name: route_b_lidar_bev_stage1_next05_fulltrain_val_b2d_eval
+  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_next05_fulltrain_val
+  checkpoint_path: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_next05_fulltrain_val/dit_policy_best.pt
+  save_every: 5
+  log_freq: 50
+
+augmentation:
+  gps_noise:
+    enabled: true
+    sigma: 0.15
+    probability: 1
+    apply_to_route: false
+
+model_optimization:
+  use_mixed_precision: true

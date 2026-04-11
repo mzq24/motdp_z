@@ -102,6 +102,7 @@ if USE_MOT:
         parse_decision_sequence, split_prompt
     )
 from team_code.lidar_utils import lidar_to_ego_coordinate, algin_lidar
+from team_code.ego_localizer import EgoLocalizer
 from team_code.ukf_utils import (
     bicycle_model_forward, measurement_function_hx,
     state_mean, measurement_mean,
@@ -120,6 +121,9 @@ PLANNER_TYPE = os.environ.get('PLANNER_TYPE', None)
 EARTH_RADIUS_EQUA = 6378137.0
 USE_UKF = True  # Enable Unscented Kalman Filter for GPS/compass smoothing
 TARGET_POSE_SOURCE = os.environ.get('TARGET_POSE_SOURCE', 'filtered').lower()
+LOCALIZER_STRATEGY = os.environ.get('LOCALIZER_STRATEGY', 'complementary').lower()
+LOCALIZER_ALPHA = float(os.environ.get('LOCALIZER_ALPHA', '0.5'))
+LIDAR_POSE_SOURCE = os.environ.get('LIDAR_POSE_SOURCE', 'ukf').lower()
 STEER_SIGN_SCALE = float(os.environ.get('STEER_SIGN_SCALE', '1.0'))
 TARGET_YAW_SIGN = float(os.environ.get('TARGET_YAW_SIGN', '1.0'))
 TARGET_GEOM_YAW_SIGN = float(os.environ.get('TARGET_GEOM_YAW_SIGN', '1.0'))
@@ -131,6 +135,12 @@ TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTA
 TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
 TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
 SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'traj_05s', 'fuse', 'fuse_traj', 'fuse3_median', 'fuse3_adaptive'
+STUCK_HELPER_TARGET_INSERT_ENABLE = os.environ.get('STUCK_HELPER_TARGET_INSERT_ENABLE', '1').lower() in (
+    '1', 'true', 'yes', 'on'
+)
+STUCK_HELPER_TARGET_1_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_1_FORWARD_M', '1.63'))
+STUCK_HELPER_TARGET_2_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_2_FORWARD_M', '2.63'))
+STUCK_HELPER_TARGET_LATERAL_M = float(os.environ.get('STUCK_HELPER_TARGET_LATERAL_M', '-3.145'))
 SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
     '1', 'true', 'yes', 'on'
 )
@@ -157,6 +167,33 @@ FRONT_ROUTE_RISK_HIGH_SIGMOID_MIN = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_
 FRONT_ROUTE_RISK_HIGH_EMA_MIN = float(os.environ.get('FRONT_ROUTE_RISK_HIGH_EMA_MIN', '0.80'))
 FRONT_ROUTE_RISK_RAW_OVERRIDE_SPEED_MS = float(os.environ.get('FRONT_ROUTE_RISK_RAW_OVERRIDE_SPEED_MS', '8.0'))
 FRONT_ROUTE_RISK_RAW_OVERRIDE_SCORE = float(os.environ.get('FRONT_ROUTE_RISK_RAW_OVERRIDE_SCORE', '1.6'))
+STAGE1_ENERGY_SPEED_CAP_ENABLE = os.environ.get('STAGE1_ENERGY_SPEED_CAP_ENABLE', '0').lower() in (
+	'1', 'true', 'yes', 'on'
+)
+STAGE1_ENERGY_SPEED_CONTROL_MODE = os.environ.get('STAGE1_ENERGY_SPEED_CONTROL_MODE', 'cap').strip().lower()
+STAGE1_ENERGY_CAP_HOLD_FRAMES = max(0, int(os.environ.get('STAGE1_ENERGY_CAP_HOLD_FRAMES', '6')))
+STAGE1_ENERGY_CAP_MIN_SPEED_MS = float(os.environ.get('STAGE1_ENERGY_CAP_MIN_SPEED_MS', '1.0'))
+STAGE1_ENERGY_CAP_LOOKAHEAD_BINS = max(0, int(os.environ.get('STAGE1_ENERGY_CAP_LOOKAHEAD_BINS', '2')))
+STAGE1_ENERGY_CAP_CUR_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_CUR_WARN', '0.20'))
+STAGE1_ENERGY_CAP_CUR_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_CUR_HIGH', '0.40'))
+STAGE1_ENERGY_CAP_PEAK_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_PEAK_WARN', '0.35'))
+STAGE1_ENERGY_CAP_PEAK_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_PEAK_HIGH', '0.55'))
+STAGE1_ENERGY_CAP_SAFE_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_SAFE_WARN', '0.15'))
+STAGE1_ENERGY_CAP_SAFE_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_SAFE_HIGH', '0.08'))
+STAGE1_ENERGY_CAP_TARGET_WARN = float(os.environ.get('STAGE1_ENERGY_CAP_TARGET_WARN', '0.35'))
+STAGE1_ENERGY_CAP_TARGET_HIGH = float(os.environ.get('STAGE1_ENERGY_CAP_TARGET_HIGH', '0.55'))
+STAGE1_ENERGY_CAP_TREND_MARGIN = float(os.environ.get('STAGE1_ENERGY_CAP_TREND_MARGIN', '0.05'))
+STAGE1_ENERGY_CAP_SPEED_EPS = float(os.environ.get('STAGE1_ENERGY_CAP_SPEED_EPS', '0.20'))
+STAGE1_ENERGY_GRADIENT_GAIN = float(os.environ.get('STAGE1_ENERGY_GRADIENT_GAIN', '2.0'))
+STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS = float(os.environ.get('STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS', '1.5'))
+STAGE1_ENERGY_GRADIENT_MIN_SCORE = float(os.environ.get('STAGE1_ENERGY_GRADIENT_MIN_SCORE', '0.15'))
+STAGE1_ENERGY_GRADIENT_SLOPE_EPS = float(os.environ.get('STAGE1_ENERGY_GRADIENT_SLOPE_EPS', '0.03'))
+STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT = float(os.environ.get('STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT', '0.10'))
+STAGE1_ENERGY_GRADIENT_MEET_WEIGHT = float(os.environ.get('STAGE1_ENERGY_GRADIENT_MEET_WEIGHT', '1.00'))
+STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT = float(os.environ.get('STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT', '2.00'))
+STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE = float(os.environ.get('STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE', '0.25'))
+STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE = float(os.environ.get('STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE', '0.15'))
+STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE = float(os.environ.get('STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE', '0.08'))
 
 ROAD_OPTION_TEXT = {
 	1: 'left',
@@ -259,6 +296,23 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if not np.isfinite(value_float):
 			return "NA"
 		return format(value_float, fmt)
+
+	def _format_energy_peak_with_speed(self):
+		peak_value = self.pid_metadata.get('speed_energy_max')
+		peak_idx = self.pid_metadata.get('speed_energy_argmax')
+		samples = self.pid_metadata.get('speed_energy_samples')
+		peak_str = self._format_debug_value(peak_value, '.1f')
+		try:
+			peak_idx_int = int(peak_idx)
+		except (TypeError, ValueError):
+			peak_idx_int = None
+
+		if isinstance(samples, (list, tuple)) and peak_idx_int is not None and 0 <= peak_idx_int < len(samples):
+			speed_str = self._format_debug_value(samples[peak_idx_int], '.1f')
+			return f"{peak_str}@{speed_str}m/s"
+		if peak_idx_int is not None:
+			return f"{peak_str}@idx{peak_idx_int}"
+		return peak_str
 
 	def _build_transfuser_bev_semantic_decoder(self, model_path, device):
 		decoder = torch.nn.Sequential(
@@ -714,6 +768,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_apply_stop': False,
 				'stop_sign_pixels': 0,
 				'stop_sign_closest_forward_m': None,
+				'stuck_helper_active': bool(self.stuck_helper > 0 and STUCK_HELPER_TARGET_INSERT_ENABLE),
+				'stuck_helper_frames_remaining': int(self.stuck_helper),
 				'force_move_blocked_reason': None,
 				'planner_wants_stop': False,
 			}
@@ -746,6 +802,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		force_move_blocked_reason = external_force_move_block_reason
 		if force_move_blocked_reason is not None:
 			self.force_move = 0
+			self.stuck_helper = 0
 		elif green_hold_active:
 			force_move_blocked_reason = 'traffic_light_green_hold'
 		elif traffic_light_debug['block_force_move']:
@@ -756,11 +813,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if ego_speed < 0.1:
 			if force_move_blocked_reason is None:
 				self.stuck_detector += 1
+				if self.stuck_detector > self.stuck_helper_threshold:
+					self.stuck_helper = max(self.stuck_helper, self.creep_duration)
 			else:
 				self.stuck_detector = 0
 				self.force_move = 0
+				self.stuck_helper = 0
 		elif ego_speed >= 1.0:
 			self.stuck_detector = 0
+			self.stuck_helper = 0
 
 		if force_move_blocked_reason is None and self.stuck_detector > self.stuck_threshold:
 			self.force_move = self.creep_duration
@@ -775,12 +836,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			brake = 1.0
 			self.stuck_detector = 0
 			self.force_move = 0
+			self.stuck_helper = 0
 
 		if traffic_light_debug['apply_stop']:
 			throttle = 0.0
 			brake = 1.0
 			self.stuck_detector = 0
 			self.force_move = 0
+			self.stuck_helper = 0
 			if force_move_blocked_reason is None:
 				force_move_blocked_reason = f"traffic_light_{traffic_light_state}"
 
@@ -789,6 +852,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			brake = 1.0
 			self.stuck_detector = 0
 			self.force_move = 0
+			self.stuck_helper = 0
 			if force_move_blocked_reason is None:
 				force_move_blocked_reason = 'stop_sign'
 
@@ -812,6 +876,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'stop_sign_closest_forward_m': stop_sign_debug['closest_forward_m'],
 			'stop_sign_mean_lateral_m': stop_sign_debug['mean_lateral_m'],
 			'stop_sign_stopped_frames': int(stop_sign_debug['stopped_frames']),
+			'stuck_helper_active': bool(self.stuck_helper > 0 and STUCK_HELPER_TARGET_INSERT_ENABLE),
+			'stuck_helper_frames_remaining': int(self.stuck_helper),
 			'force_move_blocked_reason': force_move_blocked_reason,
 			'planner_wants_stop': bool(planner_wants_stop),
 		}
@@ -1018,6 +1084,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		return "dit_policy_best.pt"
 
 	def resolve_checkpoint_path(self):
+		checkpoint_path_override = os.environ.get('CHECKPOINT_PATH_OVERRIDE', '').strip()
+		if checkpoint_path_override:
+			return checkpoint_path_override
+
 		training_cfg = self.config.get('training', {})
 		logging_cfg = self.config.get('logging', {})
 		checkpoint_path = training_cfg.get('checkpoint_path') or logging_cfg.get('checkpoint_path')
@@ -1099,6 +1169,294 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		except Exception as exc:
 			print(f"[front_route_risk_debug] failed: {exc}")
 			return None
+
+	def _get_stage1_energy_speed_cap(self, tick_data, ego_speed):
+		debug = {
+			'active': False,
+			'control_mode': STAGE1_ENERGY_SPEED_CONTROL_MODE,
+			'reason': None,
+			'speed_cap_ms': None,
+			'speed_adjust_ms': None,
+			'current_score': None,
+			'target_score': None,
+			'local_peak_score': None,
+			'query_center_ms': None,
+			'current_index': None,
+			'target_index': None,
+			'target_speed_ms': None,
+			'target_source': None,
+			'lookahead_bins': int(STAGE1_ENERGY_CAP_LOOKAHEAD_BINS),
+			'safe_threshold': None,
+			'gradient_dedv': None,
+			'gradient_gate_dedv': None,
+			'gradient_dominant_component': None,
+			'gradient_raw_adjust_ms': None,
+			'gradient_score_gate': False,
+			'gradient_slope_gate': False,
+			'gradient_chase_dedv': None,
+			'gradient_meet_dedv': None,
+			'gradient_pedestrian_dedv': None,
+			'gradient_chase_score': None,
+			'gradient_meet_score': None,
+			'gradient_pedestrian_score': None,
+			'gradient_chase_active': False,
+			'gradient_meet_active': False,
+			'gradient_pedestrian_active': False,
+			'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
+		}
+
+		if not STAGE1_ENERGY_SPEED_CAP_ENABLE:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		samples = self.last_energy_debug.get('speed_energy_samples')
+		total_curve = self.last_energy_debug.get('speed_energy_total')
+		query_center = self.last_energy_debug.get('speed_energy_query_center')
+		if samples is None or total_curve is None:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+		total_curve = np.asarray(total_curve, dtype=np.float32).reshape(-1)
+		if samples.size == 0 or total_curve.size == 0 or samples.size != total_curve.size:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		center_speed = float(query_center) if query_center is not None else float(ego_speed)
+		center_speed = max(0.0, center_speed)
+		debug['query_center_ms'] = center_speed
+		if center_speed < STAGE1_ENERGY_CAP_MIN_SPEED_MS:
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		current_idx = int(np.argmin(np.abs(samples - center_speed)))
+		peak_end = min(total_curve.size, current_idx + 1 + STAGE1_ENERGY_CAP_LOOKAHEAD_BINS)
+		current_score = float(total_curve[current_idx])
+		local_peak_score = float(np.max(total_curve[current_idx:peak_end]))
+		debug.update({
+			'current_index': current_idx,
+			'current_score': current_score,
+			'local_peak_score': local_peak_score,
+		})
+
+		target_speed = center_speed
+		target_score = current_score
+		target_idx = current_idx
+		target_source = 'query_center'
+		ref_speeds = self.last_energy_debug.get('speed_energy_ref_speeds')
+		ref_totals = self.last_energy_debug.get('speed_energy_ref_total')
+		if ref_speeds is not None:
+			ref_speeds = np.asarray(ref_speeds, dtype=np.float32).reshape(-1)
+			ref_totals = np.asarray(ref_totals if ref_totals is not None else [], dtype=np.float32).reshape(-1)
+			speed_source_to_idx = {
+				'speed_head': 0,
+				'traj': 1,
+				'traj_05s': 2,
+				'traj05': 2,
+			}
+			ref_idx = speed_source_to_idx.get(SPEED_SOURCE)
+			if ref_idx is not None and ref_idx < ref_speeds.size and np.isfinite(ref_speeds[ref_idx]):
+				target_speed = max(0.0, float(ref_speeds[ref_idx]))
+				target_idx = int(np.argmin(np.abs(samples - target_speed)))
+				if ref_idx < ref_totals.size and np.isfinite(ref_totals[ref_idx]):
+					target_score = float(ref_totals[ref_idx])
+				else:
+					target_score = float(total_curve[target_idx])
+				target_source = SPEED_SOURCE
+		debug.update({
+			'target_index': int(target_idx),
+			'target_speed_ms': float(target_speed),
+			'target_score': float(target_score),
+			'target_source': target_source,
+		})
+
+		path_lo = min(current_idx, target_idx)
+		path_hi = max(current_idx, target_idx) + 1
+		path_peak_score = float(np.max(total_curve[path_lo:path_hi]))
+		debug['local_peak_score'] = path_peak_score
+
+		speed_delta = float(target_speed - center_speed)
+		moving_toward_danger = (
+			target_score >= current_score + STAGE1_ENERGY_CAP_TREND_MARGIN
+			or path_peak_score >= current_score + STAGE1_ENERGY_CAP_TREND_MARGIN
+		)
+
+		if STAGE1_ENERGY_SPEED_CONTROL_MODE == 'gradient':
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+
+			component_specs = {
+				'chase': (
+					STAGE1_ENERGY_GRADIENT_CHASE_WEIGHT,
+					STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE,
+				),
+				'meet': (
+					STAGE1_ENERGY_GRADIENT_MEET_WEIGHT,
+					STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE,
+				),
+				'pedestrian': (
+					STAGE1_ENERGY_GRADIENT_PEDESTRIAN_WEIGHT,
+					STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE,
+				),
+			}
+			component_grad_sum = 0.0
+			component_weight_sum = 0.0
+			component_active = False
+			dominant_component = None
+			dominant_component_value = 0.0
+			dominant_component_grad = None
+			for energy_key, (component_weight, component_min_score) in component_specs.items():
+				curve_values = self.last_energy_debug.get(f'speed_energy_{energy_key}')
+				if curve_values is None:
+					continue
+				component_curve = np.asarray(curve_values, dtype=np.float32).reshape(-1)
+				if component_curve.size != total_curve.size:
+					continue
+				component_score = float(component_curve[current_idx])
+				component_grad_curve = np.gradient(component_curve.astype(np.float32), samples.astype(np.float32))
+				component_grad = float(component_grad_curve[current_idx]) if component_grad_curve.size > current_idx else 0.0
+				component_is_active = (
+					component_weight > 0.0
+					and component_score >= component_min_score
+					and abs(component_grad) >= STAGE1_ENERGY_GRADIENT_SLOPE_EPS
+				)
+				debug.update({
+					f'gradient_{energy_key}_dedv': component_grad,
+					f'gradient_{energy_key}_score': component_score,
+					f'gradient_{energy_key}_active': bool(component_is_active),
+				})
+				if component_is_active:
+					component_active = True
+					component_contribution = component_weight * component_grad
+					component_grad_sum += component_contribution
+					component_weight_sum += component_weight
+					if abs(component_contribution) >= dominant_component_value:
+						dominant_component_value = abs(component_contribution)
+						dominant_component = energy_key
+						dominant_component_grad = component_grad
+
+			if component_active:
+				current_grad = float(component_grad_sum)
+				gate_grad = float(dominant_component_grad) if dominant_component_grad is not None else current_grad
+			else:
+				energy_grad = np.gradient(total_curve.astype(np.float32), samples.astype(np.float32))
+				current_grad = float(energy_grad[current_idx]) if energy_grad.size > current_idx else 0.0
+				gate_grad = current_grad
+			raw_adjust_ms = float(-STAGE1_ENERGY_GRADIENT_GAIN * current_grad)
+			clipped_adjust_ms = float(np.clip(
+				raw_adjust_ms,
+				-STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS,
+				STAGE1_ENERGY_GRADIENT_MAX_DELTA_MS,
+			))
+			score_gate = component_active or max(current_score, path_peak_score) >= STAGE1_ENERGY_GRADIENT_MIN_SCORE
+			slope_gate = abs(gate_grad) >= STAGE1_ENERGY_GRADIENT_SLOPE_EPS
+			debug.update({
+				'gradient_dedv': current_grad,
+				'gradient_gate_dedv': gate_grad,
+				'gradient_dominant_component': dominant_component,
+				'gradient_raw_adjust_ms': raw_adjust_ms,
+				'gradient_score_gate': bool(score_gate),
+				'gradient_slope_gate': bool(slope_gate),
+			})
+
+			if (
+				score_gate
+				and slope_gate
+				and np.isfinite(clipped_adjust_ms)
+				and abs(clipped_adjust_ms) > 1e-4
+			):
+				reason_base = 'stage1_energy_gradient'
+				if dominant_component is not None:
+					reason_base = f'{reason_base}_{dominant_component}'
+				debug.update({
+					'active': True,
+					'reason': f'{reason_base}_accel' if clipped_adjust_ms > 0.0 else f'{reason_base}_brake',
+					'speed_adjust_ms': clipped_adjust_ms,
+				})
+			return debug
+
+		if STAGE1_ENERGY_SPEED_CONTROL_MODE != 'cap':
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			debug['reason'] = f'invalid_mode:{STAGE1_ENERGY_SPEED_CONTROL_MODE}'
+			return debug
+
+		level = None
+		if speed_delta >= STAGE1_ENERGY_CAP_SPEED_EPS and moving_toward_danger:
+			if target_score >= STAGE1_ENERGY_CAP_TARGET_HIGH or path_peak_score >= STAGE1_ENERGY_CAP_PEAK_HIGH:
+				level = 'high'
+				safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_HIGH)
+			elif target_score >= STAGE1_ENERGY_CAP_TARGET_WARN or path_peak_score >= STAGE1_ENERGY_CAP_TARGET_WARN:
+				level = 'warn'
+				safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_WARN)
+			else:
+				safe_threshold = None
+		elif speed_delta <= -STAGE1_ENERGY_CAP_SPEED_EPS:
+			# If the chosen target speed is already safer than the current speed,
+			# do not add extra intervention on top of the nominal slowdown.
+			if target_score >= current_score - STAGE1_ENERGY_CAP_TREND_MARGIN:
+				if target_score >= STAGE1_ENERGY_CAP_TARGET_HIGH:
+					level = 'high'
+					safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_HIGH)
+				elif target_score >= STAGE1_ENERGY_CAP_TARGET_WARN:
+					level = 'warn'
+					safe_threshold = float(STAGE1_ENERGY_CAP_SAFE_WARN)
+				else:
+					safe_threshold = None
+			else:
+				safe_threshold = None
+		else:
+			safe_threshold = None
+		debug['safe_threshold'] = safe_threshold
+
+		if level is not None:
+			speed_ceiling = max(0.0, target_speed)
+			decel_indices = np.where(samples <= speed_ceiling + 1e-3)[0]
+			if decel_indices.size == 0:
+				decel_indices = np.arange(samples.size)
+			safe_indices = [int(i) for i in decel_indices if float(total_curve[i]) <= safe_threshold]
+			if len(safe_indices) > 0:
+				chosen_idx = max(safe_indices, key=lambda i: float(samples[i]))
+				reason = f'stage1_energy_{level}'
+			else:
+				chosen_idx = int(decel_indices[np.argmin(total_curve[decel_indices])])
+				reason = f'stage1_energy_{level}_fallback'
+			candidate_cap_ms = float(samples[chosen_idx])
+			self.stage1_energy_cap_value_ms = candidate_cap_ms
+			self.stage1_energy_cap_hold_frames = int(STAGE1_ENERGY_CAP_HOLD_FRAMES)
+			debug.update({
+				'active': True,
+				'reason': reason,
+				'speed_cap_ms': candidate_cap_ms,
+				'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
+			})
+			return debug
+
+		if (
+			speed_delta <= -STAGE1_ENERGY_CAP_SPEED_EPS
+			and target_score < current_score - STAGE1_ENERGY_CAP_TREND_MARGIN
+		):
+			self.stage1_energy_cap_hold_frames = 0
+			self.stage1_energy_cap_value_ms = None
+			return debug
+
+		if self.stage1_energy_cap_hold_frames > 0 and self.stage1_energy_cap_value_ms is not None:
+			self.stage1_energy_cap_hold_frames -= 1
+			debug.update({
+				'active': True,
+				'reason': 'stage1_energy_hold',
+				'speed_cap_ms': float(self.stage1_energy_cap_value_ms),
+				'hold_frames_remaining': int(self.stage1_energy_cap_hold_frames),
+			})
+			return debug
+
+		self.stage1_energy_cap_hold_frames = 0
+		self.stage1_energy_cap_value_ms = None
+		return debug
 
 	def setup(self, path_to_conf_file):
 		self.track = autonomous_agent.Track.SENSORS
@@ -1273,6 +1631,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Initialize Unscented Kalman Filter 
 		self.carla_frame_rate = 1.0 / 20.0  # CARLA frame rate
+		self.localizer = EgoLocalizer(
+			strategy=LOCALIZER_STRATEGY,
+			dt=self.carla_frame_rate,
+			gps_alpha=LOCALIZER_ALPHA,
+			latency_compensation=False,
+		)
+		print(
+			f"[EgoLocalizer] strategy={LOCALIZER_STRATEGY}, "
+			f"alpha={LOCALIZER_ALPHA}, lidar_pose={LIDAR_POSE_SOURCE}"
+		)
 		if USE_UKF:
 			self.points = MerweScaledSigmaPoints(n=4, alpha=0.00001, beta=2, kappa=0, subtract=residual_state_x)
 			self.ukf = UKF(dim_x=4,
@@ -1355,6 +1723,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.front_route_risk_cap_hold_frames = 0
 		self.front_route_risk_cap_value_ms = None
 		self.last_front_route_risk_cap_debug = {}
+		self.stage1_energy_cap_hold_frames = 0
+		self.stage1_energy_cap_value_ms = None
+		self.last_stage1_energy_cap_debug = {}
 		self.last_terminal_route_debug = {}
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
@@ -1607,6 +1978,36 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'filtered',
 		)
 
+	def _ego_points_to_world(self, ego_points, ego_xy, yaw):
+		ego_points = np.asarray(ego_points, dtype=np.float32)
+		ego_xy = np.asarray(ego_xy, dtype=np.float32)
+		cos_yaw = np.cos(yaw)
+		sin_yaw = np.sin(yaw)
+		rotation = np.array([
+			[cos_yaw, -sin_yaw],
+			[sin_yaw, cos_yaw],
+		], dtype=np.float32)
+		return (ego_points @ rotation.T) + ego_xy
+
+	def _get_stuck_helper_target_override(self, ego_xy, yaw):
+		if not STUCK_HELPER_TARGET_INSERT_ENABLE or self.stuck_helper <= 0:
+			return None
+
+		helper_ego_points = np.array([
+			[STUCK_HELPER_TARGET_1_FORWARD_M, STUCK_HELPER_TARGET_LATERAL_M],
+			[STUCK_HELPER_TARGET_2_FORWARD_M, STUCK_HELPER_TARGET_LATERAL_M],
+		], dtype=np.float32)
+		helper_world_points = self._ego_points_to_world(helper_ego_points, ego_xy, yaw)
+		frames_remaining = int(self.stuck_helper)
+		return {
+			'active': True,
+			'frames_remaining': frames_remaining,
+			'target_point_ego': helper_ego_points[0].copy(),
+			'next_target_point_ego': helper_ego_points[1].copy(),
+			'target_point_world': helper_world_points[0].copy(),
+			'next_target_point_world': helper_world_points[1].copy(),
+		}
+
 
 	def sensors(self):
 		sensors =  [
@@ -1676,11 +2077,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Preprocess compass to CARLA coordinate system
 		compass = t_u.preprocess_compass(compass_raw)
 		
-		# Get speed for UKF
+		# Get speed
 		speed = input_data['SPEED'][1]['speed']
 		
-		# Apply Unscented Kalman Filter 
-		if USE_UKF:
+		# ---- Localizer pose: used for target point / planner pose when requested ----
+		gps_raw_xy = np.array([gps_pos[0], gps_pos[1]], dtype=np.float64)
+		if hasattr(self, 'localizer') and self.localizer is not None:
+			localized_pos, localized_yaw = self.localizer.update(
+				gps_xy=gps_raw_xy,
+				compass=compass,
+				speed=speed,
+				steer=self.control.steer,
+				throttle=self.control.throttle,
+				brake=float(self.control.brake > 0.5),
+				imu_data=input_data['IMU'][1],
+			)
+			gps_filtered = np.asarray(localized_pos, dtype=np.float64)
+			compass_filtered = float(localized_yaw)
+		elif USE_UKF:
 			if not self.filter_initialized:
 				self.ukf.x = np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed])
 				self.filter_initialized = True
@@ -1696,6 +2110,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			gps_filtered = np.array([gps_pos[0], gps_pos[1]])
 			compass_filtered = compass
 
+		# ---- Lidar alignment pose: keep the old controllable split between ukf/localizer ----
+		if LIDAR_POSE_SOURCE == 'ukf' and USE_UKF:
+			if not self.filter_initialized:
+				self.ukf.x = np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed])
+				self.filter_initialized = True
+
+			self.ukf.predict(steer=self.control.steer, throttle=self.control.throttle, brake=self.control.brake)
+			self.ukf.update(np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed]))
+			lidar_state = self.ukf.x
+			self.state_log.append(lidar_state)
+			gps_lidar = np.asarray(lidar_state[0:2], dtype=np.float64)
+			compass_lidar = float(lidar_state[2])
+		else:
+			gps_lidar = np.asarray(gps_filtered, dtype=np.float64)
+			compass_lidar = float(compass_filtered)
+
 		gps_target_pose, compass_target_pose, target_pose_source = self._resolve_target_pose(
 			gps_raw=np.array([gps_pos[0], gps_pos[1]], dtype=np.float32),
 			gps_filtered=gps_filtered,
@@ -1703,16 +2133,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			compass_filtered=compass_filtered,
 		)
 
-		# Combine two frames of lidar data using algin_lidar
-		# Use filtered GPS for lidar alignment
+		# Combine two frames of lidar data using the selected lidar pose.
 		if self.last_lidar is not None and self.last_ego_transform is not None:
 			# Calculate relative transformation between current and last frame
-			current_pos = np.array([gps_filtered[0], gps_filtered[1], 0.0])
+			current_pos = np.array([gps_lidar[0], gps_lidar[1], 0.0])
 			last_pos = np.array([self.last_ego_transform['gps'][0], self.last_ego_transform['gps'][1], 0.0])
 			relative_translation = current_pos - last_pos
 			
-			# Calculate relative rotation using filtered compass
-			current_yaw = compass_filtered
+			# Calculate relative rotation using lidar-alignment yaw
+			current_yaw = compass_lidar
 			last_yaw = self.last_ego_transform['compass']
 			relative_rotation = current_yaw - last_yaw
 			
@@ -1729,9 +2158,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			lidar_combined = lidar_ego
 		
-		# Store current frame for next iteration (use filtered values)
+		# Store current frame for next iteration (use lidar-alignment pose)
 		self.last_lidar = lidar_ego
-		self.last_ego_transform = {'gps': gps_filtered, 'compass': compass_filtered}
+		self.last_ego_transform = {'gps': gps_lidar, 'compass': compass_lidar}
 		
 		# Generate lidar BEV image from combined lidar data
 		lidar_bev_img = generate_lidar_bev_images(
@@ -1760,7 +2189,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		transfuser_lidar = transfuser_t_u.lidar_to_ego_coordinate(self.transfuser_config, input_data['LIDAR'])
 		
 		# Store state for lidar alignment
-		self.transfuser_state_log.append([gps_filtered[0], gps_filtered[1], compass_filtered, speed])
+		self.transfuser_state_log.append([gps_lidar[0], gps_lidar[1], compass_lidar, speed])
 		
 		# We only get half a LiDAR at every time step. Align the last half into the current frame.
 		if self.transfuser_lidar_last is not None and len(self.transfuser_state_log) >= 2:
@@ -1818,6 +2247,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'bev': bev,
 				'gps_filtered': gps_filtered,
 				'compass_filtered': compass_filtered,
+				'gps_lidar': gps_lidar,
+				'compass_lidar': compass_lidar,
 				'target_pose_source': target_pose_source,
 				# TransFuser processed data for DP
 				'transfuser_rgb': transfuser_rgb_tensor,  # (1, 3, H, W) on GPU
@@ -1884,15 +2315,54 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			self.last_waypoint_route = None
 
-		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])
-		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass'])
+		raw_target_point_world = np.asarray(target_point[:2], dtype=np.float32)
+		raw_next_target_point_world = np.asarray(next_target_point[:2], dtype=np.float32)
+		raw_target_point_ego = t_u.inverse_conversion_2d(
+			raw_target_point_world, result['gps'], result['compass']
+		).astype(np.float32)
+		raw_next_target_point_ego = t_u.inverse_conversion_2d(
+			raw_next_target_point_world, result['gps'], result['compass']
+		).astype(np.float32)
+
+		stuck_helper_debug = {
+			'active': False,
+			'frames_remaining': int(self.stuck_helper),
+			'target_points_ego': None,
+			'target_points_world': None,
+		}
+		stuck_helper_override = self._get_stuck_helper_target_override(
+			result['gps'][:2],
+			result['compass'],
+		)
+		if stuck_helper_override is not None:
+			ego_target_point = stuck_helper_override['target_point_ego']
+			ego_next_target_point = stuck_helper_override['next_target_point_ego']
+			target_point_world = stuck_helper_override['target_point_world']
+			next_target_point_world = stuck_helper_override['next_target_point_world']
+			stuck_helper_debug = {
+				'active': True,
+				'frames_remaining': int(stuck_helper_override['frames_remaining']),
+				'target_points_ego': [
+					stuck_helper_override['target_point_ego'].tolist(),
+					stuck_helper_override['next_target_point_ego'].tolist(),
+				],
+				'target_points_world': [
+					stuck_helper_override['target_point_world'].tolist(),
+					stuck_helper_override['next_target_point_world'].tolist(),
+				],
+			}
+		else:
+			ego_target_point = raw_target_point_ego
+			ego_next_target_point = raw_next_target_point_ego
+			target_point_world = raw_target_point_world
+			next_target_point_world = raw_next_target_point_world
 
 		forward_vec_world = np.array([
 			np.cos(result['compass']),
 			np.sin(result['compass']),
 		], dtype=np.float32)
-		target_delta_world = np.asarray(target_point[:2], dtype=np.float32) - np.asarray(result['gps'][:2], dtype=np.float32)
-		next_target_delta_world = np.asarray(next_target_point[:2], dtype=np.float32) - np.asarray(result['gps'][:2], dtype=np.float32)
+		target_delta_world = target_point_world - np.asarray(result['gps'][:2], dtype=np.float32)
+		next_target_delta_world = next_target_point_world - np.asarray(result['gps'][:2], dtype=np.float32)
 
 		def _angle_and_dot(delta_world):
 			dist = float(np.linalg.norm(delta_world))
@@ -1916,8 +2386,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
 		result['next_target_point'] = ego_next_target_point  # numpy array (2,)
-		result['target_point_world'] = np.asarray(target_point[:2], dtype=np.float32)
-		result['next_target_point_world'] = np.asarray(next_target_point[:2], dtype=np.float32)
+		result['target_point_world'] = target_point_world
+		result['next_target_point_world'] = next_target_point_world
+		result['target_point_raw_ego'] = raw_target_point_ego
+		result['next_target_point_raw_ego'] = raw_next_target_point_ego
+		result['target_point_raw_world'] = raw_target_point_world
+		result['next_target_point_raw_world'] = raw_next_target_point_world
+		result['stuck_helper_active'] = bool(stuck_helper_debug['active'])
+		result['stuck_helper_frames_remaining'] = int(stuck_helper_debug['frames_remaining'])
+		result['stuck_helper_threshold'] = int(self.stuck_helper_threshold)
+		result['stuck_helper_target_points_ego'] = stuck_helper_debug['target_points_ego']
+		result['stuck_helper_target_points_world'] = stuck_helper_debug['target_points_world']
 		result['target_dot_forward'] = target_dot_forward
 		result['next_target_dot_forward'] = next_target_dot_forward
 		result['target_cross_forward'] = target_cross_forward
@@ -2103,6 +2582,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		target_point=None,
 		terminal_speed_cap_ms=None,
 		front_route_risk_cap_ms=None,
+		stage1_energy_cap_ms=None,
+		stage1_energy_speed_adjust_ms=None,
 	):
 		"""
 		Predicts vehicle control with a PID controller.
@@ -2230,7 +2711,28 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				desired_speed_after_front_route_risk_cap,
 				front_route_risk_cap_ms,
 			)
-		desired_speed = float(desired_speed_after_front_route_risk_cap)
+		desired_speed_after_stage1_energy_adjust = float(desired_speed_after_front_route_risk_cap)
+		stage1_energy_speed_adjust_applied = False
+		if stage1_energy_speed_adjust_ms is not None and abs(float(stage1_energy_speed_adjust_ms)) > 1e-5:
+			adjusted_speed = max(
+				0.0,
+				desired_speed_after_stage1_energy_adjust + float(stage1_energy_speed_adjust_ms),
+			)
+			stage1_energy_speed_adjust_applied = (
+				abs(adjusted_speed - desired_speed_after_stage1_energy_adjust) > 1e-5
+			)
+			desired_speed_after_stage1_energy_adjust = adjusted_speed
+		desired_speed_after_stage1_energy_cap = float(desired_speed_after_stage1_energy_adjust)
+		stage1_energy_cap_applied = False
+		if stage1_energy_cap_ms is not None and stage1_energy_cap_ms > 0.0:
+			stage1_energy_cap_applied = (
+				desired_speed_after_stage1_energy_cap > float(stage1_energy_cap_ms)
+			)
+			desired_speed_after_stage1_energy_cap = min(
+				desired_speed_after_stage1_energy_cap,
+				stage1_energy_cap_ms,
+			)
+		desired_speed = float(desired_speed_after_stage1_energy_cap)
 		self.last_speed_debug = {
 			'speed_source': SPEED_SOURCE,
 			'speed_head_speed': speed_head_speed,
@@ -2244,11 +2746,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'desired_speed_after_soft_cap': float(desired_speed_after_soft_cap),
 			'desired_speed_after_terminal_cap': float(desired_speed_after_terminal_cap),
 			'desired_speed_after_front_route_risk_cap': float(desired_speed_after_front_route_risk_cap),
+			'desired_speed_after_stage1_energy_adjust': float(desired_speed_after_stage1_energy_adjust),
+			'desired_speed_after_stage1_energy_cap': float(desired_speed_after_stage1_energy_cap),
 			'soft_speed_limit_ms': float(SOFT_SPEED_LIMIT_MS),
 			'terminal_speed_cap_ms': float(terminal_speed_cap_ms) if terminal_speed_cap_ms is not None else None,
 			'terminal_speed_cap_applied': bool(terminal_speed_cap_applied),
 			'front_route_risk_cap_ms': float(front_route_risk_cap_ms) if front_route_risk_cap_ms is not None else None,
 			'front_route_risk_cap_applied': bool(front_route_risk_cap_applied),
+			'stage1_energy_control_mode': STAGE1_ENERGY_SPEED_CONTROL_MODE,
+			'stage1_energy_speed_adjust_ms': float(stage1_energy_speed_adjust_ms) if stage1_energy_speed_adjust_ms is not None else None,
+			'stage1_energy_speed_adjust_applied': bool(stage1_energy_speed_adjust_applied),
+			'stage1_energy_cap_ms': float(stage1_energy_cap_ms) if stage1_energy_cap_ms is not None else None,
+			'stage1_energy_cap_applied': bool(stage1_energy_cap_applied),
 			'hard_speed_limit_ms': float(HARD_SPEED_LIMIT_MS),
 		}
 
@@ -2623,7 +3132,23 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				speed_energy_query_center = np.asarray(speed_energy_query_center).reshape(-1)
 				if speed_energy_query_center.size > 0:
 					self.last_energy_debug['speed_energy_query_center'] = float(speed_energy_query_center[0])
+			speed_energy_ref_speeds = dp_pred_traj.get('speed_energy_ref_speeds')
+			if speed_energy_ref_speeds is not None:
+				speed_energy_ref_speeds = np.asarray(speed_energy_ref_speeds).reshape(-1)
+				if speed_energy_ref_speeds.size > 0:
+					self.last_energy_debug['speed_energy_ref_speeds'] = speed_energy_ref_speeds.astype(np.float32).tolist()
+			if speed_energy_ref_speeds is None or speed_energy_ref_speeds.size == 0:
+				ref_speed_values = []
+				for speed_key in ['speed_head_speed', 'traj_speed_1s', 'traj_speed_05s']:
+					speed_value = self.last_speed_debug.get(speed_key)
+					if speed_value is None:
+						ref_speed_values.append(np.nan)
+					else:
+						ref_speed_values.append(float(speed_value))
+				speed_energy_ref_speeds = np.asarray(ref_speed_values, dtype=np.float32)
+				self.last_energy_debug['speed_energy_ref_speeds'] = speed_energy_ref_speeds.tolist()
 			speed_energy_curves = {}
+			speed_energy_total_curve = None
 			for speed_energy_key in ['chase', 'meet', 'pedestrian']:
 				speed_energy_value = dp_pred_traj.get(f'speed_energy_{speed_energy_key}')
 				if speed_energy_value is None:
@@ -2637,9 +3162,83 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				for curve in speed_energy_curves.values():
 					total_curve = curve.copy() if total_curve is None else np.maximum(total_curve, curve)
 				if total_curve is not None:
+					speed_energy_total_curve = total_curve.astype(np.float32)
 					self.last_energy_debug['speed_energy_total'] = total_curve.astype(np.float32).tolist()
 					self.last_energy_debug['speed_energy_max'] = float(np.max(total_curve))
 					self.last_energy_debug['speed_energy_argmax'] = int(np.argmax(total_curve))
+					if speed_energy_samples is not None and speed_energy_samples.size == total_curve.size:
+						samples_np = speed_energy_samples.astype(np.float32)
+						global_min_idx = int(np.argmin(total_curve))
+						self.last_energy_debug['speed_energy_global_min_index'] = global_min_idx
+						self.last_energy_debug['speed_energy_global_min_speed'] = float(samples_np[global_min_idx])
+						self.last_energy_debug['speed_energy_global_min_value'] = float(total_curve[global_min_idx])
+
+						local_min_indices = []
+						for idx in range(total_curve.size):
+							left_ok = idx == 0 or total_curve[idx] <= total_curve[idx - 1]
+							right_ok = idx == total_curve.size - 1 or total_curve[idx] <= total_curve[idx + 1]
+							if left_ok and right_ok:
+								local_min_indices.append(idx)
+						self.last_energy_debug['speed_energy_local_min_indices'] = [int(i) for i in local_min_indices]
+						self.last_energy_debug['speed_energy_local_min_speeds'] = [float(samples_np[i]) for i in local_min_indices]
+						self.last_energy_debug['speed_energy_local_min_values'] = [float(total_curve[i]) for i in local_min_indices]
+
+						if len(local_min_indices) > 0:
+							center_speed_value = None
+							if speed_energy_query_center is not None and speed_energy_query_center.size > 0:
+								center_speed_value = float(speed_energy_query_center[0])
+							if center_speed_value is None:
+								center_speed_value = float(samples_np[global_min_idx])
+							local_choice_idx = min(
+								local_min_indices,
+								key=lambda i: (abs(float(samples_np[i]) - center_speed_value), float(total_curve[i]))
+							)
+						else:
+							local_choice_idx = global_min_idx
+						self.last_energy_debug['speed_energy_local_choice_index'] = int(local_choice_idx)
+						self.last_energy_debug['speed_energy_local_choice_speed'] = float(samples_np[local_choice_idx])
+						self.last_energy_debug['speed_energy_local_choice_value'] = float(total_curve[local_choice_idx])
+			speed_energy_ref_curves = {}
+			for speed_energy_key in ['chase', 'meet', 'pedestrian']:
+				speed_energy_value = dp_pred_traj.get(f'speed_energy_ref_{speed_energy_key}')
+				if speed_energy_value is None:
+					continue
+				speed_energy_array = np.asarray(speed_energy_value).reshape(-1)
+				if speed_energy_array.size > 0:
+					speed_energy_ref_curves[speed_energy_key] = speed_energy_array.astype(np.float32)
+					self.last_energy_debug[f'speed_energy_ref_{speed_energy_key}'] = speed_energy_array.astype(np.float32).tolist()
+			if len(speed_energy_ref_curves) > 0:
+				total_curve = None
+				for curve in speed_energy_ref_curves.values():
+					total_curve = curve.copy() if total_curve is None else np.maximum(total_curve, curve)
+				if total_curve is not None:
+					self.last_energy_debug['speed_energy_ref_total'] = total_curve.astype(np.float32).tolist()
+			elif (
+				speed_energy_ref_speeds is not None
+				and speed_energy_ref_speeds.size > 0
+				and speed_energy_samples is not None
+				and speed_energy_samples.size > 0
+				and speed_energy_total_curve is not None
+				and speed_energy_samples.size == speed_energy_total_curve.size
+			):
+				samples_np = speed_energy_samples.astype(np.float32)
+				for speed_energy_key, curve in speed_energy_curves.items():
+					ref_lookup = []
+					for ref_speed in speed_energy_ref_speeds.astype(np.float32):
+						if not np.isfinite(ref_speed):
+							ref_lookup.append(np.nan)
+							continue
+						ref_idx = int(np.argmin(np.abs(samples_np - float(ref_speed))))
+						ref_lookup.append(float(curve[ref_idx]))
+					self.last_energy_debug[f'speed_energy_ref_{speed_energy_key}'] = ref_lookup
+				ref_total_lookup = []
+				for ref_speed in speed_energy_ref_speeds.astype(np.float32):
+					if not np.isfinite(ref_speed):
+						ref_total_lookup.append(np.nan)
+						continue
+					ref_idx = int(np.argmin(np.abs(samples_np - float(ref_speed))))
+					ref_total_lookup.append(float(speed_energy_total_curve[ref_idx]))
+				self.last_energy_debug['speed_energy_ref_total'] = ref_total_lookup
 			front_route_risk_score = self._compute_front_route_risk_debug(
 				dp_pred_traj=dp_pred_traj,
 				transfuser_bev_feature=transfuser_bev_feature,
@@ -2698,6 +3297,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				gt_velocity,
 			)
 			self.last_front_route_risk_cap_debug = front_route_risk_cap_debug
+			stage1_energy_cap_debug = {}
+			if STAGE1_ENERGY_SPEED_CAP_ENABLE:
+				stage1_energy_cap_debug = self._get_stage1_energy_speed_cap(
+					tick_data,
+					gt_velocity,
+				)
+			self.last_stage1_energy_cap_debug = stage1_energy_cap_debug
 
 			# Use target_point to truncate route for lateral control
 			steer, throttle, brake = self.control_pid(
@@ -2707,6 +3313,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				target_point=target_point,
 				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
 				front_route_risk_cap_ms=front_route_risk_cap_debug.get('speed_cap_ms'),
+				stage1_energy_cap_ms=stage1_energy_cap_debug.get('speed_cap_ms') if STAGE1_ENERGY_SPEED_CAP_ENABLE else None,
+				stage1_energy_speed_adjust_ms=stage1_energy_cap_debug.get('speed_adjust_ms') if STAGE1_ENERGY_SPEED_CAP_ENABLE else None,
 			)
 			if target_speed_profile_list is not None:
 				self.last_speed_debug['target_speed_profile'] = target_speed_profile_list
@@ -2774,7 +3382,45 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'front_route_risk_effective_high_sigmoid_threshold': front_route_risk_cap_debug.get('effective_high_sigmoid_threshold'),
 				'front_route_risk_effective_high_ema_threshold': front_route_risk_cap_debug.get('effective_high_ema_threshold'),
 				'front_route_risk_cap_hold_frames_remaining': int(front_route_risk_cap_debug.get('hold_frames_remaining', 0)),
+				'stage1_energy_control_mode': stage1_energy_cap_debug.get('control_mode'),
+				'stage1_energy_speed_control_active': bool(stage1_energy_cap_debug.get('active', False)),
+				'stage1_energy_speed_control_reason': stage1_energy_cap_debug.get('reason'),
+				'stage1_energy_speed_cap_active': bool(
+					stage1_energy_cap_debug.get('active', False)
+					and stage1_energy_cap_debug.get('control_mode') == 'cap'
+				),
+				'stage1_energy_speed_cap_reason': stage1_energy_cap_debug.get('reason') if stage1_energy_cap_debug.get('control_mode') == 'cap' else None,
+				'stage1_energy_speed_cap_ms': stage1_energy_cap_debug.get('speed_cap_ms'),
+				'stage1_energy_speed_cap_applied': bool(self.last_speed_debug.get('stage1_energy_cap_applied', False)),
+				'stage1_energy_speed_adjust_ms': self.last_speed_debug.get('stage1_energy_speed_adjust_ms'),
+				'stage1_energy_speed_adjust_applied': bool(self.last_speed_debug.get('stage1_energy_speed_adjust_applied', False)),
+				'stage1_energy_current_score': stage1_energy_cap_debug.get('current_score'),
+				'stage1_energy_target_score': stage1_energy_cap_debug.get('target_score'),
+				'stage1_energy_local_peak_score': stage1_energy_cap_debug.get('local_peak_score'),
+				'stage1_energy_current_index': stage1_energy_cap_debug.get('current_index'),
+				'stage1_energy_target_index': stage1_energy_cap_debug.get('target_index'),
+				'stage1_energy_query_center_ms': stage1_energy_cap_debug.get('query_center_ms'),
+				'stage1_energy_target_speed_ms': stage1_energy_cap_debug.get('target_speed_ms'),
+				'stage1_energy_target_source': stage1_energy_cap_debug.get('target_source'),
+				'stage1_energy_safe_threshold': stage1_energy_cap_debug.get('safe_threshold'),
+				'stage1_energy_gradient_dedv': stage1_energy_cap_debug.get('gradient_dedv'),
+				'stage1_energy_gradient_gate_dedv': stage1_energy_cap_debug.get('gradient_gate_dedv'),
+				'stage1_energy_gradient_dominant_component': stage1_energy_cap_debug.get('gradient_dominant_component'),
+				'stage1_energy_gradient_raw_adjust_ms': stage1_energy_cap_debug.get('gradient_raw_adjust_ms'),
+				'stage1_energy_gradient_score_gate': bool(stage1_energy_cap_debug.get('gradient_score_gate', False)),
+				'stage1_energy_gradient_slope_gate': bool(stage1_energy_cap_debug.get('gradient_slope_gate', False)),
+				'stage1_energy_gradient_chase_dedv': stage1_energy_cap_debug.get('gradient_chase_dedv'),
+				'stage1_energy_gradient_meet_dedv': stage1_energy_cap_debug.get('gradient_meet_dedv'),
+				'stage1_energy_gradient_pedestrian_dedv': stage1_energy_cap_debug.get('gradient_pedestrian_dedv'),
+				'stage1_energy_gradient_chase_score': stage1_energy_cap_debug.get('gradient_chase_score'),
+				'stage1_energy_gradient_meet_score': stage1_energy_cap_debug.get('gradient_meet_score'),
+				'stage1_energy_gradient_pedestrian_score': stage1_energy_cap_debug.get('gradient_pedestrian_score'),
+				'stage1_energy_gradient_chase_active': bool(stage1_energy_cap_debug.get('gradient_chase_active', False)),
+				'stage1_energy_gradient_meet_active': bool(stage1_energy_cap_debug.get('gradient_meet_active', False)),
+				'stage1_energy_gradient_pedestrian_active': bool(stage1_energy_cap_debug.get('gradient_pedestrian_active', False)),
+				'stage1_energy_cap_hold_frames_remaining': int(stage1_energy_cap_debug.get('hold_frames_remaining', 0)),
 				'stuck_detector': int(self.stuck_detector),
+				'stuck_helper': int(self.stuck_helper),
 				'force_move': int(self.force_move),
 				'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
 				'traffic_light_semantic_block_force_move': bool(semantic_debug.get('traffic_light_block_force_move', False)),
@@ -2795,6 +3441,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_semantic_closest_forward_m': semantic_debug.get('stop_sign_closest_forward_m'),
 				'stop_sign_semantic_mean_lateral_m': semantic_debug.get('stop_sign_mean_lateral_m'),
 				'stop_sign_semantic_stopped_frames': int(semantic_debug.get('stop_sign_stopped_frames', 0)),
+				'stuck_helper_active': bool(semantic_debug.get('stuck_helper_active', False)),
+				'stuck_helper_frames_remaining': int(semantic_debug.get('stuck_helper_frames_remaining', 0)),
 				'force_move_blocked_reason': semantic_debug.get('force_move_blocked_reason'),
 				'planner_wants_stop_for_force_move': bool(semantic_debug.get('planner_wants_stop', False)),
 			}
@@ -2848,6 +3496,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'next_target_point_ego': tick_data['next_target_point'].tolist() if isinstance(tick_data.get('next_target_point'), np.ndarray) else tick_data.get('next_target_point'),
 				'target_point_world': tick_data['target_point_world'].tolist() if isinstance(tick_data.get('target_point_world'), np.ndarray) else tick_data.get('target_point_world'),
 				'next_target_point_world': tick_data['next_target_point_world'].tolist() if isinstance(tick_data.get('next_target_point_world'), np.ndarray) else tick_data.get('next_target_point_world'),
+				'target_point_raw_ego': tick_data['target_point_raw_ego'].tolist() if isinstance(tick_data.get('target_point_raw_ego'), np.ndarray) else tick_data.get('target_point_raw_ego'),
+				'next_target_point_raw_ego': tick_data['next_target_point_raw_ego'].tolist() if isinstance(tick_data.get('next_target_point_raw_ego'), np.ndarray) else tick_data.get('next_target_point_raw_ego'),
+				'target_point_raw_world': tick_data['target_point_raw_world'].tolist() if isinstance(tick_data.get('target_point_raw_world'), np.ndarray) else tick_data.get('target_point_raw_world'),
+				'next_target_point_raw_world': tick_data['next_target_point_raw_world'].tolist() if isinstance(tick_data.get('next_target_point_raw_world'), np.ndarray) else tick_data.get('next_target_point_raw_world'),
+				'tick_stuck_helper_active': bool(tick_data.get('stuck_helper_active', False)),
+				'tick_stuck_helper_frames_remaining': int(tick_data.get('stuck_helper_frames_remaining', 0)),
+				'tick_stuck_helper_threshold': int(tick_data.get('stuck_helper_threshold', 0)),
+				'tick_stuck_helper_target_points_ego': tick_data.get('stuck_helper_target_points_ego'),
+				'tick_stuck_helper_target_points_world': tick_data.get('stuck_helper_target_points_world'),
 				'model_route_pred_ego': self.last_route_pred.tolist() if isinstance(self.last_route_pred, np.ndarray) else self.last_route_pred,
 				'model_dp_traj_ego': self.last_dp_pred_traj.tolist() if isinstance(self.last_dp_pred_traj, np.ndarray) else self.last_dp_pred_traj,
 				'target_dot_forward': float(tick_data.get('target_dot_forward', 0.0)),
@@ -3064,31 +3721,32 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cv2.rectangle(overlay, (20, panel_top), (780, 580), (20, 20, 20), -1)
 		right = cv2.addWeighted(overlay, 0.45, right, 0.55, 0.0)
 
-		speed_kmh = float(self.pid_metadata.get('speed', 0.0)) * 3.6
+		speed_mps = float(self.pid_metadata.get('speed', 0.0))
 		command_value = self.pid_metadata.get('command_value', 'N/A')
 		command_text = self.pid_metadata.get('command_text', 'unknown')
 
 		left_status_lines = [
 			f"frm: {self.step}",
-			f"v_act: {speed_kmh:.2f} km/h",
+			f"v: {speed_mps:.2f} m/s",
 			f"src: {self.pid_metadata.get('speed_source', 'N/A')}",
 			f"fus: {self.pid_metadata.get('fusion_regime', 'N/A')}",
-			f"v_des0: {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')} m/s",
-			f"v_des: {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')} m/s",
-			f"lim_s: {self._format_debug_value(self.pid_metadata.get('soft_speed_limit_ms'), '.2f')} m/s",
-			f"lim_h: {self._format_debug_value(self.pid_metadata.get('hard_speed_limit_ms'), '.2f')} m/s",
+			f"vd0(raw): {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
+			f"vd(cap): {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
+			f"Estg: {self.pid_metadata.get('stage1_energy_control_mode', 'off')}/{int(bool(self.pid_metadata.get('stage1_energy_speed_control_active', False)))}",
+			f"dV(E): {self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')}",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
-			f"thr/brk: {float(self.pid_metadata.get('throttle', 0.0)):.3f} / {float(self.pid_metadata.get('brake', 0.0)):.3f}",
+			f"thr: {float(self.pid_metadata.get('throttle', 0.0)):.2f}",
+			f"brk: {float(self.pid_metadata.get('brake', 0.0)):.2f}",
 		]
 
 		mid_status_lines = [
 			f"cmd: {command_text} ({command_value})",
 			f"pose: {self.pid_metadata.get('target_pose_source', 'N/A')}",
-			f"tp_ang: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.2f}",
+			f"ang: {float(self.pid_metadata.get('target_angle_deg', 0.0)):.1f}",
 			f"tp_L/R/B: {int(bool(self.pid_metadata.get('target_is_left', False)))}/{int(bool(self.pid_metadata.get('target_is_right', False)))}/{int(bool(self.pid_metadata.get('target_is_behind', False)))}",
-			f"hdg_err: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.2f}",
-			f"st_idx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
-			f"st_ctrl: {float(self.pid_metadata.get('steer_controller', 0.0)):.3f}",
+			f"herr: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.1f}",
+			f"sidx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
+			f"sctl: {float(self.pid_metadata.get('steer_controller', 0.0)):.2f}",
 		]
 
 		if self.last_target_point is not None:
@@ -3101,24 +3759,26 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 
 		right_status_lines = [
-			f"qE ctr: {self._format_debug_value(self.pid_metadata.get('speed_energy_query_center'), '.1f')} m/s",
-			f"pred h/1/.5 m/s: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')}",
-			f"pred h/1/.5 km/h: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f') if self.pid_metadata.get('speed_head_speed') is None else format(float(self.pid_metadata.get('speed_head_speed')) * 3.6, '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f') if self.pid_metadata.get('traj_speed_1s') is None else format(float(self.pid_metadata.get('traj_speed_1s')) * 3.6, '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f') if self.pid_metadata.get('traj_speed_05s') is None else format(float(self.pid_metadata.get('traj_speed_05s')) * 3.6, '.1f')}",
-			f"prof km/h: {self._format_debug_speed_curve_kmh(self.pid_metadata.get('target_speed_profile'), fmt='.1f', max_items=4)}",
-			f"vs km/h: {self._format_debug_speed_curve_kmh(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=5)}",
-			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.2f', max_items=5)}",
-			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.2f', max_items=5)}",
-			f"Em: {self._format_debug_curve(self.pid_metadata.get('speed_energy_meet'), fmt='.2f', max_items=5)}",
-			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.2f', max_items=5)}",
-			f"E*: {self._format_debug_value(self.pid_metadata.get('speed_energy_max'), '.2f')}@{self.pid_metadata.get('speed_energy_argmax', 'NA')}",
+			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
+			f"v_tgt: {self._format_debug_value(self.pid_metadata.get('stage1_energy_target_speed_ms'), '.1f')} ({self.pid_metadata.get('stage1_energy_target_source', 'NA')})",
+			f"dE/dv,dV: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}",
+			f"dEc/m/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_chase_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_meet_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_pedestrian_dedv'), '.2f')}",
+			f"pred h/1/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')} m/s",
+			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=7)}",
+			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.1f', max_items=3)}",
+			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.1f', max_items=7)}",
+			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.1f', max_items=7)}",
+			f"Em: {self._format_debug_curve(self.pid_metadata.get('speed_energy_meet'), fmt='.1f', max_items=7)}",
+			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.1f', max_items=7)}",
+			f"E*: {self._format_energy_peak_with_speed()}",
 			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
-		line_gap = 20
-		font_scale = 0.43
-		col1_x = 35
-		col2_x = 275
-		col3_x = 485
+		line_gap = 18
+		font_scale = 0.39
+		col1_x = 26
+		col2_x = 220
+		col3_x = 415
 		start_y = panel_top + 28
 
 		for idx, line in enumerate(left_status_lines):
