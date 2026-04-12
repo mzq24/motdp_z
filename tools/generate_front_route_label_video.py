@@ -32,7 +32,10 @@ import cv2
 import numpy as np
 
 from scripts.data_tools.precompute_semantic_labels import (
+    _annotate_route_stage1_merge_decisions,
+    _build_merge_motion_context,
     _compute_front_route_label,
+    _default_merge_episode_debug,
     _find_ego_box,
     _load_json_gz_if_exists,
     _points_inside_oriented_box,
@@ -64,10 +67,26 @@ COMMAND_MAP = {
 MERGE_COMMAND_IDS = {5, 6}
 LEFT_COMMAND_ID = 1
 RIGHT_COMMAND_ID = 2
+LANE_FOLLOW_COMMAND_ID = 4
 INTERACTION_SAME_DIR_ANGLE_THRESH_DEG = 45.0
+INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG = 70.0
 MERGE_DEBUG_MIN_DEGO_M = 1.0
 MERGE_DEBUG_MIN_GO_DENOM_S = 0.10
 NO_ROUTE_EXTENSION_SCENES = {"HazardAtSideLane"}
+TWOWAY_START_LATERAL_THRESH_M = 0.5
+TWOWAY_RETURN_TAIL_POINTS = 12
+TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX = 10
+MERGE_TOP_LEVEL_FIELDS = (
+    "merge_decision_phase",
+    "merge_episode_id",
+    "merge_episode_active",
+    "merge_episode_no_go",
+    "merge_episode_start_frame",
+    "merge_episode_end_frame",
+    "merge_go_frame",
+    "merge_resolution_actor_id",
+    "merge_end_state",
+)
 BEV_COLORS = np.array([
     [40, 40, 40],
     [128, 128, 128],
@@ -115,6 +134,13 @@ def _is_right_turn_junction_context(current_meas):
     return bool(junction and cmd_id == RIGHT_COMMAND_ID)
 
 
+def _is_right_turn_scene_context(current_meas, event_name=None):
+    if _is_right_turn_junction_context(current_meas):
+        return True
+    event_name = str(event_name or "")
+    return event_name in {"NonSignalizedJunctionRightTurn", "SignalizedJunctionRightTurn"}
+
+
 def _is_left_turn_junction_context(current_meas):
     if current_meas is None:
         return False
@@ -132,7 +158,29 @@ def _is_left_turn_scene_context(current_meas, event_name=None):
 
 def _is_borrow_cross_scene_context(event_name=None):
     event_name = str(event_name or "")
-    return event_name in {"AccidentTwoWays", "ParkedObstacleTwoWays"}
+    return event_name in {"ConstructionObstacleTwoWays", "AccidentTwoWays", "ParkedObstacleTwoWays"}
+
+
+def _is_two_way_event_corridor_scene_context(event_name=None):
+    return str(event_name or "") in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}
+
+
+EVENT_NAME_RECORD_EXCLUDED_SCENES = {
+    "ConstructionObstacleTwoWays",
+    "AccidentTwoWays",
+    "ParkedObstacleTwoWays",
+    "VehicleOpensDoorTwoWays",
+}
+
+
+def _attach_event_name_record(interaction, event_name=None):
+    name = str(event_name or "")
+    recorded = bool(name) and name not in {"None", "none", "nan", "NaN", "null", "Null"}
+    recorded = recorded and name not in EVENT_NAME_RECORD_EXCLUDED_SCENES
+    tagged = dict(interaction)
+    tagged["event_name_recorded"] = bool(recorded)
+    tagged["event_name_record"] = name if recorded else ""
+    return tagged
 
 
 def _ego_length_m(current_boxes, default_length_m=4.5):
@@ -140,6 +188,18 @@ def _ego_length_m(current_boxes, default_length_m=4.5):
     if ego_box is None:
         return float(default_length_m)
     extent = ego_box.get("extent", None)
+    if extent is None or len(extent) < 1:
+        return float(default_length_m)
+    try:
+        return float(max(2.0 * float(extent[0]), 1.0))
+    except Exception:
+        return float(default_length_m)
+
+
+def _box_length_m(box, default_length_m=4.5):
+    if not isinstance(box, dict):
+        return float(default_length_m)
+    extent = box.get("extent", None)
     if extent is None or len(extent) < 1:
         return float(default_length_m)
     try:
@@ -242,7 +302,7 @@ def _interaction_signal_from_candidate(
     min_motion_m=0.5,
 ):
     if case <= 0 or best is None:
-        return {
+        return _attach_event_name_record({
             "mode": 0,
             "name": INTERACTION_MODE_NAMES[0],
             "subtype": "none",
@@ -251,12 +311,12 @@ def _interaction_signal_from_candidate(
             "route_heading_deg": np.nan,
             "actor_heading_deg": np.nan,
             "motion_m": 0.0,
-        }
+        }, event_name=event_name)
 
     cover = best.get("cover", {})
     actor_box = best.get("box") if case == 1 else (best.get("current_box") or best.get("box_future") or best.get("box_current_frame"))
     if _is_pedestrian_box(actor_box):
-        return {
+        return _attach_event_name_record({
             "mode": 2,
             "name": INTERACTION_MODE_NAMES[2],
             "subtype": "ped_cross",
@@ -265,10 +325,10 @@ def _interaction_signal_from_candidate(
             "route_heading_deg": np.nan,
             "actor_heading_deg": np.nan,
             "motion_m": 0.0,
-        }
+        }, event_name=event_name)
     route_heading = _route_heading_at_idx(debug.get("route_dense"), cover.get("route_idx", 0))
     if route_heading is None:
-        return {
+        return _attach_event_name_record({
             "mode": 0,
             "name": INTERACTION_MODE_NAMES[0],
             "subtype": "none",
@@ -277,7 +337,7 @@ def _interaction_signal_from_candidate(
             "route_heading_deg": np.nan,
             "actor_heading_deg": np.nan,
             "motion_m": 0.0,
-        }
+        }, event_name=event_name)
 
     actor_heading = None
     motion_m = 0.0
@@ -302,18 +362,18 @@ def _interaction_signal_from_candidate(
             actor_heading = float(box.get("yaw", 0.0))
 
     if actor_heading is None:
-        if case == 2 and _is_right_turn_junction_context(current_meas):
-            return {
+        if case in (1, 2) and _is_right_turn_scene_context(current_meas, event_name=event_name):
+            return _attach_event_name_record({
                 "mode": 2,
                 "name": INTERACTION_MODE_NAMES[2],
                 "subtype": "merge_meet",
-                "source": "junction_right_future_cover_override",
+                "source": "junction_right_scene_override_missing_heading",
                 "angle_deg": np.nan,
                 "route_heading_deg": _heading_to_deg(route_heading),
                 "actor_heading_deg": np.nan,
                 "motion_m": motion_m,
-            }
-        return {
+            }, event_name=event_name)
+        return _attach_event_name_record({
             "mode": 0,
             "name": INTERACTION_MODE_NAMES[0],
             "subtype": "none",
@@ -322,46 +382,57 @@ def _interaction_signal_from_candidate(
             "route_heading_deg": _heading_to_deg(route_heading),
             "actor_heading_deg": np.nan,
             "motion_m": motion_m,
-        }
+        }, event_name=event_name)
 
     angle_deg = abs(_heading_to_deg(actor_heading - route_heading))
     same_direction = angle_deg <= float(angle_thresh_deg)
-    if case == 2 and _is_right_turn_junction_context(current_meas):
-        return {
+    cross_direction = angle_deg >= float(INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG)
+    if case == 2 and _is_right_turn_scene_context(current_meas, event_name=event_name):
+        return _attach_event_name_record({
             "mode": 2,
             "name": INTERACTION_MODE_NAMES[2],
             "subtype": "merge_meet",
-            "source": "junction_right_future_cover_override",
+            "source": "junction_right_scene_future_override",
             "angle_deg": float(angle_deg),
             "route_heading_deg": _heading_to_deg(route_heading),
             "actor_heading_deg": _heading_to_deg(actor_heading),
             "motion_m": float(motion_m),
-        }
+        }, event_name=event_name)
     if same_direction and case == 1:
         mode = 1
         subtype = "follow_chase"
         source = f"{source}+same_dir_current_cover"
+    elif case == 1 and _is_right_turn_scene_context(current_meas, event_name=event_name):
+        mode = 2
+        subtype = "merge_meet"
+        source = f"{source}+junction_right_scene_current_override"
     else:
         mode = 2
         if same_direction and case == 2:
             subtype = "merge_meet"
             source = f"{source}+same_dir_future_cover"
+        elif not cross_direction:
+            subtype = "merge_meet"
+            if case == 1:
+                source = f"{source}+mid_angle_merge_current"
+            else:
+                source = f"{source}+mid_angle_merge_future"
         elif case == 1 and _is_left_turn_scene_context(current_meas, event_name=event_name):
             subtype = "junction_left_cross_meet"
-            source = f"{source}+junction_left_cross_current"
+            source = f"{source}+cross_dir+junction_left_cross_current"
         elif case == 1 and _is_borrow_cross_scene_context(event_name=event_name):
             subtype = "borrow_cross_meet"
-            source = f"{source}+borrow_cross_current"
+            source = f"{source}+cross_dir+borrow_cross_current"
         elif case == 2 and _is_left_turn_scene_context(current_meas, event_name=event_name):
             subtype = "junction_left_cross_meet"
-            source = f"{source}+junction_left_cross"
+            source = f"{source}+cross_dir+junction_left_cross"
         elif case == 2 and _is_borrow_cross_scene_context(event_name=event_name):
             subtype = "borrow_cross_meet"
-            source = f"{source}+borrow_cross"
+            source = f"{source}+cross_dir+borrow_cross"
         elif not same_direction:
             subtype = "cross_meet"
             source = f"{source}+cross_dir"
-    return {
+    return _attach_event_name_record({
         "mode": int(mode),
         "name": INTERACTION_MODE_NAMES[int(mode)],
         "subtype": subtype,
@@ -370,7 +441,7 @@ def _interaction_signal_from_candidate(
         "route_heading_deg": _heading_to_deg(route_heading),
         "actor_heading_deg": _heading_to_deg(actor_heading),
         "motion_m": float(motion_m),
-    }
+    }, event_name=event_name)
 
 
 def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=None):
@@ -389,6 +460,7 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
             "d_ego": np.nan,
             "d_bg": np.nan,
             "other_speed": np.nan,
+            "other_length_m": np.nan,
         }
 
     if case == 1:
@@ -410,11 +482,13 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
             "d_ego": np.nan,
             "d_bg": np.nan,
             "other_speed": float(best.get("lead_speed", np.nan)),
+            "other_length_m": float(_box_length_m(box, default_length_m=np.nan)),
             "cover_point_local_xy": np.asarray(best.get("cover", {}).get("route_point", []), dtype=np.float32).astype(float).tolist(),
         }
 
     current_box = best.get("current_box") or {}
     box_future = best.get("box_future") or {}
+    other_box = current_box if current_box else box_future
     actor_id = current_box.get("id", None)
     if actor_id is None:
         actor_id = box_future.get("id", None)
@@ -435,6 +509,7 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
         "d_ego": float(best.get("d_ego", np.nan)),
         "d_bg": float(best.get("d_bg", np.nan)),
         "other_speed": float(best.get("bg_speed", np.nan)),
+        "other_length_m": float(_box_length_m(other_box, default_length_m=np.nan)),
         "cover_point_local_xy": np.asarray(best.get("cover", {}).get("route_point", []), dtype=np.float32).astype(float).tolist(),
     }
 
@@ -463,6 +538,28 @@ def _approx_box_clearance_gap_m(box_a, box_b):
     return float(max(center_dist - radius_a - radius_b, 0.0))
 
 
+def _point_to_oriented_box_distance(point, box, margin_m=0.0):
+    point = np.asarray(point, dtype=np.float32)
+    pos = box.get("position", None)
+    extent = box.get("extent", None)
+    if point.shape != (2,) or pos is None or extent is None or len(pos) < 2 or len(extent) < 2:
+        return np.inf
+
+    center = np.asarray(pos[:2], dtype=np.float32)
+    extent = np.asarray(extent[:2], dtype=np.float32)
+    dx = point[0] - center[0]
+    dy = point[1] - center[1]
+    yaw = float(box.get("yaw", 0.0))
+    cos_y = float(np.cos(yaw))
+    sin_y = float(np.sin(yaw))
+
+    local_x = dx * cos_y + dy * sin_y
+    local_y = -dx * sin_y + dy * cos_y
+    qx = abs(local_x) - (float(extent[0]) + margin_m)
+    qy = abs(local_y) - (float(extent[1]) + margin_m)
+    return float(np.hypot(max(qx, 0.0), max(qy, 0.0)))
+
+
 def _speed_risk_samples_around_expert(speed_mps, lower_delta=5.0, upper_delta=5.0, max_speed_mps=20.0):
     speed_mps = float(max(speed_mps, 0.0))
     raw = speed_mps + np.asarray([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=np.float32)
@@ -477,6 +574,61 @@ def _risk_from_time_gap(delta_t_s, safe_gap_s):
     return float(np.clip((safe_gap_s - float(delta_t_s)) / max(float(safe_gap_s), 1e-6), 0.0, 1.0))
 
 
+def _borrow_corridor_metrics(release_info, current_meas=None, route_local=None):
+    info = release_info or {}
+    borrow_distance_m = float(info.get("borrow_distance_m", np.nan))
+    if not np.isfinite(borrow_distance_m) or borrow_distance_m <= 1e-3:
+        return None
+
+    ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
+    end_local_xy = None
+    start_local_xy = None
+    if ego_matrix_current is not None:
+        borrow_end_world_xyz = np.asarray(info.get("borrow_end_world_xyz", []), dtype=np.float32)
+        borrow_start_world_xyz = np.asarray(info.get("borrow_start_world_xyz", []), dtype=np.float32)
+        if borrow_end_world_xyz.shape == (3,):
+            end_local = _transform_points_world_xyz_to_local(borrow_end_world_xyz[None, :], ego_matrix_current)
+            if end_local.shape == (1, 2):
+                end_local_xy = end_local[0, :2].astype(np.float32)
+        if borrow_start_world_xyz.shape == (3,):
+            start_local = _transform_points_world_xyz_to_local(borrow_start_world_xyz[None, :], ego_matrix_current)
+            if start_local.shape == (1, 2):
+                start_local_xy = start_local[0, :2].astype(np.float32)
+
+    borrow_start_distance_m = float(info.get("borrow_start_distance_m", np.nan))
+    if start_local_xy is not None:
+        if route_local is not None:
+            route_poly = _route_with_origin(np.asarray(route_local, dtype=np.float32))
+            _, start_s = _project_point_to_polyline(start_local_xy, route_poly)
+            if start_s is not None and np.isfinite(float(start_s)):
+                borrow_start_distance_m = float(max(float(start_s), 0.0))
+        elif np.isfinite(float(start_local_xy[0])):
+            borrow_start_distance_m = float(max(float(start_local_xy[0]), 0.0))
+    if not np.isfinite(borrow_start_distance_m):
+        borrow_start_distance_m = 0.0
+    borrow_start_distance_m = float(max(borrow_start_distance_m, 0.0))
+
+    return {
+        "borrow_start_distance_m": float(borrow_start_distance_m),
+        "borrow_distance_m": float(borrow_distance_m),
+        "borrow_total_clear_distance_m": float(max(borrow_start_distance_m + borrow_distance_m, 0.0)),
+        "start_local_xy": None if start_local_xy is None else start_local_xy,
+        "end_local_xy": None if end_local_xy is None else end_local_xy,
+    }
+
+
+def _borrow_actor_distance_to_corridor_end_m(current_boxes, actor_id, end_local_xy, fallback_distance_m=np.nan):
+    if end_local_xy is None or np.asarray(end_local_xy, dtype=np.float32).shape != (2,):
+        return float(fallback_distance_m)
+    actor_box = _find_box_by_id(current_boxes, actor_id)
+    if actor_box is None:
+        return float(fallback_distance_m)
+    dist = _point_to_oriented_box_distance(np.asarray(end_local_xy, dtype=np.float32), actor_box, margin_m=0.0)
+    if np.isfinite(dist):
+        return float(max(dist, 0.0))
+    return float(fallback_distance_m)
+
+
 def _build_speed_curve_debug(
     current_cover,
     future_cover,
@@ -484,6 +636,7 @@ def _build_speed_curve_debug(
     current_boxes=None,
     event_name=None,
     release_info=None,
+    route_local=None,
     safe_ttc_s=3.0,
     merge_tau_s=0.25,
     merge_clearance_m=6.0,
@@ -503,6 +656,10 @@ def _build_speed_curve_debug(
     sample_speeds = _speed_risk_samples_around_expert(speed)
     chase_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     meet_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    merge_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    merge_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    borrow_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    borrow_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     ego_length_m = _ego_length_m(current_boxes)
     left_junction_conflict_len_m = _left_junction_conflict_len_m(
         current_meas,
@@ -517,6 +674,11 @@ def _build_speed_curve_debug(
             borrow_cross_conflict_len_m = float(max(borrow_distance_m, ego_length_m))
         else:
             borrow_cross_conflict_len_m = float(max(3.0 * ego_length_m, ego_length_m))
+    borrow_corridor = _borrow_corridor_metrics(
+        release_info,
+        current_meas=current_meas,
+        route_local=route_local,
+    )
 
     chase_info = {
         "valid": 0.0,
@@ -558,10 +720,17 @@ def _build_speed_curve_debug(
         "conflict_len_m": np.nan,
         "context_conflict_len_m": float(left_junction_conflict_len_m),
         "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
+        "borrow_start_distance_m": np.nan,
+        "borrow_total_distance_m": np.nan,
+        "d_bg_to_end_m": np.nan,
+        "t_bg_to_end_s": np.nan,
+        "ego_clearance_m": np.nan,
+        "bg_clearance_m": np.nan,
         "bg_speed_mps": np.nan,
         "t_bg_s": np.nan,
         "t_bg_exit_s": np.nan,
         "t_bg_clear_s": np.nan,
+        "t_ego_exit_s": np.nan,
         "safe_gap_bg_m": np.nan,
         "rear_gap_m": np.nan,
         "v_equal_mps": np.nan,
@@ -570,6 +739,17 @@ def _build_speed_curve_debug(
         "v_go_need_mps": np.nan,
         "v_yield_max_mps": np.nan,
     }
+
+    def _cross_wait_from_meet_debug(info):
+        subtype = str(info.get("subtype", "none"))
+        if "cross" not in subtype:
+            return 0.0, 0.0
+        t_exit = float(info.get("t_bg_exit_s", np.nan))
+        t_bg = float(info.get("t_bg_s", np.nan))
+        t_wait = t_exit if np.isfinite(t_exit) else t_bg
+        if not np.isfinite(t_wait):
+            return 0.0, 0.0
+        return float(max(t_wait, 0.0)), 1.0
     ped_cover = None
     if int(current_cover.get("exists", 0.0)) > 0 and str(current_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES:
         ped_cover = {
@@ -626,11 +806,18 @@ def _build_speed_curve_debug(
             )
             meet_risks[idx] = risk
         total_risks = np.maximum(chase_risks, meet_risks)
+        cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
         return {
             "sample_speeds_mps": sample_speeds.astype(np.float32),
             "chase_risks": chase_risks.astype(np.float32),
             "meet_risks": meet_risks.astype(np.float32),
+            "merge_yld_risks": merge_yld_risks.astype(np.float32),
+            "merge_go_risks": merge_go_risks.astype(np.float32),
+            "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
+            "borrow_go_risks": borrow_go_risks.astype(np.float32),
             "total_risks": total_risks.astype(np.float32),
+            "cross_wait_time_s": float(cross_wait_time_s),
+            "cross_wait_valid": float(cross_wait_valid),
             "chase": chase_info,
             "meet": meet_info,
         }
@@ -639,6 +826,80 @@ def _build_speed_curve_debug(
         bg_speed = float(current_cover.get("other_speed", np.nan))
         meet_subtype = str(current_cover.get("interaction", {}).get("subtype", "none"))
         if np.isfinite(d_ego):
+            if meet_subtype == "borrow_cross_meet" and borrow_corridor is not None:
+                bg_length_m = float(current_cover.get("other_length_m", np.nan))
+                if not np.isfinite(bg_length_m):
+                    bg_length_m = float(ego_length_m)
+                bg_clearance_m = float(max(bg_length_m, 1.0))
+                start_distance_m = float(borrow_corridor["borrow_start_distance_m"])
+                borrow_distance_m = float(borrow_corridor["borrow_distance_m"])
+                distance_to_clear_start_m = float(max(float(d_ego) - start_distance_m, 0.0) + bg_clearance_m)
+                t_bg_exit = np.inf if not np.isfinite(bg_speed) or bg_speed <= 1e-6 else distance_to_clear_start_m / max(bg_speed, 1e-6)
+                v_yield_max = np.nan
+                if np.isfinite(t_bg_exit):
+                    denom = float(t_bg_exit) + float(cross_safe_gap_s)
+                    v_yield_max = np.inf if denom <= 1e-6 else float(start_distance_m) / max(denom, 1e-6)
+                v_go_min = np.inf
+                meet_info = {
+                    "valid": 1.0,
+                    "d_ego_m": float(d_ego),
+                    "d_bg_m": 0.0,
+                    "conflict_len_m": float(borrow_distance_m),
+                    "context_conflict_len_m": float(left_junction_conflict_len_m),
+                    "borrow_conflict_len_m": float(borrow_distance_m),
+                    "borrow_start_distance_m": float(start_distance_m),
+                    "borrow_total_distance_m": float(borrow_corridor["borrow_total_clear_distance_m"]),
+                    "d_bg_to_end_m": np.nan,
+                    "ego_clearance_m": float(ego_length_m),
+                    "bg_clearance_m": float(bg_clearance_m),
+                    "bg_speed_mps": float(bg_speed),
+                    "t_bg_s": 0.0,
+                    "t_bg_exit_s": float(t_bg_exit),
+                    "t_bg_to_end_s": np.nan,
+                    "t_bg_clear_s": np.nan,
+                    "safe_gap_bg_m": np.nan,
+                    "rear_gap_m": np.nan,
+                    "v_equal_mps": np.nan,
+                    "v_go_min_mps": float(v_go_min),
+                    "v_behind_min_mps": np.nan,
+                    "v_go_need_mps": np.nan,
+                    "v_yield_max_mps": float(v_yield_max),
+                    "subtype": meet_subtype,
+                    "cover_case": "current",
+                }
+                for idx, candidate_speed in enumerate(sample_speeds):
+                    v = float(candidate_speed)
+                    if v <= 1e-6:
+                        borrow_yld_risks[idx] = 0.0
+                        borrow_go_risks[idx] = 1.0
+                        meet_risks[idx] = 0.0
+                        continue
+                    if np.isfinite(v_yield_max):
+                        yld_risk = 0.0 if v <= float(v_yield_max) else 1.0
+                    elif not np.isfinite(t_bg_exit):
+                        yld_risk = 1.0
+                    else:
+                        t_ego_hit = float(d_ego) / max(v, 1e-6)
+                        yld_risk = _risk_from_time_gap(t_ego_hit - float(t_bg_exit), cross_safe_gap_s)
+                    borrow_yld_risks[idx] = float(np.clip(yld_risk, 0.0, 1.0))
+                    borrow_go_risks[idx] = 1.0
+                    meet_risks[idx] = float(np.clip(min(borrow_yld_risks[idx], borrow_go_risks[idx]), 0.0, 1.0))
+                total_risks = np.maximum(chase_risks, meet_risks)
+                cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
+                return {
+                    "sample_speeds_mps": sample_speeds.astype(np.float32),
+                    "chase_risks": chase_risks.astype(np.float32),
+                    "meet_risks": meet_risks.astype(np.float32),
+                    "merge_yld_risks": merge_yld_risks.astype(np.float32),
+                    "merge_go_risks": merge_go_risks.astype(np.float32),
+                    "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
+                    "borrow_go_risks": borrow_go_risks.astype(np.float32),
+                    "total_risks": total_risks.astype(np.float32),
+                    "cross_wait_time_s": float(cross_wait_time_s),
+                    "cross_wait_valid": float(cross_wait_valid),
+                    "chase": chase_info,
+                    "meet": meet_info,
+                }
             conflict_len_m = np.nan
             if meet_subtype == "junction_left_cross_meet":
                 conflict_len_m = float(left_junction_conflict_len_m)
@@ -664,6 +925,7 @@ def _build_speed_curve_debug(
                 "conflict_len_m": float(conflict_len_m),
                 "context_conflict_len_m": float(left_junction_conflict_len_m),
                 "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
+                "ego_clearance_m": np.nan,
                 "bg_speed_mps": float(bg_speed),
                 "t_bg_s": float(t_bg),
                 "t_bg_exit_s": float(t_bg_exit),
@@ -709,32 +971,134 @@ def _build_speed_curve_debug(
                     )
                 meet_risks[idx] = float(max(risk, occupancy_floor))
             total_risks = np.maximum(chase_risks, meet_risks)
-            return {
-                "sample_speeds_mps": sample_speeds.astype(np.float32),
-                "chase_risks": chase_risks.astype(np.float32),
-                "meet_risks": meet_risks.astype(np.float32),
-                "total_risks": total_risks.astype(np.float32),
-                "chase": chase_info,
-                "meet": meet_info,
-            }
+        cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
+        return {
+            "sample_speeds_mps": sample_speeds.astype(np.float32),
+            "chase_risks": chase_risks.astype(np.float32),
+            "meet_risks": meet_risks.astype(np.float32),
+            "merge_yld_risks": merge_yld_risks.astype(np.float32),
+            "merge_go_risks": merge_go_risks.astype(np.float32),
+            "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
+            "borrow_go_risks": borrow_go_risks.astype(np.float32),
+            "total_risks": total_risks.astype(np.float32),
+            "cross_wait_time_s": float(cross_wait_time_s),
+            "cross_wait_valid": float(cross_wait_valid),
+            "chase": chase_info,
+            "meet": meet_info,
+        }
     if int(future_cover.get("exists", 0.0)) > 0 and future_cover["interaction"]["name"] == "meet":
         d_ego = float(future_cover.get("d_ego", np.nan))
         d_bg = float(future_cover.get("d_bg", np.nan))
         bg_speed = float(future_cover.get("other_speed", np.nan))
         meet_subtype = str(future_cover.get("interaction", {}).get("subtype", "none"))
         if np.isfinite(d_ego) and np.isfinite(d_bg) and np.isfinite(bg_speed) and d_bg > 1e-4 and bg_speed > 1e-4:
+            if meet_subtype == "borrow_cross_meet" and borrow_corridor is not None:
+                actor_id = int(future_cover.get("actor_id", -1))
+                bg_length_m = float(future_cover.get("other_length_m", np.nan))
+                if not np.isfinite(bg_length_m):
+                    bg_length_m = float(ego_length_m)
+                bg_clearance_m = float(max(bg_length_m, 1.0))
+                start_distance_m = float(borrow_corridor["borrow_start_distance_m"])
+                borrow_distance_m = float(borrow_corridor["borrow_distance_m"])
+                d_bg_to_end_m = _borrow_actor_distance_to_corridor_end_m(
+                    current_boxes=current_boxes,
+                    actor_id=actor_id,
+                    end_local_xy=borrow_corridor.get("end_local_xy"),
+                    fallback_distance_m=d_bg,
+                )
+                t_bg_to_end = float(d_bg_to_end_m / max(bg_speed, 1e-6))
+                t_bg_exit_to_end = float((d_bg_to_end_m + bg_clearance_m) / max(bg_speed, 1e-6))
+                t_bg_exit_to_start = float((d_bg_to_end_m + borrow_distance_m + bg_clearance_m) / max(bg_speed, 1e-6))
+                v_yield_max = np.nan
+                if np.isfinite(t_bg_exit_to_start):
+                    denom = float(t_bg_exit_to_start) + float(cross_safe_gap_s)
+                    v_yield_max = np.inf if denom <= 1e-6 else float(start_distance_m) / max(denom, 1e-6)
+                v_go_min = np.nan
+                if np.isfinite(t_bg_to_end):
+                    go_denom = float(t_bg_to_end) - float(cross_safe_gap_s)
+                    v_go_min = np.inf if go_denom <= 1e-6 else float(borrow_corridor["borrow_total_clear_distance_m"] + ego_length_m) / max(go_denom, 1e-6)
+                meet_info = {
+                    "valid": 1.0,
+                    "d_ego_m": float(d_ego),
+                    "d_bg_m": float(d_bg),
+                    "conflict_len_m": float(borrow_distance_m),
+                    "context_conflict_len_m": float(left_junction_conflict_len_m),
+                    "borrow_conflict_len_m": float(borrow_distance_m),
+                    "borrow_start_distance_m": float(start_distance_m),
+                    "borrow_total_distance_m": float(borrow_corridor["borrow_total_clear_distance_m"]),
+                    "d_bg_to_end_m": float(d_bg_to_end_m),
+                    "ego_clearance_m": float(ego_length_m),
+                    "bg_clearance_m": float(bg_clearance_m),
+                    "bg_speed_mps": float(bg_speed),
+                    "t_bg_s": float(d_bg / max(bg_speed, 1e-6)),
+                    "t_bg_exit_s": float(t_bg_exit_to_start),
+                    "t_bg_to_end_s": float(t_bg_to_end),
+                    "t_bg_clear_s": np.nan,
+                    "safe_gap_bg_m": np.nan,
+                    "rear_gap_m": np.nan,
+                    "v_equal_mps": np.nan,
+                    "v_go_min_mps": float(v_go_min),
+                    "v_behind_min_mps": np.nan,
+                    "v_go_need_mps": np.nan,
+                    "v_yield_max_mps": float(v_yield_max),
+                    "subtype": meet_subtype,
+                    "cover_case": "future",
+                }
+                for idx, candidate_speed in enumerate(sample_speeds):
+                    v = float(candidate_speed)
+                    if v <= 1e-6:
+                        borrow_yld_risks[idx] = 0.0
+                        borrow_go_risks[idx] = 1.0
+                        meet_risks[idx] = 0.0
+                        continue
+                    t_ego_enter = float(start_distance_m / max(v, 1e-6))
+                    t_ego_clear = float((borrow_corridor["borrow_total_clear_distance_m"] + ego_length_m) / max(v, 1e-6))
+                    if np.isfinite(v_yield_max):
+                        yld_risk = 0.0 if v <= float(v_yield_max) else 1.0
+                    else:
+                        yld_risk = _risk_from_time_gap(t_ego_enter - t_bg_exit_to_start, cross_safe_gap_s)
+                    go_risk = _risk_from_time_gap(t_bg_to_end - t_ego_clear, cross_safe_gap_s)
+                    borrow_yld_risks[idx] = float(np.clip(yld_risk, 0.0, 1.0))
+                    borrow_go_risks[idx] = float(np.clip(go_risk, 0.0, 1.0))
+                    meet_risks[idx] = float(np.clip(min(borrow_yld_risks[idx], borrow_go_risks[idx]), 0.0, 1.0))
+                total_risks = np.maximum(chase_risks, meet_risks)
+                return {
+                    "sample_speeds_mps": sample_speeds.astype(np.float32),
+                    "chase_risks": chase_risks.astype(np.float32),
+                    "meet_risks": meet_risks.astype(np.float32),
+                    "merge_yld_risks": merge_yld_risks.astype(np.float32),
+                    "merge_go_risks": merge_go_risks.astype(np.float32),
+                    "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
+                    "borrow_go_risks": borrow_go_risks.astype(np.float32),
+                    "total_risks": total_risks.astype(np.float32),
+                    "chase": chase_info,
+                    "meet": meet_info,
+                }
             conflict_len_m = np.nan
             risk_d_ego = float(d_ego)
             risk_d_bg = float(d_bg)
+            ego_clearance_m = float(max(float(ego_length_m), 1.0))
+            bg_length_m = float(future_cover.get("other_length_m", np.nan))
+            if not np.isfinite(bg_length_m):
+                bg_length_m = float(ego_length_m)
+            bg_clearance_m = float(max(bg_length_m, 1.0))
             if meet_subtype == "junction_left_cross_meet":
                 conflict_len_m = float(left_junction_conflict_len_m)
                 conflict_half_m = 0.5 * conflict_len_m
                 risk_d_ego = max(float(d_ego) - conflict_half_m, 0.0)
                 risk_d_bg = max(float(d_bg) - conflict_half_m, 0.0)
             t_bg = risk_d_bg / max(bg_speed, 1e-6)
-            t_bg_exit = (risk_d_bg + max(float(conflict_len_m) if np.isfinite(conflict_len_m) else 0.0, 0.0)) / max(bg_speed, 1e-6)
+            cross_conflict_len_m = max(float(conflict_len_m) if np.isfinite(conflict_len_m) else 0.0, 0.0)
+            bg_occ_len_m = float(
+                cross_conflict_len_m + (bg_clearance_m if meet_subtype == "junction_left_cross_meet" else 0.0)
+            )
+            ego_cross_occ_len_m = float(
+                cross_conflict_len_m + (ego_clearance_m if meet_subtype == "junction_left_cross_meet" else 0.0)
+            )
+            t_bg_exit = (risk_d_bg + bg_occ_len_m) / max(bg_speed, 1e-6)
             safe_gap_bg = float(merge_follow_base_gap_m + merge_follow_headway_s * max(bg_speed, 0.0))
-            t_bg_clear = (risk_d_bg + float(merge_clearance_m)) / max(bg_speed, 1e-6)
+            merge_clearance_effective_m = float(max(float(merge_clearance_m), float(ego_length_m)))
+            t_bg_clear = (risk_d_bg + merge_clearance_effective_m) / max(bg_speed, 1e-6)
             rear_gap_m = float(future_cover.get("rear_gap_m", np.nan))
             if meet_subtype == "merge_meet":
                 v_behind_min = max(float(bg_speed), 0.0)
@@ -749,11 +1113,11 @@ def _build_speed_curve_debug(
                     v_go_need = float(v_behind_min)
                     v_yield_max = np.nan
                 else:
-                    v_equal = d_ego / max(t_bg, 1e-6)
+                    v_equal = (d_ego + ego_clearance_m) / max(t_bg, 1e-6)
                     go_denom = t_bg - float(merge_tau_s)
-                    v_go_min = np.inf if go_denom <= 1e-6 else d_ego / max(go_denom, 1e-6)
+                    v_go_min = np.inf if go_denom <= 1e-6 else (d_ego + ego_clearance_m) / max(go_denom, 1e-6)
                     v_go_need = max(float(v_go_min), float(v_behind_min))
-                    v_yield_max = d_ego / max(t_bg + float(merge_tau_s), 1e-6)
+                    v_yield_max = d_ego / max(t_bg_clear + float(merge_tau_s), 1e-6)
                 debug_v_equal = float(v_equal)
                 debug_v_go_min = float(v_go_min)
                 if (
@@ -783,10 +1147,13 @@ def _build_speed_curve_debug(
                 "conflict_len_m": float(conflict_len_m),
                 "context_conflict_len_m": float(left_junction_conflict_len_m),
                 "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
+                "ego_clearance_m": float(ego_clearance_m) if meet_subtype in {"merge_meet", "junction_left_cross_meet"} else np.nan,
+                "bg_clearance_m": float(bg_clearance_m) if meet_subtype == "junction_left_cross_meet" else np.nan,
                 "bg_speed_mps": bg_speed,
                 "t_bg_s": float(t_bg),
                 "t_bg_exit_s": float(t_bg_exit),
                 "t_bg_clear_s": float(t_bg_clear),
+                "t_ego_exit_s": np.nan,
                 "safe_gap_bg_m": float(safe_gap_bg),
                 "rear_gap_m": float(rear_gap_m),
                 "v_equal_mps": float(debug_v_equal),
@@ -800,8 +1167,12 @@ def _build_speed_curve_debug(
                 v = float(candidate_speed)
                 if v <= 1e-6:
                     meet_risks[idx] = 0.0
+                    merge_yld_risks[idx] = 0.0
+                    merge_go_risks[idx] = 1.0 if (meet_subtype == "merge_meet" and np.isfinite(v_go_need)) else 0.0
                     continue
                 if meet_subtype == "merge_meet":
+                    yld_risk = 0.0
+                    go_risk = 0.0
                     if not np.isfinite(v_go_need):
                         risk = 0.0
                     elif not np.isfinite(v_yield_max):
@@ -825,8 +1196,12 @@ def _build_speed_curve_debug(
                                     1.0,
                                 )
                             )
+                        yld_risk = float(risk)
+                        go_risk = float(risk)
                     elif not np.isfinite(v_equal):
                         risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
+                        yld_risk = float(np.clip((v - v_yield_max) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
+                        go_risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
                     else:
                         # For same-direction merge timing, we keep two safe regimes:
                         # 1) yield behind the actor: v <= v_yield_max
@@ -838,23 +1213,55 @@ def _build_speed_curve_debug(
                         # all the way until v_go_need.
                         if v_go_need <= v_yield_max:
                             meet_risks[idx] = 0.0
+                            merge_yld_risks[idx] = 0.0
+                            merge_go_risks[idx] = 0.0
                             continue
                         peak_speed = max(float(v_equal), float(v_yield_max))
                         if v <= float(v_yield_max):
                             risk = 0.0
+                            yld_risk = 0.0
+                            go_risk = 1.0
                         elif peak_speed <= float(v_yield_max) + 1e-6:
                             risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
+                            yld_risk = float(np.clip((v - v_yield_max) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
+                            go_risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
                         elif v <= peak_speed:
                             risk = float(np.clip((v - v_yield_max) / max(peak_speed - v_yield_max, 1e-6), 0.0, 1.0))
+                            yld_risk = float(np.clip((v - v_yield_max) / max(peak_speed - v_yield_max, 1e-6), 0.0, 1.0))
+                            go_risk = 1.0
                         elif v < v_go_need:
                             risk = float(np.clip((v_go_need - v) / max(v_go_need - peak_speed, 1e-6), 0.0, 1.0))
+                            yld_risk = 1.0
+                            go_risk = float(np.clip((v_go_need - v) / max(v_go_need - peak_speed, 1e-6), 0.0, 1.0))
                         else:
                             risk = 0.0
+                            yld_risk = 1.0
+                            go_risk = 0.0
+                    if (
+                        np.isfinite(v_yield_max) and np.isfinite(v_behind_min) and
+                        float(v_behind_min) > float(v_yield_max) + 1e-6 and
+                        v > float(v_yield_max)
+                    ):
+                        rear_speed_risk = float(
+                            np.clip(
+                                (float(v_behind_min) - v) /
+                                max(float(v_behind_min) - float(v_yield_max), 1e-6),
+                                0.0,
+                                1.0,
+                            )
+                        )
+                        risk = max(float(risk), float(rear_speed_risk))
+                        yld_risk = max(float(yld_risk), float(rear_speed_risk))
+                        go_risk = max(float(go_risk), float(rear_speed_risk))
+                    merge_yld_risks[idx] = float(np.clip(np.nan_to_num(yld_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
+                    merge_go_risks[idx] = float(np.clip(np.nan_to_num(go_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
                 else:
                     conflict_len = max(float(conflict_len_m) if np.isfinite(conflict_len_m) else 0.0, 0.0)
                     t_ego_in = risk_d_ego / max(v, 1e-6)
                     if conflict_len > 1e-6:
-                        t_ego_out = (risk_d_ego + conflict_len) / max(v, 1e-6)
+                        t_ego_out = (risk_d_ego + ego_cross_occ_len_m) / max(v, 1e-6)
+                        if meet_subtype == "junction_left_cross_meet" and idx == int(len(sample_speeds) // 2):
+                            meet_info["t_ego_exit_s"] = float(t_ego_out)
                         gap_before = t_bg - t_ego_out
                         gap_after = t_ego_in - t_bg_exit
                         time_clearance = max(gap_before, gap_after)
@@ -875,6 +1282,10 @@ def _build_speed_curve_debug(
         "sample_speeds_mps": sample_speeds.astype(np.float32),
         "chase_risks": chase_risks.astype(np.float32),
         "meet_risks": meet_risks.astype(np.float32),
+        "merge_yld_risks": merge_yld_risks.astype(np.float32),
+        "merge_go_risks": merge_go_risks.astype(np.float32),
+        "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
+        "borrow_go_risks": borrow_go_risks.astype(np.float32),
         "total_risks": total_risks.astype(np.float32),
         "chase": chase_info,
         "meet": meet_info,
@@ -1164,6 +1575,504 @@ def _estimate_borrow_points_from_wait_route(
     }
 
 
+def _estimate_borrow_points_from_signed_route_shift(
+    route_local,
+    shift_sign=-1.0,
+    borrow_enter_lateral_thresh=1.25,
+    return_lateral_thresh=0.8,
+    min_enter_progress_m=4.0,
+    min_return_progress_m=6.0,
+    baseline_points=6,
+    segment_step_m=0.5,
+):
+    route_poly = _route_with_origin(route_local)
+    if route_poly.shape[0] < 3:
+        return None
+
+    arc = _polyline_arclengths(route_poly)
+    if arc.shape[0] != route_poly.shape[0]:
+        return None
+
+    baseline_count = min(max(int(baseline_points), 2), route_poly.shape[0])
+    baseline_y = float(np.median(route_poly[:baseline_count, 1]))
+    rel_y = route_poly[:, 1] - baseline_y
+    signed_rel_y = float(np.sign(float(shift_sign)) or -1.0) * rel_y
+
+    enter_idx = None
+    for idx in range(1, route_poly.shape[0]):
+        if float(arc[idx]) < float(min_enter_progress_m):
+            continue
+        if float(signed_rel_y[idx]) >= float(borrow_enter_lateral_thresh):
+            enter_idx = idx
+            break
+    if enter_idx is None:
+        return None
+
+    return_idx = None
+    for idx in range(enter_idx + 1, route_poly.shape[0]):
+        if float(arc[idx] - arc[enter_idx]) < float(min_return_progress_m):
+            continue
+        if float(signed_rel_y[idx]) <= float(return_lateral_thresh):
+            return_idx = idx
+            break
+    if return_idx is None:
+        return None
+
+    peak_signed_lateral_m = float(np.max(signed_rel_y[enter_idx:return_idx + 1]))
+    peak_lateral_m = float(np.max(np.abs(rel_y[enter_idx:return_idx + 1])))
+    query_s = np.arange(
+        float(arc[enter_idx]),
+        float(arc[return_idx]) + 1e-6,
+        float(max(segment_step_m, 1e-3)),
+        dtype=np.float32,
+    )
+    if query_s.size == 0 or float(query_s[-1]) < float(arc[return_idx]) - 1e-4:
+        query_s = np.concatenate([query_s, np.array([float(arc[return_idx])], dtype=np.float32)], axis=0)
+    segment_local = _sample_polyline_at_arclengths(route_poly, query_s)
+
+    return {
+        "enter_idx": int(enter_idx),
+        "return_idx": int(return_idx),
+        "enter_s_m": float(arc[enter_idx]),
+        "return_s_m": float(arc[return_idx]),
+        "borrow_distance_m": float(max(arc[return_idx] - arc[enter_idx], 0.0)),
+        "peak_lateral_m": float(peak_lateral_m),
+        "peak_signed_lateral_m": float(peak_signed_lateral_m),
+        "baseline_y_m": float(baseline_y),
+        "shift_sign": float(np.sign(float(shift_sign)) or -1.0),
+        "enter_local_xy": route_poly[enter_idx, :2].astype(np.float32),
+        "return_local_xy": route_poly[return_idx, :2].astype(np.float32),
+        "segment_local_xy": segment_local.astype(np.float32),
+    }
+
+
+def _box_world_xy(box, ego_matrix_current=None):
+    matrix = (box or {}).get("matrix", None)
+    if isinstance(matrix, (list, tuple, np.ndarray)):
+        matrix_arr = np.asarray(matrix, dtype=np.float32)
+        if matrix_arr.shape == (4, 4):
+            return matrix_arr[:2, 3].astype(np.float32)
+    pos = (box or {}).get("position", None)
+    if pos is None or len(pos) < 2:
+        return None
+    pos_xy = np.asarray(pos[:2], dtype=np.float32)
+    if ego_matrix_current is not None:
+        world = _transform_points_local_to_world_xyz(pos_xy[None, :], ego_matrix_current)
+        if world.shape[0] > 0:
+            return world[0, :2].astype(np.float32)
+    return pos_xy.astype(np.float32)
+
+
+def _summarize_signed_route_shift(route_local, shift_sign=-1.0, baseline_points=6):
+    route_poly = _route_with_origin(route_local)
+    if route_poly.shape[0] < 3:
+        return None
+
+    arc = _polyline_arclengths(route_poly)
+    if arc.shape[0] != route_poly.shape[0]:
+        return None
+
+    baseline_count = min(max(int(baseline_points), 2), route_poly.shape[0])
+    baseline_y = float(np.median(route_poly[:baseline_count, 1]))
+    rel_y = route_poly[:, 1] - baseline_y
+    signed_factor = float(np.sign(float(shift_sign)) or -1.0)
+    signed_rel_y = signed_factor * rel_y
+    peak_idx = int(np.argmax(signed_rel_y))
+    return {
+        "route_poly": route_poly.astype(np.float32),
+        "arc": arc.astype(np.float32),
+        "baseline_y": float(baseline_y),
+        "rel_y": rel_y.astype(np.float32),
+        "signed_rel_y": signed_rel_y.astype(np.float32),
+        "peak_idx": int(peak_idx),
+        "peak_signed_lateral_m": float(signed_rel_y[peak_idx]),
+        "shift_sign": float(signed_factor),
+    }
+
+
+def _build_borrow_geom_from_shift_summary(summary, enter_idx, return_idx, segment_step_m=0.5, mode="strict"):
+    route_poly = np.asarray(summary["route_poly"], dtype=np.float32)
+    arc = np.asarray(summary["arc"], dtype=np.float32)
+    rel_y = np.asarray(summary["rel_y"], dtype=np.float32)
+    signed_rel_y = np.asarray(summary["signed_rel_y"], dtype=np.float32)
+    enter_idx = int(enter_idx)
+    return_idx = int(return_idx)
+    if not (0 <= enter_idx < return_idx < route_poly.shape[0]):
+        return None
+
+    query_s = np.arange(
+        float(arc[enter_idx]),
+        float(arc[return_idx]) + 1e-6,
+        float(max(segment_step_m, 1e-3)),
+        dtype=np.float32,
+    )
+    if query_s.size == 0 or float(query_s[-1]) < float(arc[return_idx]) - 1e-4:
+        query_s = np.concatenate([query_s, np.array([float(arc[return_idx])], dtype=np.float32)], axis=0)
+    segment_local = _sample_polyline_at_arclengths(route_poly, query_s)
+    return {
+        "enter_idx": int(enter_idx),
+        "return_idx": int(return_idx),
+        "enter_s_m": float(arc[enter_idx]),
+        "return_s_m": float(arc[return_idx]),
+        "borrow_distance_m": float(max(arc[return_idx] - arc[enter_idx], 0.0)),
+        "peak_lateral_m": float(np.max(np.abs(rel_y[enter_idx:return_idx + 1]))),
+        "peak_signed_lateral_m": float(np.max(signed_rel_y[enter_idx:return_idx + 1])),
+        "baseline_y_m": float(summary["baseline_y"]),
+        "shift_sign": float(summary["shift_sign"]),
+        "enter_local_xy": route_poly[enter_idx, :2].astype(np.float32),
+        "return_local_xy": route_poly[return_idx, :2].astype(np.float32),
+        "segment_local_xy": segment_local.astype(np.float32),
+        "mode": str(mode),
+        "return_abs_m": float(abs(signed_rel_y[return_idx])),
+    }
+
+
+def _estimate_borrow_points_from_signed_route_shift_relaxed(
+    route_local,
+    shift_sign=-1.0,
+    borrow_enter_lateral_thresh=1.25,
+    return_lateral_thresh=0.8,
+    min_enter_progress_m=4.0,
+    min_return_progress_m=6.0,
+    baseline_points=6,
+    segment_step_m=0.5,
+    fallback_peak_lateral_thresh=2.5,
+    fallback_return_abs_thresh=1.5,
+    fallback_min_recovery_m=1.0,
+):
+    summary = _summarize_signed_route_shift(
+        route_local=route_local,
+        shift_sign=shift_sign,
+        baseline_points=baseline_points,
+    )
+    if summary is None:
+        return None
+
+    route_poly = np.asarray(summary["route_poly"], dtype=np.float32)
+    arc = np.asarray(summary["arc"], dtype=np.float32)
+    signed_rel_y = np.asarray(summary["signed_rel_y"], dtype=np.float32)
+
+    enter_idx = None
+    for idx in range(1, route_poly.shape[0]):
+        if float(arc[idx]) < float(min_enter_progress_m):
+            continue
+        if float(signed_rel_y[idx]) >= float(borrow_enter_lateral_thresh):
+            enter_idx = idx
+            break
+    if enter_idx is None:
+        return None
+
+    peak_slice = signed_rel_y[enter_idx:]
+    if peak_slice.size == 0:
+        return None
+    peak_idx = int(enter_idx + int(np.argmax(peak_slice)))
+    peak_signed = float(signed_rel_y[peak_idx])
+    if peak_signed < float(fallback_peak_lateral_thresh):
+        return None
+
+    for idx in range(peak_idx + 1, route_poly.shape[0]):
+        if float(arc[idx] - arc[enter_idx]) < float(min_return_progress_m):
+            continue
+        if float(signed_rel_y[idx]) <= float(return_lateral_thresh):
+            return _build_borrow_geom_from_shift_summary(
+                summary,
+                enter_idx=enter_idx,
+                return_idx=idx,
+                segment_step_m=segment_step_m,
+                mode="strict",
+            )
+
+    return None
+
+
+def _two_way_blocker_box_allowed(box, event_name=None, stop_speed_thresh_mps=0.25):
+    cls = _box_class_name(box)
+    if cls == "ego_car":
+        return False
+    event_name = str(event_name or "")
+    if event_name == "ConstructionObstacleTwoWays":
+        return bool(cls == "static")
+    if event_name == "AccidentTwoWays":
+        if cls not in {"car", "truck", "bus", "van", "vehicle"}:
+            return False
+        return bool(float(abs(box.get("speed", 0.0))) <= float(stop_speed_thresh_mps))
+    return False
+
+
+def _build_event_two_way_borrow_context(
+    frame_records,
+    event_name=None,
+    route_step_m=0.5,
+    borrow_start_mode="route_head",
+    borrow_enter_lateral_thresh=1.25,
+    return_lateral_thresh=0.8,
+    min_enter_progress_m=4.0,
+    min_return_progress_m=6.0,
+    blocker_pre_shift_lateral_thresh=1.75,
+    fallback_peak_lateral_thresh=2.5,
+    fallback_return_abs_thresh=1.5,
+    fallback_min_recovery_m=1.0,
+):
+    if not _is_two_way_event_corridor_scene_context(event_name=event_name):
+        return None
+
+    def _best_borrow_geom_for_route(route_local):
+        best_geom = None
+        best_priority = None
+        best_score = None
+        for shift_sign in (-1.0, 1.0):
+            strict_geom = _estimate_borrow_points_from_signed_route_shift(
+                route_local=route_local,
+                shift_sign=shift_sign,
+                borrow_enter_lateral_thresh=float(borrow_enter_lateral_thresh),
+                return_lateral_thresh=float(return_lateral_thresh),
+                min_enter_progress_m=float(min_enter_progress_m),
+                min_return_progress_m=float(min_return_progress_m),
+                segment_step_m=float(max(route_step_m, 0.25)),
+            )
+            geom = strict_geom
+            priority = 0
+            if geom is None:
+                continue
+            score = (
+                int(priority),
+                -float(geom.get("peak_signed_lateral_m", 0.0)),
+                float(geom.get("return_abs_m", np.inf)),
+            )
+            if best_score is None or score < best_score:
+                best_geom = dict(geom)
+                best_priority = int(priority)
+                best_score = score
+        if best_geom is None:
+            return None, None
+        return best_geom, int(best_priority)
+
+    route_candidates = []
+    for record_idx, record in enumerate(frame_records or []):
+        current_meas = record.get("current_meas")
+        if _measurement_command_id(current_meas) != LANE_FOLLOW_COMMAND_ID:
+            continue
+        ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
+        if ego_matrix_current is None:
+            continue
+        route_local = np.asarray(
+            record.get("sample_vis", {}).get(
+                "_route_corridor_input_local",
+                record.get("sample_vis", {}).get("_route_input_local", np.zeros((0, 2), dtype=np.float32)),
+            ),
+            dtype=np.float32,
+        )
+        borrow_geom, priority = _best_borrow_geom_for_route(route_local)
+        if borrow_geom is None:
+            continue
+        route_candidates.append({
+            "record_idx": int(record_idx),
+            "frame_id": int(record.get("frame_id", -1)),
+            "priority": int(priority),
+            "geom": dict(borrow_geom),
+        })
+
+    if not route_candidates:
+        return None
+
+    seed_actor = None
+    for route_candidate in sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"]))):
+        record = frame_records[int(route_candidate["record_idx"])]
+        eligible_boxes = []
+        for box in record.get("current_boxes") or []:
+            actor_id = box.get("id", None)
+            if actor_id is None or not _two_way_blocker_box_allowed(box, event_name=event_name):
+                continue
+            pos = box.get("position", None)
+            if pos is None or len(pos) < 2:
+                continue
+            local_x = float(pos[0])
+            local_y = float(pos[1])
+            if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
+                continue
+            eligible_boxes.append((float(local_x), float(abs(local_y)), int(actor_id), box))
+        if not eligible_boxes:
+            continue
+        eligible_boxes.sort(key=lambda item: (item[0], item[1], item[2]))
+        _, _, actor_id, seed_box = eligible_boxes[0]
+        seed_world_xy = _box_world_xy(seed_box, ego_matrix_current=record.get("current_meas", {}).get("ego_matrix", None))
+        seed_actor = {
+            "actor_id": int(actor_id),
+            "actor_class": str(_box_class_name(seed_box)),
+            "seed_frame_id": int(route_candidate["frame_id"]),
+            "seed_priority": int(route_candidate["priority"]),
+            "seed_world_xy": [] if seed_world_xy is None else np.asarray(seed_world_xy, dtype=np.float32).astype(float).tolist(),
+        }
+        break
+
+    if seed_actor is None:
+        return None
+
+    best_strict = None
+    best_fallback = None
+    for route_candidate in route_candidates:
+        record = frame_records[int(route_candidate["record_idx"])]
+        ego_matrix_current = None if record.get("current_meas") is None else record["current_meas"].get("ego_matrix", None)
+        for box in record.get("current_boxes") or []:
+            actor_id = box.get("id", None)
+            if actor_id is None or int(actor_id) != int(seed_actor["actor_id"]):
+                continue
+            pos = box.get("position", None)
+            if pos is None or len(pos) < 2:
+                continue
+            local_x = float(pos[0])
+            local_y = float(pos[1])
+            if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
+                continue
+            world_xy = _box_world_xy(box, ego_matrix_current=ego_matrix_current)
+            candidate = {
+                "score": (float(local_x), float(abs(local_y)), -int(route_candidate["frame_id"])),
+                "record_idx": int(route_candidate["record_idx"]),
+                "frame_id": int(route_candidate["frame_id"]),
+                "actor_id": int(seed_actor["actor_id"]),
+                "actor_class": str(seed_actor["actor_class"]),
+                "local_x": float(local_x),
+                "local_y": float(local_y),
+                "world_xy": [] if world_xy is None else np.asarray(world_xy, dtype=np.float32).astype(float).tolist(),
+                "geom": dict(route_candidate["geom"]),
+            }
+            if int(route_candidate["priority"]) == 0:
+                if best_strict is None or candidate["score"] < best_strict["score"]:
+                    best_strict = candidate
+            else:
+                if best_fallback is None or candidate["score"] < best_fallback["score"]:
+                    best_fallback = candidate
+
+    best_candidate = best_strict if best_strict is not None else best_fallback
+    if best_candidate is None:
+        return None
+
+    record = frame_records[int(best_candidate["record_idx"])]
+    current_meas = record.get("current_meas")
+    ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
+    if ego_matrix_current is None:
+        return None
+    borrow_geom = dict(best_candidate["geom"])
+    route_local_context = np.asarray(
+        record.get("sample_vis", {}).get(
+            "_route_corridor_input_local",
+            record.get("sample_vis", {}).get("_route_input_local", np.zeros((0, 2), dtype=np.float32)),
+        ),
+        dtype=np.float32,
+    )
+    route_poly_context = _route_with_origin(route_local_context)
+    arc_context = _polyline_arclengths(route_poly_context)
+    if (
+        route_poly_context.ndim != 2 or route_poly_context.shape[0] < 2 or route_poly_context.shape[1] != 2 or
+        arc_context.ndim != 1 or arc_context.shape[0] != route_poly_context.shape[0]
+    ):
+        return None
+    route_head_idx = int(max(route_poly_context.shape[0] - route_local_context.shape[0], 0))
+    obstacle_local = np.asarray([best_candidate["local_x"], best_candidate["local_y"]], dtype=np.float32)
+    if obstacle_local.shape != (2,) or not np.all(np.isfinite(obstacle_local)):
+        return None
+    # Choose how we anchor the corridor start along the route.
+    if str(borrow_start_mode) == "obstacle_align":
+        start_mask = np.abs(route_poly_context[:, 1]) <= float(TWOWAY_START_LATERAL_THRESH_M)
+        if not np.any(start_mask):
+            return None
+        candidate_idx = np.where(start_mask)[0]
+        candidate_x = route_poly_context[candidate_idx, 0]
+        start_idx = int(candidate_idx[np.argmin(np.abs(candidate_x - obstacle_local[0]))])
+        route_start_s = float(arc_context[start_idx])
+    else:
+        # Route head means the first actual route point, not the prepended origin.
+        route_start_s = float(arc_context[min(route_head_idx, arc_context.shape[0] - 1)])
+
+    shift_summary = _summarize_signed_route_shift(
+        route_local=route_local_context,
+        shift_sign=float(borrow_geom.get("shift_sign", -1.0)),
+    )
+    route_return_s = np.nan
+    if shift_summary is not None:
+        rel_y = np.asarray(shift_summary.get("rel_y", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+        peak_idx = int(shift_summary.get("peak_idx", route_head_idx))
+        search_start_idx = int(np.clip(max(route_head_idx, peak_idx), 0, max(rel_y.shape[0] - 1, 0)))
+        if rel_y.ndim == 1 and rel_y.shape[0] == route_poly_context.shape[0] and search_start_idx < rel_y.shape[0]:
+            if float(borrow_geom.get("shift_sign", -1.0)) < 0.0:
+                return_idx = int(search_start_idx + np.argmax(rel_y[search_start_idx:]))
+            else:
+                return_idx = int(search_start_idx + np.argmin(rel_y[search_start_idx:]))
+            route_return_s = float(arc_context[min(return_idx, arc_context.shape[0] - 1)])
+    if not np.isfinite(route_return_s) or route_return_s <= route_start_s + 1e-3:
+        front_local = np.asarray(
+            record.get("sample_vis", {}).get("_route_front_local", np.zeros((0, 2), dtype=np.float32)),
+            dtype=np.float32,
+        )
+        route_front_count = int(front_local.shape[0]) if front_local.ndim == 2 else 0
+        fallback_local_idx = route_front_count + int(TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX) - 1
+        if route_front_count <= 0 or fallback_local_idx >= route_local_context.shape[0]:
+            return None
+        fallback_poly_idx = int(route_head_idx + fallback_local_idx)
+        if fallback_poly_idx < 0 or fallback_poly_idx >= arc_context.shape[0]:
+            return None
+        route_return_s = float(arc_context[fallback_poly_idx])
+    route_return_s = float(np.clip(route_return_s, route_start_s, float(arc_context[-1])))
+
+    query_s = np.arange(
+        route_start_s,
+        route_return_s + 1e-6,
+        float(max(route_step_m, 0.25)),
+        dtype=np.float32,
+    )
+    if query_s.size == 0 or float(query_s[-1]) < route_return_s - 1e-4:
+        query_s = np.concatenate([query_s, np.array([route_return_s], dtype=np.float32)], axis=0)
+    corridor_segment_local = _sample_polyline_at_arclengths(route_poly_context, query_s)
+    if corridor_segment_local.ndim != 2 or corridor_segment_local.shape[0] < 2 or corridor_segment_local.shape[1] != 2:
+        return None
+    borrow_geom["segment_local_xy"] = corridor_segment_local.astype(np.float32)
+    borrow_geom["enter_local_xy"] = corridor_segment_local[0, :2].astype(np.float32)
+    borrow_geom["enter_s_m"] = float(route_start_s)
+    borrow_geom["return_s_m"] = float(route_return_s)
+    borrow_geom["borrow_distance_m"] = float(max(route_return_s - route_start_s, 0.0))
+    borrow_geom["start_from_route_head"] = False
+    borrow_segment_world = _transform_points_local_to_world_xyz(
+        np.asarray(borrow_geom.get("segment_local_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+        ego_matrix_current,
+    )
+    if borrow_segment_world.ndim != 2 or borrow_segment_world.shape[0] < 2 or borrow_segment_world.shape[1] < 3:
+        return None
+    borrow_world = np.stack([borrow_segment_world[0, :2], borrow_segment_world[-1, :2]], axis=0)
+    borrow_world_xyz = np.stack([borrow_segment_world[0, :3], borrow_segment_world[-1, :3]], axis=0)
+
+    return {
+        "valid": 1.0,
+        "ready": 1.0,
+        "source": "event_blocker_route_{}".format(str(borrow_geom.get("mode", "strict"))),
+        "release_frame_id": -1,
+        "enter_frame_id": int(best_candidate["frame_id"]),
+        "return_frame_id": int(best_candidate["frame_id"]),
+        "borrow_duration_s": 0.0,
+        "release_to_return_s": 0.0,
+        "borrow_start_distance_m": float(route_start_s),
+        "borrow_start_world_xy": borrow_world[0, :2].astype(float).tolist(),
+        "borrow_end_world_xy": borrow_world[1, :2].astype(float).tolist(),
+        "borrow_start_world_xyz": borrow_world_xyz[0, :3].astype(float).tolist(),
+        "borrow_end_world_xyz": borrow_world_xyz[1, :3].astype(float).tolist(),
+        "borrow_segment_world_xy": borrow_segment_world[:, :2].astype(float).tolist(),
+        "borrow_segment_world_xyz": borrow_segment_world[:, :3].astype(float).tolist(),
+        "borrow_distance_m": float(borrow_geom["borrow_distance_m"]),
+        "peak_lateral_m": float(borrow_geom["peak_lateral_m"]),
+        "peak_signed_lateral_m": float(borrow_geom.get("peak_signed_lateral_m", np.nan)),
+        "shift_sign": float(borrow_geom.get("shift_sign", np.nan)),
+        "context_frame_id": int(best_candidate["frame_id"]),
+        "anchor_actor_id": int(best_candidate["actor_id"]),
+        "anchor_distance_m": float(best_candidate["local_x"]),
+        "anchor_world_xy": list(best_candidate["world_xy"]),
+        "blocking_actor_id": int(best_candidate["actor_id"]),
+        "blocking_actor_class": str(best_candidate["actor_class"]),
+        "blocking_actor_local_x_m": float(best_candidate["local_x"]),
+        "blocking_actor_local_y_m": float(best_candidate["local_y"]),
+        "route_return_abs_m": float(borrow_geom.get("return_abs_m", np.nan)),
+        "blocked_frame_id": -1,
+    }
+
+
 def _find_nearest_future_frame_to_world_point(frame_records, start_idx, target_world_xy, max_horizon_frames=120):
     target_world_xy = np.asarray(target_world_xy, dtype=np.float32)
     if target_world_xy.shape != (2,):
@@ -1271,6 +2180,7 @@ def _annotate_release_ready(
             "return_frame_id": -1,
             "borrow_duration_s": 0.0,
             "release_to_return_s": 0.0,
+            "borrow_start_distance_m": 0.0,
             "borrow_distance_m": 0.0,
             "peak_lateral_m": 0.0,
             "blocked_frame_id": -1,
@@ -1278,6 +2188,10 @@ def _annotate_release_ready(
             "blocking_actor_class": "none",
             "borrow_start_world_xy": [],
             "borrow_end_world_xy": [],
+            "borrow_start_world_xyz": [],
+            "borrow_end_world_xyz": [],
+            "borrow_segment_world_xy": [],
+            "borrow_segment_world_xyz": [],
         }
         if float(record["wait_info"].get("wait_state", 0.0)) <= 0.5:
             record["release_ready"] = info
@@ -1301,7 +2215,13 @@ def _annotate_release_ready(
             record["release_ready"] = info
             continue
 
-        route_local = np.asarray(record["sample_vis"].get("_route_input_local", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+        route_local = np.asarray(
+            record["sample_vis"].get(
+                "_route_corridor_input_local",
+                record["sample_vis"].get("_route_input_local", np.zeros((0, 2), dtype=np.float32)),
+            ),
+            dtype=np.float32,
+        )
         borrow_geom = _estimate_borrow_points_from_wait_route(
             route_local=route_local,
             borrow_enter_lateral_thresh=borrow_enter_lateral_thresh,
@@ -1315,14 +2235,16 @@ def _annotate_release_ready(
             record["release_ready"] = info
             continue
 
-        borrow_world = _transform_points_local_to_world_xyz(
-            np.stack([borrow_geom["enter_local_xy"], borrow_geom["return_local_xy"]], axis=0),
+        borrow_segment_world = _transform_points_local_to_world_xyz(
+            np.asarray(borrow_geom["segment_local_xy"], dtype=np.float32),
             ego_matrix_current,
         )
-        if borrow_world.shape[0] != 2:
+        if borrow_segment_world.ndim != 2 or borrow_segment_world.shape[0] < 2 or borrow_segment_world.shape[1] < 3:
             info["source"] = "borrow_world_invalid"
             record["release_ready"] = info
             continue
+        borrow_world = np.stack([borrow_segment_world[0, :2], borrow_segment_world[-1, :2]], axis=0)
+        borrow_world_xyz = np.stack([borrow_segment_world[0, :3], borrow_segment_world[-1, :3]], axis=0)
 
         enter_match = _find_nearest_future_frame_to_world_point(
             frame_records,
@@ -1417,6 +2339,7 @@ def _annotate_release_ready(
             "return_frame_id": int(return_match["frame_id"]),
             "borrow_duration_s": float(borrow_duration_frames / max(float(fps_hz), 1e-6)),
             "release_to_return_s": float(release_to_return_frames / max(float(fps_hz), 1e-6)),
+            "borrow_start_distance_m": float(borrow_geom.get("enter_s_m", 0.0)),
             "borrow_distance_m": float(borrow_geom["borrow_distance_m"]),
             "peak_lateral_m": float(borrow_geom["peak_lateral_m"]),
             "blocked_frame_id": int(blocked_frame_id),
@@ -1424,6 +2347,10 @@ def _annotate_release_ready(
             "blocking_actor_class": blocking_actor_class,
             "borrow_start_world_xy": borrow_world[0, :2].astype(float).tolist(),
             "borrow_end_world_xy": borrow_world[1, :2].astype(float).tolist(),
+            "borrow_start_world_xyz": borrow_world_xyz[0, :3].astype(float).tolist(),
+            "borrow_end_world_xyz": borrow_world_xyz[1, :3].astype(float).tolist(),
+            "borrow_segment_world_xy": borrow_segment_world[:, :2].astype(float).tolist(),
+            "borrow_segment_world_xyz": borrow_segment_world[:, :3].astype(float).tolist(),
         })
         record["release_ready"] = info
 
@@ -1762,6 +2689,24 @@ def _project_point_to_polyline(point_xy, polyline_xy):
     return np.asarray(best_proj, dtype=np.float32), best_s
 
 
+def _line_segment_intersection_2d(line_p0, line_p1, seg_p0, seg_p1, eps=1e-6):
+    line_p0 = np.asarray(line_p0, dtype=np.float32)
+    line_p1 = np.asarray(line_p1, dtype=np.float32)
+    seg_p0 = np.asarray(seg_p0, dtype=np.float32)
+    seg_p1 = np.asarray(seg_p1, dtype=np.float32)
+    r = line_p1 - line_p0
+    s = seg_p1 - seg_p0
+    denom = float(r[0] * s[1] - r[1] * s[0])
+    if abs(denom) < eps:
+        return None, None
+    qp = seg_p0 - line_p0
+    t = float((qp[0] * s[1] - qp[1] * s[0]) / denom)
+    u = float((qp[0] * r[1] - qp[1] * r[0]) / denom)
+    if u < -eps or u > 1.0 + eps:
+        return None, None
+    return (line_p0 + t * r), float(np.clip(u, 0.0, 1.0))
+
+
 def _sample_polyline_at_arclengths(polyline_xy, query_s):
     pts = np.asarray(polyline_xy, dtype=np.float32)
     query_s = np.asarray(query_s, dtype=np.float32)
@@ -1843,6 +2788,8 @@ def _extend_local_route_with_scene_polyline(
     return _dedupe_polyline(merged, min_step_m=max(0.25, 0.5 * float(extension_step_m)))
 
 
+
+
 def _collect_dynamic_actor_ids(current_boxes, future_frames_data, ego_matrix_current, speed_thresh_mps=0.25, motion_thresh_m=1.0):
     dynamic_ids = set()
     current_boxes = current_boxes or []
@@ -1893,6 +2840,22 @@ def _collect_dynamic_actor_ids(current_boxes, future_frames_data, ego_matrix_cur
 
 
 def _collect_scene_nonstatic_actor_ids(route_samples, image_root, speed_thresh_mps=0.25, motion_thresh_m=1.0):
+    def _box_world_xy(box, ego_matrix_current=None):
+        matrix = (box or {}).get("matrix", None)
+        if isinstance(matrix, (list, tuple, np.ndarray)):
+            matrix_arr = np.asarray(matrix, dtype=np.float32)
+            if matrix_arr.shape == (4, 4):
+                return matrix_arr[:2, 3].astype(np.float32)
+        pos = (box or {}).get("position", None)
+        if pos is None or len(pos) < 2:
+            return None
+        pos_xy = np.asarray(pos[:2], dtype=np.float32)
+        if ego_matrix_current is not None:
+            world = _transform_points_local_to_world_xyz(pos_xy[None, :], ego_matrix_current)
+            if world.shape[0] > 0:
+                return world[0, :2].astype(np.float32)
+        return pos_xy.astype(np.float32)
+
     stats = {}
     for sample in route_samples or []:
         base_dir, frame_str = _resolve_feature_frame_info(sample)
@@ -1902,16 +2865,20 @@ def _collect_scene_nonstatic_actor_ids(route_samples, image_root, speed_thresh_m
         boxes = _load_json_gz_if_exists(boxes_path)
         if boxes is None:
             continue
+        ego_matrix_current = None
+        meas_path = os.path.join(image_root, base_dir, "measurements", f"{frame_str}.json.gz")
+        meas = _load_json_gz_if_exists(meas_path)
+        if isinstance(meas, dict):
+            ego_matrix_current = meas.get("ego_matrix", None)
         for box in boxes:
             cls = str(box.get("class", "")).lower()
             if cls in {"ego_car", "static"}:
                 continue
             actor_id = box.get("id", None)
-            pos = box.get("position", None)
-            if actor_id is None or pos is None or len(pos) < 2:
+            pos_xy = _box_world_xy(box, ego_matrix_current=ego_matrix_current)
+            if actor_id is None or pos_xy is None or pos_xy.shape != (2,):
                 continue
             actor_id = int(actor_id)
-            pos_xy = np.asarray(pos[:2], dtype=np.float32)
             speed_abs = abs(float(box.get("speed", 0.0)))
             rec = stats.setdefault(
                 actor_id,
@@ -2007,13 +2974,64 @@ def _draw_polyline(img, pts_xy, color, width, height, xlim, ylim, thickness=1, c
     cv2.polylines(img, [pts_px], isClosed=closed, color=color, thickness=thickness, lineType=cv2.LINE_AA)
 
 
-def _draw_box(img, box, color, width, height, xlim, ylim, thickness=2):
+def _draw_dashed_polyline(
+    img,
+    pts_xy,
+    color,
+    width,
+    height,
+    xlim,
+    ylim,
+    thickness=1,
+    closed=False,
+    dash_px=10.0,
+    gap_px=6.0,
+):
+    pts = np.asarray(pts_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] != 2:
+        return
+    pts_px = _to_canvas(pts, width, height, xlim, ylim).astype(np.float32)
+    if closed and pts_px.shape[0] >= 2:
+        pts_px = np.concatenate([pts_px, pts_px[:1]], axis=0)
+    if pts_px.shape[0] < 2:
+        return
+
+    dash_px = float(max(dash_px, 1.0))
+    gap_px = float(max(gap_px, 0.0))
+    for idx in range(pts_px.shape[0] - 1):
+        start = pts_px[idx]
+        end = pts_px[idx + 1]
+        seg = end - start
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len < 1e-6:
+            continue
+        direction = seg / seg_len
+        cursor = 0.0
+        while cursor < seg_len:
+            dash_end = min(cursor + dash_px, seg_len)
+            p0 = start + direction * cursor
+            p1 = start + direction * dash_end
+            cv2.line(
+                img,
+                tuple(np.round(p0).astype(np.int32)),
+                tuple(np.round(p1).astype(np.int32)),
+                color,
+                thickness,
+                lineType=cv2.LINE_AA,
+            )
+            cursor += dash_px + gap_px
+
+
+def _draw_box(img, box, color, width, height, xlim, ylim, thickness=2, dashed=False):
     pos = box.get("position", None)
     extent = box.get("extent", None)
     if pos is None or extent is None or len(pos) < 2 or len(extent) < 2:
         return
     poly = _oriented_box_corners(pos[:2], extent[:2], float(box.get("yaw", 0.0)))
-    _draw_polyline(img, poly, color, width, height, xlim, ylim, thickness=thickness, closed=True)
+    if dashed:
+        _draw_dashed_polyline(img, poly, color, width, height, xlim, ylim, thickness=thickness, closed=True)
+    else:
+        _draw_polyline(img, poly, color, width, height, xlim, ylim, thickness=thickness, closed=True)
 
 
 def _find_box_by_id(boxes, actor_id):
@@ -2233,24 +3251,47 @@ def _render_world_panel(sample, current_boxes, current_meas, label, debug, event
     ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
     borrow_start_world_xy = np.asarray(release_info.get("borrow_start_world_xy", []), dtype=np.float32)
     borrow_end_world_xy = np.asarray(release_info.get("borrow_end_world_xy", []), dtype=np.float32)
+    borrow_start_world_xyz = np.asarray(release_info.get("borrow_start_world_xyz", []), dtype=np.float32)
+    borrow_end_world_xyz = np.asarray(release_info.get("borrow_end_world_xyz", []), dtype=np.float32)
+    borrow_segment_world_xy = np.asarray(release_info.get("borrow_segment_world_xy", []), dtype=np.float32)
+    borrow_segment_world_xyz = np.asarray(release_info.get("borrow_segment_world_xyz", []), dtype=np.float32)
     if (
-        _is_left_turn_scene_context(current_meas, event_name=event_name)
+        (
+            _is_left_turn_scene_context(current_meas, event_name=event_name) or
+            _is_borrow_cross_scene_context(event_name=event_name)
+        )
         and ego_matrix_current is not None
         and borrow_start_world_xy.shape == (2,)
         and borrow_end_world_xy.shape == (2,)
     ):
-        corridor_local = _transform_points_world_to_local(
-            np.stack([borrow_start_world_xy, borrow_end_world_xy], axis=0),
-            ego_matrix_current,
-        )
-        if corridor_local.shape == (2, 2):
-            _draw_polyline(panel, corridor_local, (60, 220, 60), width, height, xlim, ylim, thickness=2)
+        corridor_local = np.zeros((0, 2), dtype=np.float32)
+        if borrow_segment_world_xyz.ndim == 2 and borrow_segment_world_xyz.shape[0] >= 2 and borrow_segment_world_xyz.shape[1] >= 3:
+            corridor_local = _transform_points_world_xyz_to_local(borrow_segment_world_xyz, ego_matrix_current)
+        elif borrow_segment_world_xy.ndim == 2 and borrow_segment_world_xy.shape[0] >= 2 and borrow_segment_world_xy.shape[1] == 2:
+            corridor_local = _transform_points_world_to_local(borrow_segment_world_xy, ego_matrix_current)
+        elif borrow_start_world_xyz.shape == (3,) and borrow_end_world_xyz.shape == (3,):
+            corridor_local = _transform_points_world_xyz_to_local(
+                np.stack([borrow_start_world_xyz, borrow_end_world_xyz], axis=0),
+                ego_matrix_current,
+            )
+        else:
+            corridor_local = _transform_points_world_to_local(
+                np.stack([borrow_start_world_xy, borrow_end_world_xy], axis=0),
+                ego_matrix_current,
+            )
+        if corridor_local.ndim == 2 and corridor_local.shape[0] >= 2 and corridor_local.shape[1] == 2:
+            corridor_color = (60, 220, 60)
+            if _is_borrow_cross_scene_context(event_name=event_name):
+                corridor_color = (80, 235, 120)
+            _draw_polyline(panel, corridor_local, corridor_color, width, height, xlim, ylim, thickness=2)
             start_px = _to_canvas(corridor_local[0], width, height, xlim, ylim)[0]
-            end_px = _to_canvas(corridor_local[1], width, height, xlim, ylim)[0]
-            cv2.circle(panel, tuple(start_px), 6, (60, 220, 60), -1, lineType=cv2.LINE_AA)
+            end_px = _to_canvas(corridor_local[-1], width, height, xlim, ylim)[0]
+            cv2.circle(panel, tuple(start_px), 6, corridor_color, -1, lineType=cv2.LINE_AA)
             cv2.circle(panel, tuple(end_px), 6, (255, 200, 0), -1, lineType=cv2.LINE_AA)
-            cv2.putText(panel, "b_in", (int(start_px[0]) + 6, int(start_px[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (20, 140, 20), 1, cv2.LINE_AA)
-            cv2.putText(panel, "b_out", (int(end_px[0]) + 6, int(end_px[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 110, 0), 1, cv2.LINE_AA)
+            cv2.drawMarker(panel, tuple(start_px), corridor_color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=12, thickness=2)
+            cv2.drawMarker(panel, tuple(end_px), (255, 200, 0), markerType=cv2.MARKER_TILTED_CROSS, markerSize=12, thickness=2)
+            cv2.putText(panel, "start", (int(start_px[0]) + 6, int(start_px[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (20, 140, 20), 1, cv2.LINE_AA)
+            cv2.putText(panel, "end", (int(end_px[0]) + 6, int(end_px[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 110, 0), 1, cv2.LINE_AA)
 
     compare_front = route_front
     compare_raw_ext = np.asarray(sample.get("_route_extension_raw", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
@@ -2324,7 +3365,7 @@ def _render_world_panel(sample, current_boxes, current_meas, label, debug, event
                 _annotate_box_label(panel, fut["current_box"], meet_text, fut_label_color, width, height, xlim, ylim)
         if 0 < frame_index <= 4:
             fut_color = (0, 0, 255) if int(future_cover["interaction"]["mode"]) == 1 else (0, 165, 255)
-            _draw_box(panel, fut["box_current_frame"], fut_color, width, height, xlim, ylim, thickness=3)
+            _draw_box(panel, fut["box_current_frame"], fut_color, width, height, xlim, ylim, thickness=3, dashed=True)
             cover_pt = np.asarray(fut["cover"]["route_point"], dtype=np.float32)
             bg_pos = np.asarray(fut["bg_pos"], dtype=np.float32)
             cover_px = _to_canvas(cover_pt, width, height, xlim, ylim)[0]
@@ -2365,11 +3406,25 @@ def _render_world_panel(sample, current_boxes, current_meas, label, debug, event
     route_name = str(sample.get("route_name", "unknown"))
     if len(route_name) > 58:
         route_name = route_name[:55] + "..."
+    def _fmt_panel_val(x, fmt="{:.2f}"):
+        try:
+            x = float(x)
+        except Exception:
+            return "NA"
+        if not np.isfinite(x):
+            return "NA"
+        return fmt.format(x)
+    cross_wait_time = float(sample.get("_cross_wait_time_s", np.nan))
+    cross_wait_valid = float(sample.get("_cross_wait_valid", 0.0))
+    cross_wait_active = float(sample.get("_cross_wait_active", 0.0))
+    cross_wait_speed = float(sample.get("_cross_wait_speed_mps", np.nan))
+    cross_wait_dist = float(sample.get("_cross_wait_start_dist", np.nan))
     lines = [
         f"{event_name} | frame {int(sample.get('frame_id', -1)):04d}",
         route_name,
         f"cover={occ['case_name']}  interact={interaction['name']}  occ={occ['risk']:.3f}  proceed={proceed['risk']:.3f}  v={wait_info['speed_mps']:.2f}",
         f"wait={int(wait_info['wait_state'])}  release={int(wait_info['release_pulse'])}  rel_ready={release_ready_str}",
+        f"cross wait: t={_fmt_panel_val(cross_wait_time)}s valid={int(cross_wait_valid>0.5)} act={int(cross_wait_active>0.5)} v={_fmt_panel_val(cross_wait_speed)} dStart={_fmt_panel_val(cross_wait_dist)}",
         f"route_mode={sample.get('_route_mode', 'local')}  route_len={float(sample.get('_route_len_m', 0.0)):.2f}m  route_pts={int(sample.get('_route_num_points', 0))}",
     ]
     if compare_mode:
@@ -2391,6 +3446,7 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
     current_cover = stage1_label.get("current_cover", _cover_candidate_summary(0, None, {}))
     future_cover = stage1_label.get("future_cover", _cover_candidate_summary(0, None, {}))
     speed_curve = stage1_label["speed_curve"]
+    merge_episode = stage1_label.get("merge_episode", _default_merge_episode_debug())
     rgb_h, rgb_w = rgb.shape[:2]
     panel_h, panel_w = panel.shape[:2]
     target_h = max(rgb_h, panel_h)
@@ -2398,7 +3454,7 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
     panel_resized = cv2.resize(panel, (int(panel_w * target_h / max(panel_h, 1)), target_h), interpolation=cv2.INTER_LINEAR)
     top = np.concatenate([rgb_resized, panel_resized], axis=1)
 
-    bar_h = 264
+    bar_h = 560
     bar = np.zeros((bar_h, top.shape[1], 3), dtype=np.uint8)
     speed = float((current_meas or {}).get("speed", 0.0))
     target_speed = float((current_meas or {}).get("target_speed", 0.0))
@@ -2426,13 +3482,34 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
         n = min((speeds.size if limit is None else int(limit)), speeds.size)
         return " ".join(f"{float(speeds[i]):.0f}" for i in range(n))
 
+    cross_wait_time = float(speed_curve.get("cross_wait_time_s", np.nan))
+    cross_wait_valid = float(speed_curve.get("cross_wait_valid", 0.0))
+    cross_wait_dist = float(sample.get("_cross_wait_start_dist", np.nan))
+    cross_wait_speed = float(sample.get("_cross_wait_speed_mps", np.nan))
+    cross_wait_active = float(sample.get("_cross_wait_active", 0.0))
     left_lines = [
         ("speed={:.2f}  target={:.2f}  wait={}  release={}  rel_ready={}".format(
             speed, target_speed, int(wait_info["wait_state"]), int(wait_info["release_pulse"]), release_ready_str
         ), (255, 255, 255), 0.62),
+        ("corridor src={}  ctx_frame={}  anchor={}".format(
+            str(release_info.get("source", "n/a")),
+            int(release_info.get("context_frame_id", -1)),
+            int(release_info.get("anchor_actor_id", -1)),
+        ), (180, 235, 180), 0.50),
         ("primary case={}  interact={}  occ={:.3f}  proceed={:.3f}".format(
             int(label["case"]), interaction["name"], float(occ["risk"]), float(proceed["risk"])
         ), (200, 200, 200), 0.58),
+    ]
+    left_lines.append(
+        ("cross wait: t={}s valid={} act={} v={} dStart={}".format(
+            _fmt_val(cross_wait_time),
+            int(cross_wait_valid > 0.5),
+            int(cross_wait_active > 0.5),
+            _fmt_val(cross_wait_speed),
+            _fmt_val(cross_wait_dist),
+        ), (120, 200, 255), 0.52)
+    )
+    left_lines.extend([
         ("aff_id={}  spd_red_id={}  route={} ({:.1f}m, {}pts)".format(
             -1 if veh_aff_id is None else int(veh_aff_id),
             -1 if spd_red_id is None else int(spd_red_id),
@@ -2440,6 +3517,10 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
             float(sample.get("_route_len_m", 0.0)),
             int(sample.get("_route_num_points", 0)),
         ), (190, 190, 190), 0.56),
+        ("corridor route: {:.1f}m, {}pts".format(
+            float(sample.get("_route_corridor_len_m", 0.0)),
+            int(sample.get("_route_corridor_num_points", 0)),
+        ), (190, 190, 190), 0.54),
         ("borrow_t={}s  rel_frame={}  ret_frame={}".format(
             _fmt_val(release_info.get("release_to_return_s", np.nan)),
             int(release_info.get("release_frame_id", -1)),
@@ -2451,11 +3532,57 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
         ("E_total={}".format(
             _fmt_sample_pairs(speed_curve["sample_speeds_mps"], speed_curve["total_risks"]),
         ), (150, 220, 255), 0.50),
-        ("E_chase={}  E_meet={}".format(
+        ("E_chase={}".format(
             _fmt_sample_pairs(speed_curve["sample_speeds_mps"], speed_curve["chase_risks"]),
+        ), (150, 220, 255), 0.48),
+        ("E_meet={}".format(
             _fmt_sample_pairs(speed_curve["sample_speeds_mps"], speed_curve["meet_risks"]),
         ), (150, 220, 255), 0.48),
-    ]
+    ])
+    merge_yld_curve = np.asarray(speed_curve.get("merge_yld_risks", []), dtype=np.float32)
+    merge_go_curve = np.asarray(speed_curve.get("merge_go_risks", []), dtype=np.float32)
+    borrow_yld_curve = np.asarray(speed_curve.get("borrow_yld_risks", []), dtype=np.float32)
+    borrow_go_curve = np.asarray(speed_curve.get("borrow_go_risks", []), dtype=np.float32)
+    show_merge_split = (
+        merge_yld_curve.shape == np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32).shape and
+        merge_go_curve.shape == np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32).shape and
+        (
+            np.any(merge_yld_curve > 1e-4) or
+            np.any(merge_go_curve > 1e-4) or
+            str(speed_curve.get("meet_debug", {}).get("subtype", "none")) == "merge_meet"
+        )
+    )
+    if show_merge_split:
+        left_lines.append(
+            ("E_merge_yld={}".format(
+                _fmt_sample_pairs(speed_curve["sample_speeds_mps"], merge_yld_curve),
+            ), (120, 220, 255), 0.48)
+        )
+        left_lines.append(
+            ("E_merge_go={}".format(
+                _fmt_sample_pairs(speed_curve["sample_speeds_mps"], merge_go_curve),
+            ), (120, 255, 180), 0.48)
+        )
+    show_borrow_split = (
+        borrow_yld_curve.shape == np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32).shape and
+        borrow_go_curve.shape == np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32).shape and
+        (
+            np.any(borrow_yld_curve > 1e-4) or
+            np.any(borrow_go_curve > 1e-4) or
+            str(speed_curve.get("meet_debug", {}).get("subtype", "none")) == "borrow_cross_meet"
+        )
+    )
+    if show_borrow_split:
+        left_lines.append(
+            ("E_borrow_yld={}".format(
+                _fmt_sample_pairs(speed_curve["sample_speeds_mps"], borrow_yld_curve),
+            ), (255, 210, 120), 0.48)
+        )
+        left_lines.append(
+            ("E_borrow_go={}".format(
+                _fmt_sample_pairs(speed_curve["sample_speeds_mps"], borrow_go_curve),
+            ), (180, 255, 120), 0.48)
+        )
     if np.any(np.asarray(speed_curve.get("ped_risks", []), dtype=np.float32) > 1e-4):
         left_lines.append(
             ("E_ped={}".format(
@@ -2470,16 +3597,32 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
         meet_subtype = str(meet_debug.get("subtype", "meet"))
         if "cross" in meet_subtype:
             left_lines.append(
-                ("{} dbg: dE={} dB={} vB={} tBin={} tBout={} cLen={}".format(
+                ("{} dbg: dE={} dB={} dBend={} vB={} tBin={} tBout={} tBend={} tEout={} cLen={}".format(
                     meet_subtype,
                     _fmt_val(meet_debug.get("d_ego_m", np.nan)),
                     _fmt_val(meet_debug.get("d_bg_m", np.nan)),
+                    _fmt_val(meet_debug.get("d_bg_to_end_m", np.nan)),
                     _fmt_val(meet_debug.get("bg_speed_mps", np.nan)),
                     _fmt_val(meet_debug.get("t_bg_s", np.nan)),
                     _fmt_val(meet_debug.get("t_bg_exit_s", np.nan)),
+                    _fmt_val(meet_debug.get("t_bg_to_end_s", np.nan)),
+                    _fmt_val(meet_debug.get("t_ego_exit_s", np.nan)),
                     _fmt_val(meet_debug.get("conflict_len_m", np.nan)),
                 ), (120, 200, 255), 0.50)
             )
+            if meet_subtype == "borrow_cross_meet":
+                left_lines.append(
+                    ("borrow dbg: dStart={} dBorrow={}".format(
+                        _fmt_val(meet_debug.get("borrow_start_distance_m", np.nan)),
+                        _fmt_val(meet_debug.get("borrow_total_distance_m", np.nan)),
+                    ), (255, 210, 120), 0.48)
+                )
+                left_lines.append(
+                    ("borrow v: v_go_min={}  v_yld_max={}".format(
+                        _fmt_val(meet_debug.get("v_go_min_mps", np.nan)),
+                        _fmt_val(meet_debug.get("v_yield_max_mps", np.nan)),
+                    ), (255, 210, 120), 0.48)
+                )
         else:
             left_lines.append(
                 ("{} dbg: dE={} dB={} vB={} tB={} gapB={} cLen={}".format(
@@ -2522,6 +3665,16 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
 
     cur_type = current_cover["interaction"].get("subtype") or current_cover["interaction"]["name"]
     fut_type = future_cover["interaction"].get("subtype") or future_cover["interaction"]["name"]
+    merge_phase = str(merge_episode.get("phase", "none"))
+    merge_end_state = str(merge_episode.get("end_state", "none"))
+    merge_frame_role = str(merge_episode.get("frame_role", "none"))
+    merge_actor_ids = ",".join(str(int(actor_id)) for actor_id in merge_episode.get("actor_ids", [])[:4]) or "-"
+    merge_switch_frames = ",".join(str(int(frame_id)) for frame_id in merge_episode.get("actor_switch_frames", [])[:4]) or "-"
+    merge_color = (200, 200, 200)
+    if merge_phase == "yld":
+        merge_color = (120, 220, 255)
+    elif merge_phase == "go":
+        merge_color = (120, 255, 160)
     right_lines = [
         ("current cover", (255, 255, 255), 0.62),
         ("id={}  type={}  dist={}m  ttc={}s".format(
@@ -2547,6 +3700,29 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
             _fmt_val(future_cover["d_bg"]),
             future_cover["interaction"]["source"],
         ), (160, 160, 160), 0.54),
+        ("merge ep={}  phase={}  no_go={}  end={}".format(
+            int(merge_episode.get("episode_id", -1)),
+            merge_phase,
+            int(float(merge_episode.get("no_go", 0.0)) > 0.5),
+            merge_end_state,
+        ), merge_color, 0.56),
+        ("role={}  fmerge_n={}  fgrace={}  rhold={}  pgrace={}".format(
+            merge_frame_role,
+            int(merge_episode.get("future_merge_count", 0)),
+            int(merge_episode.get("future_grace_index", 0)),
+            int(merge_episode.get("red_light_hold_index", 0)),
+            int(merge_episode.get("post_go_grace_index", 0)),
+        ), (170, 170, 170), 0.52),
+        ("start={}  end={}  go={}  res={}".format(
+            int(merge_episode.get("start_frame", -1)),
+            int(merge_episode.get("end_frame", -1)),
+            int(merge_episode.get("go_frame", -1)),
+            int(merge_episode.get("resolution_actor_id", -1)),
+        ), (170, 170, 170), 0.54),
+        ("actors={}  switch={}".format(
+            merge_actor_ids,
+            merge_switch_frames,
+        ), (170, 170, 170), 0.52),
     ]
 
     y = 30
@@ -2562,8 +3738,85 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
 
 
 def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
+    merge_default = _default_merge_episode_debug()
+
+    def _merge_episode_payload(precomputed=None):
+        merge_episode = sample_vis.get("_merge_episode", None)
+        if not isinstance(merge_episode, dict) and isinstance(precomputed, dict):
+            merge_episode = precomputed.get("merge_episode", None)
+        if not isinstance(merge_episode, dict):
+            return dict(merge_default)
+        payload = dict(merge_default)
+        payload.update(dict(merge_episode))
+        payload["actor_ids"] = [int(actor_id) for actor_id in payload.get("actor_ids", [])]
+        payload["actor_switch_frames"] = [int(frame_id) for frame_id in payload.get("actor_switch_frames", [])]
+        return payload
+
+    def _merge_motion_payload(precomputed=None):
+        merge_motion = sample_vis.get("_merge_motion", None)
+        if not isinstance(merge_motion, dict) and isinstance(precomputed, dict):
+            merge_motion = precomputed.get("merge_motion", None)
+        if isinstance(merge_motion, dict):
+            return dict(merge_motion)
+        debug = sample_vis.get("_debug", {})
+        return _build_merge_motion_context(
+            current_meas=current_meas,
+            route_dense=debug.get("route_dense"),
+        )
+
     precomputed = sample_vis.get("stage1_speed_debug")
-    if isinstance(precomputed, dict) and "speed_curve" in precomputed:
+    runtime_speed_overrides = (
+        "_release_info" in sample_vis or
+        "_cross_wait_time_s" in sample_vis or
+        "_speed_curve_future_cover" in sample_vis
+    )
+    if isinstance(precomputed, dict) and "speed_curve" in precomputed and not runtime_speed_overrides:
+        speed_curve = {
+            "sample_speeds_mps": np.asarray(precomputed.get("speed_curve", {}).get("sample_speeds_mps", []), dtype=np.float32).astype(float).tolist(),
+            "total_risks": np.asarray(precomputed.get("speed_curve", {}).get("total_risks", []), dtype=np.float32).astype(float).tolist(),
+            "chase_risks": np.asarray(precomputed.get("speed_curve", {}).get("chase_risks", []), dtype=np.float32).astype(float).tolist(),
+            "meet_risks": np.asarray(precomputed.get("speed_curve", {}).get("meet_risks", []), dtype=np.float32).astype(float).tolist(),
+            "merge_yld_risks": np.asarray(precomputed.get("speed_curve", {}).get("merge_yld_risks", []), dtype=np.float32).astype(float).tolist(),
+            "merge_go_risks": np.asarray(precomputed.get("speed_curve", {}).get("merge_go_risks", []), dtype=np.float32).astype(float).tolist(),
+            "borrow_yld_risks": np.asarray(precomputed.get("speed_curve", {}).get("borrow_yld_risks", []), dtype=np.float32).astype(float).tolist(),
+            "borrow_go_risks": np.asarray(precomputed.get("speed_curve", {}).get("borrow_go_risks", []), dtype=np.float32).astype(float).tolist(),
+            "ped_risks": np.asarray(precomputed.get("speed_curve", {}).get("ped_risks", []), dtype=np.float32).astype(float).tolist(),
+            "cross_wait_time_s": float(precomputed.get("speed_curve", {}).get("cross_wait_time_s", 0.0)),
+            "cross_wait_valid": float(precomputed.get("speed_curve", {}).get("cross_wait_valid", 0.0)),
+            "chase_debug": dict(precomputed.get("speed_curve", {}).get("chase_debug", {})),
+            "meet_debug": dict(precomputed.get("speed_curve", {}).get("meet_debug", {})),
+        }
+        if "cross_wait_time_s" not in precomputed.get("speed_curve", {}):
+            meet_debug = speed_curve.get("meet_debug", {})
+            subtype = str(meet_debug.get("subtype", "none"))
+            if "cross" in subtype:
+                t_exit = float(meet_debug.get("t_bg_exit_s", np.nan))
+                t_bg = float(meet_debug.get("t_bg_s", np.nan))
+                t_wait = t_exit if np.isfinite(t_exit) else t_bg
+                if np.isfinite(t_wait):
+                    speed_curve["cross_wait_time_s"] = float(max(t_wait, 0.0))
+                    speed_curve["cross_wait_valid"] = 1.0
+                else:
+                    speed_curve["cross_wait_time_s"] = 0.0
+                    speed_curve["cross_wait_valid"] = 0.0
+        if "_cross_wait_time_s" in sample_vis:
+            speed_curve["cross_wait_time_s"] = float(sample_vis.get("_cross_wait_time_s", 0.0))
+            speed_curve["cross_wait_valid"] = float(sample_vis.get("_cross_wait_valid", 0.0))
+        meet_subtype = str(speed_curve.get("meet_debug", {}).get("subtype", "none"))
+        if meet_subtype == "borrow_cross_meet":
+            borrow_yld = np.asarray(speed_curve.get("borrow_yld_risks", []), dtype=np.float32)
+            borrow_go = np.asarray(speed_curve.get("borrow_go_risks", []), dtype=np.float32)
+            if (
+                borrow_yld.shape == borrow_go.shape and
+                borrow_yld.size > 0 and
+                (np.any(borrow_yld > 1e-5) or np.any(borrow_go > 1e-5))
+            ):
+                meet_risks = np.minimum(borrow_yld, borrow_go)
+                chase_risks = np.asarray(speed_curve.get("chase_risks", []), dtype=np.float32)
+                ped_risks = np.asarray(speed_curve.get("ped_risks", []), dtype=np.float32)
+                total_risks = np.maximum(np.maximum(chase_risks, meet_risks), ped_risks)
+                speed_curve["meet_risks"] = meet_risks.astype(np.float32).astype(float).tolist()
+                speed_curve["total_risks"] = total_risks.astype(np.float32).astype(float).tolist()
         return {
             "current_cover": dict(precomputed.get("current_cover", {})),
             "future_cover": dict(precomputed.get("future_cover", {})),
@@ -2571,15 +3824,9 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
             "ped_future_cover": dict(precomputed.get("ped_future_cover", {})),
             "speed_curve_future_cover": dict(precomputed.get("speed_curve_future_cover", {})),
             "speed_curve_future_persisted": bool(precomputed.get("speed_curve_future_persisted", False)),
-            "speed_curve": {
-                "sample_speeds_mps": np.asarray(precomputed.get("speed_curve", {}).get("sample_speeds_mps", []), dtype=np.float32).astype(float).tolist(),
-                "total_risks": np.asarray(precomputed.get("speed_curve", {}).get("total_risks", []), dtype=np.float32).astype(float).tolist(),
-                "chase_risks": np.asarray(precomputed.get("speed_curve", {}).get("chase_risks", []), dtype=np.float32).astype(float).tolist(),
-                "meet_risks": np.asarray(precomputed.get("speed_curve", {}).get("meet_risks", []), dtype=np.float32).astype(float).tolist(),
-                "ped_risks": np.asarray(precomputed.get("speed_curve", {}).get("ped_risks", []), dtype=np.float32).astype(float).tolist(),
-                "chase_debug": dict(precomputed.get("speed_curve", {}).get("chase_debug", {})),
-                "meet_debug": dict(precomputed.get("speed_curve", {}).get("meet_debug", {})),
-            },
+            "merge_episode": _merge_episode_payload(precomputed),
+            "merge_motion": _merge_motion_payload(precomputed),
+            "speed_curve": speed_curve,
         }
 
     debug = sample_vis.get("_debug", {})
@@ -2587,6 +3834,7 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
     current_cover = _cover_candidate_summary(1, debug.get("best_current"), debug, current_meas=current_meas, event_name=event_name)
     future_cover = _cover_candidate_summary(2, debug.get("best_future"), debug, current_meas=current_meas, event_name=event_name)
     speed_curve_future_cover = sample_vis.get("_speed_curve_future_cover", future_cover)
+    route_for_corridor = sample_vis.get("_route_corridor_input_local", sample_vis.get("_route_input_local"))
     speed_curve = _build_speed_curve_debug(
         current_cover,
         speed_curve_future_cover,
@@ -2594,21 +3842,51 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
         current_boxes=current_boxes,
         event_name=event_name,
         release_info=sample_vis.get("_release_info"),
+        route_local=route_for_corridor,
     )
     sample_speeds = np.asarray(speed_curve["sample_speeds_mps"], dtype=np.float32)
     chase_risks = np.asarray(speed_curve["chase_risks"], dtype=np.float32)
     meet_risks = np.asarray(speed_curve["meet_risks"], dtype=np.float32)
+    merge_yld_risks = np.asarray(speed_curve.get("merge_yld_risks", np.zeros(sample_speeds.shape, dtype=np.float32)), dtype=np.float32)
+    merge_go_risks = np.asarray(speed_curve.get("merge_go_risks", np.zeros(sample_speeds.shape, dtype=np.float32)), dtype=np.float32)
+    borrow_yld_risks = np.asarray(speed_curve.get("borrow_yld_risks", np.zeros(sample_speeds.shape, dtype=np.float32)), dtype=np.float32)
+    borrow_go_risks = np.asarray(speed_curve.get("borrow_go_risks", np.zeros(sample_speeds.shape, dtype=np.float32)), dtype=np.float32)
     ped_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     if all(k in sample_vis for k in ("speed_sample_values", "speed_risk_chase_values", "speed_risk_meet_values", "speed_risk_ped_values")):
         pre_speeds = np.asarray(sample_vis.get("speed_sample_values", []), dtype=np.float32)
         pre_chase = np.asarray(sample_vis.get("speed_risk_chase_values", []), dtype=np.float32)
         pre_meet = np.asarray(sample_vis.get("speed_risk_meet_values", []), dtype=np.float32)
+        pre_merge_yld = np.asarray(sample_vis.get("speed_risk_merge_yld_values", merge_yld_risks), dtype=np.float32)
+        pre_merge_go = np.asarray(sample_vis.get("speed_risk_merge_go_values", merge_go_risks), dtype=np.float32)
+        pre_borrow_yld = np.asarray(sample_vis.get("speed_risk_borrow_yld_values", borrow_yld_risks), dtype=np.float32)
+        pre_borrow_go = np.asarray(sample_vis.get("speed_risk_borrow_go_values", borrow_go_risks), dtype=np.float32)
         pre_ped = np.asarray(sample_vis.get("speed_risk_ped_values", []), dtype=np.float32)
-        if pre_speeds.shape == sample_speeds.shape == pre_chase.shape == pre_meet.shape == pre_ped.shape:
+        if (
+            pre_speeds.shape == sample_speeds.shape == pre_chase.shape == pre_meet.shape == pre_ped.shape and
+            pre_merge_yld.shape == sample_speeds.shape and
+            pre_merge_go.shape == sample_speeds.shape and
+            pre_borrow_yld.shape == sample_speeds.shape and
+            pre_borrow_go.shape == sample_speeds.shape
+        ):
             sample_speeds = pre_speeds
             chase_risks = pre_chase
             meet_risks = pre_meet
+            merge_yld_risks = pre_merge_yld
+            merge_go_risks = pre_merge_go
+            borrow_yld_risks = pre_borrow_yld
+            borrow_go_risks = pre_borrow_go
             ped_risks = pre_ped
+    meet_subtype = str(speed_curve.get("meet", {}).get("subtype", speed_curve.get("meet_debug", {}).get("subtype", "none")))
+    if meet_subtype == "borrow_cross_meet":
+        if (
+            borrow_yld_risks.shape == borrow_go_risks.shape and
+            borrow_yld_risks.size > 0 and
+            (np.any(borrow_yld_risks > 1e-5) or np.any(borrow_go_risks > 1e-5))
+        ):
+            meet_risks = np.minimum(borrow_yld_risks, borrow_go_risks)
+    if "_cross_wait_time_s" in sample_vis:
+        speed_curve["cross_wait_time_s"] = float(sample_vis.get("_cross_wait_time_s", 0.0))
+        speed_curve["cross_wait_valid"] = float(sample_vis.get("_cross_wait_valid", 0.0))
     total_risks = np.maximum(np.maximum(chase_risks, meet_risks), ped_risks)
     return {
         "current_cover": current_cover,
@@ -2617,16 +3895,159 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
         "ped_future_cover": _cover_candidate_summary(0, None, {}),
         "speed_curve_future_cover": speed_curve_future_cover,
         "speed_curve_future_persisted": bool(sample_vis.get("_speed_curve_future_persisted", False)),
+        "merge_episode": _merge_episode_payload(),
+        "merge_motion": _merge_motion_payload(),
         "speed_curve": {
             "sample_speeds_mps": sample_speeds.astype(np.float32).astype(float).tolist(),
             "total_risks": total_risks.astype(np.float32).astype(float).tolist(),
             "chase_risks": chase_risks.astype(np.float32).astype(float).tolist(),
             "meet_risks": meet_risks.astype(np.float32).astype(float).tolist(),
+            "merge_yld_risks": merge_yld_risks.astype(np.float32).astype(float).tolist(),
+            "merge_go_risks": merge_go_risks.astype(np.float32).astype(float).tolist(),
+            "borrow_yld_risks": borrow_yld_risks.astype(np.float32).astype(float).tolist(),
+            "borrow_go_risks": borrow_go_risks.astype(np.float32).astype(float).tolist(),
             "ped_risks": ped_risks.astype(np.float32).astype(float).tolist(),
             "chase_debug": dict(speed_curve["chase"]),
             "meet_debug": dict(speed_curve["meet"]),
         },
     }
+
+
+def _annotate_frame_records_merge_episode(frame_records):
+    if not frame_records:
+        return
+
+    merge_samples = []
+    for record in frame_records:
+        sample_vis = record.get("sample_vis", {})
+        stage1_label = _stage1_label_payload(
+            sample_vis,
+            record.get("current_meas"),
+            current_boxes=record.get("current_boxes"),
+        )
+        merge_samples.append({
+            "frame_id": int(record.get("frame_id", -1)),
+            "stage1_speed_debug": {
+                "current_cover": dict(stage1_label.get("current_cover", {})),
+                "future_cover": dict(stage1_label.get("future_cover", {})),
+                "ped_current_cover": dict(stage1_label.get("ped_current_cover", {})),
+                "ped_future_cover": dict(stage1_label.get("ped_future_cover", {})),
+                "speed_curve_future_cover": dict(stage1_label.get("speed_curve_future_cover", {})),
+                "speed_curve_future_persisted": bool(stage1_label.get("speed_curve_future_persisted", False)),
+                "merge_motion": dict(stage1_label.get("merge_motion", {})),
+                "speed_curve": dict(stage1_label.get("speed_curve", {})),
+                "merge_episode": dict(stage1_label.get("merge_episode", _default_merge_episode_debug())),
+            },
+        })
+
+    _annotate_route_stage1_merge_decisions(merge_samples, list(range(len(merge_samples))))
+
+    for merge_sample, record in zip(merge_samples, frame_records):
+        sample_vis = record.get("sample_vis", {})
+        stage1_debug = merge_sample.get("stage1_speed_debug", {})
+        sample_vis["_merge_episode"] = dict(stage1_debug.get("merge_episode", _default_merge_episode_debug()))
+        for field_name in MERGE_TOP_LEVEL_FIELDS:
+            if field_name in merge_sample:
+                sample_vis[field_name] = merge_sample[field_name]
+
+
+def _cover_is_cross_meet_local(cover):
+    if int((cover or {}).get("exists", 0.0)) <= 0:
+        return False
+    interaction = (cover or {}).get("interaction", {}) or {}
+    if str(interaction.get("name", "none")) != "meet":
+        return False
+    subtype = str(interaction.get("subtype") or interaction.get("name") or "none")
+    return "cross" in subtype
+
+
+def _annotate_frame_records_cross_wait(
+    frame_records,
+    scene_borrow_context=None,
+    start_distance_m=2.0,
+    wait_speed_thresh=0.5,
+    go_speed_thresh=1.0,
+    dt_s=0.25,
+):
+    if not frame_records:
+        return
+    cross_wait_state = 0
+    cross_wait_frames = 0
+    cross_episode_active = False
+    for record in frame_records:
+        sample_vis = record.get("sample_vis", {})
+        current_meas = record.get("current_meas")
+        debug = record.get("debug", {})
+        event_name = record.get("event_name", None)
+        current_cover = _cover_candidate_summary(1, debug.get("best_current"), debug, current_meas=current_meas, event_name=event_name)
+        future_cover = _cover_candidate_summary(2, debug.get("best_future"), debug, current_meas=current_meas, event_name=event_name)
+        raw_cross_active = _cover_is_cross_meet_local(current_cover) or _cover_is_cross_meet_local(future_cover)
+        if not cross_episode_active and raw_cross_active:
+            cross_episode_active = True
+
+        route_local = np.asarray(
+            sample_vis.get("_route_corridor_input_local", sample_vis.get("_route_input_local", np.zeros((0, 2), dtype=np.float32))),
+            dtype=np.float32,
+        )
+        borrow_corridor = _borrow_corridor_metrics(
+            scene_borrow_context,
+            current_meas=current_meas,
+            route_local=route_local,
+        )
+
+        def _cross_start_distance_from_cover(cover):
+            if not _cover_is_cross_meet_local(cover):
+                return np.nan
+            interaction = (cover or {}).get("interaction", {}) or {}
+            subtype = str(interaction.get("subtype") or interaction.get("name") or "none")
+            if subtype == "borrow_cross_meet" and borrow_corridor is not None:
+                return float(borrow_corridor.get("borrow_start_distance_m", np.nan))
+            d_ego = cover.get("distance", cover.get("d_ego", np.nan))
+            try:
+                return float(d_ego)
+            except Exception:
+                return np.nan
+
+        dist_current = _cross_start_distance_from_cover(current_cover)
+        dist_future = _cross_start_distance_from_cover(future_cover)
+        if np.isfinite(dist_current) and np.isfinite(dist_future):
+            cross_start_distance = float(min(dist_current, dist_future))
+        elif np.isfinite(dist_current):
+            cross_start_distance = float(dist_current)
+        elif np.isfinite(dist_future):
+            cross_start_distance = float(dist_future)
+        else:
+            cross_start_distance = np.nan
+
+        speed = float((current_meas or {}).get("speed", 0.0))
+        near_cross_start = (
+            np.isfinite(cross_start_distance) and
+            float(cross_start_distance) <= float(start_distance_m)
+        )
+        go_now = False
+        if cross_episode_active:
+            if cross_wait_state == 0:
+                if near_cross_start and speed <= float(wait_speed_thresh):
+                    cross_wait_state = 1
+                    cross_wait_frames = 0
+            if cross_wait_state == 1:
+                if speed >= float(go_speed_thresh):
+                    go_now = True
+                    cross_wait_state = 2
+                else:
+                    cross_wait_frames += 1
+        cross_active = bool(cross_episode_active or go_now)
+        cross_wait_time_s = float(cross_wait_frames) * float(dt_s)
+        cross_wait_valid = 1.0 if (cross_wait_state == 1 or go_now) else 0.0
+        sample_vis["_cross_wait_time_s"] = float(cross_wait_time_s)
+        sample_vis["_cross_wait_valid"] = float(cross_wait_valid)
+        sample_vis["_cross_wait_start_dist"] = float(cross_start_distance) if np.isfinite(cross_start_distance) else np.nan
+        sample_vis["_cross_wait_speed_mps"] = float(speed)
+        sample_vis["_cross_wait_active"] = 1.0 if cross_active else 0.0
+        if go_now:
+            cross_episode_active = False
+            cross_wait_state = 0
+            cross_wait_frames = 0
 
 
 def _save_frame_bundle(save_dir, frame_id, frame_img, sample_vis, release_info, current_meas, current_boxes=None):
@@ -2697,6 +4118,13 @@ def main():
     parser.add_argument("--scene_route_dedupe_step_m", type=float, default=0.5)
     parser.add_argument("--scene_route_extension_step_m", type=float, default=1.0)
     parser.add_argument("--scene_route_extension_points", type=int, default=12)
+    parser.add_argument(
+        "--borrow_start_mode",
+        type=str,
+        default="route_head",
+        choices=["route_head", "obstacle_align"],
+        help="How to anchor two-way corridor start along the route.",
+    )
     parser.add_argument("--xlim", type=float, nargs=2, default=[-10.0, 35.0])
     parser.add_argument("--ylim", type=float, nargs=2, default=[-12.0, 12.0])
     parser.add_argument("--fps", type=int, default=10)
@@ -2754,7 +4182,17 @@ def main():
         speed_thresh_mps=0.25,
         motion_thresh_m=1.0,
     )
-    if args.route_source_mode in {"stitched", "scene_polyline", "scene_polyline_compare"}:
+    need_scene_polyline = bool(args.route_source_mode in {"stitched", "scene_polyline", "scene_polyline_compare"})
+    if not need_scene_polyline:
+        for sample_ctx in route_samples_context:
+            base_dir_ctx, _ = _resolve_feature_frame_info(sample_ctx)
+            if base_dir_ctx is None:
+                continue
+            event_ctx = base_dir_ctx.split(os.sep)[0] if os.sep in base_dir_ctx else base_dir_ctx.split("/")[0]
+            if _is_two_way_event_corridor_scene_context(event_name=event_ctx):
+                need_scene_polyline = True
+                break
+    if need_scene_polyline:
         scene_route_polyline_world, scene_route_polyline_anchor_s = _build_scene_route_polyline_world(
             route_samples_context,
             image_root=args.image_data_root,
@@ -2767,6 +4205,20 @@ def main():
             dedupe_step_m=args.scene_route_dedupe_step_m,
             flip_local_y=True,
         )
+
+    if route_samples_context:
+        base_dir_check, _ = _resolve_feature_frame_info(route_samples_context[0])
+        event_check = _scene_name_from_base_dir(base_dir_check) if base_dir_check else None
+        if _is_two_way_event_corridor_scene_context(event_name=event_check):
+            missing = []
+            for sample_ctx in route_samples_context:
+                base_dir_ctx, _ = _resolve_feature_frame_info(sample_ctx)
+                if base_dir_ctx is None:
+                    continue
+                if base_dir_ctx not in scene_route_polyline_world:
+                    missing.append(base_dir_ctx)
+            if missing:
+                raise RuntimeError(f"Missing scene polyline for two-way routes: {sorted(set(missing))}")
 
     safe_route = selection_name.replace("/", "_")
     frame_suffix = ""
@@ -2811,6 +4263,7 @@ def main():
 
         base_route_local = np.asarray(sample["route"], dtype=np.float32)
         route_input = base_route_local
+        route_corridor_input = route_input
         route_mode_name = args.route_source_mode
         compare_raw_ext = np.zeros((0, 2), dtype=np.float32)
         compare_flip_ext = np.zeros((0, 2), dtype=np.float32)
@@ -2850,6 +4303,27 @@ def main():
                     if extended_flip.ndim == 2 and extended_flip.shape[0] > base_route_local.shape[0]:
                         compare_flip_ext = extended_flip[base_route_local.shape[0]:].astype(np.float32)
                     route_mode_name = "scene_polyline_compare"
+        if _is_two_way_event_corridor_scene_context(event_name=event_name):
+            ego_matrix_current = current_meas.get("ego_matrix", None)
+            if ego_matrix_current is not None:
+                scene_polyline_world = scene_route_polyline_world.get(base_dir, None)
+                scene_anchor_s = scene_route_polyline_anchor_s.get(base_dir, {}).get(int(sample["frame_id"]))
+                extended_for_corridor = _extend_local_route_with_scene_polyline(
+                    route_local=base_route_local,
+                    ego_matrix_current=ego_matrix_current,
+                    scene_polyline_world=scene_polyline_world,
+                    anchor_s=scene_anchor_s,
+                    extension_step_m=args.scene_route_extension_step_m,
+                    extension_points=args.scene_route_extension_points,
+                )
+                if extended_for_corridor.ndim == 2 and extended_for_corridor.shape[0] >= 2:
+                    route_corridor_input = extended_for_corridor.astype(np.float32)
+                else:
+                    route_corridor_input = route_input
+            if route_corridor_input.ndim == 2 and route_corridor_input.shape[0] >= 2:
+                route_input = route_corridor_input
+                if route_mode_name == "local":
+                    route_mode_name = "scene_polyline_for_twoway"
         dynamic_ids = _collect_dynamic_actor_ids(
             current_boxes=current_boxes,
             future_frames_data=future_frames,
@@ -2923,13 +4397,17 @@ def main():
         sample_vis["_release_info"] = {}
         sample_vis["_route_mode"] = route_mode_name
         sample_vis["_route_len_m"] = _polyline_length_m(route_input)
+        sample_vis["_route_corridor_len_m"] = _polyline_length_m(route_corridor_input)
         sample_vis["_route_front_local"] = base_route_local
         sample_vis["_route_input_local"] = route_input
+        sample_vis["_route_corridor_input_local"] = route_corridor_input
         sample_vis["_route_extension_raw"] = compare_raw_ext
         sample_vis["_route_extension_yflip"] = compare_flip_ext
         sample_vis["_debug"] = debug
         route_arr = np.asarray(route_input, dtype=np.float32)
         sample_vis["_route_num_points"] = int(route_arr.shape[0]) if route_arr.ndim == 2 else 0
+        corridor_arr = np.asarray(route_corridor_input, dtype=np.float32)
+        sample_vis["_route_corridor_num_points"] = int(corridor_arr.shape[0]) if corridor_arr.ndim == 2 else 0
 
         frame_records.append({
             "sample": sample,
@@ -2947,6 +4425,8 @@ def main():
             "event_name": event_name,
         })
 
+    _annotate_frame_records_merge_episode(frame_records)
+
     _annotate_release_ready(
         frame_records,
         fps_hz=4.0,
@@ -2958,108 +4438,30 @@ def main():
 
     scene_borrow_context = None
     if _is_borrow_cross_scene_context(event_name=event_name):
-        for rec in frame_records:
-            info = rec.get("release_ready", {})
-            start_xy = info.get("borrow_start_world_xy", [])
-            end_xy = info.get("borrow_end_world_xy", [])
-            if len(start_xy) == 2 and len(end_xy) == 2:
-                scene_borrow_context = {
-                    "borrow_start_world_xy": list(start_xy),
-                    "borrow_end_world_xy": list(end_xy),
-                    "borrow_distance_m": float(info.get("borrow_distance_m", 0.0)),
-                    "peak_lateral_m": float(info.get("peak_lateral_m", 0.0)),
-                    "release_to_return_s": float(info.get("release_to_return_s", 0.0)),
-                    "borrow_duration_s": float(info.get("borrow_duration_s", 0.0)),
-                }
-                break
-        if scene_borrow_context is None:
-            for rec in frame_records:
-                route_local = np.asarray(
-                    rec.get("sample_vis", {}).get("_route_input_local", np.zeros((0, 2), dtype=np.float32)),
-                    dtype=np.float32,
-                )
-                current_meas = rec.get("current_meas")
-                ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
-                if ego_matrix_current is None:
-                    continue
-                enter_thresh = 1.25
-                return_thresh = 0.8
-                min_enter_m = 4.0
-                min_return_m = 6.0
-                if _is_borrow_cross_scene_context(event_name=event_name):
-                    enter_thresh = 0.6
-                    return_thresh = 0.5
-                    min_enter_m = 2.0
-                    min_return_m = 3.0
-                borrow_geom = _estimate_borrow_points_from_wait_route(
-                    route_local=route_local,
-                    borrow_enter_lateral_thresh=float(enter_thresh),
-                    return_lateral_thresh=float(return_thresh),
-                    min_enter_progress_m=float(min_enter_m),
-                    min_return_progress_m=float(min_return_m),
-                    segment_step_m=max(0.25, float(args.front_route_step_m)),
-                )
-                if borrow_geom is None:
-                    continue
-                borrow_world = _transform_points_local_to_world_xyz(
-                    np.stack([borrow_geom["enter_local_xy"], borrow_geom["return_local_xy"]], axis=0),
-                    ego_matrix_current,
-                )
-                if borrow_world.shape[0] != 2:
-                    continue
-                scene_borrow_context = {
-                    "borrow_start_world_xy": borrow_world[0, :2].astype(float).tolist(),
-                    "borrow_end_world_xy": borrow_world[1, :2].astype(float).tolist(),
-                    "borrow_distance_m": float(borrow_geom["borrow_distance_m"]),
-                    "peak_lateral_m": float(borrow_geom["peak_lateral_m"]),
-                    "release_to_return_s": 0.0,
-                    "borrow_duration_s": 0.0,
-                }
-                break
-        if scene_borrow_context is None:
-            for rec in frame_records:
-                current_meas = rec.get("current_meas")
-                route_local = np.asarray(
-                    rec.get("sample_vis", {}).get("_route_input_local", np.zeros((0, 2), dtype=np.float32)),
-                    dtype=np.float32,
-                )
-                ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
-                if ego_matrix_current is None or route_local.ndim != 2 or route_local.shape[0] < 2:
-                    continue
-                debug = rec.get("debug", {})
-                current_cover = _cover_candidate_summary(1, debug.get("best_current"), debug, current_meas=current_meas, event_name=event_name)
-                future_cover = _cover_candidate_summary(2, debug.get("best_future"), debug, current_meas=current_meas, event_name=event_name)
-                if str(current_cover.get("interaction", {}).get("subtype", "none")) == "borrow_cross_meet":
-                    cover_pt = None if debug.get("best_current") is None else np.asarray(debug["best_current"].get("cover", {}).get("route_point", None), dtype=np.float32)
-                elif str(future_cover.get("interaction", {}).get("subtype", "none")) == "borrow_cross_meet":
-                    cover_pt = None if debug.get("best_future") is None else np.asarray(debug["best_future"].get("cover", {}).get("route_point", None), dtype=np.float32)
-                else:
-                    cover_pt = None
-                if cover_pt is None or np.asarray(cover_pt).shape != (2,):
-                    continue
-                cover_proj, cover_s = _project_point_to_polyline(np.asarray(cover_pt, dtype=np.float32), route_local)
-                if cover_proj is None or cover_s is None:
-                    continue
-                ego_length_m = _ego_length_m(rec.get("current_boxes"))
-                corridor_len_m = float(max(3.0 * ego_length_m, ego_length_m))
-                start_s = max(float(cover_s) - 0.5 * corridor_len_m, 0.0)
-                end_s = min(float(cover_s) + 0.5 * corridor_len_m, float(_polyline_length_m(route_local)))
-                corridor_local = _sample_polyline_at_arclengths(
-                    route_local,
-                    np.asarray([start_s, end_s], dtype=np.float32),
-                )
-                corridor_world = _transform_points_local_to_world_xyz(corridor_local, ego_matrix_current)
-                if corridor_world.shape[0] != 2:
-                    continue
-                scene_borrow_context = {
-                    "borrow_start_world_xy": corridor_world[0, :2].astype(float).tolist(),
-                    "borrow_end_world_xy": corridor_world[1, :2].astype(float).tolist(),
-                    "borrow_distance_m": float(max(end_s - start_s, 0.0)),
-                    "peak_lateral_m": 0.0,
-                    "release_to_return_s": 0.0,
-                    "borrow_duration_s": 0.0,
-                }
-                break
+        scene_borrow_context = _build_event_two_way_borrow_context(
+            frame_records,
+            event_name=event_name,
+            route_step_m=max(0.25, float(args.front_route_step_m)),
+            borrow_start_mode=str(args.borrow_start_mode),
+            borrow_enter_lateral_thresh=1.25,
+            return_lateral_thresh=0.8,
+            min_enter_progress_m=4.0,
+            min_return_progress_m=6.0,
+        )
+        if _is_two_way_event_corridor_scene_context(event_name=event_name) and scene_borrow_context is None:
+            raise RuntimeError(
+                f"Failed to build scene-level two-way corridor for {selection_name}; "
+                "old wait/release and cover-centered fallbacks are disabled."
+            )
+
+    _annotate_frame_records_cross_wait(
+        frame_records,
+        scene_borrow_context=scene_borrow_context,
+        start_distance_m=10.0,
+        wait_speed_thresh=0.5,
+        go_speed_thresh=1.0,
+        dt_s=0.25,
+    )
 
     persisted_meet = None
     persisted_meet_frames_left = 0
@@ -3083,18 +4485,22 @@ def main():
             "return_frame_id": -1,
             "borrow_duration_s": 0.0,
             "release_to_return_s": 0.0,
+            "borrow_start_distance_m": 0.0,
             "borrow_distance_m": 0.0,
             "peak_lateral_m": 0.0,
             "blocked_frame_id": -1,
             "blocking_actor_id": -1,
             "blocking_actor_class": "none",
+            "borrow_start_world_xy": [],
+            "borrow_end_world_xy": [],
+            "borrow_start_world_xyz": [],
+            "borrow_end_world_xyz": [],
+            "borrow_segment_world_xy": [],
+            "borrow_segment_world_xyz": [],
         })
-        if scene_borrow_context is not None:
-            start_xy = release_info.get("borrow_start_world_xy", [])
-            end_xy = release_info.get("borrow_end_world_xy", [])
-            if not (len(start_xy) == 2 and len(end_xy) == 2):
-                release_info = dict(release_info)
-                release_info.update(scene_borrow_context)
+        rec_event_name = record.get("event_name", event_name)
+        if scene_borrow_context is not None and _is_two_way_event_corridor_scene_context(event_name=rec_event_name):
+            release_info = dict(scene_borrow_context)
         sample_vis["_release_info"] = dict(release_info)
 
         current_cover = _cover_candidate_summary(1, debug.get("best_current"), debug, current_meas=current_meas, event_name=event_name)

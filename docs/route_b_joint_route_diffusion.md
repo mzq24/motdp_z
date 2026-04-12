@@ -1876,6 +1876,77 @@ Additional note after checking expert-speed maxima on the successful-route subse
 - this means:
   - `Et_max` is useful as a sanity/debug ceiling
   - but not as the main deployment calibration target
+
+#### 13.15 Stage1 Energy Sparsity And Resampling Plan
+
+After the first closed-loop and per-frame debug checks, one practical issue is
+now clear:
+
+- the stage1 energy supervision is **highly sparse**
+- `general` frames often have near-zero energy everywhere
+- truly dangerous windows are short
+- some quantities such as merge / rear-floor style `v_bmin` behavior only appear
+  in a very small number of frames
+
+This means uniform frame sampling is likely to under-train the difficult
+high-energy patterns, even if the aggregate validation loss already looks good.
+
+Current plan:
+
+- keep `general` frames in the training set because they are needed to calibrate
+  low-risk behavior
+- but do **not** sample them uniformly against all other frames
+- add explicit reweighting / resampling for stage1 energy training
+
+Recommended buckets:
+
+- `general`
+  - low-energy sparse frames
+  - used to keep calibration and avoid predicting high energy everywhere
+- `danger-dense`
+  - frames where many queried speeds already have moderate/high energy
+  - these are the most informative for learning chase / meet / pedestrian risk shape
+- `transition`
+  - frames where the local energy curve changes rapidly from one frame to the next
+  - these are especially important for learning braking onset / release timing
+
+Suggested frame-level density statistics:
+
+- `rho_mean = mean(E_total(v))`
+- `rho_hot = mean(E_total(v) > tau)`
+  - a simple first choice is `tau = 0.2`
+- `rho_delta = |rho_t - rho_{t-1}|`
+
+Use these as a first pass:
+
+- low `rho_mean` and low `rho_hot`:
+  - `general`
+- high `rho_mean` or high `rho_hot`:
+  - `danger-dense`
+- high `rho_delta`:
+  - `transition`
+
+Important caution:
+
+- do **not** throw away `general` frames entirely
+- the right move is rebalancing, not only mining hard frames
+- otherwise the model will lose the low-energy calibration that currently works
+  well on normal scenes
+
+Likely next implementation step:
+
+- build a stage1 training sampler that mixes:
+  - a smaller amount of `general`
+  - an upweighted amount of `danger-dense`
+  - an upweighted amount of `transition`
+- optionally do this per head later:
+  - `chase-dense`
+  - `meet-dense`
+  - `ped-dense`
+
+This is currently the preferred direction over expecting the model to reliably
+recover extremely sparse concepts such as explicit `v_bmin`-like behavior from
+uniform full-dataset training alone.
 - for practical infer-time tuning, prefer:
   - `Et_mean` as a soft central reference
   - `Et_p90` or `Et_p95` as the conservative family-specific reference
@@ -1912,6 +1983,55 @@ Interpretation:
   - seeing `Et_max = 1.0` in successful routes is **not** by itself a labeling bug
   - it mainly means the label system is capable of saturating on rare but valid
     expert frames
+
+#### 13.16 Yield Mode Is The Key Variable In Merge Energy
+
+Another important takeaway from the recent local closed-loop debugging is that
+for `merge_meet` style interactions, the most important latent variable is not
+just "is there a conflict", but:
+
+- does ego intend to pass **in front** of the other actor
+- or does ego intend to **yield behind** that actor
+
+This choice largely determines the shape of `E_meet(v)`:
+
+- `yield-behind`
+  - lower ego speeds should be safer
+  - higher ego speeds can move ego into the dangerous overlap zone
+- `pass-front`
+  - sufficiently high ego speeds can become safer again
+  - middle-speed overlap can be the most dangerous regime
+
+This is exactly the semantic role previously approximated by:
+
+- `v_yld`
+- `v_eq`
+- `v_need`
+
+but the recent analysis suggests the more fundamental interpretation is:
+
+- `yield mode` / `pass-front vs yield-behind`
+
+Practical implication:
+
+- for merge-like scenes, differences in energy are often best explained by
+  differences in the intended passing order, not just by geometry alone
+- the same location and the same other vehicle can produce very different
+  energy values if the chosen target speed implies a different passing order
+
+Current preferred direction for later stages:
+
+- keep stage1 energy as the current teacher/risk-curve setup
+- but consider making this latent decision more explicit in later stages
+  through either:
+  - a debug-time inferred `yield mode`
+  - or an auxiliary supervision head such as:
+    - `pass_front`
+    - `yield_behind`
+
+This is now considered a more promising abstraction than expecting the model to
+reliably recover very sparse quantities such as explicit `v_bmin` directly and
+stably in all test-time situations.
 - infer-time calibration should therefore avoid using raw maxima as thresholds
 
 So the current ego path does not just sample more points. It also runs multiple full-BEV projections per batch:

@@ -12,6 +12,7 @@
 |------|------|
 | Raw dataset | `/workspace1/z_project/dataset/pdm_lite` |
 | Code | `/workspace1/z_project/code/motdp_z` |
+| Code alias | `/home/z/code/motdp_z`（link 到上面） |
 | TransFuser 权重 | `/workspace1/z_project/models/.../pretrain/` |
 | Processed data | `/workspace1/z_project/dataset/pdm_lite/tmp_data/{train,val}/` |
 | Memmap cache | `pdm_lite/tmp_data/{train,val}/tmp_data/` 下的 `.bin` |

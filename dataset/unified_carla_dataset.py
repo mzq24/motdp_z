@@ -44,7 +44,13 @@ def _apply_stage1_near_zero_speed_snap(final_sample, eps_mps=0.1):
     speed_samples[near_zero_mask] = 0.0
     final_sample['speed_sample_values'] = speed_samples
 
-    for key in ('speed_risk_chase_values', 'speed_risk_meet_values', 'speed_risk_ped_values'):
+    for key in (
+        'speed_risk_chase_values',
+        'speed_risk_meet_values',
+        'speed_risk_borrow_yld_values',
+        'speed_risk_borrow_go_values',
+        'speed_risk_ped_values',
+    ):
         value = final_sample.get(key)
         if isinstance(value, torch.Tensor) and value.shape == speed_samples.shape:
             value = value.clone()
@@ -714,7 +720,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'speed_sample_values',
                 'speed_risk_chase_values',
                 'speed_risk_meet_values',
+                'speed_risk_borrow_yld_values',
+                'speed_risk_borrow_go_values',
                 'speed_risk_ped_values',
+                'speed_cross_wait_time_s',
+                'speed_cross_wait_valid',
             }:
                 final_sample[key] = _from_numpy(value, key)
             elif key.startswith('transfuser_'):
