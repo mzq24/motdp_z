@@ -1,0 +1,127 @@
+# MoT-DP Context
+
+## Scope
+
+`MoT-DP` 这条线主要负责：
+
+- 模型结构修改
+- policy / decoder / route-b 逻辑修改
+- dataset 与 labeling 管线
+- 本地 smoke test
+- HPC training / resume / full training
+- training 后调参、复盘和结论沉淀
+
+## 当前技术主线
+
+- 基座仍是 `TransFuser backbone + DiT planner`。
+- 近期主开发线以 `Route B / annealed energy guidance` 为核心。
+- 训练和推理都高度依赖轨迹归一化统计、route/global stats、anchor 文件与 config 对齐。
+- `MoT-DP` 里的稳定结论优先沉淀在这里，不再散落在 session 对话里。
+
+## 常用基础设施
+
+- `new_hpc` 常用 repo 路径：`/workspace1/z_project/code/motdp_z`
+- `new_hpc` 常用 repo alias：`/home/z/code/motdp_z`（link 到同一份代码）
+- `new_hpc` 常用环境名：`z_dpauto`
+- 如果后续要核对 `new_hpc` 上的 labeling / video / training 行为，默认先按这两个值找代码和环境。
+
+## 当前重点方向
+
+### 1. Route B 主线
+
+- 关键思路：
+  - 用 `x_t / pred_x0` 统一命名
+  - 采用 delta z-score 归一化
+  - energy gradient 作用在 `pred_x0`，而不是直接打到 `x_{t-1}`
+  - 训练侧用 unified 34-mode forward
+- 关键文档：
+  - `./route_b_refactor.md`
+  - `./project_summary.md`
+- 关键代码区域：
+  - `../model/transformer_for_diffusion_multi_head.py`
+  - `../policy/annealed_energy_guidance_policy.py`
+  - `../training/train_carla_bev.py`
+
+### 2. Semantic Behavior Labeling
+
+- 目标：
+  - 给 anchor 轨迹打可解释的行为/允许性标签
+  - 支持训练辅助监督、推理过滤、anchor 质量分析
+- 当前状态：
+  - labeler 与 dataset on-the-fly 接入已完成
+  - behavior embedding / loss / inference filtering 仍未完全成为主线稳定能力
+- 关键文档：
+  - `./semantic_behavior_labeling.md`
+- 关键代码区域：
+  - `../tools/anchor_semantic_labeler.py`
+  - `../dataset/unified_carla_dataset.py`
+  - `../training/train_carla_bev.py`
+
+### 3. LiDAR BEV 输入升级
+
+- 当前建议：
+  - 先把 `transfuser_lidar_bev` 作为输入/细节增强支路接入
+  - 先做 `BEV only` vs `BEV + LiDAR BEV` 的清晰消融
+  - 暂时不要和 semantic-condition 分支混在同一轮里
+- 关键文档：
+  - `./detail_sampling_upgrade.md`
+  - `./session_0401_lidar_bev_followup.md`
+
+### 4. 训练效率与调参
+
+- `train_energy=false` 是重要的快速训练开关，适合先跑 diffusion-only 版本。
+- 调参时需要特别注意：
+  - `feature_suffix`
+  - `n_emb`
+  - `speed_loss_weight`
+  - `train_energy`
+  - `route_abs_stats_path`
+  - `global_abs_stats_path` / `abs_stats_path`
+- 本地 mini 验证与 HPC full-dataset 指标不能直接混用比较。
+
+### 5. Stage1 Speed Merge Labels
+
+- `stage1 speed curve energy` 当前已经显式计算 merge 相关速度阈值：
+  - `v_go_need_mps`：ego 想在当前 merge actor 前面通过冲突点时所需的最小速度
+  - `v_yield_max_mps` / `yld`：ego 想让在当前 merge actor 后面时允许的最大速度
+- 这里的 `yld` 不是“下一整个 merge window”的完整定义，更准确地说，它是“针对当前关键 merge actor 的 yield-behind 速度上界”。
+- 当前状态：
+  - 这些量已存在于 `scripts/data_tools/precompute_semantic_labels.py` 的 stage1 speed labeling / debug 中
+  - 但还没有正式进入 dataset / training 主链作为显式 supervision 或 condition
+- 当前建议：
+  - 若后续要主线化，先把 `merge_valid / v_yield_max / v_go_need / v_behind_min` 做成稳定 label
+  - 再优先接到 `predict speed`
+  - 最后再考虑把预测到的 merge-affordance 反喂给 `predict traj`
+- `junction_left_cross_meet` 这条线也要按 decomposition 来理解：
+  - 不要只把它当一个 folded `meet_risk`
+  - 应该拆成：
+    - `speed_risk_junction_cross_yld_values`
+    - `speed_risk_junction_cross_go_values`
+  - 但要注意：
+    - 它和 `borrow_cross_meet` 只是时序 / 决策语义相似
+    - 几何来源并不相同
+    - `junction_left_cross_meet` 不使用 two-way corridor
+- 现行实现说明：
+  - `cross / borrow corridor / junction-cross split / merge episode / merge speed curve` 的当前主线逻辑，统一记录在
+    `./reference/cross_meet_corridor_logic.md`
+
+## 推荐工作流
+
+1. 在 `MoT-DP` 内完成模型或 labeling 修改。
+2. 先做本地 smoke test，确认 forward / loss / config / checkpoint 加载没有明显问题。
+3. 再同步到 HPC 跑正式 training 或 resume。
+4. 训练结束后，把真正稳定的结论回写到这里，而不是只留在聊天记录里。
+
+## 新 session 读到这里后默认要知道的事
+
+- 如果本次任务是“改模型、改标签、跑训练、看 loss、调 config”，默认归 `MoT-DP` 线。
+- 如果本次任务同时涉及 close-loop，不要把 Bench2Drive 运行细节也塞进这里，转去看 `./bench2drive.md`。
+- `semantic` 线与 `lidar BEV` 线要分开做实验，避免归因混乱。
+
+## 继续深入时优先看的文档
+
+- `./project_summary.md`
+- `./route_b_refactor.md`
+- `./semantic_behavior_labeling.md`
+- `./detail_sampling_upgrade.md`
+- `./session_0401_lidar_bev_followup.md`

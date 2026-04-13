@@ -78,9 +78,15 @@ FAST_FIELDS = (
     'speed_sample_exp_index',
     'speed_risk_chase_values',
     'speed_risk_meet_values',
+    'speed_risk_junction_cross_yld_values',
+    'speed_risk_junction_cross_go_values',
+    'speed_risk_merge_yld_values',
+    'speed_risk_merge_go_values',
     'speed_risk_borrow_yld_values',
     'speed_risk_borrow_go_values',
     'speed_risk_ped_values',
+    'speed_cross_wait_time_s',
+    'speed_cross_wait_valid',
     'merge_decision_phase',
     'merge_episode_id',
     'merge_episode_active',
@@ -170,8 +176,12 @@ STAGE1_SPEED_FIELDS = (
     'speed_sample_exp_index',
     'speed_risk_chase_values',
     'speed_risk_meet_values',
+    'speed_risk_junction_cross_yld_values',
+    'speed_risk_junction_cross_go_values',
     'speed_risk_merge_yld_values',
     'speed_risk_merge_go_values',
+    'speed_risk_borrow_yld_values',
+    'speed_risk_borrow_go_values',
     'speed_risk_ped_values',
     'speed_cross_wait_time_s',
     'speed_cross_wait_valid',
@@ -2200,6 +2210,8 @@ def _build_speed_curve_debug(
             sample_speeds = sample_speeds.reshape(-1).astype(np.float32)
     chase_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     meet_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    junction_cross_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
+    junction_cross_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     merge_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     merge_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
     borrow_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
@@ -2353,6 +2365,8 @@ def _build_speed_curve_debug(
             "sample_speeds_mps": sample_speeds.astype(np.float32),
             "chase_risks": chase_risks.astype(np.float32),
             "meet_risks": meet_risks.astype(np.float32),
+            "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
+            "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
             "merge_yld_risks": merge_yld_risks.astype(np.float32),
             "merge_go_risks": merge_go_risks.astype(np.float32),
             "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
@@ -2433,6 +2447,8 @@ def _build_speed_curve_debug(
                     "sample_speeds_mps": sample_speeds.astype(np.float32),
                     "chase_risks": chase_risks.astype(np.float32),
                     "meet_risks": meet_risks.astype(np.float32),
+                    "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
+                    "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
                     "merge_yld_risks": merge_yld_risks.astype(np.float32),
                     "merge_go_risks": merge_go_risks.astype(np.float32),
                     "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
@@ -2500,6 +2516,9 @@ def _build_speed_curve_debug(
                 v = float(candidate_speed)
                 if v <= 1e-6:
                     meet_risks[idx] = 0.0
+                    if meet_subtype == "junction_left_cross_meet":
+                        junction_cross_yld_risks[idx] = 0.0
+                        junction_cross_go_risks[idx] = 1.0
                     continue
                 t_ego_in = float(max(d_ego_entry_m, 0.0) / max(v, 1e-6))
                 if float(d_ego_entry_m) <= 1e-4:
@@ -2513,12 +2532,17 @@ def _build_speed_curve_debug(
                         )
                     )
                 meet_risks[idx] = float(max(risk, occupancy_floor))
+                if meet_subtype == "junction_left_cross_meet":
+                    junction_cross_yld_risks[idx] = meet_risks[idx]
+                    junction_cross_go_risks[idx] = 1.0
             total_risks = np.maximum(chase_risks, meet_risks)
             cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
             return {
                 "sample_speeds_mps": sample_speeds.astype(np.float32),
                 "chase_risks": chase_risks.astype(np.float32),
                 "meet_risks": meet_risks.astype(np.float32),
+                "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
+                "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
                 "merge_yld_risks": merge_yld_risks.astype(np.float32),
                 "merge_go_risks": merge_go_risks.astype(np.float32),
                 "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
@@ -2674,6 +2698,10 @@ def _build_speed_curve_debug(
                 v_yield_max = np.nan
                 debug_v_equal = np.nan
                 debug_v_go_min = np.nan
+                if meet_subtype == "junction_left_cross_meet":
+                    go_denom = float(t_bg) - float(cross_safe_gap_s)
+                    v_go_min = np.inf if go_denom <= 1e-6 else (risk_d_ego + ego_cross_occ_len_m) / max(go_denom, 1e-6)
+                    v_yield_max = risk_d_ego / max(t_bg_exit + float(cross_safe_gap_s), 1e-6)
             meet_info = {
                 "valid": 1.0,
                 "d_ego_m": risk_d_ego,
@@ -2786,14 +2814,33 @@ def _build_speed_curve_debug(
                             meet_info["t_ego_exit_s"] = float(t_ego_out)
                         gap_before = t_bg - t_ego_out
                         gap_after = t_ego_in - t_bg_exit
-                        time_clearance = max(gap_before, gap_after)
-                        risk = float(
-                            np.clip(
-                                (float(cross_safe_gap_s) - time_clearance) / max(float(cross_safe_gap_s), 1e-6),
-                                0.0,
-                                1.0,
+                        if meet_subtype == "junction_left_cross_meet":
+                            yld_risk = float(
+                                np.clip(
+                                    (float(cross_safe_gap_s) - gap_after) / max(float(cross_safe_gap_s), 1e-6),
+                                    0.0,
+                                    1.0,
+                                )
                             )
-                        )
+                            go_risk = float(
+                                np.clip(
+                                    (float(cross_safe_gap_s) - gap_before) / max(float(cross_safe_gap_s), 1e-6),
+                                    0.0,
+                                    1.0,
+                                )
+                            )
+                            junction_cross_yld_risks[idx] = float(np.clip(np.nan_to_num(yld_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
+                            junction_cross_go_risks[idx] = float(np.clip(np.nan_to_num(go_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
+                            risk = float(min(junction_cross_yld_risks[idx], junction_cross_go_risks[idx]))
+                        else:
+                            time_clearance = max(gap_before, gap_after)
+                            risk = float(
+                                np.clip(
+                                    (float(cross_safe_gap_s) - time_clearance) / max(float(cross_safe_gap_s), 1e-6),
+                                    0.0,
+                                    1.0,
+                                )
+                            )
                     else:
                         delta_t = abs(t_ego_in - t_bg)
                         risk = _risk_from_time_gap(delta_t, merge_tau_s)
@@ -2804,6 +2851,8 @@ def _build_speed_curve_debug(
         "sample_speeds_mps": sample_speeds.astype(np.float32),
         "chase_risks": chase_risks.astype(np.float32),
         "meet_risks": meet_risks.astype(np.float32),
+        "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
+        "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
         "merge_yld_risks": merge_yld_risks.astype(np.float32),
         "merge_go_risks": merge_go_risks.astype(np.float32),
         "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
@@ -2870,6 +2919,8 @@ def _build_speed_curve_targets(
 
     chase_risks = np.asarray(speed_curve.get("chase_risks", zeros), dtype=np.float32)
     meet_risks_raw = np.asarray(speed_curve.get("meet_risks", zeros), dtype=np.float32)
+    junction_cross_yld_risks = np.asarray(speed_curve.get("junction_cross_yld_risks", zeros), dtype=np.float32)
+    junction_cross_go_risks = np.asarray(speed_curve.get("junction_cross_go_risks", zeros), dtype=np.float32)
     merge_yld_risks = np.asarray(speed_curve.get("merge_yld_risks", zeros), dtype=np.float32)
     merge_go_risks = np.asarray(speed_curve.get("merge_go_risks", zeros), dtype=np.float32)
     borrow_yld_risks = np.asarray(speed_curve.get("borrow_yld_risks", zeros), dtype=np.float32)
@@ -2885,6 +2936,8 @@ def _build_speed_curve_targets(
         ped_risks = meet_risks_raw.copy()
         meet_risks = zeros.copy()
         chase_risks = zeros.copy()
+        junction_cross_yld_risks = zeros.copy()
+        junction_cross_go_risks = zeros.copy()
         merge_yld_risks = zeros.copy()
         merge_go_risks = zeros.copy()
         borrow_yld_risks = zeros.copy()
@@ -2901,6 +2954,8 @@ def _build_speed_curve_targets(
             chase_risks,
             meet_risks,
             ped_risks,
+            junction_cross_yld_risks,
+            junction_cross_go_risks,
             merge_yld_risks,
             merge_go_risks,
             borrow_yld_risks,
@@ -2930,6 +2985,8 @@ def _build_speed_curve_targets(
         "total_risks": total_risks.astype(np.float32),
         "chase_risks": chase_risks.astype(np.float32),
         "meet_risks": meet_risks.astype(np.float32),
+        "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
+        "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
         "merge_yld_risks": merge_yld_risks.astype(np.float32),
         "merge_go_risks": merge_go_risks.astype(np.float32),
         "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
@@ -2947,6 +3004,8 @@ def _build_speed_curve_targets(
         chase_risks,
         meet_risks,
         ped_risks,
+        junction_cross_yld_risks,
+        junction_cross_go_risks,
         merge_yld_risks,
         merge_go_risks,
         borrow_yld_risks,
@@ -3052,6 +3111,8 @@ def _set_stage1_speed_fallback(sample):
     sample['speed_sample_exp_index'] = np.int64(3)
     sample['speed_risk_chase_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
     sample['speed_risk_meet_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
+    sample['speed_risk_junction_cross_yld_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
+    sample['speed_risk_junction_cross_go_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
     sample['speed_risk_merge_yld_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
     sample['speed_risk_merge_go_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
     sample['speed_risk_borrow_yld_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
@@ -3071,6 +3132,8 @@ def _set_stage1_speed_fallback(sample):
             'total_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
             'chase_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
             'meet_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
+            'junction_cross_yld_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
+            'junction_cross_go_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
             'merge_yld_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
             'merge_go_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
             'borrow_yld_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
@@ -4339,7 +4402,21 @@ def precompute(
                 ped_current_cover = _cover_candidate_summary(1, ped_debug.get('best_current'), ped_debug, current_meas=current_measurements, event_name=event_name)
                 ped_future_cover = _cover_candidate_summary(2, ped_debug.get('best_future'), ped_debug, current_meas=current_measurements, event_name=event_name)
 
-                sample_speeds, valid_mask, exp_index, chase_risks, meet_risks, _, merge_yld_risks, merge_go_risks, borrow_yld_risks, borrow_go_risks, speed_curve_debug = _build_speed_curve_targets(
+                (
+                    sample_speeds,
+                    valid_mask,
+                    exp_index,
+                    chase_risks,
+                    meet_risks,
+                    _,
+                    junction_cross_yld_risks,
+                    junction_cross_go_risks,
+                    merge_yld_risks,
+                    merge_go_risks,
+                    borrow_yld_risks,
+                    borrow_go_risks,
+                    speed_curve_debug,
+                ) = _build_speed_curve_targets(
                     current_cover=current_cover,
                     future_cover=speed_curve_future_cover,
                     current_meas=current_measurements,
@@ -4349,7 +4426,20 @@ def precompute(
                     event_name=event_name,
                     return_debug=True,
                 )
-                ped_sample_speeds, _, _, _, _, ped_risks, _, _, _, _ = _build_speed_curve_targets(
+                (
+                    ped_sample_speeds,
+                    _,
+                    _,
+                    _,
+                    _,
+                    ped_risks,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = _build_speed_curve_targets(
                     current_cover=ped_current_cover,
                     future_cover=ped_future_cover,
                     current_meas=current_measurements,
@@ -4366,6 +4456,8 @@ def precompute(
                 sample['speed_sample_exp_index'] = np.int64(exp_index)
                 sample['speed_risk_chase_values'] = chase_risks.astype(np.float32)
                 sample['speed_risk_meet_values'] = meet_risks.astype(np.float32)
+                sample['speed_risk_junction_cross_yld_values'] = junction_cross_yld_risks.astype(np.float32)
+                sample['speed_risk_junction_cross_go_values'] = junction_cross_go_risks.astype(np.float32)
                 sample['speed_risk_merge_yld_values'] = merge_yld_risks.astype(np.float32)
                 sample['speed_risk_merge_go_values'] = merge_go_risks.astype(np.float32)
                 sample['speed_risk_borrow_yld_values'] = borrow_yld_risks.astype(np.float32)
@@ -4373,6 +4465,8 @@ def precompute(
                 sample['speed_risk_ped_values'] = ped_risks.astype(np.float32)
                 sample['speed_cross_wait_time_s'] = np.float32(cross_wait_time_s)
                 sample['speed_cross_wait_valid'] = np.float32(cross_wait_valid)
+                speed_curve_debug['junction_cross_yld_risks'] = np.asarray(junction_cross_yld_risks, dtype=np.float32)
+                speed_curve_debug['junction_cross_go_risks'] = np.asarray(junction_cross_go_risks, dtype=np.float32)
                 speed_curve_debug['merge_yld_risks'] = np.asarray(merge_yld_risks, dtype=np.float32)
                 speed_curve_debug['merge_go_risks'] = np.asarray(merge_go_risks, dtype=np.float32)
                 speed_curve_debug['borrow_yld_risks'] = np.asarray(borrow_yld_risks, dtype=np.float32)
