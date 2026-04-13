@@ -135,6 +135,13 @@ TERMINAL_ROUTE_NEAR_DISTANCE_M = float(os.environ.get('TERMINAL_ROUTE_NEAR_DISTA
 TERMINAL_ROUTE_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_SPEED_CAP_MS', '1.2'))
 TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS = float(os.environ.get('TERMINAL_ROUTE_BEHIND_SPEED_CAP_MS', '0.8'))
 SPEED_SOURCE = os.environ.get('SPEED_SOURCE', 'speed_head').lower()  # 'speed_head', 'traj', 'traj_05s', 'fuse', 'fuse_traj', 'fuse3_median', 'fuse3_adaptive'
+STUCK_HELPER_TARGET_INSERT_ENABLE = os.environ.get('STUCK_HELPER_TARGET_INSERT_ENABLE', '1').lower() in (
+    '1', 'true', 'yes', 'on'
+)
+STUCK_HELPER_TARGET_1_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_1_FORWARD_M', '3.63'))
+STUCK_HELPER_TARGET_2_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_2_FORWARD_M', '4.63'))
+STUCK_HELPER_TARGET_LATERAL_M = float(os.environ.get('STUCK_HELPER_TARGET_LATERAL_M', '-3.145'))
+STUCK_HELPER_RELEASE_HEADING_DEG = float(os.environ.get('STUCK_HELPER_RELEASE_HEADING_DEG', '20.0'))
 SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
     '1', 'true', 'yes', 'on'
 )
@@ -350,6 +357,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_stop_brake_distance_m = 12.0
 		self.semantic_stop_min_stop_frames = 10
 		self.semantic_stop_reset_missing_frames = 5
+		self.semantic_stop_arm_speed_threshold = float(
+			os.environ.get('SEMANTIC_STOP_ARM_SPEED_THRESHOLD', '0.1')
+		)
+		self.semantic_stop_max_apply_events = max(
+			0,
+			int(os.environ.get('SEMANTIC_STOP_MAX_APPLY_EVENTS', '2'))
+		)
 		self.semantic_planner_stop_speed_threshold = 0.05
 
 		self.semantic_tl_prev_state = 'none'
@@ -357,6 +371,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_stop_state = 'NONE'
 		self.semantic_stop_stopped_frames = 0
 		self.semantic_stop_missing_frames = 0
+		self.semantic_stop_apply_events = 0
+		self.semantic_stop_prev_apply_stop = False
+		self.semantic_stop_disabled = False
 		self.last_semantic_debug = {}
 
 	def _decode_bev_semantic_classes(self, bev_feature_upscale):
@@ -664,6 +681,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			bev_classes, SEMANTIC_STOP_SIGN_CLASS, self.semantic_stop_roi
 		)
 		stop_detected = stop_stats['count'] >= self.semantic_stop_min_pixels
+		arm_speed_ok = ego_speed > self.semantic_stop_arm_speed_threshold
+
+		if self.semantic_stop_disabled:
+			self.semantic_stop_state = 'NONE'
+			self.semantic_stop_stopped_frames = 0
+			self.semantic_stop_missing_frames = 0
+			return {
+				'state': self.semantic_stop_state,
+				'hold_force_move': False,
+				'apply_stop': False,
+				'pixels': stop_stats['count'],
+				'closest_forward_m': stop_stats['closest_forward_m'],
+				'mean_lateral_m': stop_stats['mean_lateral_m'],
+				'stopped_frames': int(self.semantic_stop_stopped_frames),
+				'disabled': True,
+				'apply_events': int(self.semantic_stop_apply_events),
+				'max_apply_events': int(self.semantic_stop_max_apply_events),
+				'arm_speed_ok': bool(arm_speed_ok),
+			}
 
 		if stop_detected:
 			self.semantic_stop_missing_frames = 0
@@ -675,7 +711,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.semantic_stop_state = 'NONE'
 				self.semantic_stop_stopped_frames = 0
 		elif self.semantic_stop_state == 'NONE':
-			if stop_detected:
+			if stop_detected and arm_speed_ok:
 				self.semantic_stop_state = 'APPROACHING'
 				self.semantic_stop_stopped_frames = 0
 		elif self.semantic_stop_state == 'APPROACHING':
@@ -709,11 +745,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'closest_forward_m': closest_forward_m,
 			'mean_lateral_m': stop_stats['mean_lateral_m'],
 			'stopped_frames': int(self.semantic_stop_stopped_frames),
+			'disabled': False,
+			'apply_events': int(self.semantic_stop_apply_events),
+			'max_apply_events': int(self.semantic_stop_max_apply_events),
+			'arm_speed_ok': bool(arm_speed_ok),
 		}
 
 	def _apply_semantic_hazard_postprocess(
 		self,
 		ego_speed,
+		current_heading,
 		desired_speed_capped,
 		throttle,
 		brake,
@@ -734,12 +775,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_apply_stop': False,
 				'stop_sign_pixels': 0,
 				'stop_sign_closest_forward_m': None,
+				'stop_sign_disabled': bool(self.semantic_stop_disabled),
+				'stop_sign_apply_events': int(self.semantic_stop_apply_events),
+				'stop_sign_max_apply_events': int(self.semantic_stop_max_apply_events),
+				'stop_sign_arm_speed_ok': False,
+				'stuck_helper_active': bool(self.stuck_helper_active and STUCK_HELPER_TARGET_INSERT_ENABLE),
+				'stuck_helper_frames_remaining': int(self.stuck_helper),
+				'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
+				'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
 				'force_move_blocked_reason': None,
 				'planner_wants_stop': False,
 			}
 
 		traffic_light_debug = self._get_semantic_traffic_light_debug(bev_classes)
 		stop_sign_debug = self._update_semantic_stop_sign_debug(bev_classes, ego_speed)
+		stop_sign_apply_rising = bool(stop_sign_debug['apply_stop']) and not self.semantic_stop_prev_apply_stop
+		self.semantic_stop_prev_apply_stop = bool(stop_sign_debug['apply_stop'])
 		traffic_light_state = traffic_light_debug['state']
 		if (
 			traffic_light_state == 'green'
@@ -766,21 +817,29 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		force_move_blocked_reason = external_force_move_block_reason
 		if force_move_blocked_reason is not None:
 			self.force_move = 0
+			self._reset_stuck_helper_state()
 		elif green_hold_active:
 			force_move_blocked_reason = 'traffic_light_green_hold'
 		elif traffic_light_debug['block_force_move']:
 			force_move_blocked_reason = f"traffic_light_{traffic_light_debug['state']}"
-		elif stop_sign_debug['hold_force_move']:
+		elif stop_sign_debug['apply_stop']:
 			force_move_blocked_reason = 'stop_sign'
+
+		if force_move_blocked_reason is None:
+			self._update_stuck_helper_release(current_heading)
 
 		if ego_speed < 0.1:
 			if force_move_blocked_reason is None:
 				self.stuck_detector += 1
+				if self.stuck_detector > self.stuck_helper_threshold:
+					self._activate_stuck_helper(current_heading)
 			else:
 				self.stuck_detector = 0
 				self.force_move = 0
-		elif ego_speed >= 1.0:
+				self._reset_stuck_helper_state()
+		elif ego_speed >= 1.0 and not self.stuck_helper_active:
 			self.stuck_detector = 0
+			self._reset_stuck_helper_state()
 
 		if force_move_blocked_reason is None and self.stuck_detector > self.stuck_threshold:
 			self.force_move = self.creep_duration
@@ -795,12 +854,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			brake = 1.0
 			self.stuck_detector = 0
 			self.force_move = 0
+			self._reset_stuck_helper_state()
 
 		if traffic_light_debug['apply_stop']:
 			throttle = 0.0
 			brake = 1.0
 			self.stuck_detector = 0
 			self.force_move = 0
+			self._reset_stuck_helper_state()
 			if force_move_blocked_reason is None:
 				force_move_blocked_reason = f"traffic_light_{traffic_light_state}"
 
@@ -809,8 +870,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			brake = 1.0
 			self.stuck_detector = 0
 			self.force_move = 0
+			self._reset_stuck_helper_state()
 			if force_move_blocked_reason is None:
 				force_move_blocked_reason = 'stop_sign'
+			if stop_sign_apply_rising:
+				self.semantic_stop_apply_events += 1
+				if (
+					self.semantic_stop_max_apply_events > 0
+					and self.semantic_stop_apply_events >= self.semantic_stop_max_apply_events
+				):
+					self.semantic_stop_disabled = True
+					self.semantic_stop_state = 'NONE'
+					self.semantic_stop_stopped_frames = 0
+					self.semantic_stop_missing_frames = 0
 
 		debug = {
 			'traffic_light_state': traffic_light_debug['state'],
@@ -832,6 +904,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'stop_sign_closest_forward_m': stop_sign_debug['closest_forward_m'],
 			'stop_sign_mean_lateral_m': stop_sign_debug['mean_lateral_m'],
 			'stop_sign_stopped_frames': int(stop_sign_debug['stopped_frames']),
+			'stop_sign_disabled': bool(self.semantic_stop_disabled),
+			'stop_sign_apply_events': int(self.semantic_stop_apply_events),
+			'stop_sign_max_apply_events': int(self.semantic_stop_max_apply_events),
+			'stop_sign_arm_speed_ok': bool(stop_sign_debug.get('arm_speed_ok', False)),
+			'stuck_helper_active': bool(self.stuck_helper_active and STUCK_HELPER_TARGET_INSERT_ENABLE),
+			'stuck_helper_frames_remaining': int(self.stuck_helper),
+			'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
+			'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
 			'force_move_blocked_reason': force_move_blocked_reason,
 			'planner_wants_stop': bool(planner_wants_stop),
 		}
@@ -1442,6 +1522,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Stuck detection
 		self.stuck_detector = 0
 		self.stuck_helper = 0
+		self.stuck_helper_active = False
+		self.stuck_helper_start_heading = None
+		self.stuck_helper_heading_delta_deg = 0.0
 		self.force_move = 0
 
 		self.steer_step = 0
@@ -1811,6 +1894,58 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'filtered',
 		)
 
+	def _ego_points_to_world(self, ego_points, ego_xy, yaw):
+		ego_points = np.asarray(ego_points, dtype=np.float32)
+		ego_xy = np.asarray(ego_xy, dtype=np.float32)
+		cos_yaw = np.cos(yaw)
+		sin_yaw = np.sin(yaw)
+		rotation = np.array([
+			[cos_yaw, -sin_yaw],
+			[sin_yaw, cos_yaw],
+		], dtype=np.float32)
+		return (ego_points @ rotation.T) + ego_xy
+
+	def _get_stuck_helper_target_override(self, ego_xy, yaw):
+		if not STUCK_HELPER_TARGET_INSERT_ENABLE or not self.stuck_helper_active:
+			return None
+
+		helper_ego_points = np.array([
+			[STUCK_HELPER_TARGET_1_FORWARD_M, STUCK_HELPER_TARGET_LATERAL_M],
+			[STUCK_HELPER_TARGET_2_FORWARD_M, STUCK_HELPER_TARGET_LATERAL_M],
+		], dtype=np.float32)
+		helper_world_points = self._ego_points_to_world(helper_ego_points, ego_xy, yaw)
+		frames_remaining = int(self.stuck_helper)
+		return {
+			'active': True,
+			'frames_remaining': frames_remaining,
+			'target_point_ego': helper_ego_points[0].copy(),
+			'next_target_point_ego': helper_ego_points[1].copy(),
+			'target_point_world': helper_world_points[0].copy(),
+			'next_target_point_world': helper_world_points[1].copy(),
+		}
+
+	def _reset_stuck_helper_state(self):
+		self.stuck_helper = 0
+		self.stuck_helper_active = False
+		self.stuck_helper_start_heading = None
+		self.stuck_helper_heading_delta_deg = 0.0
+
+	def _activate_stuck_helper(self, current_heading):
+		self.stuck_helper_active = True
+		self.stuck_helper = 1
+		self.stuck_helper_start_heading = float(current_heading)
+		self.stuck_helper_heading_delta_deg = 0.0
+
+	def _update_stuck_helper_release(self, current_heading):
+		if not self.stuck_helper_active or self.stuck_helper_start_heading is None:
+			return
+		delta_rad = float(current_heading) - float(self.stuck_helper_start_heading)
+		delta_deg = float(np.rad2deg(np.arctan2(np.sin(delta_rad), np.cos(delta_rad))))
+		self.stuck_helper_heading_delta_deg = abs(delta_deg)
+		if self.stuck_helper_heading_delta_deg >= STUCK_HELPER_RELEASE_HEADING_DEG:
+			self.stuck_detector = 0
+			self._reset_stuck_helper_state()
+
 
 	def sensors(self):
 		sensors =  [
@@ -2118,15 +2253,54 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			self.last_waypoint_route = None
 
-		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])
-		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass'])
+		raw_target_point_world = np.asarray(target_point[:2], dtype=np.float32)
+		raw_next_target_point_world = np.asarray(next_target_point[:2], dtype=np.float32)
+		raw_target_point_ego = t_u.inverse_conversion_2d(
+			raw_target_point_world, result['gps'], result['compass']
+		).astype(np.float32)
+		raw_next_target_point_ego = t_u.inverse_conversion_2d(
+			raw_next_target_point_world, result['gps'], result['compass']
+		).astype(np.float32)
+
+		stuck_helper_debug = {
+			'active': False,
+			'frames_remaining': int(self.stuck_helper),
+			'target_points_ego': None,
+			'target_points_world': None,
+		}
+		stuck_helper_override = self._get_stuck_helper_target_override(
+			result['gps'][:2],
+			result['compass'],
+		)
+		if stuck_helper_override is not None:
+			ego_target_point = stuck_helper_override['target_point_ego']
+			ego_next_target_point = stuck_helper_override['next_target_point_ego']
+			target_point_world = stuck_helper_override['target_point_world']
+			next_target_point_world = stuck_helper_override['next_target_point_world']
+			stuck_helper_debug = {
+				'active': True,
+				'frames_remaining': int(stuck_helper_override['frames_remaining']),
+				'target_points_ego': [
+					stuck_helper_override['target_point_ego'].tolist(),
+					stuck_helper_override['next_target_point_ego'].tolist(),
+				],
+				'target_points_world': [
+					stuck_helper_override['target_point_world'].tolist(),
+					stuck_helper_override['next_target_point_world'].tolist(),
+				],
+			}
+		else:
+			ego_target_point = raw_target_point_ego
+			ego_next_target_point = raw_next_target_point_ego
+			target_point_world = raw_target_point_world
+			next_target_point_world = raw_next_target_point_world
 
 		forward_vec_world = np.array([
 			np.cos(result['compass']),
 			np.sin(result['compass']),
 		], dtype=np.float32)
-		target_delta_world = np.asarray(target_point[:2], dtype=np.float32) - np.asarray(result['gps'][:2], dtype=np.float32)
-		next_target_delta_world = np.asarray(next_target_point[:2], dtype=np.float32) - np.asarray(result['gps'][:2], dtype=np.float32)
+		target_delta_world = target_point_world - np.asarray(result['gps'][:2], dtype=np.float32)
+		next_target_delta_world = next_target_point_world - np.asarray(result['gps'][:2], dtype=np.float32)
 
 		def _angle_and_dot(delta_world):
 			dist = float(np.linalg.norm(delta_world))
@@ -2150,8 +2324,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
 		result['next_target_point'] = ego_next_target_point  # numpy array (2,)
-		result['target_point_world'] = np.asarray(target_point[:2], dtype=np.float32)
-		result['next_target_point_world'] = np.asarray(next_target_point[:2], dtype=np.float32)
+		result['target_point_world'] = target_point_world
+		result['next_target_point_world'] = next_target_point_world
+		result['target_point_raw_ego'] = raw_target_point_ego
+		result['next_target_point_raw_ego'] = raw_next_target_point_ego
+		result['target_point_raw_world'] = raw_target_point_world
+		result['next_target_point_raw_world'] = raw_next_target_point_world
+		result['stuck_helper_active'] = bool(stuck_helper_debug['active'])
+		result['stuck_helper_frames_remaining'] = int(stuck_helper_debug['frames_remaining'])
+		result['stuck_helper_heading_delta_deg'] = float(self.stuck_helper_heading_delta_deg)
+		result['stuck_helper_release_heading_deg'] = float(STUCK_HELPER_RELEASE_HEADING_DEG)
+		result['stuck_helper_threshold'] = int(self.stuck_helper_threshold)
+		result['stuck_helper_target_points_ego'] = stuck_helper_debug['target_points_ego']
+		result['stuck_helper_target_points_world'] = stuck_helper_debug['target_points_world']
 		result['target_dot_forward'] = target_dot_forward
 		result['next_target_dot_forward'] = next_target_dot_forward
 		result['target_cross_forward'] = target_cross_forward
@@ -2701,7 +2886,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				lidar_pil = Image.fromarray(lidar_np, mode='RGB')
 				lidar_pil_list = [lidar_pil]
 
-				if self.stuck_helper > 0:
+				if self.stuck_helper_active:
 					target_point_speed = torch.cat([speed, next_target_point], dim=-1)
 					# print("Get stucked! Trigger the stuck helper!")
 				else:
@@ -3056,6 +3241,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.last_speed_debug['target_speed_profile'] = target_speed_profile_list
 			throttle, brake, semantic_debug = self._apply_semantic_hazard_postprocess(
 				ego_speed=gt_velocity,
+				current_heading=float(tick_data.get('compass', 0.0)),
 				desired_speed_capped=self.last_speed_debug.get('desired_speed_capped'),
 				throttle=throttle,
 				brake=brake,
@@ -3153,6 +3339,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_semantic_closest_forward_m': semantic_debug.get('stop_sign_closest_forward_m'),
 				'stop_sign_semantic_mean_lateral_m': semantic_debug.get('stop_sign_mean_lateral_m'),
 				'stop_sign_semantic_stopped_frames': int(semantic_debug.get('stop_sign_stopped_frames', 0)),
+				'stop_sign_semantic_disabled': bool(semantic_debug.get('stop_sign_disabled', False)),
+				'stop_sign_semantic_apply_events': int(semantic_debug.get('stop_sign_apply_events', 0)),
+				'stop_sign_semantic_max_apply_events': int(semantic_debug.get('stop_sign_max_apply_events', 0)),
+				'stop_sign_semantic_arm_speed_ok': bool(semantic_debug.get('stop_sign_arm_speed_ok', False)),
+				'stuck_helper_active': bool(semantic_debug.get('stuck_helper_active', False)),
+				'stuck_helper_frames_remaining': int(semantic_debug.get('stuck_helper_frames_remaining', 0)),
+				'stuck_helper_heading_delta_deg': float(semantic_debug.get('stuck_helper_heading_delta_deg', 0.0)),
+				'stuck_helper_release_heading_deg': float(semantic_debug.get('stuck_helper_release_heading_deg', 0.0)),
 				'force_move_blocked_reason': semantic_debug.get('force_move_blocked_reason'),
 				'planner_wants_stop_for_force_move': bool(semantic_debug.get('planner_wants_stop', False)),
 			}
@@ -3206,6 +3400,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'next_target_point_ego': tick_data['next_target_point'].tolist() if isinstance(tick_data.get('next_target_point'), np.ndarray) else tick_data.get('next_target_point'),
 				'target_point_world': tick_data['target_point_world'].tolist() if isinstance(tick_data.get('target_point_world'), np.ndarray) else tick_data.get('target_point_world'),
 				'next_target_point_world': tick_data['next_target_point_world'].tolist() if isinstance(tick_data.get('next_target_point_world'), np.ndarray) else tick_data.get('next_target_point_world'),
+				'target_point_raw_ego': tick_data['target_point_raw_ego'].tolist() if isinstance(tick_data.get('target_point_raw_ego'), np.ndarray) else tick_data.get('target_point_raw_ego'),
+				'next_target_point_raw_ego': tick_data['next_target_point_raw_ego'].tolist() if isinstance(tick_data.get('next_target_point_raw_ego'), np.ndarray) else tick_data.get('next_target_point_raw_ego'),
+				'target_point_raw_world': tick_data['target_point_raw_world'].tolist() if isinstance(tick_data.get('target_point_raw_world'), np.ndarray) else tick_data.get('target_point_raw_world'),
+				'next_target_point_raw_world': tick_data['next_target_point_raw_world'].tolist() if isinstance(tick_data.get('next_target_point_raw_world'), np.ndarray) else tick_data.get('next_target_point_raw_world'),
+				'tick_stuck_helper_active': bool(tick_data.get('stuck_helper_active', False)),
+				'tick_stuck_helper_frames_remaining': int(tick_data.get('stuck_helper_frames_remaining', 0)),
+				'tick_stuck_helper_heading_delta_deg': float(tick_data.get('stuck_helper_heading_delta_deg', 0.0)),
+				'tick_stuck_helper_release_heading_deg': float(tick_data.get('stuck_helper_release_heading_deg', 0.0)),
+				'tick_stuck_helper_threshold': int(tick_data.get('stuck_helper_threshold', 0)),
+				'tick_stuck_helper_target_points_ego': tick_data.get('stuck_helper_target_points_ego'),
+				'tick_stuck_helper_target_points_world': tick_data.get('stuck_helper_target_points_world'),
 				'model_route_pred_ego': self.last_route_pred.tolist() if isinstance(self.last_route_pred, np.ndarray) else self.last_route_pred,
 				'model_dp_traj_ego': self.last_dp_pred_traj.tolist() if isinstance(self.last_dp_pred_traj, np.ndarray) else self.last_dp_pred_traj,
 				'target_dot_forward': float(tick_data.get('target_dot_forward', 0.0)),

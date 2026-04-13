@@ -22,7 +22,7 @@ Key differences from Route A (DiffusionDiTCarlaPolicy):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Tuple
 import numpy as np
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
