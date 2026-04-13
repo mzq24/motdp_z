@@ -388,6 +388,25 @@ def _oriented_boxes_intersect(center_a, extent_a, yaw_a, center_b, extent_b, yaw
     return True
 
 
+def _route_corridor_half_lengths(route_s, min_half_len_m=0.0):
+    route_s = np.asarray(route_s, dtype=np.float32)
+    if route_s.ndim != 1 or route_s.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    min_half_len_m = float(max(float(min_half_len_m), 0.05))
+    if route_s.shape[0] == 1:
+        return np.asarray([min_half_len_m], dtype=np.float32)
+
+    step = np.maximum(np.diff(route_s), 0.0).astype(np.float32)
+    local_step = np.zeros_like(route_s, dtype=np.float32)
+    local_step[0] = step[0]
+    local_step[-1] = step[-1]
+    if route_s.shape[0] > 2:
+        local_step[1:-1] = np.maximum(step[:-1], step[1:])
+
+    return np.maximum(0.5 * local_step, min_half_len_m).astype(np.float32)
+
+
 def _transform_box_to_current_frame(box, transform):
     pos = box.get('position', None)
     if pos is None or len(pos) < 2:
@@ -464,7 +483,14 @@ def _bump_vru_hazard(severity, actor_class_id):
     return int(severity)
 
 
-def _find_route_cover_point(route_dense, route_s, box, corridor_margin_m, corridor_half_len_m=0.0):
+def _find_route_cover_point(
+    route_dense,
+    route_s,
+    box,
+    corridor_margin_m,
+    corridor_half_len_m=0.0,
+    route_half_lens=None,
+):
     actor_class_id = _canonical_actor_class(box)
     if actor_class_id == ACTOR_CLASS_NONE:
         return None
@@ -480,30 +506,39 @@ def _find_route_cover_point(route_dense, route_s, box, corridor_margin_m, corrid
         return None
     if route_s.ndim != 1 or route_s.shape[0] != route_dense.shape[0]:
         return None
+    if route_half_lens is not None:
+        route_half_lens = np.asarray(route_half_lens, dtype=np.float32)
+        if route_half_lens.ndim != 1 or route_half_lens.shape[0] != route_dense.shape[0]:
+            route_half_lens = None
 
     actor_center = np.asarray(pos[:2], dtype=np.float32)
     actor_extent = np.asarray(extent[:2], dtype=np.float32)
     actor_yaw = float(box.get('yaw', 0.0))
     corridor_half_wid = float(max(float(corridor_margin_m), 1e-3))
+    if route_half_lens is None:
+        route_half_lens = _route_corridor_half_lengths(route_s, min_half_len_m=corridor_half_len_m)
+    actor_radius = float(np.linalg.norm(actor_extent))
+
+    # Broad-phase coarse filter: if the distance between the actor center and a
+    # route corridor cell center exceeds the sum of their circumradii, the two
+    # oriented boxes cannot intersect. This preserves the exact SAT result while
+    # skipping most route indices before the expensive box-box test.
+    cell_radii = np.sqrt(np.square(route_half_lens) + float(corridor_half_wid ** 2)).astype(np.float32)
+    center_delta = route_dense[:, :2] - actor_center[None, :]
+    center_dist_sq = np.einsum('ij,ij->i', center_delta, center_delta).astype(np.float32)
+    candidate_indices = np.flatnonzero(center_dist_sq <= np.square(cell_radii + actor_radius))
+    if candidate_indices.size == 0:
+        return None
 
     first_idx = None
     first_heading = None
     first_half_len = None
-    for route_idx in range(route_dense.shape[0]):
+    for route_idx in candidate_indices:
+        route_idx = int(route_idx)
         route_heading = _route_heading_at_idx(route_dense, route_idx)
         if route_heading is None:
             continue
-        if route_dense.shape[0] <= 1:
-            local_step = 0.0
-        elif route_idx == 0:
-            local_step = float(max(route_s[1] - route_s[0], 0.0))
-        elif route_idx == route_dense.shape[0] - 1:
-            local_step = float(max(route_s[-1] - route_s[-2], 0.0))
-        else:
-            prev_step = float(max(route_s[route_idx] - route_s[route_idx - 1], 0.0))
-            next_step = float(max(route_s[route_idx + 1] - route_s[route_idx], 0.0))
-            local_step = max(prev_step, next_step)
-        corridor_half_len = max(0.5 * local_step, float(corridor_half_len_m), 0.05)
+        corridor_half_len = float(route_half_lens[route_idx])
         if _oriented_boxes_intersect(
             center_a=route_dense[route_idx],
             extent_a=np.asarray([corridor_half_len, corridor_half_wid], dtype=np.float32),
@@ -716,6 +751,7 @@ def _compute_front_route_label(
         float(corridor_margin_m),
         float(ego_extent[1]) if ego_extent.shape[0] >= 2 else 0.0,
     ))
+    route_half_lens = _route_corridor_half_lengths(route_s, min_half_len_m=corridor_half_len_m)
 
     # Case 1: a vehicle already covers the current route -> pursuit / following problem.
     best_current = None
@@ -724,6 +760,7 @@ def _compute_front_route_label(
             route_dense, route_s, box,
             corridor_half_width_m,
             corridor_half_len_m=corridor_half_len_m,
+            route_half_lens=route_half_lens,
         )
         if cover is None:
             continue
@@ -790,6 +827,7 @@ def _compute_front_route_label(
                 route_dense, route_s, box_cur,
                 corridor_half_width_m,
                 corridor_half_len_m=corridor_half_len_m,
+                route_half_lens=route_half_lens,
             )
             if cover is None:
                 continue
@@ -3647,6 +3685,22 @@ def _atomic_json_save(payload, target_path):
     os.replace(tmp_path, target_path)
 
 
+def _format_stage1_timing_map(timing_map):
+    if not isinstance(timing_map, dict):
+        return ""
+    parts = []
+    for key in ('front_route', 'route_total'):
+        if key not in timing_map:
+            continue
+        value = timing_map[key]
+        try:
+            value_f = float(value)
+        except Exception:
+            continue
+        parts.append(f"{key}={value_f:.2f}s")
+    return " ".join(parts)
+
+
 def precompute(
     dataset_path,
     image_data_root,
@@ -3662,6 +3716,8 @@ def precompute(
     front_block_safe_distance_m=30.0,
     checkpoint_every_minutes=20.0,
     stage1_only=False,
+    stage1_timing=False,
+    stage1_timing_every=1,
 ):
     anchor_centers_abs = None
     num_modes = None
@@ -3682,9 +3738,17 @@ def precompute(
     packed_path = _ensure_packed_samples(dataset_path)
 
     print(f"Loading {packed_path}...")
+    load_start_time = time.perf_counter()
     with open(packed_path, 'rb') as f:
         samples = pickle.load(f)
+    load_elapsed_s = float(time.perf_counter() - load_start_time)
     print(f"Loaded {len(samples)} samples")
+    if stage1_timing:
+        packed_size_gb = float(os.path.getsize(packed_path)) / 1e9 if os.path.exists(packed_path) else np.nan
+        print(
+            f"[stage1_timing] load_samples={load_elapsed_s:.2f}s "
+            f"packed_size_gb={packed_size_gb:.2f}"
+        )
 
     already_semantic = sum(1 for s in samples if 'behavior_labels' in s and 'allowed_flags' in s and 'scene_buckets' in s)
     already_energy = sum(1 for s in samples if 'energy_targets' in s and 'energy_active_mask' in s)
@@ -3993,7 +4057,16 @@ def precompute(
                 continue
             route_groups[base_dir].append(sample_idx)
 
-        for base_dir, route_sample_indices in tqdm(route_groups.items(), desc="Stage1 speed", leave=False):
+        total_stage1_routes = int(len(route_groups))
+        stage1_timing_every = max(int(stage1_timing_every), 1)
+        stage1_timing_totals = defaultdict(float)
+        for route_group_idx, (base_dir, route_sample_indices) in enumerate(
+            tqdm(route_groups.items(), desc="Stage1 speed", leave=False),
+            start=1,
+        ):
+            route_total_start = time.perf_counter()
+            route_timing = defaultdict(float)
+            route_fallback_count = 0
             if base_dir is None:
                 for sample_idx in route_sample_indices:
                     stage1_processed += 1
@@ -4001,7 +4074,16 @@ def precompute(
                     _set_stage1_speed_fallback(samples[sample_idx])
                     stage1_speed_built += 1
                     fallback += 1
+                    route_fallback_count += 1
                     _maybe_checkpoint(phase='stage1_speed')
+                if stage1_timing and (route_group_idx % stage1_timing_every == 0):
+                    route_total_s = float(time.perf_counter() - route_total_start)
+                    print(
+                        f"[stage1_timing] route={route_group_idx}/{total_stage1_routes} "
+                        f"base_dir=<missing> frames={len(route_sample_indices)} "
+                        f"total={route_total_s:.2f}s avg={route_total_s / max(len(route_sample_indices), 1):.3f}s/frame "
+                        f"fallback={route_fallback_count}"
+                    )
                 continue
 
             route_sample_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
@@ -4076,6 +4158,7 @@ def precompute(
                     _set_stage1_speed_fallback(sample)
                     stage1_speed_built += 1
                     fallback += 1
+                    route_fallback_count += 1
                     _maybe_checkpoint(phase='stage1_speed')
                     continue
 
@@ -4087,6 +4170,7 @@ def precompute(
                     _set_stage1_speed_fallback(sample)
                     stage1_speed_built += 1
                     fallback += 1
+                    route_fallback_count += 1
                     _maybe_checkpoint(phase='stage1_speed')
                     continue
 
@@ -4095,6 +4179,7 @@ def precompute(
                     _set_stage1_speed_fallback(sample)
                     stage1_speed_built += 1
                     fallback += 1
+                    route_fallback_count += 1
                     _maybe_checkpoint(phase='stage1_speed')
                     continue
 
@@ -4103,6 +4188,7 @@ def precompute(
                     _set_stage1_speed_fallback(sample)
                     stage1_speed_built += 1
                     fallback += 1
+                    route_fallback_count += 1
                     _maybe_checkpoint(phase='stage1_speed')
                     continue
                 if event_name not in NO_ROUTE_EXTENSION_SCENES and base_dir_cur in scene_route_polyline_world:
@@ -4123,6 +4209,7 @@ def precompute(
 
                 current_boxes_dynamic = _filter_current_boxes_dynamic(current_boxes, scene_nonstatic_actor_ids)
                 future_frames_dynamic = _filter_future_frames_dynamic(future_frames_data, scene_nonstatic_actor_ids)
+                timing_start = time.perf_counter()
                 _, front_debug = _compute_front_route_label(
                     route=route_input,
                     current_boxes=current_boxes_dynamic,
@@ -4137,6 +4224,7 @@ def precompute(
                     block_safe_distance_m=front_block_safe_distance_m,
                     return_debug=True,
                 )
+                route_timing['front_route'] += float(time.perf_counter() - timing_start)
                 current_cover = _cover_candidate_summary(1, front_debug.get('best_current'), front_debug, current_meas=current_measurements, event_name=event_name)
                 future_cover = _cover_candidate_summary(2, front_debug.get('best_future'), front_debug, current_meas=current_measurements, event_name=event_name)
                 speed_curve_future_cover = dict(future_cover)
@@ -4315,8 +4403,27 @@ def precompute(
             _annotate_route_stage1_merge_decisions(samples, route_sample_indices)
             dirty_since_checkpoint = True
             _maybe_checkpoint(phase='stage1_speed')
+            route_total_s = float(time.perf_counter() - route_total_start)
+            route_timing['route_total'] += route_total_s
+            for key, value in route_timing.items():
+                stage1_timing_totals[key] += float(value)
+            if stage1_timing and (route_group_idx % stage1_timing_every == 0):
+                route_name = str(base_dir)
+                print(
+                    f"[stage1_timing] route={route_group_idx}/{total_stage1_routes} "
+                    f"event={event_name} frames={len(route_sample_indices)} "
+                    f"avg={route_total_s / max(len(route_sample_indices), 1):.3f}s/frame "
+                    f"fallback={route_fallback_count} "
+                    f"{_format_stage1_timing_map(dict(route_timing))} "
+                    f"base_dir={route_name}"
+                )
 
         _maybe_checkpoint(phase='stage1_speed', force_reason='phase_complete')
+        if stage1_timing and total_stage1_routes > 0:
+            print(
+                f"[stage1_timing] totals routes={total_stage1_routes} "
+                f"{_format_stage1_timing_map(dict(stage1_timing_totals))}"
+            )
     except BaseException as exc:
         try:
             _maybe_checkpoint(phase='exception', force_reason=f'exception_{type(exc).__name__}')
@@ -4354,6 +4461,10 @@ if __name__ == '__main__':
                         help='Periodically atomically save updated samples_packed.pkl to make long runs resumable. Set <=0 to disable.')
     parser.add_argument('--stage1_only', action='store_true',
                         help='Skip old semantic/energy/ego/front_route labeling and only (re)compute stage1 speed-energy labels.')
+    parser.add_argument('--stage1_timing', action='store_true',
+                        help='Print lightweight stage1 timing summaries (load/front_route/route_total).')
+    parser.add_argument('--stage1_timing_every', type=int, default=1,
+                        help='When --stage1_timing is set, print every N route groups.')
     parser.add_argument('--force', action='store_true', help='Re-compute even if labels exist')
     args = parser.parse_args()
 
@@ -4371,4 +4482,6 @@ if __name__ == '__main__':
                front_max_ttc_s=args.front_max_ttc_s,
                front_block_safe_distance_m=args.front_block_safe_distance_m,
                checkpoint_every_minutes=args.checkpoint_every_minutes,
-               stage1_only=args.stage1_only)
+               stage1_only=args.stage1_only,
+               stage1_timing=args.stage1_timing,
+               stage1_timing_every=args.stage1_timing_every)
