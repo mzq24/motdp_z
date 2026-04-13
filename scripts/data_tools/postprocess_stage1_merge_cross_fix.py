@@ -225,12 +225,27 @@ def _find_first_consecutive_run(values: List[bool], run_len: int) -> Tuple[int, 
     return None
 
 
+def _find_contiguous_true_runs(values: List[bool]) -> List[Tuple[int, int]]:
+    runs: List[Tuple[int, int]] = []
+    start = None
+    for idx, flag in enumerate(values):
+        if flag and start is None:
+            start = idx
+        elif not flag and start is not None:
+            runs.append((start, idx - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(values) - 1))
+    return runs
+
+
 def _fix_merge_scene(
     samples: List[dict],
     indices: List[int],
     speed_thresh: float,
     consecutive_frames: int,
     stop_speed_thresh: float,
+    post_go_fallback_frames: int,
 ) -> bool:
     active_vals = [float(samples[idx].get("merge_episode_active", 0.0)) > 0.5 for idx in indices]
     tail_block = _find_last_contiguous_true_block(active_vals)
@@ -239,9 +254,51 @@ def _fix_merge_scene(
 
     block_start_local, block_end_local = tail_block
     block_indices = indices[block_start_local : block_end_local + 1]
-    has_go_frame = any(float(samples[idx].get("merge_go_frame", -1.0)) >= 0.0 for idx in block_indices)
+    go_frame_value = max(int(samples[idx].get("merge_go_frame", -1)) for idx in block_indices)
+    has_go_frame = go_frame_value >= 0
     no_go_scene = any(float(samples[idx].get("merge_episode_no_go", 0.0)) > 0.5 for idx in block_indices)
-    if has_go_frame or not no_go_scene:
+    if has_go_frame:
+        go_local = None
+        for local_pos, sample_idx in enumerate(block_indices):
+            if int(samples[sample_idx].get("frame_id", -1)) == int(go_frame_value):
+                go_local = local_pos
+                break
+        if go_local is None:
+            return False
+        fallback_end_local = min(int(go_local) + int(post_go_fallback_frames), len(block_indices) - 1)
+        if fallback_end_local >= len(block_indices) - 1:
+            return False
+
+        changed = False
+        for local_pos, sample_idx in enumerate(block_indices):
+            if local_pos <= fallback_end_local:
+                continue
+            _set_stage1_merge_defaults(samples[sample_idx])
+            changed = True
+        if not changed:
+            return False
+
+        new_end_idx = block_indices[fallback_end_local]
+        new_end_frame = _frame_id_from_sample(samples[new_end_idx])
+        new_end_state = "ended_route_end" if new_end_idx == indices[-1] else "ended_with_chase"
+        for local_pos, sample_idx in enumerate(block_indices[: fallback_end_local + 1]):
+            phase = "yld" if local_pos < go_local else "go"
+            info = dict((_ensure_stage1_debug(samples[sample_idx]).get("merge_episode") or {}))
+            info.update({
+                "phase": phase,
+                "phase_code": int(MERGE_DECISION_PHASE_TO_CODE[phase]),
+                "active": 1.0,
+                "no_go": 0.0,
+                "go_frame": int(go_frame_value),
+                "end_frame": int(new_end_frame),
+                "end_state": str(new_end_state),
+                "end_state_code": int(MERGE_END_STATE_TO_CODE.get(new_end_state, 0)),
+                "postprocess_post_go_fallback_frames": int(post_go_fallback_frames),
+            })
+            _set_stage1_merge_annotation(samples[sample_idx], info)
+        return True
+
+    if not no_go_scene:
         return False
 
     speeds = [_sample_current_speed_mps(samples[idx]) for idx in block_indices]
@@ -314,53 +371,72 @@ def _recompute_cross_scene(
     cross_go_speed_thresh: float,
     cross_wait_dt_s: float,
 ) -> int:
-    cross_episode_active = False
-    cross_wait_frames = 0
-    cross_active_count = 0
-
+    records = []
     for idx in indices:
         sample = samples[idx]
         stage1_debug = sample.get("stage1_speed_debug")
         current_cover = stage1_debug.get("current_cover", {}) if isinstance(stage1_debug, dict) else {}
         future_cover = stage1_debug.get("speed_curve_future_cover", {}) if isinstance(stage1_debug, dict) else {}
-
         raw_cross_active = _cover_is_cross_meet(current_cover) or _cover_is_cross_meet(future_cover)
         d_start = _cross_start_distance_m(sample)
         near_cross_start = np.isfinite(d_start) and float(d_start) <= float(cross_start_distance_m)
         ego_speed = float(_sample_current_speed_mps(sample))
-
         wait_now = bool(raw_cross_active and near_cross_start and ego_speed <= float(cross_wait_speed_thresh))
-        if (not cross_episode_active) and wait_now:
-            cross_episode_active = True
-            cross_wait_frames = 0
+        go_now = bool(raw_cross_active and near_cross_start and ego_speed >= float(cross_go_speed_thresh))
+        candidate_now = bool(raw_cross_active and near_cross_start)
+        records.append({
+            "sample_idx": int(idx),
+            "raw_cross_active": bool(raw_cross_active),
+            "near_cross_start": bool(near_cross_start),
+            "wait_now": bool(wait_now),
+            "go_now": bool(go_now),
+            "candidate_now": bool(candidate_now),
+        })
 
-        go_now = bool(
-            raw_cross_active and
-            (cross_episode_active or near_cross_start) and
-            ego_speed >= float(cross_go_speed_thresh)
-        )
+    candidate_runs = _find_contiguous_true_runs([record["candidate_now"] for record in records])
+    cross_active_count = 0
+    keep_run_mask = [False] * len(records)
+    cross_wait_time_values = [0.0] * len(records)
+    cross_wait_valid_values = [0.0] * len(records)
+    cross_go_values = [0.0] * len(records)
 
-        if cross_episode_active and wait_now and not go_now:
-            cross_wait_frames += 1
+    for run_start, run_end in candidate_runs:
+        run_wait_any = any(records[pos]["wait_now"] for pos in range(run_start, run_end + 1))
+        run_go_any = any(records[pos]["go_now"] for pos in range(run_start, run_end + 1))
+        if not (run_wait_any or run_go_any):
+            continue
+        for pos in range(run_start, run_end + 1):
+            keep_run_mask[pos] = True
+        wait_frames = 0
+        for pos in range(run_start, run_end + 1):
+            if records[pos]["wait_now"]:
+                wait_frames += 1
+            else:
+                wait_frames = 0
+            cross_wait_time_values[pos] = float(wait_frames) * float(cross_wait_dt_s)
+            cross_wait_valid_values[pos] = 1.0 if records[pos]["wait_now"] else 0.0
+            cross_go_values[pos] = 1.0 if records[pos]["go_now"] else 0.0
 
-        cross_active = 1.0 if (cross_episode_active or go_now) else 0.0
+    for pos, record in enumerate(records):
+        sample = samples[record["sample_idx"]]
+        cross_active = 1.0 if keep_run_mask[pos] else 0.0
         sample["cross_active"] = float(cross_active)
         sample["cross_episode_active"] = float(cross_active)
+        sample["speed_cross_wait_time_s"] = np.float32(cross_wait_time_values[pos])
+        sample["speed_cross_wait_valid"] = np.float32(cross_wait_valid_values[pos])
         if cross_active > 0.5:
             cross_active_count += 1
 
         speed_curve = _ensure_debug_speed_curve(sample)
         speed_curve["cross_active"] = float(cross_active)
         speed_curve["cross_episode_active"] = float(cross_active)
-        speed_curve["cross_wait_time_s_recomputed"] = float(cross_wait_frames) * float(cross_wait_dt_s)
-        speed_curve["cross_wait_valid_recomputed"] = 1.0 if wait_now else 0.0
-        speed_curve["cross_active_raw_recomputed"] = 1.0 if raw_cross_active else 0.0
-        speed_curve["cross_active_near_start_recomputed"] = 1.0 if near_cross_start else 0.0
-        speed_curve["cross_go_recomputed"] = 1.0 if go_now else 0.0
-
-        if go_now:
-            cross_episode_active = False
-            cross_wait_frames = 0
+        speed_curve["cross_wait_time_s"] = float(cross_wait_time_values[pos])
+        speed_curve["cross_wait_valid"] = float(cross_wait_valid_values[pos])
+        speed_curve["cross_wait_time_s_recomputed"] = float(cross_wait_time_values[pos])
+        speed_curve["cross_wait_valid_recomputed"] = float(cross_wait_valid_values[pos])
+        speed_curve["cross_active_raw_recomputed"] = 1.0 if record["raw_cross_active"] else 0.0
+        speed_curve["cross_active_near_start_recomputed"] = 1.0 if record["near_cross_start"] else 0.0
+        speed_curve["cross_go_recomputed"] = float(cross_go_values[pos])
 
     return cross_active_count
 
@@ -372,6 +448,7 @@ def main() -> None:
     parser.add_argument("--merge_speed_thresh", type=float, default=2.0)
     parser.add_argument("--merge_consecutive_frames", type=int, default=5)
     parser.add_argument("--merge_stop_speed_thresh", type=float, default=0.5)
+    parser.add_argument("--merge_post_go_fallback_frames", type=int, default=6)
     parser.add_argument("--cross_start_distance_m", type=float, default=10.0)
     parser.add_argument("--cross_wait_speed_thresh", type=float, default=0.5)
     parser.add_argument("--cross_go_speed_thresh", type=float, default=1.0)
@@ -392,6 +469,7 @@ def main() -> None:
             speed_thresh=float(args.merge_speed_thresh),
             consecutive_frames=int(args.merge_consecutive_frames),
             stop_speed_thresh=float(args.merge_stop_speed_thresh),
+            post_go_fallback_frames=int(args.merge_post_go_fallback_frames),
         ):
             merge_fixed_scenes += 1
         cross_active_samples += _recompute_cross_scene(
