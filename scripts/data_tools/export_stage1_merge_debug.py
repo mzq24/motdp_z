@@ -181,6 +181,35 @@ def _sample_has_merge_signal(sample: Dict[str, Any]) -> bool:
     return False
 
 
+def _sample_has_raw_merge_cover(sample: Dict[str, Any]) -> bool:
+    stage1_debug = sample.get("stage1_speed_debug")
+    if not isinstance(stage1_debug, dict):
+        return False
+    return _is_merge_cover(stage1_debug.get("current_cover") or {}) or _is_merge_cover(stage1_debug.get("future_cover") or {})
+
+
+def _sample_has_speed_curve_merge(sample: Dict[str, Any]) -> bool:
+    stage1_debug = sample.get("stage1_speed_debug")
+    if not isinstance(stage1_debug, dict):
+        return False
+    if _is_merge_cover(stage1_debug.get("speed_curve_future_cover") or {}):
+        return True
+    speed_curve = stage1_debug.get("speed_curve")
+    if isinstance(speed_curve, dict):
+        meet_debug = speed_curve.get("meet_debug", {})
+        if isinstance(meet_debug, dict) and str(meet_debug.get("subtype", "none")) == "merge_meet":
+            return True
+    return False
+
+
+def _sample_has_merge_active(sample: Dict[str, Any]) -> bool:
+    return bool(float(sample.get("merge_episode_active", 0.0)) > 0.5)
+
+
+def _frame_ids_from_indices(samples: List[Dict[str, Any]], indices: List[int]) -> List[int]:
+    return [int(_frame_id_from_sample(samples[idx])) for idx in indices]
+
+
 def _frame_debug_record(sample: Dict[str, Any]) -> Dict[str, Any]:
     stage1_debug = sample.get("stage1_speed_debug")
     if not isinstance(stage1_debug, dict):
@@ -197,6 +226,9 @@ def _frame_debug_record(sample: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "frame_id": int(sample.get("frame_id", -1)),
         "current_speed_mps": _sanitize_scalar(_sample_current_speed_mps(sample)),
+        "raw_merge_cover": bool(_sample_has_raw_merge_cover(sample)),
+        "speed_curve_merge": bool(_sample_has_speed_curve_merge(sample)),
+        "merge_signal": bool(_sample_has_merge_signal(sample)),
         "merge_episode_active": float(sample.get("merge_episode_active", 0.0)),
         "merge_episode_start_frame": int(sample.get("merge_episode_start_frame", -1)),
         "merge_episode_end_frame": int(sample.get("merge_episode_end_frame", -1)),
@@ -268,6 +300,9 @@ def main() -> None:
     with open(tmp_jsonl, "w", encoding="utf-8") as f_jsonl:
         for scene_name, indices in grouped_scenes:
             signal_indices = [idx for idx in indices if _sample_has_merge_signal(samples[idx])]
+            raw_cover_indices = [idx for idx in indices if _sample_has_raw_merge_cover(samples[idx])]
+            speed_curve_indices = [idx for idx in indices if _sample_has_speed_curve_merge(samples[idx])]
+            active_indices = [idx for idx in indices if _sample_has_merge_active(samples[idx])]
             if args.merge_signal_only and not signal_indices:
                 continue
             if signal_indices:
@@ -287,8 +322,10 @@ def main() -> None:
                 "num_frames": int(len(indices)),
                 "merge_signal_frame_count": int(len(signal_indices)),
                 "merge_active_frame_count": int(
-                    sum(float(samples[idx].get("merge_episode_active", 0.0)) > 0.5 for idx in indices)
+                    len(active_indices)
                 ),
+                "raw_merge_cover_frame_count": int(len(raw_cover_indices)),
+                "speed_curve_merge_frame_count": int(len(speed_curve_indices)),
                 "episode_ids": [int(episode_id) for episode_id in episode_ids],
                 "episodes": [
                     _episode_summary(samples, indices, episode_id)
@@ -296,8 +333,29 @@ def main() -> None:
                 ],
             }
             if signal_indices:
-                frame_ids = [_frame_id_from_sample(samples[idx]) for idx in signal_indices]
-                scene_summary["merge_signal_frame_range"] = [int(min(frame_ids)), int(max(frame_ids))]
+                signal_frame_ids = _frame_ids_from_indices(samples, signal_indices)
+                scene_summary["merge_signal_frame_ids"] = signal_frame_ids
+                scene_summary["merge_signal_frame_range"] = [int(min(signal_frame_ids)), int(max(signal_frame_ids))]
+            else:
+                scene_summary["merge_signal_frame_ids"] = []
+            if raw_cover_indices:
+                raw_frame_ids = _frame_ids_from_indices(samples, raw_cover_indices)
+                scene_summary["raw_merge_cover_frame_ids"] = raw_frame_ids
+                scene_summary["raw_merge_cover_frame_range"] = [int(min(raw_frame_ids)), int(max(raw_frame_ids))]
+            else:
+                scene_summary["raw_merge_cover_frame_ids"] = []
+            if speed_curve_indices:
+                speed_curve_frame_ids = _frame_ids_from_indices(samples, speed_curve_indices)
+                scene_summary["speed_curve_merge_frame_ids"] = speed_curve_frame_ids
+                scene_summary["speed_curve_merge_frame_range"] = [int(min(speed_curve_frame_ids)), int(max(speed_curve_frame_ids))]
+            else:
+                scene_summary["speed_curve_merge_frame_ids"] = []
+            if active_indices:
+                active_frame_ids = _frame_ids_from_indices(samples, active_indices)
+                scene_summary["merge_active_frame_ids"] = active_frame_ids
+                scene_summary["merge_active_frame_range"] = [int(min(active_frame_ids)), int(max(active_frame_ids))]
+            else:
+                scene_summary["merge_active_frame_ids"] = []
             scene_summaries.append(scene_summary)
 
             for idx in signal_indices:
