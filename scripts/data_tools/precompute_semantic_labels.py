@@ -87,6 +87,18 @@ FAST_FIELDS = (
     'speed_risk_ped_values',
     'speed_cross_wait_time_s',
     'speed_cross_wait_valid',
+    'junction_cross_episode_id',
+    'junction_cross_episode_active',
+    'junction_cross_episode_start_frame',
+    'junction_cross_episode_end_frame',
+    'borrow_cross_decision_phase',
+    'borrow_cross_episode_id',
+    'borrow_cross_episode_active',
+    'borrow_cross_active_time_s',
+    'borrow_cross_episode_start_frame',
+    'borrow_cross_episode_end_frame',
+    'borrow_cross_go_frame',
+    'borrow_cross_context_frame',
     'merge_decision_phase',
     'merge_episode_id',
     'merge_episode_active',
@@ -96,6 +108,7 @@ FAST_FIELDS = (
     'merge_go_frame',
     'merge_resolution_actor_id',
     'merge_end_state',
+    'merge_hold',
 )
 
 
@@ -150,6 +163,14 @@ STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES = 6
 STAGE1_GO_END_STEER_ABS_THRESH = 0.08
 STAGE1_GO_END_HEADING_ALIGN_THRESH_DEG = 12.0
 STAGE1_GO_END_CONFIRM_FRAMES = 3
+STAGE1_MERGE_SPEED_CAP_MPS = 1000.0
+STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
+STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
+STAGE1_MERGE_AREA_POST_MARGIN_M = 3.0
+STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
+STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
+STAGE1_PERSISTED_MEET_FRAMES = 3
+STAGE1_BORROW_ACTIVE_DT_S = 0.25
 STAGE1_CROSS_WAIT_DT_S = 0.25
 STAGE1_CROSS_GO_SPEED_THRESH = 1.0
 STAGE1_CROSS_WAIT_SPEED_THRESH = 0.5
@@ -168,6 +189,7 @@ MERGE_END_STATE_TO_CODE = {
     'ended_with_other_current_actor': 3,
     'ended_empty': 4,
     'ended_route_end': 5,
+    'ended_merge_area': 6,
 }
 
 STAGE1_SPEED_FIELDS = (
@@ -185,6 +207,18 @@ STAGE1_SPEED_FIELDS = (
     'speed_risk_ped_values',
     'speed_cross_wait_time_s',
     'speed_cross_wait_valid',
+    'junction_cross_episode_id',
+    'junction_cross_episode_active',
+    'junction_cross_episode_start_frame',
+    'junction_cross_episode_end_frame',
+    'borrow_cross_decision_phase',
+    'borrow_cross_episode_id',
+    'borrow_cross_episode_active',
+    'borrow_cross_active_time_s',
+    'borrow_cross_episode_start_frame',
+    'borrow_cross_episode_end_frame',
+    'borrow_cross_go_frame',
+    'borrow_cross_context_frame',
     'merge_decision_phase',
     'merge_episode_id',
     'merge_episode_active',
@@ -194,7 +228,14 @@ STAGE1_SPEED_FIELDS = (
     'merge_go_frame',
     'merge_resolution_actor_id',
     'merge_end_state',
+    'merge_hold',
 )
+
+CROSS_DECISION_PHASE_TO_CODE = {
+    'none': 0,
+    'yld': 1,
+    'go': 2,
+}
 
 
 def _has_all_fast_fields(sample):
@@ -964,7 +1005,7 @@ def _is_left_turn_scene_context(current_meas, event_name=None):
 
 
 def _is_borrow_cross_scene_context(event_name=None):
-    return str(event_name or "") in {"ConstructionObstacleTwoWays", "AccidentTwoWays", "ParkedObstacleTwoWays"}
+    return str(event_name or "") in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}
 
 
 EVENT_NAME_RECORD_EXCLUDED_SCENES = {
@@ -1242,6 +1283,11 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
             "d_bg": np.nan,
             "other_speed": np.nan,
             "other_length_m": np.nan,
+            "route_distance_m": np.nan,
+            "ego_route_front_s_m": np.nan,
+            "route_point_local_xy": [],
+            "scene_route_conflict_s_m": np.nan,
+            "scene_route_conflict_world_xy": [],
         }
 
     if case == 1:
@@ -1250,6 +1296,8 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
         gap_distance = float(best.get("gap_distance", np.nan))
         closing_speed = float(best.get("closing_speed", np.nan))
         ttc = np.inf if not np.isfinite(closing_speed) or closing_speed <= 1e-6 else gap_distance / closing_speed
+        cover = best.get("cover") or {}
+        route_point_local = np.asarray(cover.get("route_point", []), dtype=np.float32).reshape(-1)
         return {
             "exists": 1.0,
             "case": int(case),
@@ -1264,6 +1312,11 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
             "d_bg": np.nan,
             "other_speed": float(best.get("lead_speed", np.nan)),
             "other_length_m": float(_box_length_m(box, default_length_m=np.nan)),
+            "route_distance_m": float(cover.get("route_distance", np.nan)),
+            "ego_route_front_s_m": float(best.get("ego_route_front_s", np.nan)),
+            "route_point_local_xy": route_point_local[:2].astype(float).tolist() if route_point_local.size >= 2 else [],
+            "scene_route_conflict_s_m": np.nan,
+            "scene_route_conflict_world_xy": [],
         }
 
     current_box = best.get("current_box") or {}
@@ -1276,6 +1329,8 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
     meet_dist = float(best.get("meet_dist", np.nan))
     meet_speed = float(best.get("meet_speed", np.nan))
     ttc = np.inf if not np.isfinite(meet_speed) or meet_speed <= 1e-6 else meet_dist / meet_speed
+    cover = best.get("cover") or {}
+    route_point_local = np.asarray(cover.get("route_point", []), dtype=np.float32).reshape(-1)
     return {
         "exists": 1.0,
         "case": int(case),
@@ -1290,7 +1345,49 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
         "d_bg": float(best.get("d_bg", np.nan)),
         "other_speed": float(best.get("bg_speed", np.nan)),
         "other_length_m": float(_box_length_m(other_box, default_length_m=np.nan)),
+        "route_distance_m": float(cover.get("route_distance", np.nan)),
+        "ego_route_front_s_m": float(best.get("ego_route_front_s", np.nan)),
+        "route_point_local_xy": route_point_local[:2].astype(float).tolist() if route_point_local.size >= 2 else [],
+        "scene_route_conflict_s_m": np.nan,
+        "scene_route_conflict_world_xy": [],
     }
+
+
+def _augment_cover_with_scene_route_fields(cover, ego_matrix_current, scene_route_polyline_world):
+    cover_out = dict(cover or {})
+    cover_out.setdefault("scene_route_conflict_s_m", np.nan)
+    cover_out.setdefault("scene_route_conflict_world_xy", [])
+    if int(cover_out.get("exists", 0.0)) <= 0:
+        return cover_out
+    route_point_local = np.asarray(cover_out.get("route_point_local_xy", []), dtype=np.float32).reshape(-1)
+    scene_route_polyline_world = np.asarray(scene_route_polyline_world, dtype=np.float32)
+    if (
+        ego_matrix_current is None or route_point_local.size < 2 or
+        scene_route_polyline_world.ndim != 2 or scene_route_polyline_world.shape[0] < 2
+    ):
+        return cover_out
+    route_point_world = _transform_points_local_to_world_xyz(
+        route_point_local[:2][None, :],
+        ego_matrix_current,
+    )
+    if route_point_world.shape[0] == 0:
+        return cover_out
+    proj_world, proj_s = _project_point_to_polyline(route_point_world[0, :2], scene_route_polyline_world[:, :2])
+    cover_out["scene_route_conflict_world_xy"] = route_point_world[0, :2].astype(float).tolist()
+    cover_out["scene_route_conflict_s_m"] = float(proj_s) if proj_s is not None else np.nan
+    if proj_world is not None and not cover_out["scene_route_conflict_world_xy"]:
+        cover_out["scene_route_conflict_world_xy"] = np.asarray(proj_world, dtype=np.float32).astype(float).tolist()
+    return cover_out
+
+
+def _merge_speed_cap(value, default=np.nan):
+    try:
+        value = float(value)
+    except Exception:
+        return float(default)
+    if not np.isfinite(value):
+        return float(default)
+    return float(np.clip(value, 0.0, float(STAGE1_MERGE_SPEED_CAP_MPS)))
 
 
 def _find_box_by_id(boxes, actor_id):
@@ -1469,20 +1566,28 @@ def _borrow_corridor_metrics(release_info, current_meas=None, route_local=None):
                 start_local_xy = start_local[0, :2].astype(np.float32)
 
     borrow_start_distance_m = float(info.get("borrow_start_distance_m", np.nan))
+    borrow_end_distance_m = np.nan
     if start_local_xy is not None:
         if route_local is not None:
             route_poly = _route_with_origin(np.asarray(route_local, dtype=np.float32))
             _, start_s = _project_point_to_polyline(start_local_xy, route_poly)
             if start_s is not None and np.isfinite(float(start_s)):
                 borrow_start_distance_m = float(max(float(start_s), 0.0))
+            if end_local_xy is not None:
+                _, end_s = _project_point_to_polyline(end_local_xy, route_poly)
+                if end_s is not None and np.isfinite(float(end_s)):
+                    borrow_end_distance_m = float(max(float(end_s), 0.0))
         elif np.isfinite(float(start_local_xy[0])):
             borrow_start_distance_m = float(max(float(start_local_xy[0]), 0.0))
+    if not np.isfinite(borrow_end_distance_m) and end_local_xy is not None and np.isfinite(float(end_local_xy[0])):
+        borrow_end_distance_m = float(max(float(end_local_xy[0]), 0.0))
     if not np.isfinite(borrow_start_distance_m):
         borrow_start_distance_m = 0.0
     borrow_start_distance_m = float(max(borrow_start_distance_m, 0.0))
 
     return {
         "borrow_start_distance_m": float(borrow_start_distance_m),
+        "borrow_end_distance_m": float(borrow_end_distance_m) if np.isfinite(borrow_end_distance_m) else np.nan,
         "borrow_distance_m": float(borrow_distance_m),
         "borrow_total_clear_distance_m": float(max(borrow_start_distance_m + borrow_distance_m, 0.0)),
         "start_local_xy": None if start_local_xy is None else start_local_xy,
@@ -1825,6 +1930,55 @@ def _two_way_blocker_box_allowed(box, event_name=None, stop_speed_thresh_mps=0.2
     return False
 
 
+def _empty_two_way_borrow_context(
+    event_name=None,
+    failure_reason="unknown",
+    failure_stage="unknown",
+    seed_actor=None,
+    best_candidate=None,
+    route_candidate_count=0,
+):
+    seed_actor = dict(seed_actor or {})
+    best_candidate = dict(best_candidate or {})
+    return {
+        "valid": 0.0,
+        "ready": 0.0,
+        "source": "event_blocker_route_missing",
+        "failure_reason": str(failure_reason),
+        "failure_stage": str(failure_stage),
+        "event_name": str(event_name or ""),
+        "route_candidate_count": int(route_candidate_count),
+        "release_frame_id": -1,
+        "enter_frame_id": -1,
+        "return_frame_id": -1,
+        "borrow_duration_s": 0.0,
+        "release_to_return_s": 0.0,
+        "borrow_start_distance_m": np.nan,
+        "borrow_start_world_xy": [],
+        "borrow_end_world_xy": [],
+        "borrow_start_world_xyz": [],
+        "borrow_end_world_xyz": [],
+        "borrow_segment_world_xy": [],
+        "borrow_segment_world_xyz": [],
+        "borrow_distance_m": np.nan,
+        "peak_lateral_m": np.nan,
+        "peak_signed_lateral_m": np.nan,
+        "shift_sign": np.nan,
+        "context_frame_id": int(best_candidate.get("frame_id", -1)),
+        "anchor_actor_id": int(seed_actor.get("actor_id", best_candidate.get("actor_id", -1))),
+        "anchor_distance_m": float(best_candidate.get("local_x", np.nan)),
+        "anchor_world_xy": list(best_candidate.get("world_xy", seed_actor.get("seed_world_xy", []))),
+        "blocking_actor_id": int(seed_actor.get("actor_id", best_candidate.get("actor_id", -1))),
+        "blocking_actor_class": str(seed_actor.get("actor_class", best_candidate.get("actor_class", "none"))),
+        "blocking_actor_local_x_m": float(best_candidate.get("local_x", np.nan)),
+        "blocking_actor_local_y_m": float(best_candidate.get("local_y", np.nan)),
+        "seed_frame_id": int(seed_actor.get("seed_frame_id", -1)),
+        "seed_priority": int(seed_actor.get("seed_priority", -1)),
+        "route_return_abs_m": np.nan,
+        "blocked_frame_id": -1,
+    }
+
+
 def _build_event_two_way_borrow_context(
     frame_records,
     event_name=None,
@@ -1892,7 +2046,12 @@ def _build_event_two_way_borrow_context(
             "geom": dict(borrow_geom),
         })
     if not route_candidates:
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="no_route_candidates",
+            failure_stage="route_candidates",
+            route_candidate_count=0,
+        )
 
     seed_actor = None
     for route_candidate in sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"]))):
@@ -1924,7 +2083,12 @@ def _build_event_two_way_borrow_context(
         }
         break
     if seed_actor is None:
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="no_blocker_seed",
+            failure_stage="seed_actor",
+            route_candidate_count=len(route_candidates),
+        )
 
     best_strict = None
     best_fallback = None
@@ -1963,13 +2127,26 @@ def _build_event_two_way_borrow_context(
 
     best_candidate = best_strict if best_strict is not None else best_fallback
     if best_candidate is None:
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="seed_actor_not_recovered",
+            failure_stage="context_frame_search",
+            seed_actor=seed_actor,
+            route_candidate_count=len(route_candidates),
+        )
 
     record = frame_records[int(best_candidate["record_idx"])]
     current_meas = record.get("current_meas")
     ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
     if ego_matrix_current is None:
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="missing_ego_matrix",
+            failure_stage="context_frame_search",
+            seed_actor=seed_actor,
+            best_candidate=best_candidate,
+            route_candidate_count=len(route_candidates),
+        )
 
     borrow_geom = dict(best_candidate["geom"])
     route_local_context = np.asarray(record.get("route_input_local", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
@@ -1979,15 +2156,36 @@ def _build_event_two_way_borrow_context(
         route_poly_context.ndim != 2 or route_poly_context.shape[0] < 2 or route_poly_context.shape[1] != 2 or
         arc_context.ndim != 1 or arc_context.shape[0] != route_poly_context.shape[0]
     ):
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="invalid_context_route",
+            failure_stage="context_route",
+            seed_actor=seed_actor,
+            best_candidate=best_candidate,
+            route_candidate_count=len(route_candidates),
+        )
     route_head_idx = int(max(route_poly_context.shape[0] - route_local_context.shape[0], 0))
     obstacle_local = np.asarray([best_candidate["local_x"], best_candidate["local_y"]], dtype=np.float32)
     if obstacle_local.shape != (2,) or not np.all(np.isfinite(obstacle_local)):
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="invalid_blocker_local_xy",
+            failure_stage="context_route",
+            seed_actor=seed_actor,
+            best_candidate=best_candidate,
+            route_candidate_count=len(route_candidates),
+        )
     if str(borrow_start_mode) == "obstacle_align":
         start_mask = np.abs(route_poly_context[:, 1]) <= float(TWOWAY_START_LATERAL_THRESH_M)
         if not np.any(start_mask):
-            return None
+            return _empty_two_way_borrow_context(
+                event_name=event_name,
+                failure_reason="no_start_mask",
+                failure_stage="route_start",
+                seed_actor=seed_actor,
+                best_candidate=best_candidate,
+                route_candidate_count=len(route_candidates),
+            )
         candidate_idx = np.where(start_mask)[0]
         candidate_x = route_poly_context[candidate_idx, 0]
         start_idx = int(candidate_idx[np.argmin(np.abs(candidate_x - obstacle_local[0]))])
@@ -2015,10 +2213,24 @@ def _build_event_two_way_borrow_context(
         route_front_count = int(record.get("route_front_count", 0))
         fallback_local_idx = route_front_count + int(TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX) - 1
         if route_front_count <= 0 or fallback_local_idx >= route_local_context.shape[0]:
-            return None
+            return _empty_two_way_borrow_context(
+                event_name=event_name,
+                failure_reason="no_return_point",
+                failure_stage="route_end",
+                seed_actor=seed_actor,
+                best_candidate=best_candidate,
+                route_candidate_count=len(route_candidates),
+            )
         fallback_poly_idx = int(route_head_idx + fallback_local_idx)
         if fallback_poly_idx < 0 or fallback_poly_idx >= arc_context.shape[0]:
-            return None
+            return _empty_two_way_borrow_context(
+                event_name=event_name,
+                failure_reason="invalid_return_point",
+                failure_stage="route_end",
+                seed_actor=seed_actor,
+                best_candidate=best_candidate,
+                route_candidate_count=len(route_candidates),
+            )
         route_return_s = float(arc_context[fallback_poly_idx])
     route_return_s = float(np.clip(route_return_s, route_start_s, float(arc_context[-1])))
 
@@ -2032,7 +2244,14 @@ def _build_event_two_way_borrow_context(
         query_s = np.concatenate([query_s, np.array([route_return_s], dtype=np.float32)], axis=0)
     corridor_segment_local = _sample_polyline_at_arclengths(route_poly_context, query_s)
     if corridor_segment_local.ndim != 2 or corridor_segment_local.shape[0] < 2 or corridor_segment_local.shape[1] != 2:
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="empty_corridor_segment",
+            failure_stage="corridor_segment",
+            seed_actor=seed_actor,
+            best_candidate=best_candidate,
+            route_candidate_count=len(route_candidates),
+        )
 
     borrow_geom["segment_local_xy"] = corridor_segment_local.astype(np.float32)
     borrow_geom["enter_local_xy"] = corridor_segment_local[0, :2].astype(np.float32)
@@ -2045,7 +2264,14 @@ def _build_event_two_way_borrow_context(
         ego_matrix_current,
     )
     if borrow_segment_world.ndim != 2 or borrow_segment_world.shape[0] < 2 or borrow_segment_world.shape[1] < 3:
-        return None
+        return _empty_two_way_borrow_context(
+            event_name=event_name,
+            failure_reason="invalid_corridor_world",
+            failure_stage="corridor_world",
+            seed_actor=seed_actor,
+            best_candidate=best_candidate,
+            route_candidate_count=len(route_candidates),
+        )
     borrow_world = np.stack([borrow_segment_world[0, :2], borrow_segment_world[-1, :2]], axis=0)
     borrow_world_xyz = np.stack([borrow_segment_world[0, :3], borrow_segment_world[-1, :3]], axis=0)
 
@@ -2053,6 +2279,10 @@ def _build_event_two_way_borrow_context(
         "valid": 1.0,
         "ready": 1.0,
         "source": "event_blocker_route_{}".format(str(borrow_geom.get("mode", "strict"))),
+        "failure_reason": "none",
+        "failure_stage": "none",
+        "event_name": str(event_name or ""),
+        "route_candidate_count": int(len(route_candidates)),
         "release_frame_id": -1,
         "enter_frame_id": int(best_candidate["frame_id"]),
         "return_frame_id": int(best_candidate["frame_id"]),
@@ -2077,6 +2307,8 @@ def _build_event_two_way_borrow_context(
         "blocking_actor_class": str(best_candidate["actor_class"]),
         "blocking_actor_local_x_m": float(best_candidate["local_x"]),
         "blocking_actor_local_y_m": float(best_candidate["local_y"]),
+        "seed_frame_id": int(seed_actor.get("seed_frame_id", -1)),
+        "seed_priority": int(seed_actor.get("seed_priority", -1)),
         "route_return_abs_m": float(borrow_geom.get("return_abs_m", np.nan)),
         "blocked_frame_id": -1,
     }
@@ -2164,11 +2396,10 @@ def _extend_local_route_with_scene_polyline(route_local, ego_matrix_current, sce
     if tail_s is None:
         return route_local
     query_s = tail_s + float(extension_step_m) * np.arange(1, int(extension_points) + 1, dtype=np.float32)
-    extension_world = _sample_polyline_at_arclengths(scene_polyline_world[:, :2], query_s)
+    extension_world = _sample_polyline_at_arclengths(scene_polyline_world, query_s)
     if extension_world.shape[0] == 0:
         return route_local
-    extension_world_xyz = np.concatenate([extension_world, np.zeros((extension_world.shape[0], 1), dtype=np.float32)], axis=1)
-    extension_local = _transform_points_world_xyz_to_local(extension_world_xyz, ego_matrix_current)
+    extension_local = _transform_points_world_xyz_to_local(extension_world, ego_matrix_current)
     if extension_local.shape[0] == 0:
         return route_local
     merged = np.concatenate([route_local[:, :2], extension_local], axis=0)
@@ -2282,12 +2513,14 @@ def _build_speed_curve_debug(
         "bg_speed_mps": np.nan,
         "t_bg_s": np.nan,
         "t_bg_exit_s": np.nan,
+        "t_current_bg_exit_s": np.nan,
         "t_bg_clear_s": np.nan,
         "t_ego_exit_s": np.nan,
         "safe_gap_bg_m": np.nan,
         "rear_gap_m": np.nan,
         "v_equal_mps": np.nan,
         "v_go_min_mps": np.nan,
+        "v_go_cap_mps": np.nan,
         "v_behind_min_mps": np.nan,
         "v_go_need_mps": np.nan,
         "v_yield_max_mps": np.nan,
@@ -2464,6 +2697,10 @@ def _build_speed_curve_debug(
                 conflict_len_m = float(left_junction_conflict_len_m)
             elif "cross" in meet_subtype and meet_subtype != "borrow_cross_meet":
                 conflict_len_m = float(max(ego_length_m, 1.0))
+            bg_length_m = float(current_cover.get("other_length_m", np.nan))
+            if not np.isfinite(bg_length_m):
+                bg_length_m = float(ego_length_m)
+            bg_clearance_m = float(max(bg_length_m, 1.0))
             d_ego_entry_m = np.nan
             if not np.isfinite(d_ego_entry_m):
                 if np.isfinite(conflict_len_m):
@@ -2471,7 +2708,19 @@ def _build_speed_curve_debug(
                 else:
                     d_ego_entry_m = float(max(float(d_ego), 0.0))
             t_bg = 0.0
-            if np.isfinite(bg_speed) and bg_speed > 1e-3 and np.isfinite(conflict_len_m):
+            current_bg_exit_s = np.nan
+            junction_go_cap_mps = np.nan
+            if meet_subtype == "junction_left_cross_meet" and np.isfinite(conflict_len_m):
+                current_bg_occ_len_m = float(max(0.5 * float(conflict_len_m), 0.0) + bg_clearance_m)
+                if np.isfinite(bg_speed) and bg_speed > 1e-3:
+                    current_bg_exit_s = float(current_bg_occ_len_m / max(bg_speed, 1e-6))
+                else:
+                    current_bg_exit_s = np.inf
+                denom = float(current_bg_exit_s) + float(cross_safe_gap_s)
+                if np.isfinite(denom):
+                    junction_go_cap_mps = np.inf if denom <= 1e-6 else float(d_ego_entry_m) / max(denom, 1e-6)
+                t_bg_exit = float(current_bg_exit_s)
+            elif np.isfinite(bg_speed) and bg_speed > 1e-3 and np.isfinite(conflict_len_m):
                 t_bg_exit = float(conflict_len_m / max(bg_speed, 1e-6))
             elif np.isfinite(conflict_len_m):
                 t_bg_exit = np.inf
@@ -2484,18 +2733,21 @@ def _build_speed_curve_debug(
                 "conflict_len_m": float(conflict_len_m),
                 "context_conflict_len_m": float(left_junction_conflict_len_m),
                 "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
-                "ego_clearance_m": np.nan,
+                "ego_clearance_m": float(ego_length_m) if meet_subtype == "junction_left_cross_meet" else np.nan,
+                "bg_clearance_m": float(bg_clearance_m) if meet_subtype == "junction_left_cross_meet" else np.nan,
                 "bg_speed_mps": float(bg_speed),
                 "t_bg_s": float(t_bg),
                 "t_bg_exit_s": float(t_bg_exit),
+                "t_current_bg_exit_s": float(current_bg_exit_s),
                 "t_bg_clear_s": np.nan,
                 "safe_gap_bg_m": np.nan,
                 "rear_gap_m": np.nan,
                 "v_equal_mps": np.nan,
-                "v_go_min_mps": np.nan,
+                "v_go_min_mps": 0.0 if meet_subtype == "junction_left_cross_meet" else np.nan,
+                "v_go_cap_mps": float(junction_go_cap_mps),
                 "v_behind_min_mps": np.nan,
                 "v_go_need_mps": np.nan,
-                "v_yield_max_mps": np.nan,
+                "v_yield_max_mps": float(junction_go_cap_mps) if meet_subtype == "junction_left_cross_meet" else np.nan,
                 "subtype": meet_subtype,
                 "cover_case": "current",
             }
@@ -2531,10 +2783,22 @@ def _build_speed_curve_debug(
                             1.0,
                         )
                     )
-                meet_risks[idx] = float(max(risk, occupancy_floor))
                 if meet_subtype == "junction_left_cross_meet":
-                    junction_cross_yld_risks[idx] = meet_risks[idx]
-                    junction_cross_go_risks[idx] = 1.0
+                    current_cap_risk = _risk_from_time_gap(t_ego_in - float(t_bg_exit), cross_safe_gap_s)
+                    junction_cross_yld_risks[idx] = float(
+                        np.clip(np.nan_to_num(current_cap_risk, nan=1.0, posinf=0.0, neginf=1.0), 0.0, 1.0)
+                    )
+                    junction_cross_go_risks[idx] = float(
+                        np.clip(np.nan_to_num(current_cap_risk, nan=1.0, posinf=0.0, neginf=1.0), 0.0, 1.0)
+                    )
+                    meet_risks[idx] = float(
+                        max(
+                            float(np.clip(np.nan_to_num(current_cap_risk, nan=1.0, posinf=0.0, neginf=1.0), 0.0, 1.0)),
+                            occupancy_floor,
+                        )
+                    )
+                else:
+                    meet_risks[idx] = float(max(risk, occupancy_floor))
             total_risks = np.maximum(chase_risks, meet_risks)
             cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
             return {
@@ -2654,6 +2918,28 @@ def _build_speed_curve_debug(
                 conflict_half_m = 0.5 * conflict_len_m
                 risk_d_ego = max(float(d_ego) - conflict_half_m, 0.0)
                 risk_d_bg = max(float(d_bg) - conflict_half_m, 0.0)
+            current_junction_bg_exit_s = np.nan
+            current_junction_go_cap_mps = np.nan
+            if (
+                meet_subtype == "junction_left_cross_meet" and
+                int(current_cover.get("exists", 0.0)) > 0 and
+                str(current_cover.get("interaction", {}).get("subtype", "none")) == "junction_left_cross_meet"
+            ):
+                current_bg_speed = float(current_cover.get("other_speed", np.nan))
+                current_bg_length_m = float(current_cover.get("other_length_m", np.nan))
+                if not np.isfinite(current_bg_length_m):
+                    current_bg_length_m = float(ego_length_m)
+                current_bg_clearance_m = float(max(current_bg_length_m, 1.0))
+                current_bg_occ_len_m = float(max(0.5 * float(conflict_len_m), 0.0) + current_bg_clearance_m)
+                if np.isfinite(current_bg_speed) and current_bg_speed > 1e-3:
+                    current_junction_bg_exit_s = float(current_bg_occ_len_m / max(current_bg_speed, 1e-6))
+                else:
+                    current_junction_bg_exit_s = np.inf
+                cap_denom = float(current_junction_bg_exit_s) + float(cross_safe_gap_s)
+                if np.isfinite(cap_denom):
+                    current_junction_go_cap_mps = (
+                        np.inf if cap_denom <= 1e-6 else (risk_d_ego / max(cap_denom, 1e-6))
+                    )
             t_bg = risk_d_bg / max(bg_speed, 1e-6)
             cross_conflict_len_m = max(float(conflict_len_m) if np.isfinite(conflict_len_m) else 0.0, 0.0)
             bg_occ_len_m = float(
@@ -2668,26 +2954,25 @@ def _build_speed_curve_debug(
             t_bg_clear = (risk_d_bg + merge_clearance_effective_m) / max(bg_speed, 1e-6)
             rear_gap_m = float(future_cover.get("rear_gap_m", np.nan))
             if meet_subtype == "merge_meet":
-                v_behind_min = max(float(bg_speed), 0.0)
-                if d_ego <= 0.25:
-                    v_equal = np.nan
-                    v_go_min = np.nan
-                    v_go_need = float(v_behind_min)
-                    v_yield_max = np.nan
-                else:
-                    v_equal = (d_ego + ego_clearance_m) / max(t_bg, 1e-6)
-                    go_denom = t_bg - float(merge_tau_s)
-                    v_go_min = np.inf if go_denom <= 1e-6 else (d_ego + ego_clearance_m) / max(go_denom, 1e-6)
-                    v_go_need = max(float(v_go_min), float(v_behind_min))
-                    v_yield_max = d_ego / max(t_bg_clear + float(merge_tau_s), 1e-6)
+                v_behind_min = _merge_speed_cap(max(float(bg_speed), 0.0), default=0.0)
+                v_equal = _merge_speed_cap(
+                    (d_ego + ego_clearance_m) / max(t_bg, 1e-3),
+                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+                )
+                v_go_min = _merge_speed_cap(
+                    (d_ego + ego_clearance_m) / max(t_bg - float(merge_tau_s), 1e-3),
+                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+                )
+                v_go_need = _merge_speed_cap(
+                    max(float(v_go_min), float(v_behind_min)),
+                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+                )
+                v_yield_max = _merge_speed_cap(
+                    d_ego / max(t_bg_clear + float(merge_tau_s), 1e-3),
+                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+                )
                 debug_v_equal = float(v_equal)
                 debug_v_go_min = float(v_go_min)
-                if (
-                    d_ego <= float(MERGE_DEBUG_MIN_DEGO_M) or
-                    (np.isfinite(t_bg) and (t_bg - float(merge_tau_s)) <= float(MERGE_DEBUG_MIN_GO_DENOM_S))
-                ):
-                    debug_v_equal = np.nan
-                    debug_v_go_min = np.nan
             else:
                 safe_gap_bg = np.nan
                 t_bg_clear = np.nan
@@ -2714,12 +2999,14 @@ def _build_speed_curve_debug(
                 "bg_speed_mps": bg_speed,
                 "t_bg_s": float(t_bg),
                 "t_bg_exit_s": float(t_bg_exit),
+                "t_current_bg_exit_s": float(current_junction_bg_exit_s),
                 "t_bg_clear_s": float(t_bg_clear),
                 "t_ego_exit_s": np.nan,
                 "safe_gap_bg_m": float(safe_gap_bg),
                 "rear_gap_m": float(rear_gap_m),
                 "v_equal_mps": float(debug_v_equal),
                 "v_go_min_mps": float(debug_v_go_min),
+                "v_go_cap_mps": float(current_junction_go_cap_mps),
                 "v_behind_min_mps": float(v_behind_min),
                 "v_go_need_mps": float(v_go_need),
                 "v_yield_max_mps": float(v_yield_max),
@@ -2829,6 +3116,17 @@ def _build_speed_curve_debug(
                                     1.0,
                                 )
                             )
+                            if np.isfinite(current_junction_bg_exit_s):
+                                current_gap_after = t_ego_in - float(current_junction_bg_exit_s)
+                                current_cap_risk = float(
+                                    np.clip(
+                                        (float(cross_safe_gap_s) - current_gap_after) /
+                                        max(float(cross_safe_gap_s), 1e-6),
+                                        0.0,
+                                        1.0,
+                                    )
+                                )
+                                go_risk = max(float(go_risk), float(current_cap_risk))
                             junction_cross_yld_risks[idx] = float(np.clip(np.nan_to_num(yld_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
                             junction_cross_go_risks[idx] = float(np.clip(np.nan_to_num(go_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
                             risk = float(min(junction_cross_yld_risks[idx], junction_cross_go_risks[idx]))
@@ -3039,6 +3337,8 @@ def _build_stage1_speed_debug_payload(
     speed_curve_future_persisted,
     speed_curve_debug,
     merge_motion=None,
+    scene_borrow_context=None,
+    borrow_motion=None,
 ):
     return _to_stage1_debug_python({
         "current_cover": dict(current_cover),
@@ -3049,6 +3349,8 @@ def _build_stage1_speed_debug_payload(
         "speed_curve_future_persisted": bool(speed_curve_future_persisted),
         "speed_curve": dict(speed_curve_debug),
         "merge_motion": dict(merge_motion or {}),
+        "scene_borrow_context": None if scene_borrow_context is None else dict(scene_borrow_context),
+        "borrow_motion": dict(borrow_motion or {}),
     })
 
 
@@ -3058,16 +3360,23 @@ def _default_merge_episode_debug():
         'phase_code': int(MERGE_DECISION_PHASE_TO_CODE['none']),
         'episode_id': -1,
         'active': 0.0,
+        'hold': 0.0,
+        'hold_reason': 'none',
         'no_go': 0.0,
         'start_frame': -1,
         'end_frame': -1,
         'go_frame': -1,
+        'go_reason': 'none',
         'resolution_actor_id': -1,
         'end_state': 'none',
         'end_state_code': int(MERGE_END_STATE_TO_CODE['none']),
         'actor_ids': [],
         'actor_switch_frames': [],
         'future_merge_count': 0,
+        'merge_area_start_s_m': np.nan,
+        'merge_area_end_s_m': np.nan,
+        'merge_area_first_conflict_s_m': np.nan,
+        'merge_area_last_conflict_s_m': np.nan,
         'frame_role': 'none',
         'future_grace_index': 0,
         'red_light_hold_index': 0,
@@ -3077,6 +3386,60 @@ def _default_merge_episode_debug():
         'actor_grace_frames': int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES),
         'resolution_lookahead_frames': int(STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES),
     }
+
+
+def _default_borrow_cross_episode_debug():
+    return {
+        'phase': 'none',
+        'phase_code': int(CROSS_DECISION_PHASE_TO_CODE['none']),
+        'episode_id': -1,
+        'active': 0.0,
+        'active_time_s': 0.0,
+        'start_frame': -1,
+        'end_frame': -1,
+        'go_frame': -1,
+        'context_frame': -1,
+        'window_start_distance_m': np.nan,
+        'window_end_distance_m': np.nan,
+        'frame_role': 'none',
+    }
+
+
+def _default_junction_cross_episode_debug():
+    return {
+        'episode_id': -1,
+        'active': 0.0,
+        'start_frame': -1,
+        'end_frame': -1,
+        'frame_role': 'none',
+        'area_center_world_xy': [],
+        'area_radius_m': np.nan,
+        'candidate_frame_count': 0,
+    }
+
+
+def _set_stage1_junction_cross_defaults(sample):
+    sample['junction_cross_episode_id'] = np.int64(-1)
+    sample['junction_cross_episode_active'] = np.float32(0.0)
+    sample['junction_cross_episode_start_frame'] = np.int64(-1)
+    sample['junction_cross_episode_end_frame'] = np.int64(-1)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['junction_cross_episode'] = _default_junction_cross_episode_debug()
+
+
+def _set_stage1_borrow_cross_defaults(sample):
+    sample['borrow_cross_decision_phase'] = np.int64(CROSS_DECISION_PHASE_TO_CODE['none'])
+    sample['borrow_cross_episode_id'] = np.int64(-1)
+    sample['borrow_cross_episode_active'] = np.float32(0.0)
+    sample['borrow_cross_active_time_s'] = np.float32(0.0)
+    sample['borrow_cross_episode_start_frame'] = np.int64(-1)
+    sample['borrow_cross_episode_end_frame'] = np.int64(-1)
+    sample['borrow_cross_go_frame'] = np.int64(-1)
+    sample['borrow_cross_context_frame'] = np.int64(-1)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['borrow_cross_episode'] = _default_borrow_cross_episode_debug()
 
 
 def _set_stage1_merge_defaults(sample):
@@ -3089,6 +3452,7 @@ def _set_stage1_merge_defaults(sample):
     sample['merge_go_frame'] = np.int64(-1)
     sample['merge_resolution_actor_id'] = np.int64(-1)
     sample['merge_end_state'] = np.int64(MERGE_END_STATE_TO_CODE['none'])
+    sample['merge_hold'] = np.float32(0.0)
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['merge_episode'] = _default_merge_episode_debug()
@@ -3144,7 +3508,11 @@ def _set_stage1_speed_fallback(sample):
             'chase_debug': {'valid': 0.0},
             'meet_debug': {'valid': 0.0},
         },
+        scene_borrow_context=None,
+        borrow_motion=None,
     )
+    _set_stage1_junction_cross_defaults(sample)
+    _set_stage1_borrow_cross_defaults(sample)
     _set_stage1_merge_defaults(sample)
 
 
@@ -3181,7 +3549,13 @@ def _cover_is_cross_meet(cover):
     return 'cross' in subtype
 
 
-def _build_merge_motion_context(current_meas, route_dense):
+def _build_merge_motion_context(
+    current_meas,
+    route_dense,
+    ego_matrix_current=None,
+    current_boxes=None,
+    scene_route_polyline_world=None,
+):
     steer = np.nan if current_meas is None else float(current_meas.get('steer', np.nan))
     theta = np.nan if current_meas is None else float(current_meas.get('theta', np.nan))
     speed = np.nan if current_meas is None else float(current_meas.get('speed', np.nan))
@@ -3191,6 +3565,39 @@ def _build_merge_motion_context(current_meas, route_dense):
     if route_heading_local is None:
         route_heading_local = _route_heading_at_idx(route_dense, 0)
     heading_error_deg = np.nan if route_heading_local is None else abs(_heading_to_deg(route_heading_local))
+    ego_half_length_m = float(DEFAULT_EGO_EXTENT_2D[0])
+    ego_box = _find_ego_box(current_boxes or [])
+    if ego_box is not None:
+        ego_extent = np.asarray(ego_box.get('extent', DEFAULT_EGO_EXTENT_2D)[:2], dtype=np.float32)
+        if ego_extent.size >= 1 and np.isfinite(float(ego_extent[0])):
+            ego_half_length_m = float(max(float(ego_extent[0]), 1e-3))
+
+    scene_route_center_s = np.nan
+    scene_route_front_s = np.nan
+    scene_route_rear_s = np.nan
+    ego_world_xy = np.asarray([np.nan, np.nan], dtype=np.float32)
+    scene_route_polyline_world = np.asarray(scene_route_polyline_world, dtype=np.float32)
+    if (
+        ego_matrix_current is not None and
+        scene_route_polyline_world.ndim == 2 and
+        scene_route_polyline_world.shape[0] >= 2
+    ):
+        ego_matrix_np = np.asarray(ego_matrix_current, dtype=np.float32)
+        if ego_matrix_np.ndim == 2 and ego_matrix_np.shape[0] >= 3 and ego_matrix_np.shape[1] >= 4:
+            ego_world_xy = ego_matrix_np[:2, 3].astype(np.float32)
+        ego_probe_local = np.asarray(
+            [
+                [0.0, 0.0],
+                [float(ego_half_length_m), 0.0],
+                [-float(ego_half_length_m), 0.0],
+            ],
+            dtype=np.float32,
+        )
+        ego_probe_world = _transform_points_local_to_world_xyz(ego_probe_local, ego_matrix_current)
+        if ego_probe_world.shape[0] == 3:
+            _, scene_route_center_s = _project_point_to_polyline(ego_probe_world[0, :2], scene_route_polyline_world[:, :2])
+            _, scene_route_front_s = _project_point_to_polyline(ego_probe_world[1, :2], scene_route_polyline_world[:, :2])
+            _, scene_route_rear_s = _project_point_to_polyline(ego_probe_world[2, :2], scene_route_polyline_world[:, :2])
     return {
         'steer': float(steer) if np.isfinite(steer) else np.nan,
         'theta_rad': float(theta) if np.isfinite(theta) else np.nan,
@@ -3199,6 +3606,11 @@ def _build_merge_motion_context(current_meas, route_dense):
         'stop_sign_hazard': float(stop_sign_hazard),
         'route_heading_local_rad': np.nan if route_heading_local is None else float(route_heading_local),
         'heading_error_deg': float(heading_error_deg) if np.isfinite(heading_error_deg) else np.nan,
+        'ego_half_length_m': float(ego_half_length_m),
+        'ego_world_xy': ego_world_xy.astype(float).tolist() if np.all(np.isfinite(ego_world_xy)) else [],
+        'scene_route_center_s_m': float(scene_route_center_s) if np.isfinite(scene_route_center_s) else np.nan,
+        'scene_route_front_s_m': float(scene_route_front_s) if np.isfinite(scene_route_front_s) else np.nan,
+        'scene_route_rear_s_m': float(scene_route_rear_s) if np.isfinite(scene_route_rear_s) else np.nan,
     }
 
 
@@ -3224,17 +3636,6 @@ def _merge_is_red_light_wait(merge_motion):
     )
 
 
-def _merge_end_state_from_cover(cover):
-    if int((cover or {}).get('exists', 0.0)) <= 0:
-        return 'ended_empty'
-    if _cover_is_chase(cover):
-        return 'ended_with_chase'
-    subtype = _cover_interaction_subtype(cover)
-    if 'cross' in subtype:
-        return 'ended_with_cross'
-    return 'ended_with_other_current_actor'
-
-
 def _cover_angle_deg(cover):
     interaction = ((cover or {}).get('interaction') or {})
     try:
@@ -3254,99 +3655,573 @@ def _cover_is_cross_like(cover):
     return bool(np.isfinite(angle_deg) and angle_deg >= float(INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG))
 
 
-def _cover_is_merge_heading_compatible(cover):
-    if int((cover or {}).get('exists', 0.0)) <= 0:
+
+
+def _merge_record_scene_front_s(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    front_s = float(merge_motion.get('scene_route_front_s_m', np.nan))
+    if np.isfinite(front_s):
+        return float(front_s)
+    center_s = float(merge_motion.get('scene_route_center_s_m', np.nan))
+    return float(center_s) if np.isfinite(center_s) else np.nan
+
+
+def _merge_record_scene_rear_s(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    rear_s = float(merge_motion.get('scene_route_rear_s_m', np.nan))
+    if np.isfinite(rear_s):
+        return float(rear_s)
+    center_s = float(merge_motion.get('scene_route_center_s_m', np.nan))
+    return float(center_s) if np.isfinite(center_s) else np.nan
+
+
+def _merge_record_speed_mps(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    speed_mps = float(merge_motion.get('speed_mps', np.nan))
+    return float(speed_mps) if np.isfinite(speed_mps) else np.nan
+
+
+def _merge_record_conflict_s(record):
+    future_cover = (record or {}).get('future_cover') or {}
+    if not _cover_is_merge_meet(future_cover):
+        return np.nan
+    conflict_s = float(future_cover.get('scene_route_conflict_s_m', np.nan))
+    if np.isfinite(conflict_s):
+        return float(conflict_s)
+    route_distance_m = float(future_cover.get('route_distance_m', np.nan))
+    ego_route_front_s_m = float(future_cover.get('ego_route_front_s_m', np.nan))
+    scene_front_s_m = _merge_record_scene_front_s(record)
+    if np.isfinite(route_distance_m) and np.isfinite(ego_route_front_s_m) and np.isfinite(scene_front_s_m):
+        return float(scene_front_s_m + max(route_distance_m - ego_route_front_s_m, 0.0))
+    return np.nan
+
+
+def _merge_record_thresholds(record):
+    meet_debug = (record or {}).get('meet_debug') or {}
+    if str(meet_debug.get('subtype', 'none')) != 'merge_meet':
+        return np.nan, np.nan, np.nan
+    v_yield_max = _merge_speed_cap(meet_debug.get('v_yield_max_mps', np.nan))
+    v_go_min = _merge_speed_cap(meet_debug.get('v_go_min_mps', np.nan))
+    v_go_need = _merge_speed_cap(meet_debug.get('v_go_need_mps', np.nan))
+    go_threshold = float(v_go_need) if np.isfinite(v_go_need) else float(v_go_min)
+    return float(v_yield_max), float(v_go_min), float(go_threshold)
+
+
+def _merge_record_go_signal(record, merge_area_start_s_m):
+    front_s = _merge_record_scene_front_s(record)
+    if np.isfinite(front_s) and np.isfinite(float(merge_area_start_s_m)) and front_s >= float(merge_area_start_s_m):
+        return True, 'merge_area_entry'
+    speed_mps = _merge_record_speed_mps(record)
+    v_yield_max, _, go_threshold = _merge_record_thresholds(record)
+    if np.isfinite(speed_mps):
+        if np.isfinite(go_threshold) and speed_mps >= float(go_threshold):
+            return True, 'speed_go_threshold'
+        if not np.isfinite(v_yield_max) and not np.isfinite(go_threshold):
+            return False, 'threshold_missing'
+    return False, 'none'
+
+
+def _merge_record_passed_area(record, merge_area_end_s_m):
+    rear_s = _merge_record_scene_rear_s(record)
+    if not np.isfinite(rear_s) or not np.isfinite(float(merge_area_end_s_m)):
         return False
-    if _cover_is_chase(cover):
-        return True
-    if _cover_is_cross_like(cover):
-        return False
-    subtype = _cover_interaction_subtype(cover)
-    if subtype == 'merge_meet':
-        return True
-    interaction_name = _cover_interaction_name(cover)
-    angle_deg = _cover_angle_deg(cover)
-    return bool(
-        interaction_name == 'meet' and
-        (not np.isfinite(angle_deg) or angle_deg < float(INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG))
-    )
+    return bool(rear_s >= float(merge_area_end_s_m))
 
 
-def _cover_is_merge_seed(cover):
-    if int((cover or {}).get('exists', 0.0)) <= 0:
-        return False
-    if _cover_is_cross_like(cover):
-        return False
-    subtype = _cover_interaction_subtype(cover)
-    if subtype == 'merge_meet':
-        return True
-    interaction_name = _cover_interaction_name(cover)
-    angle_deg = _cover_angle_deg(cover)
-    return bool(
-        interaction_name == 'meet' and
-        (not np.isfinite(angle_deg) or angle_deg < float(INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG))
-    )
+def _merge_collect_conflict_candidate_positions(records, start_scan_pos):
+    if int(start_scan_pos) < 0 or int(start_scan_pos) >= len(records):
+        return []
+    first_conflict_s = _merge_record_conflict_s(records[int(start_scan_pos)])
+    if not np.isfinite(first_conflict_s):
+        return []
+    max_front_s = float(first_conflict_s) + float(STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M)
+    candidate_positions = []
+    for pos in range(int(start_scan_pos), len(records)):
+        front_s = _merge_record_scene_front_s(records[pos])
+        if np.isfinite(front_s) and np.isfinite(max_front_s) and float(front_s) > float(max_front_s):
+            break
+        conflict_s = _merge_record_conflict_s(records[pos])
+        if np.isfinite(conflict_s):
+            candidate_positions.append(int(pos))
+    return candidate_positions
 
 
-def _collect_merge_actor_tracks(records, scan_positions):
-    tracks = {}
+def _merge_resolve_conflict_area(records, candidate_positions):
+    points = []
+    for pos in candidate_positions:
+        conflict_s = _merge_record_conflict_s(records[int(pos)])
+        front_s = _merge_record_scene_front_s(records[int(pos)])
+        if not np.isfinite(conflict_s):
+            continue
+        points.append({
+            'pos': int(pos),
+            'conflict_s': float(conflict_s),
+            'front_s': float(front_s) if np.isfinite(front_s) else np.nan,
+        })
+    if len(points) < int(STAGE1_MERGE_START_CONFIRM_FRAMES):
+        return None
 
-    def _track_for_actor(actor_id):
-        track = tracks.get(int(actor_id))
-        if track is None:
-            track = {
-                'actor_id': int(actor_id),
-                'future_positions': [],
-                'current_merge_positions': [],
-                'current_positions': [],
-                'chase_positions': [],
-                'first_merge_pos': None,
-                'first_current_pos': None,
-                'last_pos': None,
-            }
-            tracks[int(actor_id)] = track
-        return track
+    points_by_s = sorted(points, key=lambda item: (float(item['conflict_s']), int(item['pos'])))
+    clusters = []
+    current_cluster = [points_by_s[0]]
+    for item in points_by_s[1:]:
+        prev_s = float(current_cluster[-1]['conflict_s'])
+        cur_s = float(item['conflict_s'])
+        if abs(cur_s - prev_s) <= float(STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M):
+            current_cluster.append(item)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [item]
+    clusters.append(current_cluster)
 
-    def _append_unique(track, key, pos):
-        if not track[key] or int(track[key][-1]) != int(pos):
-            track[key].append(int(pos))
+    valid_clusters = [cluster for cluster in clusters if len(cluster) >= int(STAGE1_MERGE_START_CONFIRM_FRAMES)]
+    if not valid_clusters:
+        return None
 
-    for pos in scan_positions:
+    def _cluster_sort_key(cluster):
+        conflict_vals = [float(item['conflict_s']) for item in cluster]
+        spread = float(max(conflict_vals) - min(conflict_vals)) if conflict_vals else np.inf
+        min_front_s = min(
+            [float(item['front_s']) for item in cluster if np.isfinite(float(item['front_s']))] or [np.inf]
+        )
+        return (-len(cluster), spread, min_front_s, min(int(item['pos']) for item in cluster))
+
+    best_cluster = min(valid_clusters, key=_cluster_sort_key)
+    inlier_positions = sorted(int(item['pos']) for item in best_cluster)
+    conflict_vals = [float(item['conflict_s']) for item in best_cluster]
+    front_candidates = [
+        (float(item['front_s']), int(item['pos']))
+        for item in best_cluster
+        if np.isfinite(float(item['front_s']))
+    ]
+    if front_candidates:
+        _, start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))
+    else:
+        start_pos = min(inlier_positions)
+
+    return {
+        'start_pos': int(start_pos),
+        'inlier_positions': inlier_positions,
+        'first_conflict_s_m': float(min(conflict_vals)),
+        'last_conflict_s_m': float(max(conflict_vals)),
+    }
+
+
+def _merge_episode_actor_summary(records, start_pos, end_pos):
+    actor_ids = []
+    actor_switch_frames = []
+    last_actor_id = None
+    for pos in range(int(start_pos), int(end_pos) + 1):
         future_cover = records[pos]['future_cover']
-        if _cover_is_merge_seed(future_cover) and _cover_is_merge_heading_compatible(future_cover):
-            actor_id = _cover_actor_id(future_cover)
-            if actor_id >= 0:
-                track = _track_for_actor(actor_id)
-                _append_unique(track, 'future_positions', pos)
-                if track['first_merge_pos'] is None:
-                    track['first_merge_pos'] = int(pos)
-                track['last_pos'] = int(pos)
+        if not _cover_is_merge_meet(future_cover):
+            continue
+        actor_id = _cover_actor_id(future_cover)
+        if actor_id < 0:
+            continue
+        actor_ids.append(int(actor_id))
+        if last_actor_id is None or int(actor_id) != int(last_actor_id):
+            actor_switch_frames.append(int(records[pos]['frame_id']))
+            last_actor_id = int(actor_id)
+    if not actor_ids:
+        return [], [], -1
+    unique_actor_ids = []
+    for actor_id in actor_ids:
+        if actor_id not in unique_actor_ids:
+            unique_actor_ids.append(int(actor_id))
+    counts = {}
+    for actor_id in actor_ids:
+        counts[int(actor_id)] = counts.get(int(actor_id), 0) + 1
+    dominant_actor_id = max(sorted(counts.keys()), key=lambda actor_id: (counts[actor_id], -unique_actor_ids.index(actor_id)))
+    return unique_actor_ids, actor_switch_frames, int(dominant_actor_id)
 
-        current_cover = records[pos]['current_cover']
-        current_actor_id = _cover_actor_id(current_cover)
-        if current_actor_id < 0 or not _cover_is_merge_heading_compatible(current_cover):
-            continue
-        if _cover_is_merge_seed(current_cover):
-            track = _track_for_actor(current_actor_id)
-            _append_unique(track, 'current_merge_positions', pos)
-            _append_unique(track, 'current_positions', pos)
-            if track['first_merge_pos'] is None:
-                track['first_merge_pos'] = int(pos)
-            if track['first_current_pos'] is None:
-                track['first_current_pos'] = int(pos)
-            track['last_pos'] = int(pos)
-            continue
-        track = tracks.get(int(current_actor_id))
-        if track is None:
-            continue
-        _append_unique(track, 'current_positions', pos)
-        if _cover_is_chase(current_cover):
-            _append_unique(track, 'chase_positions', pos)
-        if track['first_current_pos'] is None:
-            track['first_current_pos'] = int(pos)
-        track['last_pos'] = int(pos)
 
-    return tracks
+def _junction_cover_conflict_world_xy(cover):
+    if int((cover or {}).get('exists', 0.0)) <= 0:
+        return None
+    if str(((cover or {}).get('interaction') or {}).get('subtype', 'none')) != 'junction_left_cross_meet':
+        return None
+    pt = np.asarray((cover or {}).get('scene_route_conflict_world_xy', []), dtype=np.float32).reshape(-1)
+    if pt.size >= 2 and np.all(np.isfinite(pt[:2])):
+        return pt[:2].astype(np.float32)
+    return None
+
+
+def _junction_record_conflict_world_xy(record):
+    future_cover = (record or {}).get('future_cover') or {}
+    pt = _junction_cover_conflict_world_xy(future_cover)
+    if pt is not None:
+        return pt
+    current_cover = (record or {}).get('current_cover') or {}
+    return _junction_cover_conflict_world_xy(current_cover)
+
+
+def _junction_record_conflict_radius_m(record):
+    meet_debug = (record or {}).get('meet_debug') or {}
+    radius_m = float(meet_debug.get('context_conflict_len_m', np.nan))
+    if np.isfinite(radius_m) and radius_m > 0.0:
+        return float(radius_m)
+    return float(STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M)
+
+
+def _junction_record_scene_front_s(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    front_s = float(merge_motion.get('scene_route_front_s_m', np.nan))
+    if np.isfinite(front_s):
+        return float(front_s)
+    center_s = float(merge_motion.get('scene_route_center_s_m', np.nan))
+    return float(center_s) if np.isfinite(center_s) else np.nan
+
+
+def _junction_record_ego_world_xy(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    pt = np.asarray(merge_motion.get('ego_world_xy', []), dtype=np.float32).reshape(-1)
+    if pt.size >= 2 and np.all(np.isfinite(pt[:2])):
+        return pt[:2].astype(np.float32)
+    return None
+
+
+def _junction_cluster_conflict_candidates(records):
+    candidate_points = []
+    for pos, record in enumerate(records):
+        pt = _junction_record_conflict_world_xy(record)
+        if pt is None:
+            continue
+        candidate_points.append({
+            'pos': int(pos),
+            'frame_id': int(record.get('frame_id', -1)),
+            'point_xy': pt.astype(np.float32),
+            'radius_m': float(_junction_record_conflict_radius_m(record)),
+            'front_s': float(_junction_record_scene_front_s(record)),
+        })
+    if not candidate_points:
+        return []
+
+    clusters = []
+    for item in sorted(candidate_points, key=lambda entry: int(entry['pos'])):
+        assigned = None
+        for cluster in clusters:
+            center = np.asarray(cluster['center_xy'], dtype=np.float32)
+            radius_m = float(max(cluster['radius_m'], item['radius_m']))
+            if float(np.linalg.norm(item['point_xy'] - center)) <= radius_m:
+                assigned = cluster
+                break
+        if assigned is None:
+            clusters.append({
+                'center_xy': item['point_xy'].astype(np.float32),
+                'radius_m': float(item['radius_m']),
+                'items': [item],
+            })
+            continue
+        assigned['items'].append(item)
+        pts = np.stack([entry['point_xy'] for entry in assigned['items']], axis=0)
+        assigned['center_xy'] = np.mean(pts, axis=0).astype(np.float32)
+        assigned['radius_m'] = float(max(float(assigned['radius_m']), float(item['radius_m'])))
+
+    valid_clusters = []
+    for cluster in clusters:
+        items = list(cluster['items'])
+        if len(items) < int(STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS):
+            continue
+        front_candidates = [
+            (float(entry['front_s']), int(entry['pos']))
+            for entry in items
+            if np.isfinite(float(entry['front_s']))
+        ]
+        if front_candidates:
+            _, start_pos = min(front_candidates, key=lambda entry: (float(entry[0]), int(entry[1])))
+        else:
+            start_pos = min(int(entry['pos']) for entry in items)
+        valid_clusters.append({
+            'center_xy': np.asarray(cluster['center_xy'], dtype=np.float32),
+            'radius_m': float(cluster['radius_m']),
+            'items': items,
+            'start_pos': int(start_pos),
+        })
+    valid_clusters.sort(key=lambda cluster: int(cluster['start_pos']))
+    return valid_clusters
+
+
+def _set_stage1_junction_cross_annotation(sample, cross_info):
+    sample['junction_cross_episode_id'] = np.int64(int(cross_info.get('episode_id', -1)))
+    sample['junction_cross_episode_active'] = np.float32(float(cross_info.get('active', 0.0)))
+    sample['junction_cross_episode_start_frame'] = np.int64(int(cross_info.get('start_frame', -1)))
+    sample['junction_cross_episode_end_frame'] = np.int64(int(cross_info.get('end_frame', -1)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['junction_cross_episode'] = _to_stage1_debug_python(dict(cross_info))
+
+
+def _build_borrow_motion_context(release_info, current_meas=None, route_local=None, frame_id=-1):
+    speed_mps = np.nan if current_meas is None else float(current_meas.get('speed', np.nan))
+    corridor = _borrow_corridor_metrics(
+        release_info,
+        current_meas=current_meas,
+        route_local=route_local,
+    )
+    if corridor is None:
+        return {
+            'valid': 0.0,
+            'frame_id': int(frame_id),
+            'speed_mps': float(speed_mps) if np.isfinite(speed_mps) else np.nan,
+            'borrow_start_distance_m': np.nan,
+            'borrow_end_distance_m': np.nan,
+            'corridor_length_m': np.nan,
+            'context_frame_id': int((release_info or {}).get('context_frame_id', -1)),
+        }
+    return {
+        'valid': 1.0,
+        'frame_id': int(frame_id),
+        'speed_mps': float(speed_mps) if np.isfinite(speed_mps) else np.nan,
+        'borrow_start_distance_m': float(corridor.get('borrow_start_distance_m', np.nan)),
+        'borrow_end_distance_m': float(corridor.get('borrow_end_distance_m', np.nan)),
+        'corridor_length_m': float(corridor.get('borrow_distance_m', np.nan)),
+        'context_frame_id': int((release_info or {}).get('context_frame_id', -1)),
+    }
+
+
+def _set_stage1_borrow_cross_annotation(sample, cross_info):
+    phase = str(cross_info.get('phase', 'none'))
+    sample['borrow_cross_decision_phase'] = np.int64(CROSS_DECISION_PHASE_TO_CODE.get(phase, 0))
+    sample['borrow_cross_episode_id'] = np.int64(int(cross_info.get('episode_id', -1)))
+    sample['borrow_cross_episode_active'] = np.float32(float(cross_info.get('active', 0.0)))
+    sample['borrow_cross_active_time_s'] = np.float32(float(cross_info.get('active_time_s', 0.0)))
+    sample['borrow_cross_episode_start_frame'] = np.int64(int(cross_info.get('start_frame', -1)))
+    sample['borrow_cross_episode_end_frame'] = np.int64(int(cross_info.get('end_frame', -1)))
+    sample['borrow_cross_go_frame'] = np.int64(int(cross_info.get('go_frame', -1)))
+    sample['borrow_cross_context_frame'] = np.int64(int(cross_info.get('context_frame', -1)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['borrow_cross_episode'] = _to_stage1_debug_python(dict(cross_info))
+
+
+def _borrow_find_slowdown_start_pos(records, candidate_positions, search_stop_pos):
+    positions = [int(pos) for pos in candidate_positions if int(pos) <= int(search_stop_pos)]
+    for pos in positions:
+        if pos + 2 >= len(records):
+            continue
+        v0 = float((records[pos].get('borrow_motion') or {}).get('speed_mps', np.nan))
+        v1 = float((records[pos + 1].get('borrow_motion') or {}).get('speed_mps', np.nan))
+        v2 = float((records[pos + 2].get('borrow_motion') or {}).get('speed_mps', np.nan))
+        if not (np.isfinite(v0) and np.isfinite(v1) and np.isfinite(v2)):
+            continue
+        if v1 <= v0 - 0.15 and v2 <= v1 + 0.05:
+            return int(pos)
+    return None
+
+
+def _annotate_route_stage1_borrow_cross_decisions(samples, route_sample_indices):
+    ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
+    records = []
+    for sample_idx in ordered_indices:
+        sample = samples[sample_idx]
+        stage1_debug = sample.get('stage1_speed_debug') or {}
+        scene_borrow_context = stage1_debug.get('scene_borrow_context') or {}
+        current_cover = stage1_debug.get('current_cover') or {}
+        future_cover = stage1_debug.get('future_cover') or {}
+        speed_curve_future_cover = stage1_debug.get('speed_curve_future_cover') or {}
+        records.append({
+            'sample_idx': int(sample_idx),
+            'frame_id': int(sample.get('frame_id', -1)),
+            'scene_borrow_context': scene_borrow_context,
+            'borrow_motion': stage1_debug.get('borrow_motion') or {},
+            'current_cover': current_cover,
+            'future_cover': future_cover,
+            'speed_curve_future_cover': speed_curve_future_cover,
+        })
+
+    default_info = _default_borrow_cross_episode_debug()
+    for record in records:
+        _set_stage1_borrow_cross_annotation(samples[record['sample_idx']], default_info)
+
+    if not records:
+        return
+
+    scene_borrow_context = None
+    for record in records:
+        ctx = record.get('scene_borrow_context') or {}
+        if float(ctx.get('valid', 0.0)) > 0.5 and float(ctx.get('ready', 0.0)) > 0.5:
+            scene_borrow_context = ctx
+            break
+    if scene_borrow_context is None:
+        return
+
+    event_name = str(scene_borrow_context.get('event_name', ''))
+    if event_name not in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}:
+        return
+
+    context_frame_id = int(scene_borrow_context.get('context_frame_id', -1))
+    context_pos = None
+    if context_frame_id >= 0:
+        for pos, record in enumerate(records):
+            if int(record['frame_id']) == int(context_frame_id):
+                context_pos = int(pos)
+                break
+    if context_pos is None:
+        return
+
+    end_pos = None
+    for pos in range(int(context_pos), len(records)):
+        end_dist = float((records[pos].get('borrow_motion') or {}).get('borrow_end_distance_m', np.nan))
+        if np.isfinite(end_dist) and end_dist <= 0.5:
+            end_pos = int(pos)
+            break
+    if end_pos is None:
+        return
+
+    go_pos = None
+    context_speed = float((records[context_pos].get('borrow_motion') or {}).get('speed_mps', np.nan))
+    if np.isfinite(context_speed) and context_speed > 0.5:
+        go_pos = int(context_pos)
+    else:
+        for pos in range(int(context_pos), int(end_pos) + 1):
+            motion = records[pos].get('borrow_motion') or {}
+            speed_mps = float(motion.get('speed_mps', np.nan))
+            start_dist = float(motion.get('borrow_start_distance_m', np.nan))
+            if np.isfinite(speed_mps) and speed_mps > 0.5 and np.isfinite(start_dist) and start_dist <= 5.0:
+                go_pos = int(pos)
+                break
+
+    band_positions = []
+    for pos, record in enumerate(records):
+        if pos > int(end_pos):
+            break
+        start_dist = float((record.get('borrow_motion') or {}).get('borrow_start_distance_m', np.nan))
+        if np.isfinite(start_dist) and 0.0 <= start_dist <= 10.0:
+            band_positions.append(int(pos))
+    if not band_positions:
+        return
+
+    start_pos = _borrow_find_slowdown_start_pos(
+        records,
+        candidate_positions=band_positions,
+        search_stop_pos=(go_pos if go_pos is not None else end_pos),
+    )
+    if start_pos is None:
+        fallback_positions = [
+            int(pos) for pos in band_positions
+            if int(pos) <= int(go_pos if go_pos is not None else end_pos)
+        ]
+        if not fallback_positions:
+            return
+        start_pos = min(
+            fallback_positions,
+            key=lambda pos: abs(float((records[pos].get('borrow_motion') or {}).get('borrow_start_distance_m', np.nan)) - 5.0),
+        )
+
+    if int(start_pos) > int(end_pos):
+        return
+
+    episode_id = 0
+    start_frame = int(records[start_pos]['frame_id'])
+    end_frame = int(records[end_pos]['frame_id'])
+    go_frame = int(records[go_pos]['frame_id']) if go_pos is not None else -1
+    for pos in range(int(start_pos), int(end_pos) + 1):
+        phase = 'yld' if (go_pos is None or int(pos) < int(go_pos)) else 'go'
+        frame_role = 'active'
+        if int(pos) == int(start_pos):
+            frame_role = 'start'
+        if go_pos is not None and int(pos) == int(go_pos):
+            frame_role = 'go_start'
+        if int(pos) == int(end_pos):
+            frame_role = 'end'
+        cross_info = {
+            'phase': str(phase),
+            'phase_code': int(CROSS_DECISION_PHASE_TO_CODE.get(phase, 0)),
+            'episode_id': int(episode_id),
+            'active': 1.0,
+            'active_time_s': float((int(pos) - int(start_pos)) * float(STAGE1_BORROW_ACTIVE_DT_S)),
+            'start_frame': int(start_frame),
+            'end_frame': int(end_frame),
+            'go_frame': int(go_frame),
+            'context_frame': int(context_frame_id),
+            'window_start_distance_m': 10.0,
+            'window_end_distance_m': 0.0,
+            'frame_role': str(frame_role),
+        }
+        _set_stage1_borrow_cross_annotation(samples[records[pos]['sample_idx']], cross_info)
+
+
+def _annotate_route_stage1_junction_cross_decisions(samples, route_sample_indices):
+    ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
+    records = []
+    for sample_idx in ordered_indices:
+        sample = samples[sample_idx]
+        stage1_debug = sample.get('stage1_speed_debug') or {}
+        current_cover = stage1_debug.get('current_cover') or {}
+        future_cover = stage1_debug.get('future_cover') or {}
+        speed_curve = stage1_debug.get('speed_curve') or {}
+        records.append({
+            'sample_idx': int(sample_idx),
+            'frame_id': int(sample.get('frame_id', -1)),
+            'current_cover': current_cover,
+            'future_cover': future_cover,
+            'merge_motion': stage1_debug.get('merge_motion') or {},
+            'meet_debug': speed_curve.get('meet_debug') or {},
+        })
+
+    default_info = _default_junction_cross_episode_debug()
+    for record in records:
+        _set_stage1_junction_cross_annotation(samples[record['sample_idx']], default_info)
+
+    if not records:
+        return
+
+    episode_id = 0
+    prev_end_pos = -1
+    for cluster in _junction_cluster_conflict_candidates(records):
+        start_pos = max(int(cluster['start_pos']), int(prev_end_pos) + 1)
+        if start_pos >= len(records):
+            continue
+        center_xy = np.asarray(cluster['center_xy'], dtype=np.float32)
+        radius_m = float(cluster['radius_m'])
+        if center_xy.shape != (2,) or not np.all(np.isfinite(center_xy)) or not np.isfinite(radius_m) or radius_m <= 0.0:
+            continue
+
+        cluster_positions = sorted(int(item['pos']) for item in cluster['items'] if int(item['pos']) >= int(start_pos))
+        if len(cluster_positions) < int(STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS):
+            continue
+
+        end_pos = None
+        has_entered_area = False
+        for pos in range(int(start_pos), len(records)):
+            ego_xy = _junction_record_ego_world_xy(records[pos])
+            if ego_xy is None:
+                continue
+            inside_area = float(np.linalg.norm(ego_xy - center_xy)) <= float(radius_m)
+            if inside_area:
+                has_entered_area = True
+                continue
+            if has_entered_area and not inside_area:
+                end_pos = int(pos)
+                break
+        if end_pos is None:
+            end_pos = int(max(cluster_positions) if not has_entered_area else len(records) - 1)
+
+        if int(start_pos) > int(end_pos):
+            continue
+
+        start_frame = int(records[start_pos]['frame_id'])
+        end_frame = int(records[end_pos]['frame_id'])
+        candidate_frame_count = int(len(cluster_positions))
+        for pos in range(int(start_pos), int(end_pos) + 1):
+            frame_role = 'active'
+            if int(pos) == int(start_pos):
+                frame_role = 'start'
+            if int(pos) == int(end_pos):
+                frame_role = 'end'
+            cross_info = {
+                'episode_id': int(episode_id),
+                'active': 1.0,
+                'start_frame': int(start_frame),
+                'end_frame': int(end_frame),
+                'frame_role': str(frame_role),
+                'area_center_world_xy': center_xy.astype(float).tolist(),
+                'area_radius_m': float(radius_m),
+                'candidate_frame_count': int(candidate_frame_count),
+            }
+            _set_stage1_junction_cross_annotation(samples[records[pos]['sample_idx']], cross_info)
+        prev_end_pos = int(end_pos)
+        episode_id += 1
 
 
 def _set_stage1_merge_annotation(sample, merge_info):
@@ -3361,9 +4236,94 @@ def _set_stage1_merge_annotation(sample, merge_info):
     sample['merge_go_frame'] = np.int64(int(merge_info.get('go_frame', -1)))
     sample['merge_resolution_actor_id'] = np.int64(int(merge_info.get('resolution_actor_id', -1)))
     sample['merge_end_state'] = np.int64(MERGE_END_STATE_TO_CODE.get(end_state, 0))
+    sample['merge_hold'] = np.float32(float(merge_info.get('hold', 0.0)))
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['merge_episode'] = _to_stage1_debug_python(dict(merge_info))
+
+
+def _gate_route_stage1_merge_speed_risks(samples, route_sample_indices):
+    for sample_idx in route_sample_indices:
+        sample = samples[int(sample_idx)]
+        merge_active = float(sample.get('merge_episode_active', 0.0))
+        if merge_active > 0.5:
+            continue
+
+        merge_yld = np.asarray(sample.get('speed_risk_merge_yld_values', []), dtype=np.float32).reshape(-1)
+        merge_go = np.asarray(sample.get('speed_risk_merge_go_values', []), dtype=np.float32).reshape(-1)
+        if merge_yld.size > 0:
+            sample['speed_risk_merge_yld_values'] = np.zeros_like(merge_yld, dtype=np.float32)
+        if merge_go.size > 0:
+            sample['speed_risk_merge_go_values'] = np.zeros_like(merge_go, dtype=np.float32)
+
+        stage1_debug = sample.get('stage1_speed_debug')
+        if not isinstance(stage1_debug, dict):
+            continue
+        speed_curve = stage1_debug.get('speed_curve')
+        if not isinstance(speed_curve, dict):
+            continue
+        debug_merge_yld = np.asarray(speed_curve.get('merge_yld_risks', []), dtype=np.float32).reshape(-1)
+        debug_merge_go = np.asarray(speed_curve.get('merge_go_risks', []), dtype=np.float32).reshape(-1)
+        if debug_merge_yld.size > 0:
+            speed_curve['merge_yld_risks'] = np.zeros_like(debug_merge_yld, dtype=np.float32)
+        if debug_merge_go.size > 0:
+            speed_curve['merge_go_risks'] = np.zeros_like(debug_merge_go, dtype=np.float32)
+
+
+def _gate_route_stage1_borrow_speed_risks(samples, route_sample_indices):
+    for sample_idx in route_sample_indices:
+        sample = samples[int(sample_idx)]
+        borrow_active = float(sample.get('borrow_cross_episode_active', 0.0))
+        if borrow_active > 0.5:
+            continue
+
+        borrow_yld = np.asarray(sample.get('speed_risk_borrow_yld_values', []), dtype=np.float32).reshape(-1)
+        borrow_go = np.asarray(sample.get('speed_risk_borrow_go_values', []), dtype=np.float32).reshape(-1)
+        if borrow_yld.size > 0:
+            sample['speed_risk_borrow_yld_values'] = np.zeros_like(borrow_yld, dtype=np.float32)
+        if borrow_go.size > 0:
+            sample['speed_risk_borrow_go_values'] = np.zeros_like(borrow_go, dtype=np.float32)
+
+        stage1_debug = sample.get('stage1_speed_debug')
+        if not isinstance(stage1_debug, dict):
+            continue
+        speed_curve = stage1_debug.get('speed_curve')
+        if not isinstance(speed_curve, dict):
+            continue
+        debug_borrow_yld = np.asarray(speed_curve.get('borrow_yld_risks', []), dtype=np.float32).reshape(-1)
+        debug_borrow_go = np.asarray(speed_curve.get('borrow_go_risks', []), dtype=np.float32).reshape(-1)
+        if debug_borrow_yld.size > 0:
+            speed_curve['borrow_yld_risks'] = np.zeros_like(debug_borrow_yld, dtype=np.float32)
+        if debug_borrow_go.size > 0:
+            speed_curve['borrow_go_risks'] = np.zeros_like(debug_borrow_go, dtype=np.float32)
+
+
+def _gate_route_stage1_junction_speed_risks(samples, route_sample_indices):
+    for sample_idx in route_sample_indices:
+        sample = samples[int(sample_idx)]
+        junction_active = float(sample.get('junction_cross_episode_active', 0.0))
+        if junction_active > 0.5:
+            continue
+
+        junction_yld = np.asarray(sample.get('speed_risk_junction_cross_yld_values', []), dtype=np.float32).reshape(-1)
+        junction_go = np.asarray(sample.get('speed_risk_junction_cross_go_values', []), dtype=np.float32).reshape(-1)
+        if junction_yld.size > 0:
+            sample['speed_risk_junction_cross_yld_values'] = np.zeros_like(junction_yld, dtype=np.float32)
+        if junction_go.size > 0:
+            sample['speed_risk_junction_cross_go_values'] = np.zeros_like(junction_go, dtype=np.float32)
+
+        stage1_debug = sample.get('stage1_speed_debug')
+        if not isinstance(stage1_debug, dict):
+            continue
+        speed_curve = stage1_debug.get('speed_curve')
+        if not isinstance(speed_curve, dict):
+            continue
+        debug_junction_yld = np.asarray(speed_curve.get('junction_cross_yld_risks', []), dtype=np.float32).reshape(-1)
+        debug_junction_go = np.asarray(speed_curve.get('junction_cross_go_risks', []), dtype=np.float32).reshape(-1)
+        if debug_junction_yld.size > 0:
+            speed_curve['junction_cross_yld_risks'] = np.zeros_like(debug_junction_yld, dtype=np.float32)
+        if debug_junction_go.size > 0:
+            speed_curve['junction_cross_go_risks'] = np.zeros_like(debug_junction_go, dtype=np.float32)
 
 
 def _annotate_route_stage1_merge_decisions(samples, route_sample_indices, grace_frames=STAGE1_MERGE_GRACE_FRAMES):
@@ -3374,344 +4334,152 @@ def _annotate_route_stage1_merge_decisions(samples, route_sample_indices, grace_
         stage1_debug = sample.get('stage1_speed_debug') or {}
         current_cover = stage1_debug.get('current_cover') or _cover_candidate_summary(0, None, {})
         future_cover = stage1_debug.get('future_cover') or _cover_candidate_summary(0, None, {})
+        speed_curve = stage1_debug.get('speed_curve') or {}
         records.append({
             'sample_idx': int(sample_idx),
             'frame_id': int(sample.get('frame_id', -1)),
             'current_cover': current_cover,
             'future_cover': future_cover,
             'merge_motion': stage1_debug.get('merge_motion') or {},
+            'meet_debug': speed_curve.get('meet_debug') or {},
         })
 
     default_info = _default_merge_episode_debug()
     for record in records:
         _set_stage1_merge_annotation(samples[record['sample_idx']], default_info)
 
-    pos = 0
     num_records = len(records)
-    raw_episodes = []
+    pos = 0
+    episode_id = 0
     while pos < num_records:
-        if not _cover_is_merge_meet(records[pos]['future_cover']):
-            pos += 1
-            continue
-
-        start_pos = pos
-        episode_positions = []
-        episode_role = {}
-        empty_run = 0
-        red_light_hold_run = 0
-        last_future_merge_pos = start_pos
-        future_merge_positions = []
-
+        start_scan_pos = None
         while pos < num_records:
-            future_cover = records[pos]['future_cover']
-            if _cover_is_merge_meet(future_cover):
-                empty_run = 0
-                red_light_hold_run = 0
-                last_future_merge_pos = pos
-                episode_positions.append(pos)
-                future_merge_positions.append(pos)
-                episode_role[int(pos)] = ('future_merge', 0)
-                pos += 1
-                continue
-            if empty_run < int(grace_frames):
-                empty_run += 1
-                red_light_hold_run = 0
-                episode_positions.append(pos)
-                episode_role[int(pos)] = ('future_grace', int(empty_run))
-                pos += 1
-                continue
-            if _merge_is_red_light_wait(records[pos].get('merge_motion', {})):
-                red_light_hold_run += 1
-                episode_positions.append(pos)
-                episode_role[int(pos)] = ('red_light_hold', int(red_light_hold_run))
-                pos += 1
-                continue
+            if np.isfinite(_merge_record_conflict_s(records[pos])):
+                start_scan_pos = int(pos)
+                break
+            pos += 1
+        if start_scan_pos is None:
             break
 
-        if not episode_positions:
-            continue
-
-        if len(future_merge_positions) < int(STAGE1_MERGE_START_CONFIRM_FRAMES):
-            pos = max(int(pos), int(episode_positions[-1]) + 1)
-            continue
-
-        raw_episodes.append({
-            'start_pos': int(start_pos),
-            'end_pos': int(episode_positions[-1]),
-            'episode_positions': [int(episode_pos) for episode_pos in episode_positions],
-            'episode_role': {int(k): (str(v[0]), int(v[1])) for k, v in episode_role.items()},
-            'future_merge_positions': [int(episode_pos) for episode_pos in future_merge_positions],
-            'last_future_merge_pos': int(last_future_merge_pos),
-        })
-
-    merged_episodes = []
-    for raw_episode in raw_episodes:
-        episode = {
-            'start_pos': int(raw_episode['start_pos']),
-            'end_pos': int(raw_episode['end_pos']),
-            'episode_positions': list(raw_episode['episode_positions']),
-            'episode_role': dict(raw_episode['episode_role']),
-            'future_merge_positions': list(raw_episode['future_merge_positions']),
-            'last_future_merge_pos': int(raw_episode['last_future_merge_pos']),
-        }
-        if not merged_episodes:
-            merged_episodes.append(episode)
-            continue
-
-        prev_episode = merged_episodes[-1]
-        gap_frames = int(episode['start_pos']) - int(prev_episode['end_pos']) - 1
-        if gap_frames > int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES):
-            merged_episodes.append(episode)
-            continue
-
-        previous_end_pos = int(prev_episode['end_pos'])
-        for gap_pos in range(previous_end_pos + 1, int(episode['start_pos'])):
-            if gap_pos not in prev_episode['episode_role']:
-                prev_episode['episode_positions'].append(int(gap_pos))
-                prev_episode['episode_role'][int(gap_pos)] = ('chain_grace', int(gap_pos - previous_end_pos))
-
-        for episode_pos in episode['episode_positions']:
-            if int(episode_pos) not in prev_episode['episode_positions']:
-                prev_episode['episode_positions'].append(int(episode_pos))
-            if int(episode_pos) in episode['episode_role']:
-                prev_episode['episode_role'][int(episode_pos)] = episode['episode_role'][int(episode_pos)]
-
-        prev_episode['future_merge_positions'].extend(int(episode_pos) for episode_pos in episode['future_merge_positions'])
-        prev_episode['future_merge_positions'] = sorted(set(prev_episode['future_merge_positions']))
-        prev_episode['episode_positions'] = sorted(set(prev_episode['episode_positions']))
-        prev_episode['end_pos'] = max(int(prev_episode['end_pos']), int(episode['end_pos']))
-        prev_episode['last_future_merge_pos'] = max(
-            int(prev_episode['last_future_merge_pos']),
-            int(episode['last_future_merge_pos']),
-        )
-
-    for episode_id, episode in enumerate(merged_episodes):
-        start_pos = int(episode['start_pos'])
-        merge_end_pos = int(episode['end_pos'])
-        episode_positions = [int(episode_pos) for episode_pos in episode['episode_positions']]
-        episode_role = {int(k): (str(v[0]), int(v[1])) for k, v in (episode.get('episode_role') or {}).items()}
-        future_merge_positions = [int(episode_pos) for episode_pos in episode['future_merge_positions']]
-        last_future_merge_pos = int(episode['last_future_merge_pos'])
-        start_frame = int(records[start_pos]['frame_id'])
-        end_state = 'ended_route_end'
-        resolution_actor_id = -1
-        resolution_found_pos = None
-        go_pos = None
-
-        actor_scan_end = min(
-            num_records - 1,
-            int(merge_end_pos) + max(
-                int(grace_frames),
-                int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES),
-                int(STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES),
-            ),
-        )
-        actor_tracks = _collect_merge_actor_tracks(
+        area_info = _merge_resolve_conflict_area(
             records,
-            range(int(start_pos), int(actor_scan_end) + 1),
+            _merge_collect_conflict_candidate_positions(records, start_scan_pos),
         )
-        ordered_tracks = sorted(
-            actor_tracks.values(),
-            key=lambda track: (
-                int(track['first_merge_pos']) if track['first_merge_pos'] is not None else (
-                    int(track['first_current_pos']) if track['first_current_pos'] is not None else (num_records + 1)
-                ),
-                int(track['first_current_pos']) if track['first_current_pos'] is not None else (num_records + 1),
-                int(track['actor_id']),
-            ),
-        )
-        actor_ids = [int(track['actor_id']) for track in ordered_tracks]
-        actor_id_set = set(int(actor_id) for actor_id in actor_ids)
-        actor_switch_frames = [
-            int(records[int(track['first_merge_pos'])]['frame_id'])
-            for track in ordered_tracks[1:]
-            if track.get('first_merge_pos') is not None and 0 <= int(track['first_merge_pos']) < num_records
+        if area_info is None:
+            pos = int(start_scan_pos) + 1
+            continue
+
+        start_pos = int(area_info['start_pos'])
+        future_merge_positions = [int(p) for p in area_info.get('inlier_positions', [])]
+        conflict_s_values = [
+            float(_merge_record_conflict_s(records[int(p)]))
+            for p in future_merge_positions
+            if np.isfinite(_merge_record_conflict_s(records[int(p)]))
         ]
+        if not future_merge_positions or not conflict_s_values:
+            pos = int(start_scan_pos) + 1
+            continue
 
-        resolution_track = None
-        resolution_candidates = []
-        for track in ordered_tracks:
-            first_merge_pos = track.get('first_merge_pos', None)
-            first_current_pos = track.get('first_current_pos', None)
-            if first_merge_pos is None or first_current_pos is None:
-                continue
-            if int(first_current_pos) < int(first_merge_pos):
-                continue
-            resolution_candidates.append((
-                int(first_current_pos),
-                int(track.get('last_pos') if track.get('last_pos') is not None else first_current_pos),
-                int(first_merge_pos),
-                int(track['actor_id']),
-                track,
-            ))
-        if resolution_candidates:
-            _, _, _, _, resolution_track = max(resolution_candidates, key=lambda item: (item[0], item[1], item[2], item[3]))
-            resolution_actor_id = int(resolution_track['actor_id'])
-            resolution_found_pos = int(resolution_track['first_current_pos'])
-            go_pos = int(resolution_track['first_current_pos'])
-            if resolution_track.get('chase_positions'):
-                end_state = 'ended_with_chase'
-            else:
-                end_state = 'ended_with_other_current_actor'
+        go_pos = None
+        go_reason = 'none'
+        end_pos = None
+        end_state = 'ended_route_end'
+        scan_pos = int(start_pos)
 
-        resolve_scan_end = min(
-            num_records - 1,
-            int(merge_end_pos) + int(STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES),
-        )
-        if resolution_actor_id < 0:
-            for search_pos in range(int(last_future_merge_pos) + 1, int(resolve_scan_end) + 1):
-                if _merge_is_red_light_wait(records[search_pos].get('merge_motion', {})):
-                    continue
-                current_cover = records[search_pos]['current_cover']
-                if int((current_cover or {}).get('exists', 0.0)) <= 0:
-                    continue
-                current_actor_id = _cover_actor_id(current_cover)
-                if current_actor_id not in actor_id_set:
-                    continue
-                if resolution_actor_id < 0:
-                    resolution_actor_id = int(current_actor_id)
-                    resolution_found_pos = int(search_pos)
-                    end_state = 'ended_with_other_current_actor'
-                if _cover_is_chase(current_cover) and current_actor_id in actor_id_set:
-                    resolution_actor_id = int(current_actor_id)
-                    resolution_found_pos = int(search_pos)
-                    end_state = 'ended_with_chase'
-                    break
+        merge_area_first_conflict_s_m = float(area_info['first_conflict_s_m'])
+        merge_area_last_conflict_s_m = float(area_info['last_conflict_s_m'])
+        merge_area_start_s_m = float(merge_area_first_conflict_s_m)
+        merge_area_end_s_m = float(merge_area_last_conflict_s_m + float(STAGE1_MERGE_AREA_POST_MARGIN_M))
 
-        next_pos = merge_end_pos + 1
-        if resolution_actor_id < 0 and next_pos < num_records:
-            next_current_cover = records[next_pos]['current_cover']
-            end_state = _merge_end_state_from_cover(next_current_cover)
-            next_actor_id = _cover_actor_id(next_current_cover)
-            if end_state == 'ended_with_chase' and next_actor_id in actor_id_set:
-                resolution_actor_id = int(next_actor_id)
-        if resolution_actor_id >= 0 and go_pos is None:
-            for episode_pos in episode_positions:
-                if _merge_is_red_light_wait(records[episode_pos].get('merge_motion', {})):
-                    continue
-                current_cover = records[episode_pos]['current_cover']
-                if _cover_actor_id(current_cover) == resolution_actor_id:
-                    go_pos = episode_pos
-                    break
-            if go_pos is None and resolution_found_pos is not None:
-                go_pos = int(resolution_found_pos)
+        while scan_pos < num_records:
+            if go_pos is None:
+                has_go_signal, current_go_reason = _merge_record_go_signal(
+                    records[scan_pos],
+                    merge_area_start_s_m=merge_area_start_s_m,
+                )
+                if has_go_signal:
+                    go_pos = int(scan_pos)
+                    go_reason = str(current_go_reason)
 
-        post_pos = merge_end_pos + 1
-        post_empty_run = 0
-        if resolution_actor_id >= 0 and go_pos is not None:
-            while post_pos < num_records:
-                future_cover = records[post_pos]['future_cover']
-                current_cover = records[post_pos]['current_cover']
-                current_actor_id = _cover_actor_id(current_cover)
-                if _cover_is_merge_meet(future_cover):
-                    break
-                if int((current_cover or {}).get('exists', 0.0)) > 0 and current_actor_id == resolution_actor_id:
-                    episode_positions.append(post_pos)
-                    if _cover_is_chase(current_cover):
-                        episode_role[int(post_pos)] = ('go_follow', 0)
-                        end_state = 'ended_with_chase'
-                    else:
-                        episode_role[int(post_pos)] = ('go_current_actor', 0)
-                    post_empty_run = 0
-                    post_pos += 1
-                    continue
-                if (
-                    int((current_cover or {}).get('exists', 0.0)) > 0
-                    and current_actor_id >= 0
-                    and current_actor_id not in actor_id_set
-                    and post_empty_run < int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES)
-                ):
-                    episode_positions.append(post_pos)
-                    post_empty_run += 1
-                    episode_role[int(post_pos)] = ('go_other_actor_grace', int(post_empty_run))
-                    post_pos += 1
-                    continue
-                if int((current_cover or {}).get('exists', 0.0)) > 0:
-                    break
-                if post_empty_run < int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES):
-                    episode_positions.append(post_pos)
-                    post_empty_run += 1
-                    episode_role[int(post_pos)] = ('go_empty_grace', int(post_empty_run))
-                    post_pos += 1
-                    continue
+            if _merge_record_passed_area(records[scan_pos], merge_area_end_s_m):
+                end_pos = int(scan_pos)
+                end_state = 'ended_merge_area'
                 break
+            scan_pos += 1
 
-        if resolution_actor_id >= 0 and go_pos is None:
-            for episode_pos in episode_positions:
-                if _merge_is_red_light_wait(records[episode_pos].get('merge_motion', {})):
-                    continue
-                current_cover = records[episode_pos]['current_cover']
-                if _cover_actor_id(current_cover) == resolution_actor_id:
-                    go_pos = episode_pos
-                    break
-
-        end_pos = episode_positions[-1]
-        lane_settle_start_pos = None
-        if resolution_actor_id >= 0 and go_pos is not None:
-            stable_count = 0
-            stable_scan_start = max(int(go_pos), int(merge_end_pos) + 1)
-            for scan_pos in range(stable_scan_start, int(end_pos) + 1):
-                if _cover_is_merge_meet(records[scan_pos]['future_cover']):
-                    stable_count = 0
-                    continue
-                if _merge_is_red_light_wait(records[scan_pos].get('merge_motion', {})):
-                    stable_count = 0
-                    continue
-                if _merge_go_lane_settled(records[scan_pos].get('merge_motion', {})):
-                    stable_count += 1
-                    if stable_count >= int(STAGE1_GO_END_CONFIRM_FRAMES):
-                        lane_settle_start_pos = int(scan_pos) - int(STAGE1_GO_END_CONFIRM_FRAMES) + 1
-                        break
-                else:
-                    stable_count = 0
-            if lane_settle_start_pos is not None and lane_settle_start_pos > int(go_pos):
-                end_pos = int(lane_settle_start_pos) - 1
-        effective_episode_positions = [episode_pos for episode_pos in episode_positions if int(episode_pos) <= int(end_pos)]
+        if end_pos is None:
+            end_pos = num_records - 1
+        start_frame = int(records[start_pos]['frame_id'])
         end_frame = int(records[end_pos]['frame_id'])
         no_go = go_pos is None
+        actor_ids, actor_switch_frames, dominant_actor_id = _merge_episode_actor_summary(records, start_pos, end_pos)
+
         red_light_hold_indices = {}
         red_light_hold_run = 0
-        for episode_pos in effective_episode_positions:
+        for episode_pos in range(int(start_pos), int(end_pos) + 1):
             if _merge_is_red_light_wait(records[episode_pos].get('merge_motion', {})):
                 red_light_hold_run += 1
                 red_light_hold_indices[int(episode_pos)] = int(red_light_hold_run)
             else:
                 red_light_hold_run = 0
-        for episode_pos in effective_episode_positions:
+
+        merge_area_first_conflict_s_m = float(min(conflict_s_values))
+        merge_area_last_conflict_s_m = float(max(conflict_s_values))
+        merge_area_start_s_m = float(merge_area_first_conflict_s_m)
+        merge_area_end_s_m = float(merge_area_last_conflict_s_m + float(STAGE1_MERGE_AREA_POST_MARGIN_M))
+
+        for episode_pos in range(int(start_pos), int(end_pos) + 1):
             record = records[episode_pos]
-            role_name, role_index = episode_role.get(int(episode_pos), ('none', 0))
             red_light_hold = _merge_is_red_light_wait(record.get('merge_motion', {}))
+            hold_reason = 'red_light' if red_light_hold else 'none'
             if no_go:
                 phase = 'yld'
-                active = 1.0
             else:
-                phase = 'yld' if episode_pos < int(go_pos) else 'go'
-                active = 1.0
+                phase = 'yld' if int(episode_pos) < int(go_pos) else 'go'
+            frame_role = phase
+            if int(episode_pos) == int(start_pos):
+                frame_role = 'start'
+            if red_light_hold:
+                frame_role = 'hold'
+            if go_pos is not None and int(episode_pos) == int(go_pos):
+                frame_role = 'go_start'
+            if int(episode_pos) == int(end_pos):
+                frame_role = 'end'
             merge_info = {
-                'phase': phase,
+                'phase': str(phase),
                 'phase_code': int(MERGE_DECISION_PHASE_TO_CODE[phase]),
                 'episode_id': int(episode_id),
-                'active': float(active),
+                'active': 1.0,
+                'hold': float(red_light_hold),
+                'hold_reason': str(hold_reason),
                 'no_go': float(no_go),
                 'start_frame': int(start_frame),
                 'end_frame': int(end_frame),
                 'go_frame': int(records[go_pos]['frame_id']) if go_pos is not None else -1,
-                'resolution_actor_id': int(resolution_actor_id),
+                'resolution_actor_id': int(dominant_actor_id),
                 'end_state': str(end_state),
                 'end_state_code': int(MERGE_END_STATE_TO_CODE.get(end_state, 0)),
                 'actor_ids': [int(actor_id) for actor_id in actor_ids],
                 'actor_switch_frames': [int(frame_id) for frame_id in actor_switch_frames],
                 'future_merge_count': int(len(future_merge_positions)),
-                'frame_role': 'red_light_hold' if red_light_hold else str(role_name),
-                'future_grace_index': int(role_index) if (str(role_name) == 'future_grace' and not red_light_hold) else 0,
+                'merge_area_start_s_m': float(merge_area_start_s_m),
+                'merge_area_end_s_m': float(merge_area_end_s_m),
+                'merge_area_first_conflict_s_m': float(merge_area_first_conflict_s_m),
+                'merge_area_last_conflict_s_m': float(merge_area_last_conflict_s_m),
+                'frame_role': str(frame_role),
+                'future_grace_index': 0,
                 'red_light_hold_index': int(red_light_hold_indices.get(int(episode_pos), 0)),
-                'post_go_grace_index': int(role_index) if str(role_name) in {'go_empty_grace', 'go_other_actor_grace'} else 0,
+                'post_go_grace_index': 0,
                 'red_light_hold': float(red_light_hold),
-                'grace_frames': int(grace_frames),
-                'actor_grace_frames': int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES),
-                'resolution_lookahead_frames': int(STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES),
+                'grace_frames': 0,
+                'actor_grace_frames': 0,
+                'resolution_lookahead_frames': 0,
+                'go_reason': str(go_reason),
             }
             _set_stage1_merge_annotation(samples[record['sample_idx']], merge_info)
+
+        episode_id += 1
+        pos = int(end_pos) + 1
 
 
 def _build_future_frames_data(image_data_root, base_dir, frame_str, num_future):
@@ -4296,7 +5064,7 @@ def precompute(
                 if int(future_cover.get('exists', 0.0)) > 0 and future_cover['interaction']['name'] == 'meet':
                     persisted_meet = dict(future_cover)
                     persisted_meet['actor_id'] = int(future_cover.get('actor_id', -1))
-                    persisted_meet_frames_left = 4
+                    persisted_meet_frames_left = STAGE1_PERSISTED_MEET_FRAMES
                 elif persisted_meet is not None and persisted_meet_frames_left > 0:
                     actor_id = int(persisted_meet.get('actor_id', -1))
                     actor_box = _find_box_by_id(current_boxes_dynamic, actor_id)
@@ -4331,6 +5099,23 @@ def precompute(
                         persisted_meet = None
                         persisted_meet_frames_left = 0
 
+                scene_route_world = scene_route_polyline_world.get(base_dir_cur)
+                current_cover = _augment_cover_with_scene_route_fields(
+                    current_cover,
+                    ego_matrix_current=ego_matrix_current,
+                    scene_route_polyline_world=scene_route_world,
+                )
+                future_cover = _augment_cover_with_scene_route_fields(
+                    future_cover,
+                    ego_matrix_current=ego_matrix_current,
+                    scene_route_polyline_world=scene_route_world,
+                )
+                speed_curve_future_cover = _augment_cover_with_scene_route_fields(
+                    speed_curve_future_cover,
+                    ego_matrix_current=ego_matrix_current,
+                    scene_route_polyline_world=scene_route_world,
+                )
+
                 raw_cross_active = _cover_is_cross_meet(current_cover) or _cover_is_cross_meet(speed_curve_future_cover)
                 if not cross_episode_active and raw_cross_active:
                     cross_episode_active = True
@@ -4338,6 +5123,12 @@ def precompute(
                     scene_borrow_context,
                     current_meas=current_measurements,
                     route_local=route_input,
+                )
+                borrow_motion = _build_borrow_motion_context(
+                    scene_borrow_context,
+                    current_meas=current_measurements,
+                    route_local=route_input,
+                    frame_id=int(sample.get('frame_id', -1)),
                 )
 
                 def _cross_start_distance_from_cover(cover):
@@ -4489,12 +5280,22 @@ def precompute(
                     merge_motion=_build_merge_motion_context(
                         current_meas=current_measurements,
                         route_dense=front_debug.get('route_dense'),
+                        ego_matrix_current=ego_matrix_current,
+                        current_boxes=current_boxes_dynamic,
+                        scene_route_polyline_world=scene_route_world,
                     ),
+                    scene_borrow_context=scene_borrow_context,
+                    borrow_motion=borrow_motion,
                 )
                 stage1_speed_built += 1
                 _maybe_checkpoint(phase='stage1_speed')
 
+            _annotate_route_stage1_borrow_cross_decisions(samples, route_sample_indices)
+            _annotate_route_stage1_junction_cross_decisions(samples, route_sample_indices)
             _annotate_route_stage1_merge_decisions(samples, route_sample_indices)
+            _gate_route_stage1_junction_speed_risks(samples, route_sample_indices)
+            _gate_route_stage1_borrow_speed_risks(samples, route_sample_indices)
+            _gate_route_stage1_merge_speed_risks(samples, route_sample_indices)
             dirty_since_checkpoint = True
             _maybe_checkpoint(phase='stage1_speed')
             route_total_s = float(time.perf_counter() - route_total_start)
