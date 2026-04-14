@@ -3668,6 +3668,7 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
     merge_phase = str(merge_episode.get("phase", "none"))
     merge_end_state = str(merge_episode.get("end_state", "none"))
     merge_frame_role = str(merge_episode.get("frame_role", "none"))
+    speed_curve_source = str(stage1_label.get("speed_curve_source", "unknown"))
     merge_actor_ids = ",".join(str(int(actor_id)) for actor_id in merge_episode.get("actor_ids", [])[:4]) or "-"
     merge_switch_frames = ",".join(str(int(frame_id)) for frame_id in merge_episode.get("actor_switch_frames", [])[:4]) or "-"
     merge_color = (200, 200, 200)
@@ -3700,6 +3701,7 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
             _fmt_val(future_cover["d_bg"]),
             future_cover["interaction"]["source"],
         ), (160, 160, 160), 0.54),
+        ("speed src={}".format(speed_curve_source), (170, 170, 170), 0.52),
         ("merge ep={}  phase={}  no_go={}  end={}".format(
             int(merge_episode.get("episode_id", -1)),
             merge_phase,
@@ -3739,6 +3741,7 @@ def _compose_frame(rgb, panel, sample, label, current_meas, current_boxes, inter
 
 def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
     merge_default = _default_merge_episode_debug()
+    prefer_packed_speed_risk = bool(sample_vis.get("_prefer_packed_speed_risk", True))
 
     def _merge_episode_payload(precomputed=None):
         merge_episode = sample_vis.get("_merge_episode", None)
@@ -3770,7 +3773,7 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
         "_cross_wait_time_s" in sample_vis or
         "_speed_curve_future_cover" in sample_vis
     )
-    if isinstance(precomputed, dict) and "speed_curve" in precomputed and not runtime_speed_overrides:
+    if isinstance(precomputed, dict) and "speed_curve" in precomputed and not runtime_speed_overrides and prefer_packed_speed_risk:
         speed_curve = {
             "sample_speeds_mps": np.asarray(precomputed.get("speed_curve", {}).get("sample_speeds_mps", []), dtype=np.float32).astype(float).tolist(),
             "total_risks": np.asarray(precomputed.get("speed_curve", {}).get("total_risks", []), dtype=np.float32).astype(float).tolist(),
@@ -3826,6 +3829,7 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
             "speed_curve_future_persisted": bool(precomputed.get("speed_curve_future_persisted", False)),
             "merge_episode": _merge_episode_payload(precomputed),
             "merge_motion": _merge_motion_payload(precomputed),
+            "speed_curve_source": "packed",
             "speed_curve": speed_curve,
         }
 
@@ -3852,7 +3856,8 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
     borrow_yld_risks = np.asarray(speed_curve.get("borrow_yld_risks", np.zeros(sample_speeds.shape, dtype=np.float32)), dtype=np.float32)
     borrow_go_risks = np.asarray(speed_curve.get("borrow_go_risks", np.zeros(sample_speeds.shape, dtype=np.float32)), dtype=np.float32)
     ped_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    if all(k in sample_vis for k in ("speed_sample_values", "speed_risk_chase_values", "speed_risk_meet_values", "speed_risk_ped_values")):
+    speed_curve_source = "recomputed"
+    if prefer_packed_speed_risk and all(k in sample_vis for k in ("speed_sample_values", "speed_risk_chase_values", "speed_risk_meet_values", "speed_risk_ped_values")):
         pre_speeds = np.asarray(sample_vis.get("speed_sample_values", []), dtype=np.float32)
         pre_chase = np.asarray(sample_vis.get("speed_risk_chase_values", []), dtype=np.float32)
         pre_meet = np.asarray(sample_vis.get("speed_risk_meet_values", []), dtype=np.float32)
@@ -3876,6 +3881,7 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
             borrow_yld_risks = pre_borrow_yld
             borrow_go_risks = pre_borrow_go
             ped_risks = pre_ped
+            speed_curve_source = "packed_override"
     meet_subtype = str(speed_curve.get("meet", {}).get("subtype", speed_curve.get("meet_debug", {}).get("subtype", "none")))
     if meet_subtype == "borrow_cross_meet":
         if (
@@ -3897,6 +3903,7 @@ def _stage1_label_payload(sample_vis, current_meas, current_boxes=None):
         "speed_curve_future_persisted": bool(sample_vis.get("_speed_curve_future_persisted", False)),
         "merge_episode": _merge_episode_payload(),
         "merge_motion": _merge_motion_payload(),
+        "speed_curve_source": speed_curve_source,
         "speed_curve": {
             "sample_speeds_mps": sample_speeds.astype(np.float32).astype(float).tolist(),
             "total_risks": total_risks.astype(np.float32).astype(float).tolist(),
@@ -4134,6 +4141,19 @@ def main():
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--save_frames_dir", type=str, default=None, help="Optional directory to save per-frame PNGs and route JSON")
     parser.add_argument("--save_only_after_release", action="store_true", help="If set, only save frames from the first release pulse onward")
+    parser.set_defaults(prefer_packed_speed_risk=True)
+    parser.add_argument(
+        "--prefer_packed_speed_risk",
+        dest="prefer_packed_speed_risk",
+        action="store_true",
+        help="Prefer packed speed-risk arrays when available. Default behavior.",
+    )
+    parser.add_argument(
+        "--recompute_speed_risk_only",
+        dest="prefer_packed_speed_risk",
+        action="store_false",
+        help="Ignore packed speed-risk arrays and force speed-risk recomputation from current cover/debug inputs.",
+    )
     args = parser.parse_args()
 
     if bool(args.dataset_path) == bool(args.route_dir):
@@ -4404,6 +4424,7 @@ def main():
         sample_vis["_route_extension_raw"] = compare_raw_ext
         sample_vis["_route_extension_yflip"] = compare_flip_ext
         sample_vis["_debug"] = debug
+        sample_vis["_prefer_packed_speed_risk"] = bool(args.prefer_packed_speed_risk)
         route_arr = np.asarray(route_input, dtype=np.float32)
         sample_vis["_route_num_points"] = int(route_arr.shape[0]) if route_arr.ndim == 2 else 0
         corridor_arr = np.asarray(route_corridor_input, dtype=np.float32)
