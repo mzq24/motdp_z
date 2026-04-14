@@ -80,6 +80,8 @@ def main() -> None:
             key = _sample_key(sample)
             if key not in index:
                 raise KeyError(f"overlay key missing from base dataset: {key}")
+            if key in replaced_keys:
+                raise ValueError(f"duplicate overlay key across shards: {key}")
             base_samples[index[key]] = sample
             replaced_keys.add(key)
             replaced_here += 1
@@ -88,6 +90,12 @@ def main() -> None:
             "sample_count": len(overlay_samples),
             "replaced_count": replaced_here,
         })
+
+    if len(replaced_keys) != len(base_samples):
+        raise RuntimeError(
+            "overlay coverage mismatch: "
+            f"replaced={len(replaced_keys)} base={len(base_samples)}"
+        )
 
     _atomic_pickle_save(base_samples, args.output)
     summary = {

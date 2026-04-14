@@ -83,39 +83,25 @@ def _atomic_json_save(payload, target_path: str) -> None:
 
 
 def _build_route_groups(samples: Sequence[Dict]) -> List[Dict]:
-    groups: List[Dict] = []
-    last_base = None
-    indices: List[int] = []
-    start_index = 0
+    groups_by_base: Dict[str, Dict] = {}
+    ordered_bases: List[str] = []
     for sample_idx, sample in enumerate(samples):
         base_dir = _resolve_base_dir(sample)
-        if base_dir != last_base:
-            if indices:
-                groups.append(
-                    {
-                        "base_dir": last_base,
-                        "indices": indices,
-                        "start_index": start_index,
-                        "end_index": indices[-1],
-                        "sample_count": len(indices),
-                    }
-                )
-            last_base = base_dir
-            indices = [sample_idx]
-            start_index = sample_idx
-        else:
-            indices.append(sample_idx)
-    if indices:
-        groups.append(
-            {
-                "base_dir": last_base,
-                "indices": indices,
-                "start_index": start_index,
-                "end_index": indices[-1],
-                "sample_count": len(indices),
+        group = groups_by_base.get(base_dir)
+        if group is None:
+            group = {
+                "base_dir": base_dir,
+                "indices": [],
+                "start_index": sample_idx,
+                "end_index": sample_idx,
+                "sample_count": 0,
             }
-        )
-    return groups
+            groups_by_base[base_dir] = group
+            ordered_bases.append(base_dir)
+        group["indices"].append(sample_idx)
+        group["end_index"] = sample_idx
+        group["sample_count"] += 1
+    return [groups_by_base[base_dir] for base_dir in ordered_bases]
 
 
 def _split_groups_evenly(groups: Sequence[Dict], num_shards: int) -> List[List[Dict]]:
@@ -164,6 +150,7 @@ def _summarize_groups(groups: Sequence[Dict]) -> Dict:
     if not groups:
         return {
             "route_group_count": 0,
+            "scene_count": 0,
             "sample_count": 0,
             "first_scene": "",
             "last_scene": "",
@@ -172,6 +159,7 @@ def _summarize_groups(groups: Sequence[Dict]) -> Dict:
         }
     return {
         "route_group_count": len(groups),
+        "scene_count": len(groups),
         "sample_count": sum(int(group["sample_count"]) for group in groups),
         "first_scene": str(groups[0]["base_dir"]),
         "last_scene": str(groups[-1]["base_dir"]),
@@ -211,6 +199,7 @@ def main() -> None:
         "output_root": os.path.realpath(args.output_root),
         "num_input_samples": len(samples),
         "num_route_groups": len(groups),
+        "num_scenes": len(groups),
         "num_shards": len(shards),
         "clear_existing_stage1": not args.keep_existing_stage1,
         "shards": [],

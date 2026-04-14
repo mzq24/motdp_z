@@ -406,6 +406,128 @@ In the current implementation:
 - for two-way borrow scenes, the cross start comes from the scene corridor
 - for junction cross scenes, it comes from generic cover geometry instead
 
+### 8.1 2026-04-14 agreed direction for `borrow_cross_meet` window
+
+For the two-way borrowed-lane case, the geometry stack is now considered
+stable enough to separate:
+
+- corridor localization
+- `yld / go` speed logic
+- borrow-cross episode window
+
+The intended layering is:
+
+1. localize blocker / obstacle from event-driven scene logic
+2. choose the blocker-consistent `context_frame_id`
+3. use that context-frame `route + 12` extension to build corridor `start/end`
+4. detect corridor `current_cover / future_cover`
+5. compute:
+   - `v_yield_max_mps`
+   - `v_go_min_mps`
+6. build `borrow_cross_active` as an explicit start/end window
+
+Important interpretation:
+
+- `yld / go`
+  - speed-phase semantics
+- `borrow_cross_active`
+  - episode window semantics
+- they are related, but not the same label
+
+### 8.2 Agreed `borrow_cross_meet` speed semantics
+
+Once corridor `start/end` is fixed:
+
+- if an oncoming actor already covers the corridor:
+  - ego can only `yld`
+- if the corridor is not currently covered:
+  - `go` means ego can enter, traverse, and fully clear the corridor before the
+    next oncoming actor reaches it
+
+So the key question is not classification anymore; it is the timing logic:
+
+- `yld`
+  - oncoming traffic already occupies / reaches the corridor first
+- `go`
+  - ego fully clears the corridor before that oncoming occupation happens
+
+With correct `v_yield_max_mps / v_go_min_mps`, the later speed-curve energy is
+treated as a deterministic mapping and should not be the fragile part.
+
+### 8.3 Agreed `borrow_cross_meet` window start/end
+
+Current agreed direction:
+
+- the window should be route/progress based
+- `start` and `end` must be an explicit pair
+
+#### `go` phase start
+
+At the geometric `context frame`, ego is usually near the borrowed-lane entry.
+
+If ego speed is already greater than `0.5 m/s` there:
+
+- treat that frame as the start of `go`
+
+Otherwise:
+
+- keep searching forward near corridor start
+- the first frame where speed rises above `0.5 m/s`
+  - becomes the `go` start
+
+#### window end
+
+Current intended definition:
+
+- the borrow-cross window ends when ego reaches corridor end
+
+This is intentionally simpler than a full-vehicle clear condition, because the
+current corridor end already includes a conservative margin.
+
+#### active timer
+
+Because the oncoming background vehicle can move outside the perception range
+while the borrowed-lane interaction is still semantically active, we also keep
+an explicit active timer:
+
+- `borrow_cross_active_time_s`
+- it starts at `0.0` on the active-window start frame
+- it increases by `0.25s` each frame while `borrow_cross_episode_active == 1`
+- it resets to `0.0` outside the active window
+
+This timer is intended as an extra conditioning signal for models when the
+causal background actor is no longer directly visible.
+
+#### window start
+
+Current intended definition:
+
+- use route-based distance to corridor start
+- inspect the band:
+  - `[corridor_start_s - 10 m, corridor_start_s]`
+- if a stable slowdown onset is present there:
+  - use that slowdown point as the window start
+- if no clear slowdown onset is present:
+  - fall back to the `5 m` point before corridor start
+
+So the practical fallback is:
+
+- preferred: slowdown onset in the `10 m -> 0 m` band
+- fallback: fixed `5 m` pre-start point
+
+### 8.4 Stability note
+
+The main stability concern is not blocker localization anymore.
+
+The main remaining sensitivity is:
+
+- how we define "slowdown starts"
+
+Current agreed fallback means this is no longer a hard blocker:
+
+- use slowdown if it is clearly visible
+- otherwise use the fixed `5 m` pre-start fallback
+
 ## 9. Junction-left cross split: `yld` / `go`
 
 `junction_left_cross_meet` should be treated as a decomposed cross-decision
@@ -435,6 +557,38 @@ Those values were mainly stored inside `meet_debug`, but the saved supervision
 was still mostly folded into:
 
 - `speed_risk_meet_values`
+
+### 9.2 Current `junction_cross_active` direction
+
+`junction_left_cross_meet` now also carries an explicit episode window:
+
+- `junction_cross_episode_id`
+- `junction_cross_episode_active`
+- `junction_cross_episode_start_frame`
+- `junction_cross_episode_end_frame`
+
+The intended logic is:
+
+1. treat single-frame cover only as conflict-point evidence
+2. accumulate multi-frame conflict-point history
+3. cluster those conflict points into a stable local conflict area
+4. choose the in-area frame with minimum ego route progress as `start`
+5. keep the episode active until ego leaves that conflict area
+
+Important:
+
+- `cover` is evidence, not the hard window start by itself
+- the area is built from collision/conflict history, not one raw cover frame
+- `end` is defined by ego leaving the conflict area
+
+In practice this means:
+
+- the false early current-only junction-cross cases are less likely to open a
+  window by themselves
+- `junction_cross_active` is now parallel in spirit to:
+  - route-based `merge_active`
+  - corridor-based `borrow_cross_active`
+  while still using its own local cross-conflict geometry
 
 So older sessions may remember that "junction cross had go/yld ideas already".
 That memory is correct at the debug / formula level, but not at the stable
@@ -558,6 +712,183 @@ High-level flow:
   - to cover chase / continuity / lane-settle transition
 9. end `go` when lane-settle is confirmed
   - current code uses steer + heading alignment
+
+## 12. 2026-04-14 merge relabeling direction
+
+The current packed labels should not be treated as authoritative for merge
+analysis.
+
+We already found at least one route where:
+
+- packed `current_cover / future_cover` reported raw merge cover
+- but the same route, when recomputed with the current video-time cover logic,
+  had no raw merge cover at all
+
+So the current working rule is:
+
+- do not use old packed merge-cover debug to decide final merge logic
+- for the next full relabeling pass, use the current code path and regenerate
+  stage1 from scratch
+
+### 12.1 Agreed merge layering
+
+The intended interpretation stays:
+
+- `cover`
+  - geometric base fact
+- `v_yield_max / v_go_min / v_go_need`
+  - threshold layer derived from cover and timing
+- `merge_yld_risks / merge_go_risks / meet_risks`
+  - deterministic energy / risk mapping from the threshold layer
+
+But this interpretation is only trustworthy when the underlying merge cover is
+freshly recomputed.
+
+### 12.2 Agreed start / end principles
+
+The merge window should be built as an explicit start/end pair.
+
+- if there is a `merge start`, there must be a matching `merge end`
+- if there is a `merge end`, there must be a matching `merge start`
+
+Current agreed direction:
+
+- `merge_start`
+  - anchor from the first valid `future_cover == merge_meet`
+- `merge_active`
+  - should span the full merge window from `start` to `end`
+- do not rely on ad-hoc active grace to define the window itself
+  - short cover dropouts may exist inside the window, but the window should be
+    defined by start/end, not by local grace bookkeeping
+
+### 12.3 Agreed hold semantics
+
+`hold / wait` is not on the same layer as `yld / go`.
+
+The intended decomposition is:
+
+- `merge_active`
+  - episode window
+- `merge_phase`
+  - `yld` or `go`
+- `merge_hold`
+  - separate state inside the active window
+  - for example red-light hold
+
+So:
+
+- `yld / go` describes the merge decision phase
+- `hold` describes why ego is not moving / is still paused
+- `hold` should not replace the active window
+
+### 12.4 Agreed finite-threshold policy
+
+For merge debug / saved threshold values:
+
+- avoid emitting `NaN` just because a denominator is very small
+- instead, clamp very large speeds to a large finite cap
+  - current discussion example: `1000 m/s`
+
+This applies especially to:
+
+- `v_equal_mps`
+- `v_go_min_mps`
+- `v_go_need_mps`
+- `v_yield_max_mps`
+
+The branch split between "front-arrive timing" and "rear catch-up regime" can
+remain, but the exported values should be finite and clipped rather than hidden
+behind `NaN`.
+
+### 12.5 Agreed route-based merge-area direction
+
+For the next merge relabeling pass, the preferred end logic is route-based.
+
+Current agreed direction:
+
+1. when merge first appears, record the future-merge conflict / collision point
+2. keep recording later merge conflict points as the same merge evolves
+3. convert those points into a route-aligned merge area
+4. end the merge window when ego has progressed past that merge area
+
+Why route-based:
+
+- it keeps the active window aligned with ego progress
+- it is cheaper than purely world-space geometric fitting
+- it naturally supports a single start/end window
+
+### 12.6 Geometry confidence ideas that are still open
+
+The following idea is considered promising, but is not yet fixed:
+
+- use recorded merge conflict points to build a confidence signal for the merge
+  area
+
+Two candidate confidence formulations were discussed:
+
+1. fit a circle to the conflict points
+  - smaller fitted radius -> higher confidence
+2. use a fixed-radius circle, for example radius `5 m`
+  - center it at the first merge conflict point
+  - more later conflict points inside the circle -> higher confidence
+
+Current status:
+
+- the merge area itself should still be route-based
+- the circle-based logic is only a candidate confidence / quality score, not
+  yet the primary definition of `merge_end`
+
+### 12.7 Small merge questions intentionally left open
+
+These are the items still worth discussing before the final relabeling pass:
+
+- the exact finite cap used for very large threshold speeds
+- how the route-aligned merge area is best projected / widened
+- whether we want to save an explicit `merge_hold` top-level field in stage1
+- whether circle-based confidence is useful enough to save as debug
+
+### 12.8 2026-04-14 implementation status in code
+
+The current in-repo mainline has now moved part of this direction into
+`precompute_semantic_labels.py`.
+
+Current implementation status:
+
+- merge cover summaries now retain route/progress geometry:
+  - `route_distance_m`
+  - `ego_route_front_s_m`
+  - `route_point_local_xy`
+  - `scene_route_conflict_s_m`
+  - `scene_route_conflict_world_xy`
+- merge motion debug now retains route-progress state:
+  - `scene_route_center_s_m`
+  - `scene_route_front_s_m`
+  - `scene_route_rear_s_m`
+  - `ego_half_length_m`
+- merge threshold debug now uses finite clipped values rather than hiding near
+  singular cases with `NaN`
+  - current cap in code: `STAGE1_MERGE_SPEED_CAP_MPS = 1000.0`
+- merge episode parsing is no longer driven by a resolution actor as the main
+  source of truth
+  - `merge_start`
+    - first future merge seed with valid route-progress conflict geometry
+  - `merge_area`
+    - built from min/max recorded merge conflict progress on the scene route
+    - no longer adds a front pre-margin before the first future conflict point
+  - `go`
+    - triggered either by entering the merge area or by speed crossing the go
+      threshold
+  - `end`
+    - triggered when ego rear progress passes the merge-area end
+  - `hold`
+    - kept separate and currently tied to red-light wait
+
+What this means:
+
+- `merge_active` is now intended to be a route-window label
+- `yld / go` is a phase label inside that window
+- actor ids remain as debug only and should not be treated as the main merge
+  decision source
 
 Per-frame episode output contains:
 

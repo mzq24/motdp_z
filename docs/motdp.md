@@ -92,6 +92,26 @@
   - 若后续要主线化，先把 `merge_valid / v_yield_max / v_go_need / v_behind_min` 做成稳定 label
   - 再优先接到 `predict speed`
   - 最后再考虑把预测到的 merge-affordance 反喂给 `predict traj`
+- 2026-04-14 讨论后的更具体建议：
+  - 当前阶段先把 stage1 speed-energy 主线化为：
+    - `chase`
+    - `merge_yld / merge_go + merge_active`
+    - `cross_yld / cross_go + cross_active`
+    - `pedestrian`
+  - 这里的 `merge / cross` 更适合先作为 speed-affordance / branch-energy 监督
+  - 当前更倾向直接做 condition predict，但 condition 形式应为 soft probability，
+    不是硬 token：
+    - `p_none`
+    - `p_merge_yld`
+    - `p_merge_go`
+    - `p_cross_yld`
+    - `p_cross_go`
+  - 训练上先用 GT soft condition，后面再逐步混入 model infer 的 condition
+  - predictor 侧先直接把 soft condition 强注入 `traj queries / mode embedding`
+  - 如果后续仍然存在明显的 speed/traj 不一致，再考虑额外引入
+    route-progress consistency 作为 stage1+ 扩展
+  - 详细讨论记录在：
+    - `./brainstorm/route_b_stage1plus_stage2_brainstorm_20260406.md`
 - `junction_left_cross_meet` 这条线也要按 decomposition 来理解：
   - 不要只把它当一个 folded `meet_risk`
   - 应该拆成：
@@ -104,6 +124,29 @@
 - 现行实现说明：
   - `cross / borrow corridor / junction-cross split / merge episode / merge speed curve` 的当前主线逻辑，统一记录在
     `./reference/cross_meet_corridor_logic.md`
+  - `2026-04-14` 之后，merge 这条线还额外记录了“下一次 full relabeling 的 agreed direction”：
+    - 旧 packed merge cover 不能直接信
+    - merge window 要按明确 start/end 定义
+    - `hold` 与 `yld/go` 分层
+    - merge area 更偏向 route-based 定义
+  - 当前代码主线也已经开始按这个方向实现：
+    - merge cover 会额外保留 scene-route conflict progress
+    - merge motion 会保留 ego 的 scene-route center/front/rear progress
+    - merge parser 正在转向 route-based `start -> merge_area -> go -> end`
+    - merge area 的起点现在直接等于第一批 future conflict point，不再往前加 pre-margin
+    - actor id 更偏向 debug，不再作为 merge-go 的唯一锚点
+  - `borrow_cross_meet` 这条线目前也有了更明确的分层方向：
+    - blocker/context-frame/corridor 定位已经相对稳定
+    - `v_yield_max / v_go_min` 主要是时序计算问题
+    - 后续要重点主线化的是 route-based borrow window `start/end`
+    - `yld/go` 与 `borrow_cross_active` 需要分层定义
+    - 现在还新增了 `borrow_cross_active_time_s`，从 active start 开始累计，用来补偿对向车超出感知范围时的条件信息
+  - `junction_left_cross_meet` 现在也开始有显式 episode：
+    - 不再只看单帧 cover
+    - 会累计 multi-frame collision/conflict point history
+    - 用局部 conflict area 定义 `junction_cross_active`
+    - `start` 取 area 内 ego route progress 最小的那一帧
+    - `end` 取 ego 离开 conflict area 的那一帧
 
 ## 推荐工作流
 
