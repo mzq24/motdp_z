@@ -16,8 +16,6 @@ from tools.generate_front_route_label_video import (
     _cover_candidate_summary,
     _filter_current_boxes_dynamic,
     _filter_future_frames_dynamic,
-    _interaction_name,
-    _interaction_subtype,
     _load_future_frames,
     _load_json_gz_if_exists,
     _resolve_feature_frame_info,
@@ -57,6 +55,15 @@ def _group_indices_by_scene(samples: List[Dict[str, Any]]) -> List[Tuple[str, Li
         indices.sort(key=lambda i: _frame_id_from_sample(samples[i]))
         grouped.append((base_dir, indices))
     return grouped
+
+
+def _interaction_name(cover: Dict[str, Any]) -> str:
+    return str(((cover or {}).get("interaction") or {}).get("name", "none"))
+
+
+def _interaction_subtype(cover: Dict[str, Any]) -> str:
+    interaction = ((cover or {}).get("interaction") or {})
+    return str(interaction.get("subtype") or interaction.get("name") or "none")
 
 
 def _is_merge_cover(cover: Dict[str, Any]) -> bool:
