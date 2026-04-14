@@ -1751,6 +1751,29 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.time_emb = SinusoidalPosEmb(n_emb)
         self.ego_status_proj = nn.Linear(status_dim, n_emb)
         self.history_encoder = HistoryEncoder(status_dim, n_emb)
+        self.traj_window_condition_dim = 4
+        self.traj_phase_condition_dim = 2
+        self.traj_borrow_aux_dim = 1
+        self.traj_branch_condition_dim = (
+            self.traj_window_condition_dim
+            + self.traj_phase_condition_dim
+            + self.traj_borrow_aux_dim
+        )
+        self.traj_window_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_window_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_phase_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_phase_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_borrow_aux_proj = nn.Sequential(
+            nn.Linear(self.traj_borrow_aux_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
 
         # Route-specific conditioning generator
         self.route_status_proj = nn.Sequential(
@@ -1845,9 +1868,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     nn.Linear(n_emb // 2, 1),
                 )
 
+            def _make_speed_energy_active_head():
+                return nn.Sequential(
+                    nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
+                    nn.Linear(n_emb // 2, 1),
+                )
+
             self.speed_energy_chase_head = _make_speed_energy_head()
-            self.speed_energy_meet_head = _make_speed_energy_head()
+            self.speed_energy_merge_yld_head = _make_speed_energy_head()
+            self.speed_energy_merge_go_head = _make_speed_energy_head()
+            self.speed_energy_junction_yld_head = _make_speed_energy_head()
+            self.speed_energy_junction_go_head = _make_speed_energy_head()
+            self.speed_energy_borrow_yld_head = _make_speed_energy_head()
+            self.speed_energy_borrow_go_head = _make_speed_energy_head()
             self.speed_energy_pedestrian_head = _make_speed_energy_head()
+            self.speed_energy_merge_active_head = _make_speed_energy_active_head()
+            self.speed_energy_junction_active_head = _make_speed_energy_active_head()
+            self.speed_energy_borrow_active_head = _make_speed_energy_active_head()
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -2071,6 +2108,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         B, K = speed_samples.shape
         route_geom = self.speed_energy_route_proj(route_points.reshape(B, -1)).unsqueeze(1)
         scene_memory = torch.cat([mode_out[:, :1, :], route_geom], dim=1)
+        active_input = torch.cat([mode_out[:, 0, :], route_geom[:, 0, :]], dim=-1)
         speed_norm = (speed_samples / 20.0).unsqueeze(-1)
         speed_queries = self.speed_energy_speed_query_proj(speed_norm)
         speed_queries = speed_queries + self.speed_energy_query_token.expand(B, K, -1)
@@ -2083,8 +2121,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         head_input = self.speed_energy_query_norm(speed_queries + attn_out)
         return {
             'chase': self.speed_energy_chase_head(head_input).squeeze(-1),
-            'meet': self.speed_energy_meet_head(head_input).squeeze(-1),
+            'merge_yld': self.speed_energy_merge_yld_head(head_input).squeeze(-1),
+            'merge_go': self.speed_energy_merge_go_head(head_input).squeeze(-1),
+            'junction_yld': self.speed_energy_junction_yld_head(head_input).squeeze(-1),
+            'junction_go': self.speed_energy_junction_go_head(head_input).squeeze(-1),
+            'borrow_yld': self.speed_energy_borrow_yld_head(head_input).squeeze(-1),
+            'borrow_go': self.speed_energy_borrow_go_head(head_input).squeeze(-1),
             'pedestrian': self.speed_energy_pedestrian_head(head_input).squeeze(-1),
+            'merge_active_logits': self.speed_energy_merge_active_head(active_input).squeeze(-1),
+            'junction_active_logits': self.speed_energy_junction_active_head(active_input).squeeze(-1),
+            'borrow_active_logits': self.speed_energy_borrow_active_head(active_input).squeeze(-1),
         }
 
     def _forward_traj_energy_context(
@@ -2186,6 +2232,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         x_t_abs: Optional[torch.Tensor] = None,
         bev_proj_cached: Optional[torch.Tensor] = None,
         transfuser_lidar_bev: Optional[torch.Tensor] = None,
+        branch_condition: Optional[torch.Tensor] = None,
+        branch_condition_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Ego denoising path with joint trajectory+route waypoint diffusion.
@@ -2230,6 +2278,24 @@ class TransformerForDiffusion(ModuleAttrMixin):
         wp_emb = self._embed_waypoint_tokens(traj_points)
         diff_query = self.diff_mode_query.expand(B, T_traj, -1)
         traj_emb = wp_emb + diff_query + conditioning.unsqueeze(1)
+        if branch_condition is not None:
+            branch_condition = branch_condition.to(device=device, dtype=model_dtype)
+            if branch_condition.dim() != 2 or branch_condition.shape[-1] != self.traj_branch_condition_dim:
+                raise ValueError(
+                    "forward_ego expects branch_condition as "
+                    f"(B, {self.traj_branch_condition_dim}), got {branch_condition.shape}"
+                )
+            window_cond = branch_condition[:, :self.traj_window_condition_dim]
+            phase_start = self.traj_window_condition_dim
+            phase_end = phase_start + self.traj_phase_condition_dim
+            phase_cond = branch_condition[:, phase_start:phase_end]
+            borrow_aux = branch_condition[:, phase_end:]
+            branch_cond_emb = (
+                self.traj_window_condition_proj(window_cond)
+                + self.traj_phase_condition_proj(phase_cond)
+                + self.traj_borrow_aux_proj(borrow_aux)
+            ) * float(branch_condition_scale)
+            traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)
         traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
 
         speed_emb = self.speed_query.expand(B, -1, -1) + conditioning.unsqueeze(1)

@@ -96,18 +96,20 @@
   - 当前阶段先把 stage1 speed-energy 主线化为：
     - `chase`
     - `merge_yld / merge_go + merge_active`
-    - `cross_yld / cross_go + cross_active`
+    - `junction_yld / junction_go + junction_active`
+    - `borrow_yld / borrow_go + borrow_active`
     - `pedestrian`
-  - 这里的 `merge / cross` 更适合先作为 speed-affordance / branch-energy 监督
-  - 当前更倾向直接做 condition predict，但 condition 形式应为 soft probability，
-    不是硬 token：
-    - `p_none`
-    - `p_merge_yld`
-    - `p_merge_go`
-    - `p_cross_yld`
-    - `p_cross_go`
+  - 这里的 `merge / junction / borrow` 更适合作为 window-level speed-affordance /
+    branch-energy 监督
+  - 当前更倾向直接做 condition predict，但 condition 形式改为 hierarchical
+    soft condition，而不是硬 token：
+    - `window = [none, merge, junction, borrow]`
+    - `phase = [yld, go]`
+    - `borrow_cross_active_time_s`
   - 训练上先用 GT soft condition，后面再逐步混入 model infer 的 condition
   - predictor 侧先直接把 soft condition 强注入 `traj queries / mode embedding`
+  - `borrow_cross_active_time_s` 主要用于补偿 borrow 过程中 causal BG
+    vehicle 超出感知范围时的条件信息
   - 如果后续仍然存在明显的 speed/traj 不一致，再考虑额外引入
     route-progress consistency 作为 stage1+ 扩展
   - 详细讨论记录在：

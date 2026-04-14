@@ -145,7 +145,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         self.energy_chase_weight = route_b_cfg.get('energy_chase_weight', route_b_cfg.get('energy_front_weight', 1.0))
         self.energy_meet_weight = route_b_cfg.get('energy_meet_weight', route_b_cfg.get('energy_left_weight', 1.0))
+        self.energy_merge_weight = route_b_cfg.get('energy_merge_weight', self.energy_meet_weight)
+        self.energy_cross_weight = route_b_cfg.get('energy_cross_weight', self.energy_meet_weight)
+        self.energy_junction_weight = route_b_cfg.get('energy_junction_weight', self.energy_cross_weight)
+        self.energy_borrow_weight = route_b_cfg.get('energy_borrow_weight', self.energy_cross_weight)
         self.energy_ped_weight = route_b_cfg.get('energy_ped_weight', route_b_cfg.get('energy_pedestrian_weight', 1.0))
+        self.energy_merge_active_weight = route_b_cfg.get('energy_merge_active_weight', 0.25)
+        self.energy_cross_active_weight = route_b_cfg.get('energy_cross_active_weight', 0.25)
+        self.energy_junction_active_weight = route_b_cfg.get(
+            'energy_junction_active_weight', self.energy_cross_active_weight
+        )
+        self.energy_borrow_active_weight = route_b_cfg.get(
+            'energy_borrow_active_weight', self.energy_cross_active_weight
+        )
         self.train_stage1_speed_energy_until_epoch = route_b_cfg.get('train_stage1_speed_energy_until_epoch', None)
         self.train_speed_head_until_epoch = route_b_cfg.get('train_speed_head_until_epoch', None)
         self.train_stage1_speed_energy_after_update_every = route_b_cfg.get(
@@ -159,6 +171,37 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.stage1_query_brake_mps2 = float(route_b_cfg.get('stage1_query_brake_mps2', 6.0))
         self.stage1_query_accel_mps2 = float(route_b_cfg.get('stage1_query_accel_mps2', 2.5))
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
+        self.use_traj_branch_condition = bool(route_b_cfg.get('use_traj_branch_condition', False))
+        self.traj_branch_condition_scale = float(route_b_cfg.get('traj_branch_condition_scale', 2.0))
+        self.traj_branch_condition_detach = bool(route_b_cfg.get('traj_branch_condition_detach', True))
+        self.traj_branch_condition_gt_prob_start = float(route_b_cfg.get('traj_branch_condition_gt_prob_start', 1.0))
+        self.traj_branch_condition_gt_prob_end = float(
+            route_b_cfg.get('traj_branch_condition_gt_prob_end', self.traj_branch_condition_gt_prob_start)
+        )
+        self.traj_branch_condition_gt_decay_epochs = max(
+            int(route_b_cfg.get('traj_branch_condition_gt_decay_epochs', 0)), 0
+        )
+        self.traj_branch_condition_affinity_scale = float(
+            route_b_cfg.get('traj_branch_condition_affinity_scale', 6.0)
+        )
+        self.traj_branch_condition_borrow_time_scale = float(
+            route_b_cfg.get('traj_branch_condition_borrow_time_scale', 8.0)
+        )
+        self.traj_window_condition_names = (
+            'none',
+            'merge',
+            'junction',
+            'borrow',
+        )
+        self.traj_phase_condition_names = (
+            'yld',
+            'go',
+        )
+        self.traj_branch_condition_names = (
+            *self.traj_window_condition_names,
+            *self.traj_phase_condition_names,
+            'borrow_time',
+        )
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -369,15 +412,422 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         return speed_profile.to(device=device, dtype=model_dtype).clamp(min=0.0, max=20.0)
 
     def _has_stage1_speed_energy_labels(self, batch: Dict[str, torch.Tensor]) -> bool:
-        return self.use_stage1_speed_energy and all(
-            key in batch for key in (
-                'speed_sample_values',
-                'speed_sample_valid_mask',
-                'speed_sample_exp_index',
-                'speed_risk_chase_values',
-                'speed_risk_meet_values',
-                'speed_risk_ped_values',
-            )
+        if not self.use_stage1_speed_energy:
+            return False
+        required = (
+            self._resolve_stage1_batch_key(batch, 'speed_sample_values'),
+            self._resolve_stage1_batch_key(batch, 'speed_sample_valid_mask'),
+            self._resolve_stage1_batch_key(batch, 'speed_risk_chase_values'),
+            self._resolve_stage1_batch_key(batch, 'speed_risk_merge_yld_values'),
+            self._resolve_stage1_batch_key(batch, 'speed_risk_merge_go_values'),
+            self._resolve_stage1_batch_key(batch, 'speed_risk_ped_values'),
+        )
+        if any(key is None for key in required):
+            return False
+        return (
+            self._get_stage1_cross_curve(batch, 'yld', device=None, model_dtype=None) is not None
+            and self._get_stage1_cross_curve(batch, 'go', device=None, model_dtype=None) is not None
+        )
+
+    @staticmethod
+    def _resolve_stage1_batch_key(batch: Dict[str, torch.Tensor], base_key: str):
+        dense_key = f'{base_key}_dense'
+        if dense_key in batch:
+            return dense_key
+        if base_key in batch:
+            return base_key
+        return None
+
+    def _get_stage1_batch_tensor(
+        self,
+        batch: Dict[str, torch.Tensor],
+        base_key: str,
+        device: Optional[torch.device],
+        model_dtype: Optional[torch.dtype],
+    ):
+        resolved_key = self._resolve_stage1_batch_key(batch, base_key)
+        if resolved_key is None:
+            return None
+        value = batch[resolved_key]
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
+        if device is None and model_dtype is None:
+            return value
+        kwargs = {}
+        if device is not None:
+            kwargs['device'] = device
+        if model_dtype is not None:
+            kwargs['dtype'] = model_dtype
+        return value.to(**kwargs)
+
+    def _get_stage1_cross_curve(
+        self,
+        batch: Dict[str, torch.Tensor],
+        suffix: str,
+        device: Optional[torch.device],
+        model_dtype: Optional[torch.dtype],
+    ):
+        direct = self._get_stage1_batch_tensor(
+            batch,
+            f'speed_risk_cross_{suffix}_values',
+            device=device,
+            model_dtype=model_dtype,
+        )
+        if direct is not None:
+            return direct
+        junction = self._get_stage1_batch_tensor(
+            batch,
+            f'speed_risk_junction_cross_{suffix}_values',
+            device=device,
+            model_dtype=model_dtype,
+        )
+        borrow = self._get_stage1_batch_tensor(
+            batch,
+            f'speed_risk_borrow_{suffix}_values',
+            device=device,
+            model_dtype=model_dtype,
+        )
+        if junction is None:
+            return borrow
+        if borrow is None:
+            return junction
+        return torch.maximum(junction, borrow)
+
+    def _get_stage1_junction_curve(
+        self,
+        batch: Dict[str, torch.Tensor],
+        suffix: str,
+        device: Optional[torch.device],
+        model_dtype: Optional[torch.dtype],
+    ):
+        return self._get_stage1_batch_tensor(
+            batch,
+            f'speed_risk_junction_cross_{suffix}_values',
+            device=device,
+            model_dtype=model_dtype,
+        )
+
+    def _get_stage1_borrow_curve(
+        self,
+        batch: Dict[str, torch.Tensor],
+        suffix: str,
+        device: Optional[torch.device],
+        model_dtype: Optional[torch.dtype],
+    ):
+        return self._get_stage1_batch_tensor(
+            batch,
+            f'speed_risk_borrow_{suffix}_values',
+            device=device,
+            model_dtype=model_dtype,
+        )
+
+    def _get_stage1_active_target(
+        self,
+        batch: Dict[str, torch.Tensor],
+        keys,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        curve_tensors=None,
+    ):
+        for key in keys:
+            if key in batch:
+                value = batch[key]
+                if not isinstance(value, torch.Tensor):
+                    value = torch.as_tensor(value)
+                return value.to(device=device, dtype=model_dtype).reshape(-1).clamp_(0.0, 1.0)
+        if curve_tensors is not None:
+            active_mask = None
+            for curve in curve_tensors:
+                if curve is None:
+                    continue
+                curve_active = curve.detach().abs().amax(dim=-1) > 1e-6
+                active_mask = curve_active if active_mask is None else (active_mask | curve_active)
+            if active_mask is not None:
+                return active_mask.to(device=device, dtype=model_dtype)
+        return None
+
+    def _get_stage1_borrow_time_target(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if 'borrow_cross_active_time_s' not in batch:
+            return None
+        value = batch['borrow_cross_active_time_s']
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
+        return value.to(device=device, dtype=model_dtype).reshape(-1)
+
+    def _compose_stage1_speed_energy_outputs(self, raw_scores: dict) -> dict:
+        merge_active_prob = torch.sigmoid(raw_scores['merge_active_logits'])
+        junction_active_prob = torch.sigmoid(raw_scores['junction_active_logits'])
+        borrow_active_prob = torch.sigmoid(raw_scores['borrow_active_logits'])
+        merge_curve = merge_active_prob.unsqueeze(-1) * torch.minimum(raw_scores['merge_yld'], raw_scores['merge_go'])
+        junction_curve = junction_active_prob.unsqueeze(-1) * torch.minimum(
+            raw_scores['junction_yld'], raw_scores['junction_go']
+        )
+        borrow_curve = borrow_active_prob.unsqueeze(-1) * torch.minimum(
+            raw_scores['borrow_yld'], raw_scores['borrow_go']
+        )
+        cross_active_prob = torch.maximum(junction_active_prob, borrow_active_prob)
+        cross_curve = torch.maximum(junction_curve, borrow_curve)
+        total_curve = torch.maximum(
+            torch.maximum(raw_scores['chase'], merge_curve),
+            torch.maximum(cross_curve, raw_scores['pedestrian']),
+        )
+        composed = dict(raw_scores)
+        composed.update({
+            'merge_active_prob': merge_active_prob,
+            'junction_active_prob': junction_active_prob,
+            'borrow_active_prob': borrow_active_prob,
+            'cross_active_prob': cross_active_prob,
+            'merge': merge_curve,
+            'junction': junction_curve,
+            'borrow': borrow_curve,
+            'cross_yld': torch.maximum(raw_scores['junction_yld'], raw_scores['borrow_yld']),
+            'cross_go': torch.maximum(raw_scores['junction_go'], raw_scores['borrow_go']),
+            'cross_active_logits': torch.maximum(
+                raw_scores['junction_active_logits'],
+                raw_scores['borrow_active_logits'],
+            ),
+            'cross': cross_curve,
+            'total': total_curve,
+        })
+        return composed
+
+    def _get_traj_branch_condition_gt_prob(self) -> float:
+        start = float(self.traj_branch_condition_gt_prob_start)
+        end = float(self.traj_branch_condition_gt_prob_end)
+        decay_epochs = int(self.traj_branch_condition_gt_decay_epochs)
+        if decay_epochs <= 0:
+            return start
+        progress = min(max(float(self._current_epoch), 0.0) / float(decay_epochs), 1.0)
+        return start + (end - start) * progress
+
+    @staticmethod
+    def _gather_stage1_curve_at_index(curve: Optional[torch.Tensor], ref_index: torch.Tensor):
+        if curve is None:
+            return None
+        if ref_index.dim() == 1:
+            ref_index = ref_index.unsqueeze(-1)
+        ref_index = ref_index.clamp(min=0, max=curve.shape[-1] - 1).long()
+        return torch.gather(curve, dim=-1, index=ref_index).squeeze(-1)
+
+    def _compose_traj_branch_condition_probs(
+        self,
+        merge_yld_risk: Optional[torch.Tensor],
+        merge_go_risk: Optional[torch.Tensor],
+        junction_yld_risk: Optional[torch.Tensor],
+        junction_go_risk: Optional[torch.Tensor],
+        borrow_yld_risk: Optional[torch.Tensor],
+        borrow_go_risk: Optional[torch.Tensor],
+        merge_active: Optional[torch.Tensor],
+        junction_active: Optional[torch.Tensor],
+        borrow_active: Optional[torch.Tensor],
+        borrow_time_s: Optional[torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        def _to_score(risk_tensor: Optional[torch.Tensor], active_tensor: torch.Tensor) -> torch.Tensor:
+            if risk_tensor is None:
+                return torch.zeros_like(active_tensor)
+            risk_tensor = risk_tensor.to(device=device, dtype=model_dtype).clamp(0.0, 1.0)
+            return active_tensor * torch.exp(-self.traj_branch_condition_affinity_scale * risk_tensor)
+
+        if merge_active is None and junction_active is None and borrow_active is None:
+            probs = torch.zeros(1, len(self.traj_branch_condition_names), device=device, dtype=model_dtype)
+            probs[:, 0] = 1.0
+            return probs
+
+        active_template = merge_active
+        if active_template is None:
+            active_template = junction_active if junction_active is not None else borrow_active
+        active_template = active_template.to(device=device, dtype=model_dtype).reshape(-1)
+        zero = torch.zeros_like(active_template)
+        merge_active = merge_active.to(device=device, dtype=model_dtype).reshape(-1) if merge_active is not None else zero
+        junction_active = (
+            junction_active.to(device=device, dtype=model_dtype).reshape(-1)
+            if junction_active is not None else zero
+        )
+        borrow_active = (
+            borrow_active.to(device=device, dtype=model_dtype).reshape(-1)
+            if borrow_active is not None else zero
+        )
+
+        merge_yld_score = _to_score(merge_yld_risk, merge_active)
+        merge_go_score = _to_score(merge_go_risk, merge_active)
+        junction_yld_score = _to_score(junction_yld_risk, junction_active)
+        junction_go_score = _to_score(junction_go_risk, junction_active)
+        borrow_yld_score = _to_score(borrow_yld_risk, borrow_active)
+        borrow_go_score = _to_score(borrow_go_risk, borrow_active)
+
+        none_score = torch.clamp(
+            1.0 - torch.maximum(torch.maximum(merge_active, junction_active), borrow_active),
+            min=0.0,
+        )
+        window_scores = torch.stack([
+            none_score,
+            torch.maximum(merge_yld_score, merge_go_score),
+            torch.maximum(junction_yld_score, junction_go_score),
+            torch.maximum(borrow_yld_score, borrow_go_score),
+        ], dim=-1)
+        window_zero_mask = window_scores.sum(dim=-1, keepdim=True) <= 1e-6
+        if window_zero_mask.any():
+            window_fallback = torch.zeros_like(window_scores)
+            window_fallback[:, 0] = 1.0
+            window_scores = torch.where(window_zero_mask, window_fallback, window_scores)
+        window_probs = window_scores / window_scores.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        phase_scores = torch.stack([
+            merge_yld_score + junction_yld_score + borrow_yld_score,
+            merge_go_score + junction_go_score + borrow_go_score,
+        ], dim=-1)
+        phase_sum = phase_scores.sum(dim=-1, keepdim=True)
+        phase_probs = torch.where(
+            phase_sum > 1e-6,
+            phase_scores / phase_sum.clamp(min=1e-6),
+            torch.zeros_like(phase_scores),
+        )
+
+        if borrow_time_s is None:
+            borrow_time_cond = zero
+        else:
+            borrow_time_cond = borrow_time_s.to(device=device, dtype=model_dtype).reshape(-1)
+            borrow_time_cond = torch.clamp(
+                borrow_time_cond / max(self.traj_branch_condition_borrow_time_scale, 1e-6),
+                min=0.0,
+                max=1.0,
+            ) * borrow_active
+
+        return torch.cat([
+            window_probs,
+            phase_probs,
+            borrow_time_cond.unsqueeze(-1),
+        ], dim=-1)
+
+    def _build_stage1_branch_condition_gt(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        speed_sample_values = self._get_stage1_batch_tensor(
+            batch, 'speed_sample_values', device=device, model_dtype=model_dtype
+        )
+        if speed_sample_values is None:
+            return None
+        ref_index = self._get_stage1_batch_tensor(
+            batch, 'speed_sample_exp_index', device=device, model_dtype=None
+        )
+        if ref_index is None:
+            next_speed_target = batch.get('next_speed_target_mps')
+            if next_speed_target is not None:
+                if not isinstance(next_speed_target, torch.Tensor):
+                    next_speed_target = torch.as_tensor(next_speed_target)
+                next_speed_target = next_speed_target.to(device=device, dtype=model_dtype).reshape(-1, 1)
+            else:
+                next_speed_target = speed_sample_values[:, speed_sample_values.shape[1] // 2: speed_sample_values.shape[1] // 2 + 1]
+            ref_index = torch.argmin(torch.abs(speed_sample_values - next_speed_target), dim=-1)
+        ref_index = ref_index.to(device=device).reshape(-1)
+
+        merge_yld_curve = self._get_stage1_batch_tensor(
+            batch, 'speed_risk_merge_yld_values', device=device, model_dtype=model_dtype
+        )
+        merge_go_curve = self._get_stage1_batch_tensor(
+            batch, 'speed_risk_merge_go_values', device=device, model_dtype=model_dtype
+        )
+        junction_yld_curve = self._get_stage1_junction_curve(
+            batch, 'yld', device=device, model_dtype=model_dtype
+        )
+        junction_go_curve = self._get_stage1_junction_curve(
+            batch, 'go', device=device, model_dtype=model_dtype
+        )
+        borrow_yld_curve = self._get_stage1_borrow_curve(
+            batch, 'yld', device=device, model_dtype=model_dtype
+        )
+        borrow_go_curve = self._get_stage1_borrow_curve(
+            batch, 'go', device=device, model_dtype=model_dtype
+        )
+        merge_active = self._get_stage1_active_target(
+            batch,
+            keys=('merge_active', 'merge_episode_active'),
+            device=device,
+            model_dtype=model_dtype,
+            curve_tensors=(merge_yld_curve, merge_go_curve),
+        )
+        junction_active = self._get_stage1_active_target(
+            batch,
+            keys=('junction_cross_active', 'junction_cross_episode_active'),
+            device=device,
+            model_dtype=model_dtype,
+            curve_tensors=(junction_yld_curve, junction_go_curve),
+        )
+        borrow_active = self._get_stage1_active_target(
+            batch,
+            keys=('borrow_cross_active', 'borrow_cross_episode_active'),
+            device=device,
+            model_dtype=model_dtype,
+            curve_tensors=(borrow_yld_curve, borrow_go_curve),
+        )
+        borrow_time_s = self._get_stage1_borrow_time_target(batch, device=device, model_dtype=model_dtype)
+        return self._compose_traj_branch_condition_probs(
+            merge_yld_risk=self._gather_stage1_curve_at_index(merge_yld_curve, ref_index),
+            merge_go_risk=self._gather_stage1_curve_at_index(merge_go_curve, ref_index),
+            junction_yld_risk=self._gather_stage1_curve_at_index(junction_yld_curve, ref_index),
+            junction_go_risk=self._gather_stage1_curve_at_index(junction_go_curve, ref_index),
+            borrow_yld_risk=self._gather_stage1_curve_at_index(borrow_yld_curve, ref_index),
+            borrow_go_risk=self._gather_stage1_curve_at_index(borrow_go_curve, ref_index),
+            merge_active=merge_active,
+            junction_active=junction_active,
+            borrow_active=borrow_active,
+            borrow_time_s=borrow_time_s,
+            device=device,
+            model_dtype=model_dtype,
+        )
+
+    def _infer_traj_branch_condition(
+        self,
+        traj_norm: torch.Tensor,
+        traj_abs: torch.Tensor,
+        route_points_abs: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        bev_proj: torch.Tensor,
+        speed_ref: torch.Tensor,
+        transfuser_lidar_bev: Optional[torch.Tensor],
+        borrow_time_s: Optional[torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_stage1_speed_energy:
+            return None
+        speed_samples = speed_ref.to(device=device, dtype=model_dtype).reshape(-1, 1).clamp(0.0, 20.0)
+        raw_scores, _ = self.model.forward_speed_energy_eval(
+            x_t=traj_norm,
+            x_t_abs=traj_abs,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            ego_status=ego_status,
+            speed_samples=speed_samples,
+            bev_proj_cached=bev_proj,
+            route_points=route_points_abs,
+            transfuser_lidar_bev=transfuser_lidar_bev,
+        )
+        return self._compose_traj_branch_condition_probs(
+            merge_yld_risk=raw_scores['merge_yld'].reshape(-1),
+            merge_go_risk=raw_scores['merge_go'].reshape(-1),
+            junction_yld_risk=raw_scores['junction_yld'].reshape(-1),
+            junction_go_risk=raw_scores['junction_go'].reshape(-1),
+            borrow_yld_risk=raw_scores['borrow_yld'].reshape(-1),
+            borrow_go_risk=raw_scores['borrow_go'].reshape(-1),
+            merge_active=torch.sigmoid(raw_scores['merge_active_logits']),
+            junction_active=torch.sigmoid(raw_scores['junction_active_logits']),
+            borrow_active=torch.sigmoid(raw_scores['borrow_active_logits']),
+            borrow_time_s=borrow_time_s,
+            device=device,
+            model_dtype=model_dtype,
         )
 
     def _build_stage1_speed_samples(
@@ -786,13 +1236,61 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         gt_abs = trajectory.unsqueeze(1)  # (B, 1, T, 2)
         gt_normed = self.abs_to_norm(gt_abs)
 
-        speed_sample_values = batch['speed_sample_values'].to(device=device, dtype=model_dtype)
-        speed_sample_valid_mask = batch['speed_sample_valid_mask'].to(device=device) > 0.5
-        speed_risk_chase = batch['speed_risk_chase_values'].to(device=device, dtype=model_dtype)
-        speed_risk_meet = batch['speed_risk_meet_values'].to(device=device, dtype=model_dtype)
-        speed_risk_ped = batch['speed_risk_ped_values'].to(device=device, dtype=model_dtype)
+        speed_sample_values = self._get_stage1_batch_tensor(
+            batch, 'speed_sample_values', device=device, model_dtype=model_dtype
+        )
+        speed_sample_valid_mask = self._get_stage1_batch_tensor(
+            batch, 'speed_sample_valid_mask', device=device, model_dtype=None
+        )
+        speed_sample_valid_mask = speed_sample_valid_mask > 0.5
+        speed_risk_chase = self._get_stage1_batch_tensor(
+            batch, 'speed_risk_chase_values', device=device, model_dtype=model_dtype
+        )
+        speed_risk_merge_yld = self._get_stage1_batch_tensor(
+            batch, 'speed_risk_merge_yld_values', device=device, model_dtype=model_dtype
+        )
+        speed_risk_merge_go = self._get_stage1_batch_tensor(
+            batch, 'speed_risk_merge_go_values', device=device, model_dtype=model_dtype
+        )
+        speed_risk_junction_yld = self._get_stage1_junction_curve(
+            batch, 'yld', device=device, model_dtype=model_dtype
+        )
+        speed_risk_junction_go = self._get_stage1_junction_curve(
+            batch, 'go', device=device, model_dtype=model_dtype
+        )
+        speed_risk_borrow_yld = self._get_stage1_borrow_curve(
+            batch, 'yld', device=device, model_dtype=model_dtype
+        )
+        speed_risk_borrow_go = self._get_stage1_borrow_curve(
+            batch, 'go', device=device, model_dtype=model_dtype
+        )
+        speed_risk_ped = self._get_stage1_batch_tensor(
+            batch, 'speed_risk_ped_values', device=device, model_dtype=model_dtype
+        )
 
-        stage1_scores, _ = self.model.forward_speed_energy(
+        merge_active_target = self._get_stage1_active_target(
+            batch,
+            keys=('merge_active', 'merge_episode_active'),
+            device=device,
+            model_dtype=model_dtype,
+            curve_tensors=(speed_risk_merge_yld, speed_risk_merge_go),
+        )
+        junction_active_target = self._get_stage1_active_target(
+            batch,
+            keys=('junction_cross_active', 'junction_cross_episode_active'),
+            device=device,
+            model_dtype=model_dtype,
+            curve_tensors=(speed_risk_junction_yld, speed_risk_junction_go),
+        )
+        borrow_active_target = self._get_stage1_active_target(
+            batch,
+            keys=('borrow_cross_active', 'borrow_cross_episode_active'),
+            device=device,
+            model_dtype=model_dtype,
+            curve_tensors=(speed_risk_borrow_yld, speed_risk_borrow_go),
+        )
+
+        raw_stage1_scores, _ = self.model.forward_speed_energy(
             x_t=gt_normed,
             x_t_abs=gt_abs,
             timestep=torch.zeros(gt_abs.shape[0], device=device, dtype=torch.long),
@@ -804,16 +1302,91 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_points=route_gt,
             transfuser_lidar_bev=transfuser_lidar_bev,
         )
+        stage1_scores = self._compose_stage1_speed_energy_outputs(raw_stage1_scores)
 
         loss_chase = self._masked_smooth_l1(stage1_scores['chase'], speed_risk_chase, speed_sample_valid_mask)
-        loss_meet = self._masked_smooth_l1(stage1_scores['meet'], speed_risk_meet, speed_sample_valid_mask)
         loss_ped = self._masked_smooth_l1(stage1_scores['pedestrian'], speed_risk_ped, speed_sample_valid_mask)
+
+        merge_branch_mask = speed_sample_valid_mask
+        if merge_active_target is not None:
+            merge_branch_mask = merge_branch_mask & (merge_active_target.unsqueeze(-1) > 0.5)
+        junction_branch_mask = speed_sample_valid_mask
+        if junction_active_target is not None:
+            junction_branch_mask = junction_branch_mask & (junction_active_target.unsqueeze(-1) > 0.5)
+        borrow_branch_mask = speed_sample_valid_mask
+        if borrow_active_target is not None:
+            borrow_branch_mask = borrow_branch_mask & (borrow_active_target.unsqueeze(-1) > 0.5)
+
+        loss_merge_yld = self._masked_smooth_l1(stage1_scores['merge_yld'], speed_risk_merge_yld, merge_branch_mask)
+        loss_merge_go = self._masked_smooth_l1(stage1_scores['merge_go'], speed_risk_merge_go, merge_branch_mask)
+        loss_junction_yld = self._masked_smooth_l1(
+            stage1_scores['junction_yld'], speed_risk_junction_yld, junction_branch_mask
+        )
+        loss_junction_go = self._masked_smooth_l1(
+            stage1_scores['junction_go'], speed_risk_junction_go, junction_branch_mask
+        )
+        loss_borrow_yld = self._masked_smooth_l1(
+            stage1_scores['borrow_yld'], speed_risk_borrow_yld, borrow_branch_mask
+        )
+        loss_borrow_go = self._masked_smooth_l1(
+            stage1_scores['borrow_go'], speed_risk_borrow_go, borrow_branch_mask
+        )
+        loss_merge = 0.5 * (loss_merge_yld + loss_merge_go)
+        loss_junction = 0.5 * (loss_junction_yld + loss_junction_go)
+        loss_borrow = 0.5 * (loss_borrow_yld + loss_borrow_go)
+        loss_cross = loss_junction + loss_borrow
+
+        zero = gt_abs.new_tensor(0.0)
+        loss_merge_active = zero
+        if merge_active_target is not None:
+            loss_merge_active = F.binary_cross_entropy_with_logits(
+                stage1_scores['merge_active_logits'].float(),
+                merge_active_target.float(),
+            )
+        loss_junction_active = zero
+        if junction_active_target is not None:
+            loss_junction_active = F.binary_cross_entropy_with_logits(
+                stage1_scores['junction_active_logits'].float(),
+                junction_active_target.float(),
+            )
+        loss_borrow_active = zero
+        if borrow_active_target is not None:
+            loss_borrow_active = F.binary_cross_entropy_with_logits(
+                stage1_scores['borrow_active_logits'].float(),
+                borrow_active_target.float(),
+            )
+        loss_cross_active = loss_junction_active + loss_borrow_active
         energy_loss = (
             self.energy_chase_weight * loss_chase
-            + self.energy_meet_weight * loss_meet
+            + self.energy_merge_weight * loss_merge
+            + self.energy_junction_weight * loss_junction
+            + self.energy_borrow_weight * loss_borrow
             + self.energy_ped_weight * loss_ped
+            + self.energy_merge_active_weight * loss_merge_active
+            + self.energy_junction_active_weight * loss_junction_active
+            + self.energy_borrow_active_weight * loss_borrow_active
         )
-        return energy_loss, loss_chase, loss_meet, loss_ped
+        return {
+            'energy_loss': energy_loss,
+            'chase_loss': loss_chase,
+            'merge_loss': loss_merge,
+            'junction_loss': loss_junction,
+            'borrow_loss': loss_borrow,
+            'cross_loss': loss_cross,
+            'pedestrian_loss': loss_ped,
+            'merge_yld_loss': loss_merge_yld,
+            'merge_go_loss': loss_merge_go,
+            'junction_yld_loss': loss_junction_yld,
+            'junction_go_loss': loss_junction_go,
+            'borrow_yld_loss': loss_borrow_yld,
+            'borrow_go_loss': loss_borrow_go,
+            'cross_yld_loss': loss_junction_yld + loss_borrow_yld,
+            'cross_go_loss': loss_junction_go + loss_borrow_go,
+            'merge_active_loss': loss_merge_active,
+            'junction_active_loss': loss_junction_active,
+            'borrow_active_loss': loss_borrow_active,
+            'cross_active_loss': loss_cross_active,
+        }
 
     def _train_branch_enabled_with_schedule(self, until_epoch, after_update_every) -> bool:
         """1-based epoch cutoff with optional lower-frequency updates after the cutoff."""
@@ -927,15 +1500,71 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         noisy_joint = noisy_flat.unsqueeze(1)  # (B, 1, T_joint, 2)
         noisy_joint_abs = self.joint_norm_to_abs(noisy_joint)
 
-        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-            x_t=noisy_joint,
-            x_t_abs=noisy_joint_abs,
-            timestep=diff_timesteps,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            bev_proj_cached=bev_proj,
-            transfuser_lidar_bev=transfuser_lidar_bev,
+        traj_branch_condition = None
+        traj_branch_condition_gt = None
+        if self.use_traj_branch_condition and has_stage1_speed_energy:
+            traj_branch_condition_gt = self._build_stage1_branch_condition_gt(
+                batch=batch,
+                device=device,
+                model_dtype=model_dtype,
+            )
+
+        branch_gt_prob = 1.0
+        if train_stage1_speed_energy_active:
+            branch_gt_prob = self._get_traj_branch_condition_gt_prob()
+
+        def _forward_ego_with_branch(branch_condition_tensor: Optional[torch.Tensor]):
+            branch_input = branch_condition_tensor
+            if branch_input is not None and self.traj_branch_condition_detach:
+                branch_input = branch_input.detach()
+            return self.model.forward_ego(
+                x_t=noisy_joint,
+                x_t_abs=noisy_joint_abs,
+                timestep=diff_timesteps,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                bev_proj_cached=bev_proj,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+                branch_condition=branch_input,
+                branch_condition_scale=self.traj_branch_condition_scale,
+            )
+
+        if (
+            traj_branch_condition_gt is not None
+            and branch_gt_prob < (1.0 - 1e-6)
+            and train_stage1_speed_energy_active
+        ):
+            poses_reg_base, route_pred_base, _, _, speed_pred_base, _ = _forward_ego_with_branch(None)
+            route_pred_base_abs = self.route_norm_to_abs(route_pred_base.detach())
+            traj_branch_speed_ref = (
+                self.decode_speed_two_hot(speed_pred_base, self.model.speed_classes)
+                if speed_pred_base is not None else
+                ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+            )
+            traj_branch_condition_infer = self._infer_traj_branch_condition(
+                traj_norm=poses_reg_base.detach(),
+                traj_abs=self.norm_to_abs(poses_reg_base.detach()),
+                route_points_abs=route_pred_base_abs,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                bev_proj=bev_proj,
+                speed_ref=traj_branch_speed_ref.detach(),
+                transfuser_lidar_bev=transfuser_lidar_bev,
+                borrow_time_s=self._get_stage1_borrow_time_target(batch, device=device, model_dtype=model_dtype),
+                device=device,
+                model_dtype=model_dtype,
+            )
+            traj_branch_condition = (
+                branch_gt_prob * traj_branch_condition_gt
+                + (1.0 - branch_gt_prob) * traj_branch_condition_infer
+            )
+        else:
+            traj_branch_condition = traj_branch_condition_gt
+
+        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = _forward_ego_with_branch(
+            traj_branch_condition
         )
         poses_reg_abs = self.norm_to_abs(poses_reg)
         route_pred_abs = self.route_norm_to_abs(route_pred)
@@ -993,9 +1622,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         energy_loss = zero_t
         loss_front = loss_left = loss_right = loss_ped = loss_off = zero_t
         loss_route = zero_t
+        stage1_extra_losses = {}
 
         if train_stage1_speed_energy_active:
-            energy_loss, loss_chase_stage1, loss_meet_stage1, loss_ped_stage1 = self._compute_stage1_speed_energy_loss(
+            stage1_loss_dict = self._compute_stage1_speed_energy_loss(
                 batch=batch,
                 trajectory=trajectory,
                 route_gt=route_gt,
@@ -1007,11 +1637,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 device=device,
                 model_dtype=model_dtype,
             )
-            loss_front = loss_chase_stage1
-            loss_left = loss_meet_stage1
-            loss_right = zero_t
-            loss_ped = loss_ped_stage1
+            energy_loss = stage1_loss_dict['energy_loss']
+            loss_front = stage1_loss_dict['chase_loss']
+            loss_left = stage1_loss_dict['merge_loss']
+            loss_right = stage1_loss_dict['cross_loss']
+            loss_ped = stage1_loss_dict['pedestrian_loss']
             loss_off = zero_t
+            stage1_extra_losses = {
+                'energy_merge_yld_loss': stage1_loss_dict['merge_yld_loss'],
+                'energy_merge_go_loss': stage1_loss_dict['merge_go_loss'],
+                'energy_junction_yld_loss': stage1_loss_dict['junction_yld_loss'],
+                'energy_junction_go_loss': stage1_loss_dict['junction_go_loss'],
+                'energy_borrow_yld_loss': stage1_loss_dict['borrow_yld_loss'],
+                'energy_borrow_go_loss': stage1_loss_dict['borrow_go_loss'],
+                'energy_cross_yld_loss': stage1_loss_dict['cross_yld_loss'],
+                'energy_cross_go_loss': stage1_loss_dict['cross_go_loss'],
+                'energy_merge_active_loss': stage1_loss_dict['merge_active_loss'],
+                'energy_junction_active_loss': stage1_loss_dict['junction_active_loss'],
+                'energy_borrow_active_loss': stage1_loss_dict['borrow_active_loss'],
+                'energy_cross_active_loss': stage1_loss_dict['cross_active_loss'],
+            }
         elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
             (
                 M_anchor,
@@ -1218,7 +1863,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'energy_front_loss': loss_front,
             'energy_left_loss': loss_left,
             'energy_right_loss': loss_right,
+            'energy_chase_loss': loss_front,
+            'energy_merge_loss': loss_left,
+            'energy_cross_loss': loss_right,
             'energy_ped_loss': loss_ped,
+            'energy_pedestrian_loss': loss_ped,
             'energy_off_loss': loss_off,
             'energy_route_loss': loss_route,
             'reg_loss': loss_reg,
@@ -1231,6 +1880,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             loss_dict['speed_profile_loss'] = speed_profile_loss
             for step_idx, step_loss in enumerate(speed_profile_step_losses):
                 loss_dict[f'speed_profile_step{step_idx}_loss'] = step_loss
+        loss_dict.update(stage1_extra_losses)
         return loss_dict
 
     # ========== Unified Training: Single Forward Pass ==========
@@ -1947,6 +2597,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_for_guidance: Optional[torch.Tensor] = None,
         energy_weights: Optional[Dict[str, float]] = None,
         transfuser_lidar_bev: Optional[torch.Tensor] = None,
+        borrow_time_s: Optional[torch.Tensor] = None,
     ):
         """
         DDIM from N(0,I) with annealed energy gradient guidance.
@@ -1992,6 +2643,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         energy_scores = None
         speed_pred = None
         speed_profile_pred = None
+        traj_branch_condition_probs = None
 
         for step_i, k in enumerate(roll_timesteps):
             t_cur = k.item()
@@ -2021,6 +2673,40 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         bev_proj_cached=bev_proj,
                         transfuser_lidar_bev=transfuser_lidar_bev,
                     )
+                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
+                        route_pred_abs = self.route_norm_to_abs(route_pred.detach())
+                        branch_speed_ref = (
+                            self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
+                            if speed_pred is not None else
+                            ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+                        )
+                        traj_branch_condition_probs = self._infer_traj_branch_condition(
+                            traj_norm=poses_reg.detach(),
+                            traj_abs=self.norm_to_abs(poses_reg.detach()),
+                            route_points_abs=route_pred_abs,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj=bev_proj,
+                            speed_ref=branch_speed_ref.detach(),
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            borrow_time_s=borrow_time_s,
+                            device=device,
+                            model_dtype=model_dtype,
+                        )
+                        branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
+                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                            x_t=x_input,
+                            x_t_abs=x_t_abs,
+                            timestep=t_tensor,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj_cached=bev_proj,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            branch_condition=branch_input,
+                            branch_condition_scale=self.traj_branch_condition_scale,
+                        )
                     pred_x0 = poses_reg.detach()  # (B, M, T, 2)
                     route_context = route_for_guidance if route_for_guidance is not None else self.route_norm_to_abs(route_pred.detach())
                     route_pred_norm = route_pred.detach().unsqueeze(1)  # (B, 1, T_route, 2)
@@ -2110,6 +2796,40 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         bev_proj_cached=bev_proj,
                         transfuser_lidar_bev=transfuser_lidar_bev,
                     )
+                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
+                        route_pred_abs = self.route_norm_to_abs(route_pred.detach())
+                        branch_speed_ref = (
+                            self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
+                            if speed_pred is not None else
+                            ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+                        )
+                        traj_branch_condition_probs = self._infer_traj_branch_condition(
+                            traj_norm=poses_reg.detach(),
+                            traj_abs=self.norm_to_abs(poses_reg.detach()),
+                            route_points_abs=route_pred_abs,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj=bev_proj,
+                            speed_ref=branch_speed_ref.detach(),
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            borrow_time_s=borrow_time_s,
+                            device=device,
+                            model_dtype=model_dtype,
+                        )
+                        branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
+                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                            x_t=x_input,
+                            x_t_abs=x_t_abs,
+                            timestep=t_tensor,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj_cached=bev_proj,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            branch_condition=branch_input,
+                            branch_condition_scale=self.traj_branch_condition_scale,
+                        )
                 energy_scores = None
                 pred_x0_corrected = torch.cat([
                     poses_reg.float(),
@@ -2150,7 +2870,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             speed_energy_query_center = center_speed
             speed_energy_samples = self._build_stage1_speed_samples(center_speed, device, model_dtype)
             best_traj_norm = self.abs_to_norm(best_trajectory.unsqueeze(1))
-            speed_energy_scores, _ = self.model.forward_speed_energy_eval(
+            speed_energy_scores_raw, _ = self.model.forward_speed_energy_eval(
                 x_t=best_traj_norm,
                 x_t_abs=best_trajectory.unsqueeze(1),
                 transfuser_bev_feature=transfuser_bev_feature,
@@ -2161,6 +2881,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 route_points=route_pred.detach(),
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
+            speed_energy_scores = self._compose_stage1_speed_energy_outputs(speed_energy_scores_raw)
             traj_speed_1s_ref, traj_speed_05s_ref = self._compute_inference_traj_speed_refs(
                 best_trajectory, model_dtype
             )
@@ -2168,7 +2889,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             speed_energy_ref_speeds = torch.stack(
                 [head_speed_ref, traj_speed_1s_ref, traj_speed_05s_ref], dim=-1
             ).clamp_(0.0, 20.0)
-            speed_energy_ref_scores, _ = self.model.forward_speed_energy_eval(
+            speed_energy_ref_scores_raw, _ = self.model.forward_speed_energy_eval(
                 x_t=best_traj_norm,
                 x_t_abs=best_trajectory.unsqueeze(1),
                 transfuser_bev_feature=transfuser_bev_feature,
@@ -2179,6 +2900,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 route_points=route_pred.detach(),
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
+            speed_energy_ref_scores = self._compose_stage1_speed_energy_outputs(speed_energy_ref_scores_raw)
 
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
@@ -2190,6 +2912,23 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_energy_query_center': speed_energy_query_center,
             'speed_energy_ref_speeds': speed_energy_ref_speeds,
             'speed_energy_ref_scores': speed_energy_ref_scores,
+            'traj_branch_condition_probs': traj_branch_condition_probs,
+            'traj_window_condition_probs': (
+                traj_branch_condition_probs[:, :len(self.traj_window_condition_names)]
+                if traj_branch_condition_probs is not None else None
+            ),
+            'traj_phase_condition_probs': (
+                traj_branch_condition_probs[
+                    :,
+                    len(self.traj_window_condition_names):
+                    len(self.traj_window_condition_names) + len(self.traj_phase_condition_names)
+                ]
+                if traj_branch_condition_probs is not None else None
+            ),
+            'traj_borrow_time_condition': (
+                traj_branch_condition_probs[:, -1]
+                if traj_branch_condition_probs is not None else None
+            ),
             'poses_cls': poses_cls,                   # (B, 1)
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
             'target_speed': target_speed_pred,        # (B,) m/s
@@ -2214,6 +2953,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_for_guidance = nobs.get('route', None)
         if route_for_guidance is not None:
             route_for_guidance = route_for_guidance.to(dtype=model_dtype)
+        borrow_time_s = nobs.get('borrow_cross_active_time_s', None)
+        if borrow_time_s is not None:
+            borrow_time_s = borrow_time_s.to(device=device, dtype=model_dtype).reshape(-1)
 
         # Accept dynamic energy weights from kwargs (LLM Router interface)
         energy_weights = kwargs.get('energy_weights', None)
@@ -2227,6 +2969,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_for_guidance=route_for_guidance,
             energy_weights=energy_weights,
             transfuser_lidar_bev=transfuser_lidar_bev,
+            borrow_time_s=borrow_time_s,
         )
 
         best_traj = sample_result['best_trajectory']
@@ -2245,6 +2988,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['target_speed'] = sample_result['target_speed'].detach().float().cpu().numpy()
         if sample_result.get('target_speed_profile') is not None:
             result['target_speed_profile'] = sample_result['target_speed_profile'].detach().float().cpu().numpy()
+        if sample_result.get('traj_branch_condition_probs') is not None:
+            result['traj_branch_condition_probs'] = (
+                sample_result['traj_branch_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_window_condition_probs') is not None:
+            result['traj_window_condition_probs'] = (
+                sample_result['traj_window_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_phase_condition_probs') is not None:
+            result['traj_phase_condition_probs'] = (
+                sample_result['traj_phase_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_borrow_time_condition') is not None:
+            result['traj_borrow_time_condition'] = (
+                sample_result['traj_borrow_time_condition'].detach().float().cpu().numpy()
+            )
 
         # Add energy scores if available
         if sample_result['energy_scores'] is not None:
@@ -2259,14 +3018,70 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 result['speed_energy_samples'] = sample_result['speed_energy_samples'].detach().float().cpu().numpy()
             if sample_result.get('speed_energy_query_center') is not None:
                 result['speed_energy_query_center'] = sample_result['speed_energy_query_center'].detach().float().cpu().numpy()
-            for key in ('chase', 'meet', 'pedestrian'):
+            for key in (
+                'chase',
+                'merge_yld',
+                'merge_go',
+                'junction_yld',
+                'junction_go',
+                'borrow_yld',
+                'borrow_go',
+                'cross_yld',
+                'cross_go',
+                'merge',
+                'junction',
+                'borrow',
+                'cross',
+                'pedestrian',
+                'total',
+            ):
+                if key in ses:
+                    result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
+            for key in (
+                'merge_active_logits',
+                'junction_active_logits',
+                'borrow_active_logits',
+                'cross_active_logits',
+                'merge_active_prob',
+                'junction_active_prob',
+                'borrow_active_prob',
+                'cross_active_prob',
+            ):
                 if key in ses:
                     result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
         if sample_result.get('speed_energy_ref_scores') is not None:
             ref = sample_result['speed_energy_ref_scores']
             if sample_result.get('speed_energy_ref_speeds') is not None:
                 result['speed_energy_ref_speeds'] = sample_result['speed_energy_ref_speeds'].detach().float().cpu().numpy()
-            for key in ('chase', 'meet', 'pedestrian'):
+            for key in (
+                'chase',
+                'merge_yld',
+                'merge_go',
+                'junction_yld',
+                'junction_go',
+                'borrow_yld',
+                'borrow_go',
+                'cross_yld',
+                'cross_go',
+                'merge',
+                'junction',
+                'borrow',
+                'cross',
+                'pedestrian',
+                'total',
+            ):
+                if key in ref:
+                    result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
+            for key in (
+                'merge_active_logits',
+                'junction_active_logits',
+                'borrow_active_logits',
+                'cross_active_logits',
+                'merge_active_prob',
+                'junction_active_prob',
+                'borrow_active_prob',
+                'cross_active_prob',
+            ):
                 if key in ref:
                     result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
 

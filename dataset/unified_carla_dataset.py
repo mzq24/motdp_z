@@ -23,13 +23,7 @@ import textwrap
 
 
 def _apply_stage1_near_zero_speed_snap(final_sample, eps_mps=0.1):
-    required = (
-        'speed_sample_values',
-        'speed_risk_chase_values',
-        'speed_risk_meet_values',
-        'speed_risk_ped_values',
-    )
-    if not all(k in final_sample for k in required):
+    if 'speed_sample_values' not in final_sample:
         return
 
     speed_samples = final_sample['speed_sample_values']
@@ -47,6 +41,8 @@ def _apply_stage1_near_zero_speed_snap(final_sample, eps_mps=0.1):
     for key in (
         'speed_risk_chase_values',
         'speed_risk_meet_values',
+        'speed_risk_cross_yld_values',
+        'speed_risk_cross_go_values',
         'speed_risk_junction_cross_yld_values',
         'speed_risk_junction_cross_go_values',
         'speed_risk_merge_yld_values',
@@ -578,7 +574,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         clone_keys = set()
 
         def _from_numpy(value, key, dtype=torch.float32):
-            tensor = torch.from_numpy(value)
+            if isinstance(value, np.ndarray):
+                tensor = torch.from_numpy(value)
+            else:
+                tensor = torch.as_tensor(value)
             if dtype is not None:
                 tensor = tensor.to(dtype=dtype)
             clone_keys.add(key)
@@ -724,6 +723,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'speed_sample_values',
                 'speed_risk_chase_values',
                 'speed_risk_meet_values',
+                'speed_risk_cross_yld_values',
+                'speed_risk_cross_go_values',
                 'speed_risk_junction_cross_yld_values',
                 'speed_risk_junction_cross_go_values',
                 'speed_risk_merge_yld_values',
@@ -733,8 +734,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'speed_risk_ped_values',
                 'speed_cross_wait_time_s',
                 'speed_cross_wait_valid',
+                'borrow_cross_active_time_s',
             }:
                 final_sample[key] = _from_numpy(value, key)
+            elif key in {
+                'merge_active',
+                'merge_episode_active',
+                'cross_active',
+                'cross_episode_active',
+                'junction_cross_episode_active',
+                'borrow_cross_episode_active',
+            }:
+                final_sample[key] = torch.as_tensor(value, dtype=torch.float32)
             elif key.startswith('transfuser_'):
                 # Skip transfuser paths, we already loaded them as tensors
                 continue

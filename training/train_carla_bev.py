@@ -201,15 +201,20 @@ def validate_model(
                     val_metrics['alignment_loss'].append(loss_dict['alignment_loss'].item())
                 if 'energy_front_loss' in loss_dict:
                     val_metrics['energy_front_loss'].append(loss_dict['energy_front_loss'].item())
-                    val_metrics['energy_chase_loss'].append(loss_dict['energy_front_loss'].item())
+                if 'energy_chase_loss' in loss_dict:
+                    val_metrics['energy_chase_loss'].append(loss_dict['energy_chase_loss'].item())
                 if 'energy_left_loss' in loss_dict:
                     val_metrics['energy_left_loss'].append(loss_dict['energy_left_loss'].item())
-                    val_metrics['energy_meet_loss'].append(loss_dict['energy_left_loss'].item())
+                if 'energy_merge_loss' in loss_dict:
+                    val_metrics['energy_merge_loss'].append(loss_dict['energy_merge_loss'].item())
                 if 'energy_ped_loss' in loss_dict:
                     val_metrics['energy_ped_loss'].append(loss_dict['energy_ped_loss'].item())
-                    val_metrics['energy_pedestrian_loss'].append(loss_dict['energy_ped_loss'].item())
+                if 'energy_pedestrian_loss' in loss_dict:
+                    val_metrics['energy_pedestrian_loss'].append(loss_dict['energy_pedestrian_loss'].item())
                 if 'energy_right_loss' in loss_dict:
                     val_metrics['energy_right_loss'].append(loss_dict['energy_right_loss'].item())
+                if 'energy_cross_loss' in loss_dict:
+                    val_metrics['energy_cross_loss'].append(loss_dict['energy_cross_loss'].item())
                 if 'energy_off_loss' in loss_dict:
                     val_metrics['energy_off_loss'].append(loss_dict['energy_off_loss'].item())
                 if 'energy_route_loss' in loss_dict:
@@ -218,6 +223,22 @@ def validate_model(
                     val_metrics['speed_loss'].append(loss_dict['speed_loss'].item())
                 if 'speed_profile_loss' in loss_dict:
                     val_metrics['speed_profile_loss'].append(loss_dict['speed_profile_loss'].item())
+                for key in (
+                    'energy_merge_yld_loss',
+                    'energy_merge_go_loss',
+                    'energy_junction_yld_loss',
+                    'energy_junction_go_loss',
+                    'energy_borrow_yld_loss',
+                    'energy_borrow_go_loss',
+                    'energy_cross_yld_loss',
+                    'energy_cross_go_loss',
+                    'energy_merge_active_loss',
+                    'energy_junction_active_loss',
+                    'energy_borrow_active_loss',
+                    'energy_cross_active_loss',
+                ):
+                    if key in loss_dict:
+                        val_metrics[key].append(loss_dict[key].item())
                 for key, value in loss_dict.items():
                     if key.startswith('speed_profile_step') and key.endswith('_loss'):
                         val_metrics[key].append(value.item() if isinstance(value, torch.Tensor) else value)
@@ -230,6 +251,8 @@ def validate_model(
                     'transfuser_lidar_bev': batch['transfuser_lidar_bev'],
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],
                 }
+                if 'borrow_cross_active_time_s' in batch:
+                    obs_dict['borrow_cross_active_time_s'] = batch['borrow_cross_active_time_s']
                 if getattr(model_for_inference, 'use_vqa_anchor', False) and 'vqa_anchor' in batch:
                     obs_dict['vqa_anchor'] = batch['vqa_anchor']
                 target_actions = batch['agent_pos']
@@ -957,23 +980,18 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         # Separate energy head params from decoder params
         energy_param_ids = set()
         energy_params = []
-        for module_name in [
-            'energy_front_head',
-            'energy_left_head',
-            'energy_right_head',
-            'energy_pedestrian_head',
-            'energy_offroad_head',
-            'energy_route_head',
-            'front_route_risk_head',
-            'speed_energy_speed_proj',
-            'speed_energy_chase_head',
-            'speed_energy_meet_head',
-            'speed_energy_pedestrian_head',
-        ]:
-            module = getattr(policy_for_params.model, module_name, None)
-            if module is None:
-                continue
-            for p in module.parameters():
+        energy_param_prefixes = (
+            'energy_front_head.',
+            'energy_left_head.',
+            'energy_right_head.',
+            'energy_pedestrian_head.',
+            'energy_offroad_head.',
+            'energy_route_head.',
+            'front_route_risk_head.',
+            'speed_energy_',
+        )
+        for param_name, p in policy_for_params.model.named_parameters():
+            if any(param_name.startswith(prefix) for prefix in energy_param_prefixes):
                 energy_param_ids.add(id(p))
                 energy_params.append(p)
 
@@ -1362,7 +1380,16 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 for lk in ('cls_loss', 'reg_loss', 'route_loss', 'speed_loss', 'speed_profile_loss',
                            'energy_loss', 'alignment_loss',
                            'energy_front_loss', 'energy_left_loss', 'energy_right_loss',
-                           'energy_ped_loss', 'energy_off_loss', 'energy_route_loss'):
+                           'energy_chase_loss', 'energy_merge_loss', 'energy_cross_loss',
+                           'energy_ped_loss', 'energy_pedestrian_loss',
+                           'energy_off_loss', 'energy_route_loss',
+                           'energy_merge_yld_loss', 'energy_merge_go_loss',
+                           'energy_junction_yld_loss', 'energy_junction_go_loss',
+                           'energy_borrow_yld_loss', 'energy_borrow_go_loss',
+                           'energy_cross_yld_loss', 'energy_cross_go_loss',
+                           'energy_merge_active_loss',
+                           'energy_junction_active_loss', 'energy_borrow_active_loss',
+                           'energy_cross_active_loss'):
                     if lk in loss_dict:
                         val = loss_dict[lk]
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
