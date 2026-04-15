@@ -108,3 +108,151 @@ python scripts/build_feature_cache_fp16.py --dataset_root /path/to/pdm_lite/trai
 ```
 
 输出到 `{dataset_root}/tmp_data/`，只需跑一次。
+
+## Stage1 Full Relabeling 产物路径
+
+`new_hpc` 上这一轮 stage1 full relabeling 相关文件，后续排查时优先看这些
+小 `json/meta/log`，不要默认反复扫大 `samples_packed.pkl`。
+
+### Full merged 输出
+
+- full relabeled packed：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.pkl`
+- full dataset episode 统计：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/stage1_episode_stats.json`
+
+### 16-way shard 输出
+
+- shard root：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16`
+- 全局 split 摘要：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16/split_summary.json`
+- 单 shard 目录示例：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16/shard_11_of_16`
+- 单 shard 常用文件：
+  - `samples_packed.pkl`
+  - `split_meta.json`
+  - `stage1_relabel.log`
+
+### Scene-level train / val split
+
+- scene split root：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5`
+- train packed：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5/train/samples_packed.pkl`
+- val packed：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5/val/samples_packed.pkl`
+- 如果单独导出过 train / val episode 统计，默认也放在：
+  - `.../train/stage1_episode_stats.json`
+  - `.../val/stage1_episode_stats.json`
+
+### 当前排查约定
+
+- 想确认 shard 切分是否正确：先看 `split_summary.json` 和单 shard 的 `split_meta.json`
+- 想确认 full relabeling 是否已经 merge 回总包：先看 `samples_packed.stage1_merged.pkl`
+  的时间戳，再用少量 sample 对照 shard
+- 想看 merge / borrow / junction 的总量：先看 `stage1_episode_stats.json`
+- 想看 train / val 是否继承了 full relabeling：优先对比 `train/val` 的
+  `stage1_episode_stats.json`
+
+## samples_packed 的头尾裁边规则
+
+`samples_packed.pkl` 不是 raw route 的逐帧完整拷贝。当前打包逻辑会系统性裁掉：
+
+- 头部若干帧
+- 尾部若干帧
+
+原因在：
+
+- `dataset/preprocess_pdm_lite.py`
+
+当前公式是：
+
+- `scen_start_frame_offset = max((obs_horizon - 1) * hz_interval, 4)`
+- `last_valid_future_frame_offset = action_horizon * hz_interval`
+- `last_frame_idx = num_seq - last_valid_future_frame_offset - 1`
+- 中心帧循环：
+  - `for ii in range(scen_start_frame_offset, last_frame_idx, sample_interval):`
+
+这意味着：
+
+- 头部至少会丢前 `max((obs_horizon - 1) * hz_interval, 4)` 帧
+- 尾部会丢最后 `action_horizon * hz_interval + 1` 附近的一段中心帧
+
+所以对于 stage1 relabeling / corridor-end 检查，必须明确：
+
+- raw route 的总帧数
+- packed 中实际保留的 frame_id 范围
+
+一个已确认的例子：
+
+- `ConstructionObstacleTwoWays/Town12_Rep0_1490_0_route0_11_08_09_11_32`
+  - raw route: `0..125`（126 帧）
+  - packed: `6..112`（107 帧）
+  - 丢失尾帧：`113..125`
+
+这会直接影响依赖尾部可见性的标签，例如：
+
+- `borrow_end_distance_m <= 0.5`
+
+如果 end 发生在 packed 看不到的尾帧里，当前 full relabeling 就会把这类
+scene 误读成“没有 end / 没有 active”，即使 raw route / video 中其实还能继续看到。
+
+## Stage1 头尾补全 relabel 流程
+
+如果我们希望：
+
+- 不改 `precompute_semantic_labels.py` 的核心 episode 逻辑
+- 但又让 stage1 relabeling 能看到 raw route 的头尾帧
+
+当前推荐流程是：
+
+1. 先基于 raw-vs-packed coverage index，生成一份 **仅给 stage1 使用** 的
+   临时 padded packed
+2. 在这份 padded packed 上跑 `--stage1_only --force`
+3. 再把 relabel 后的 stage1 字段投影回原始 trimmed packed
+
+这样：
+
+- training / `getitem` 继续用原始 trimmed packed
+- stage1 labeling 能看到 head/tail 时间轴
+- 不需要为了补头尾去改 merge / borrow / junction 的判定逻辑
+
+### 相关脚本
+
+- 构建临时 padded packed：
+  - `scripts/data_tools/build_stage1_padded_packed.py`
+- 把 padded relabel 的 stage1 字段投影回原始 packed：
+  - `scripts/data_tools/project_stage1_fields_from_padded.py`
+
+### 典型调用链
+
+```bash
+# 1. 基于 raw-vs-packed coverage index 生成 padded packed
+python scripts/data_tools/build_stage1_padded_packed.py \
+  --packed_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.pkl \
+  --coverage_json /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/route_frame_coverage_index.json \
+  --image_root /workspace1/z_project/dataset/pdm_lite \
+  --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.pkl \
+  --overwrite
+
+# 2. 用现有 shard 流程在 padded packed 上跑 stage1 relabel
+SOURCE=/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.pkl \
+NUM_SHARDS=16 \
+bash codex_bash/split_stage1_full.sh
+
+SHARD_ROOT=/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16 \
+bash codex_bash/run_stage1_full_shards.sh
+
+BASE=/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.pkl \
+SHARD_ROOT=/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16 \
+OUTPUT=/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.pkl \
+bash codex_bash/merge_stage1_full.sh
+
+# 3. 只把 stage1 字段投影回原始 trimmed packed
+python scripts/data_tools/project_stage1_fields_from_padded.py \
+  --base /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.pkl \
+  --padded_relabel /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.pkl \
+  --output /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.pkl \
+  --overwrite
+```

@@ -528,6 +528,64 @@ Current agreed fallback means this is no longer a hard blocker:
 - use slowdown if it is clearly visible
 - otherwise use the fixed `5 m` pre-start fallback
 
+### 8.5 Packed-frame truncation caveat
+
+For two-way borrow scenes, an important failure mode is not geometry, but packed
+sample coverage.
+
+The raw route can contain more frames than the corresponding
+`samples_packed.pkl` route slice:
+
+- some head frames may be missing
+- some tail frames may also be missing
+
+So a scene can simultaneously have:
+
+- valid `scene_borrow_context`
+- valid `borrow_motion`
+- many `borrow_cross_meet` frames
+- a reasonable `go` candidate
+
+but still fail to produce `borrow_cross_episode_active`, simply because the
+packed route slice ends before ego ever reaches:
+
+- `borrow_end_distance_m <= 0.5`
+
+One concrete confirmed example during relabeling review was:
+
+- `ConstructionObstacleTwoWays/Town12_Rep0_1490_0_route0_11_08_09_11_32`
+  - raw route frames: `0..125`
+  - packed route frames: `6..112`
+  - missing tail frames: `113..125`
+
+In that case:
+
+- corridor localization was valid
+- `context_frame_id` and `go` were reasonable
+- but the packed slice never observed the final corridor-end clearance
+
+So for `ConstructionObstacleTwoWays` scenes that show:
+
+- valid context
+- no `borrow_cross_episode_active`
+- no `borrow_end_distance_m <= 0.5`
+
+we should first suspect packed-frame truncation before concluding that borrow
+window logic itself is wrong.
+
+The current preferred mitigation is **not** to weaken borrow end logic with a
+fallback. Instead:
+
+- build a temporary stage1-only padded packed with raw head/tail frames restored
+- run stage1 relabeling on that padded packed
+- then project the relabeled stage1 fields back onto the original trimmed packed
+
+This keeps:
+
+- the geometry / episode logic unchanged
+- the training dataset shape unchanged
+- while letting stage1 labeling see the full route head/tail timeline
+
 ## 9. Junction-left cross split: `yld` / `go`
 
 `junction_left_cross_meet` should be treated as a decomposed cross-decision
