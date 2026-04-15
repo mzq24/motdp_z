@@ -167,6 +167,8 @@ STAGE1_MERGE_SPEED_CAP_MPS = 1000.0
 STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
 STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
 STAGE1_MERGE_AREA_POST_MARGIN_M = 3.0
+STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
+STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
 STAGE1_PERSISTED_MEET_FRAMES = 3
@@ -3655,6 +3657,22 @@ def _cover_is_cross_like(cover):
     return bool(np.isfinite(angle_deg) and angle_deg >= float(INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG))
 
 
+def _current_follow_chase_start_gate(record):
+    current_cover = (record or {}).get('current_cover') or {}
+    if int(current_cover.get('exists', 0.0)) <= 0:
+        return False
+    if _cover_interaction_subtype(current_cover) != 'follow_chase':
+        return False
+    other_speed = float(current_cover.get('other_speed', np.nan))
+    route_distance_m = float(current_cover.get('route_distance_m', np.nan))
+    if not np.isfinite(other_speed) or not np.isfinite(route_distance_m):
+        return False
+    return bool(
+        other_speed <= float(STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS) and
+        route_distance_m <= float(STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M)
+    )
+
+
 
 
 def _merge_record_scene_front_s(record):
@@ -4169,7 +4187,17 @@ def _annotate_route_stage1_junction_cross_decisions(samples, route_sample_indice
     episode_id = 0
     prev_end_pos = -1
     for cluster in _junction_cluster_conflict_candidates(records):
-        start_pos = max(int(cluster['start_pos']), int(prev_end_pos) + 1)
+        cluster_positions = sorted(
+            int(item['pos']) for item in cluster['items']
+            if int(item['pos']) > int(prev_end_pos)
+        )
+        cluster_positions = [
+            int(pos) for pos in cluster_positions
+            if not _current_follow_chase_start_gate(records[int(pos)])
+        ]
+        if not cluster_positions:
+            continue
+        start_pos = max(int(min(cluster_positions)), int(prev_end_pos) + 1)
         if start_pos >= len(records):
             continue
         center_xy = np.asarray(cluster['center_xy'], dtype=np.float32)
@@ -4177,7 +4205,6 @@ def _annotate_route_stage1_junction_cross_decisions(samples, route_sample_indice
         if center_xy.shape != (2,) or not np.all(np.isfinite(center_xy)) or not np.isfinite(radius_m) or radius_m <= 0.0:
             continue
 
-        cluster_positions = sorted(int(item['pos']) for item in cluster['items'] if int(item['pos']) >= int(start_pos))
         if len(cluster_positions) < int(STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS):
             continue
 
@@ -4369,7 +4396,6 @@ def _annotate_route_stage1_merge_decisions(samples, route_sample_indices, grace_
             pos = int(start_scan_pos) + 1
             continue
 
-        start_pos = int(area_info['start_pos'])
         future_merge_positions = [int(p) for p in area_info.get('inlier_positions', [])]
         conflict_s_values = [
             float(_merge_record_conflict_s(records[int(p)]))
@@ -4379,6 +4405,22 @@ def _annotate_route_stage1_merge_decisions(samples, route_sample_indices, grace_
         if not future_merge_positions or not conflict_s_values:
             pos = int(start_scan_pos) + 1
             continue
+        eligible_start_positions = [
+            int(p) for p in future_merge_positions
+            if not _current_follow_chase_start_gate(records[int(p)])
+        ]
+        if not eligible_start_positions:
+            pos = int(max(future_merge_positions)) + 1
+            continue
+        front_candidates = []
+        for p in eligible_start_positions:
+            front_s = _merge_record_scene_front_s(records[int(p)])
+            if np.isfinite(front_s):
+                front_candidates.append((float(front_s), int(p)))
+        if front_candidates:
+            _, start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))
+        else:
+            start_pos = min(eligible_start_positions)
 
         go_pos = None
         go_reason = 'none'

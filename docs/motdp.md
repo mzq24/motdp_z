@@ -24,6 +24,9 @@
 - `new_hpc` 常用 repo alias：`/home/z/code/motdp_z`（link 到同一份代码）
 - `new_hpc` 常用环境名：`z_dpauto`
 - 如果后续要核对 `new_hpc` 上的 labeling / video / training 行为，默认先按这两个值找代码和环境。
+- 如果后续要核对 stage1 full relabeling 产物、shard summary、scene split 输出：
+  - 先看 `./reference/hpc_dataset_guide.md`
+  - 不要默认先扫大 `samples_packed.pkl`
 
 ## 当前重点方向
 
@@ -149,6 +152,13 @@
     - 用局部 conflict area 定义 `junction_cross_active`
     - `start` 取 area 内 ego route progress 最小的那一帧
     - `end` 取 ego 离开 conflict area 的那一帧
+  - `merge/junction` 的 hard episode start 现在还有一个很窄的
+    current-chase gate：
+    - `current_cover.subtype == follow_chase`
+    - `other_speed <= 0.5`
+    - `route_distance_m <= 15`
+    - 只影响 future-driven episode 的 **start**
+    - 不影响已经开始的 episode 延续
 
 ## 推荐工作流
 

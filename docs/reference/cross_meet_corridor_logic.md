@@ -586,6 +586,35 @@ This keeps:
 - the training dataset shape unchanged
 - while letting stage1 labeling see the full route head/tail timeline
 
+### 8.6 Current-chase start gate for future merge / junction
+
+For hard `merge` / `junction` episode start, a future interaction candidate
+should not open too early when the current main route blocker is still a very
+near, slow same-direction lead vehicle.
+
+Current agreed gate:
+
+- only applied to **episode start**
+- does **not** cancel an already-started episode
+- does **not** change soft risk computation
+
+Gate condition:
+
+- `current_cover.subtype == follow_chase`
+- `current_cover.other_speed <= 0.5 m/s`
+- `current_cover.route_distance_m <= 15 m`
+
+When all three hold:
+
+- do not start a future-driven hard `merge` episode yet
+- do not start a future-driven hard `junction` episode yet
+
+This was introduced to suppress cases where:
+
+- current interaction is still a near lead blocker
+- but a farther `future_cover` candidate would otherwise open a hard episode
+  too early
+
 ## 9. Junction-left cross split: `yld` / `go`
 
 `junction_left_cross_meet` should be treated as a decomposed cross-decision
