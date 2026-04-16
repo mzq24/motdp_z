@@ -1008,6 +1008,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     warmup_epochs = int(config.get('training', {}).get('warmup_epochs', 5))
     lr_final = float(config.get('training', {}).get('lr_final', 1e-7))
     use_lr_scheduler = config.get('training', {}).get('use_lr_scheduler', True)
+    resume_rebuild_scheduler = bool(config.get('training', {}).get('resume_rebuild_scheduler', False))
 
     if use_lr_scheduler:
         from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, ConstantLR
@@ -1102,6 +1103,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             for sub_sched in sched._schedulers:
                 _set_scheduler_base_lrs(sub_sched, lr_value)
 
+    def _fast_forward_scheduler(sched, steps: int):
+        if sched is None or steps <= 0:
+            return
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(int(steps)):
+                sched.step()
+
     # EMA (Exponential Moving Average) for stable inference
     ema_cfg = config.get('ema', {})
     model_for_ema = policy.module if world_size > 1 else policy
@@ -1145,21 +1155,29 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 if rank == 0:
                     print("  ⚠ Could not restore energy optimizer state")
         if scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
-            try:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if resume_rebuild_scheduler:
                 if rank == 0:
-                    print("  ✓ Scheduler state restored")
-            except Exception:
-                if rank == 0:
-                    print("  ⚠ Could not restore scheduler state")
+                    print("  ↺ Skipping decoder scheduler state restore (resume_rebuild_scheduler=true)")
+            else:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    if rank == 0:
+                        print("  ✓ Scheduler state restored")
+                except Exception:
+                    if rank == 0:
+                        print("  ⚠ Could not restore scheduler state")
         if scheduler_energy is not None and 'scheduler_energy_state_dict' in checkpoint and checkpoint['scheduler_energy_state_dict'] is not None:
-            try:
-                scheduler_energy.load_state_dict(checkpoint['scheduler_energy_state_dict'])
+            if resume_rebuild_scheduler:
                 if rank == 0:
-                    print("  ✓ Energy scheduler state restored")
-            except Exception:
-                if rank == 0:
-                    print("  ⚠ Could not restore energy scheduler state")
+                    print("  ↺ Skipping energy scheduler state restore (resume_rebuild_scheduler=true)")
+            else:
+                try:
+                    scheduler_energy.load_state_dict(checkpoint['scheduler_energy_state_dict'])
+                    if rank == 0:
+                        print("  ✓ Energy scheduler state restored")
+                except Exception:
+                    if rank == 0:
+                        print("  ⚠ Could not restore energy scheduler state")
 
         resume_override_lr = config.get('optimizer', {}).get('resume_override_lr', None)
         resume_override_lr_energy = config.get('optimizer', {}).get('resume_override_lr_energy', resume_override_lr)
@@ -1181,6 +1199,24 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             _set_scheduler_base_lrs(scheduler_energy, resume_override_lr_energy)
             if rank == 0:
                 print(f"  ✓ Resume override energy lr -> {resume_override_lr_energy:.2e}")
+
+        if resume_rebuild_scheduler:
+            if scheduler is not None:
+                _fast_forward_scheduler(scheduler, start_epoch)
+                if rank == 0:
+                    print(
+                        "  ✓ Rebuilt decoder scheduler from config and "
+                        f"fast-forwarded to start_epoch={start_epoch} "
+                        f"(lr={optimizer.param_groups[0]['lr']:.2e})"
+                    )
+            if scheduler_energy is not None:
+                _fast_forward_scheduler(scheduler_energy, start_epoch)
+                if rank == 0:
+                    print(
+                        "  ✓ Rebuilt energy scheduler from config and "
+                        f"fast-forwarded to start_epoch={start_epoch} "
+                        f"(lr={optimizer_energy.param_groups[0]['lr']:.2e})"
+                    )
 
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit")
