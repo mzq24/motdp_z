@@ -139,9 +139,12 @@ STUCK_HELPER_TARGET_INSERT_ENABLE = os.environ.get('STUCK_HELPER_TARGET_INSERT_E
     '1', 'true', 'yes', 'on'
 )
 STUCK_HELPER_TARGET_1_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_1_FORWARD_M', '3.63'))
-STUCK_HELPER_TARGET_2_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_2_FORWARD_M', '4.63'))
+STUCK_HELPER_TARGET_2_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_2_FORWARD_M', '25.63'))
 STUCK_HELPER_TARGET_LATERAL_M = float(os.environ.get('STUCK_HELPER_TARGET_LATERAL_M', '-3.145'))
 STUCK_HELPER_RELEASE_HEADING_DEG = float(os.environ.get('STUCK_HELPER_RELEASE_HEADING_DEG', '20.0'))
+STUCK_HELPER_STARTUP_DISTANCE_M = float(os.environ.get('STUCK_HELPER_STARTUP_DISTANCE_M', '10.0'))
+STUCK_HELPER_STARTUP_THRESHOLD = int(os.environ.get('STUCK_HELPER_STARTUP_THRESHOLD', '100'))
+STUCK_HELPER_POSTSTART_THRESHOLD = int(os.environ.get('STUCK_HELPER_POSTSTART_THRESHOLD', '300'))
 EARLY_TARGET_PROMOTE_ENABLE = os.environ.get('EARLY_TARGET_PROMOTE_ENABLE', '1').lower() in (
     '1', 'true', 'yes', 'on'
 )
@@ -570,6 +573,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		parts = [format(float(v), fmt) for v in arr]
 		return '[' + ', '.join(parts) + ']'
 
+	def _format_debug_first(self, values, fmt='.2f'):
+		if values is None:
+			return 'NA'
+		if isinstance(values, torch.Tensor):
+			arr = values.detach().cpu().float().reshape(-1).tolist()
+		else:
+			arr = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+		if len(arr) == 0:
+			return 'NA'
+		return self._format_debug_value(arr[0], fmt)
+
 	def _format_debug_speed_curve_kmh(self, values, fmt='.1f', max_items=7):
 		if values is None:
 			return 'NA'
@@ -817,9 +831,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_max_apply_events': int(self.semantic_stop_max_apply_events),
 				'stop_sign_arm_speed_ok': False,
 				'stuck_helper_active': bool(self.stuck_helper_active and STUCK_HELPER_TARGET_INSERT_ENABLE),
+				'stuck_helper_mode': self.stuck_helper_mode,
 				'stuck_helper_frames_remaining': int(self.stuck_helper),
 				'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
 				'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
+				'stuck_helper_in_startup_zone': bool(self.stuck_helper_in_startup_zone),
+				'stuck_helper_distance_from_start_m': float(self.stuck_helper_distance_from_start_m),
+				'stuck_helper_startup_distance_m': float(self.stuck_helper_startup_distance_m),
+				'stuck_helper_startup_threshold': int(self.stuck_helper_startup_threshold),
+				'stuck_helper_poststart_threshold': int(self.stuck_helper_poststart_threshold),
+				'stuck_helper_startup_reference_xy': (
+					self.stuck_helper_startup_reference_xy.tolist()
+					if isinstance(self.stuck_helper_startup_reference_xy, np.ndarray)
+					else self.stuck_helper_startup_reference_xy
+				),
 				'force_move_blocked_reason': None,
 				'planner_wants_stop': False,
 			}
@@ -867,11 +892,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if force_move_blocked_reason is None:
 			self._update_stuck_helper_release(current_heading)
 
+		current_stuck_helper_threshold = (
+			self.stuck_helper_startup_threshold
+			if self.stuck_helper_in_startup_zone
+			else self.stuck_helper_poststart_threshold
+		)
+		self.stuck_helper_threshold = int(current_stuck_helper_threshold)
+
 		if ego_speed < 0.1:
 			if force_move_blocked_reason is None:
 				self.stuck_detector += 1
-				if self.stuck_detector > self.stuck_helper_threshold:
-					self._activate_stuck_helper(current_heading)
+				if (
+					self.stuck_helper_in_startup_zone
+					and self.stuck_detector > current_stuck_helper_threshold
+				):
+					self._activate_stuck_helper(current_heading, mode='startup')
 			else:
 				self.stuck_detector = 0
 				self.force_move = 0
@@ -948,9 +983,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'stop_sign_max_apply_events': int(self.semantic_stop_max_apply_events),
 			'stop_sign_arm_speed_ok': bool(stop_sign_debug.get('arm_speed_ok', False)),
 			'stuck_helper_active': bool(self.stuck_helper_active and STUCK_HELPER_TARGET_INSERT_ENABLE),
+			'stuck_helper_mode': self.stuck_helper_mode,
 			'stuck_helper_frames_remaining': int(self.stuck_helper),
 			'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
 			'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
+			'stuck_helper_in_startup_zone': bool(self.stuck_helper_in_startup_zone),
+			'stuck_helper_distance_from_start_m': float(self.stuck_helper_distance_from_start_m),
+			'stuck_helper_startup_distance_m': float(self.stuck_helper_startup_distance_m),
+			'stuck_helper_startup_threshold': int(self.stuck_helper_startup_threshold),
+			'stuck_helper_poststart_threshold': int(self.stuck_helper_poststart_threshold),
+			'stuck_helper_startup_reference_xy': (
+				self.stuck_helper_startup_reference_xy.tolist()
+				if isinstance(self.stuck_helper_startup_reference_xy, np.ndarray)
+				else self.stuck_helper_startup_reference_xy
+			),
 			'force_move_blocked_reason': force_move_blocked_reason,
 			'planner_wants_stop': bool(planner_wants_stop),
 		}
@@ -1175,6 +1221,78 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 	def _predict_dp_action(self, dp_obs_dict):
 		return self.net.predict_action(dp_obs_dict, no_noise=True)
+
+	def _get_observed_borrow_time_s(self, current_time_s):
+		if self.borrow_latched and self.borrow_candidate_start_time_s is not None:
+			return max(float(current_time_s) - float(self.borrow_candidate_start_time_s), 0.0)
+		return 0.0
+
+	def _update_borrow_semantic_state(self, dp_pred_traj, current_time_s):
+		relation_probs = dp_pred_traj.get('lane_dir_relation_probs')
+		if relation_probs is not None:
+			relation_probs = np.asarray(relation_probs, dtype=np.float32).reshape(-1)
+			if relation_probs.size == 2:
+				relation_probs = np.clip(relation_probs, 1e-6, None)
+				relation_probs = relation_probs / np.sum(relation_probs)
+				prev_relation = np.asarray(self.prev_lane_dir_relation_probs, dtype=np.float32).reshape(-1)
+				if prev_relation.size != 2:
+					prev_relation = np.array([0.5, 0.5], dtype=np.float32)
+				same_smoothed = 0.7 * relation_probs[0] + 0.3 * prev_relation[0]
+				opposite_smoothed = 0.45 * relation_probs[1] + 0.55 * prev_relation[1]
+				relation_smoothed = np.array([same_smoothed, opposite_smoothed], dtype=np.float32)
+				relation_smoothed /= max(float(np.sum(relation_smoothed)), 1e-6)
+				self.prev_lane_dir_relation_probs = relation_smoothed
+
+		relation_smoothed = np.asarray(self.prev_lane_dir_relation_probs, dtype=np.float32).reshape(-1)
+		if relation_smoothed.size != 2:
+			relation_smoothed = np.array([0.5, 0.5], dtype=np.float32)
+			self.prev_lane_dir_relation_probs = relation_smoothed
+
+		borrow_prob = None
+		traj_window_probs = dp_pred_traj.get('traj_window_condition_probs')
+		if traj_window_probs is not None:
+			traj_window_probs = np.asarray(traj_window_probs, dtype=np.float32).reshape(-1)
+			if traj_window_probs.size >= 4:
+				borrow_prob = float(traj_window_probs[3])
+		if borrow_prob is None:
+			speed_borrow_prob = dp_pred_traj.get('speed_energy_borrow_active_prob')
+			if speed_borrow_prob is not None:
+				speed_borrow_prob = np.asarray(speed_borrow_prob, dtype=np.float32).reshape(-1)
+				if speed_borrow_prob.size > 0:
+					borrow_prob = float(speed_borrow_prob[0])
+		if borrow_prob is None:
+			borrow_prob = 0.0
+
+		opposite_prob = float(relation_smoothed[1])
+		current_time_s = float(current_time_s)
+		if self.borrow_candidate_start_time_s is None and (borrow_prob > 0.25 or opposite_prob > 0.65):
+			self.borrow_candidate_start_time_s = current_time_s
+
+		if borrow_prob > 0.5:
+			self.borrow_latch_counter += 1
+		else:
+			self.borrow_latch_counter = 0
+
+		if (not self.borrow_latched) and self.borrow_latch_counter >= 2:
+			self.borrow_latched = True
+			self.borrow_release_counter = 0
+			if self.borrow_candidate_start_time_s is None:
+				self.borrow_candidate_start_time_s = current_time_s
+
+		if self.borrow_latched:
+			if borrow_prob < 0.2 and opposite_prob < 0.55:
+				self.borrow_release_counter += 1
+			else:
+				self.borrow_release_counter = 0
+			if self.borrow_release_counter >= 4:
+				self.borrow_latched = False
+				self.borrow_release_counter = 0
+				self.borrow_latch_counter = 0
+				self.borrow_candidate_start_time_s = None
+		elif borrow_prob < 0.1 and opposite_prob < 0.45:
+			self.borrow_candidate_start_time_s = None
+
+		self.borrow_observed_time_s = self._get_observed_borrow_time_s(current_time_s)
 
 	def _compute_front_route_risk_debug(
 		self,
@@ -1682,7 +1800,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.clip_delta = 1.0
 		self.clip_throttle = 1.0
 		self.stuck_threshold = 300 #800
-		self.stuck_helper_threshold = 100
+		self.stuck_helper_threshold = STUCK_HELPER_STARTUP_THRESHOLD
+		self.stuck_helper_startup_threshold = STUCK_HELPER_STARTUP_THRESHOLD
+		self.stuck_helper_poststart_threshold = STUCK_HELPER_POSTSTART_THRESHOLD
+		self.stuck_helper_startup_distance_m = STUCK_HELPER_STARTUP_DISTANCE_M
 		self.creep_duration = 15
 		self.creep_throttle = 0.4
 		
@@ -1690,8 +1811,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.stuck_detector = 0
 		self.stuck_helper = 0
 		self.stuck_helper_active = False
+		self.stuck_helper_mode = None
 		self.stuck_helper_start_heading = None
 		self.stuck_helper_heading_delta_deg = 0.0
+		self.stuck_helper_startup_reference_xy = None
+		self.stuck_helper_distance_from_start_m = 0.0
+		self.stuck_helper_in_startup_zone = True
 		self.force_move = 0
 
 		self.steer_step = 0
@@ -1799,8 +1924,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_waypoint_route = None  # Store the planner waypoint route (in ego frame)
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 		self.last_energy_debug = {}
+		self.last_branch_condition_debug = {}
 		self.last_model_input_debug = {}
 		self.last_speed_debug = {}
+		self.prev_lane_dir_relation_probs = np.array([0.5, 0.5], dtype=np.float32)
+		self.borrow_candidate_start_time_s = None
+		self.borrow_latched = False
+		self.borrow_latch_counter = 0
+		self.borrow_release_counter = 0
+		self.borrow_observed_time_s = 0.0
 		self.front_route_risk_ema = None
 		self.front_route_risk_sigmoid_history = deque(maxlen=FRONT_ROUTE_RISK_RECENT_WINDOW)
 		self.front_route_risk_cap_hold_frames = 0
@@ -2073,7 +2205,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		return (ego_points @ rotation.T) + ego_xy
 
 	def _get_stuck_helper_target_override(self, ego_xy, yaw):
-		if not STUCK_HELPER_TARGET_INSERT_ENABLE or not self.stuck_helper_active:
+		if (
+			not STUCK_HELPER_TARGET_INSERT_ENABLE
+			or not self.stuck_helper_active
+			or self.stuck_helper_mode != 'startup'
+		):
 			return None
 
 		helper_ego_points = np.array([
@@ -2094,14 +2230,35 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def _reset_stuck_helper_state(self):
 		self.stuck_helper = 0
 		self.stuck_helper_active = False
+		self.stuck_helper_mode = None
 		self.stuck_helper_start_heading = None
 		self.stuck_helper_heading_delta_deg = 0.0
 
-	def _activate_stuck_helper(self, current_heading):
+	def _activate_stuck_helper(self, current_heading, mode='startup'):
 		self.stuck_helper_active = True
 		self.stuck_helper = 1
+		self.stuck_helper_mode = mode
 		self.stuck_helper_start_heading = float(current_heading)
 		self.stuck_helper_heading_delta_deg = 0.0
+
+	def _update_stuck_helper_startup_state(self, ego_xy):
+		if ego_xy is None:
+			return
+		ego_xy = np.asarray(ego_xy, dtype=np.float32)
+		if self.stuck_helper_startup_reference_xy is None:
+			self.stuck_helper_startup_reference_xy = ego_xy.copy()
+		delta_xy = ego_xy - self.stuck_helper_startup_reference_xy
+		self.stuck_helper_distance_from_start_m = float(np.linalg.norm(delta_xy))
+		self.stuck_helper_in_startup_zone = (
+			self.stuck_helper_distance_from_start_m <= self.stuck_helper_startup_distance_m
+		)
+		self.stuck_helper_threshold = (
+			self.stuck_helper_startup_threshold
+			if self.stuck_helper_in_startup_zone
+			else self.stuck_helper_poststart_threshold
+		)
+		if not self.stuck_helper_in_startup_zone and self.stuck_helper_mode == 'startup':
+			self._reset_stuck_helper_state()
 
 	def _update_stuck_helper_release(self, current_heading):
 		if not self.stuck_helper_active or self.stuck_helper_start_heading is None:
@@ -2360,6 +2517,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'transfuser_lidar_bev': transfuser_lidar_bev_tensor,  # (1, C, H, W) on GPU, raw for backbone
 				'transfuser_lidar_bev_inv': transfuser_lidar_bev_inv,  # (1, C, H, W) inverted for DiT detail
 				}
+		self._update_stuck_helper_startup_state(result['gps'][:2])
 		
 		waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
 		
@@ -2555,10 +2713,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result['target_point_raw_world'] = raw_target_point_world
 		result['next_target_point_raw_world'] = raw_next_target_point_world
 		result['stuck_helper_active'] = bool(stuck_helper_debug['active'])
+		result['stuck_helper_mode'] = self.stuck_helper_mode
 		result['stuck_helper_frames_remaining'] = int(stuck_helper_debug['frames_remaining'])
 		result['stuck_helper_heading_delta_deg'] = float(self.stuck_helper_heading_delta_deg)
 		result['stuck_helper_release_heading_deg'] = float(STUCK_HELPER_RELEASE_HEADING_DEG)
 		result['stuck_helper_threshold'] = int(self.stuck_helper_threshold)
+		result['stuck_helper_in_startup_zone'] = bool(self.stuck_helper_in_startup_zone)
+		result['stuck_helper_distance_from_start_m'] = float(self.stuck_helper_distance_from_start_m)
+		result['stuck_helper_startup_distance_m'] = float(self.stuck_helper_startup_distance_m)
+		result['stuck_helper_startup_threshold'] = int(self.stuck_helper_startup_threshold)
+		result['stuck_helper_poststart_threshold'] = int(self.stuck_helper_poststart_threshold)
+		result['stuck_helper_startup_reference_xy'] = (
+			self.stuck_helper_startup_reference_xy.tolist()
+			if isinstance(self.stuck_helper_startup_reference_xy, np.ndarray)
+			else self.stuck_helper_startup_reference_xy
+		)
 		result['stuck_helper_target_points_ego'] = stuck_helper_debug['target_points_ego']
 		result['stuck_helper_target_points_world'] = stuck_helper_debug['target_points_world']
 		result['target_dot_forward'] = target_dot_forward
@@ -3252,13 +3421,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				}
 
 				# Build dp_obs_dict with transfuser features
+				current_time_s = float(self.step) * float(self.carla_frame_rate)
+				borrow_time_cond_s = self._get_observed_borrow_time_s(current_time_s)
 				dp_obs_dict = {
 					'ego_status': ego_status_stacked,
 					'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
 					'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
 					'transfuser_lidar_bev': transfuser_lidar_bev_detail,  # (1, 2, 256, 256)
+					'prev_lane_dir_relation_probs': torch.from_numpy(
+						self.prev_lane_dir_relation_probs.astype(np.float32)
+					).unsqueeze(0).to('cuda', dtype=torch.float32),
+					'borrow_cross_active_time_s': torch.tensor(
+						[borrow_time_cond_s], device='cuda', dtype=torch.float32
+					),
 				}
 			dp_pred_traj = self._predict_dp_action(dp_obs_dict)
+			self._update_borrow_semantic_state(dp_pred_traj, current_time_s)
 			# Store predicted target speed for control_pid
 			self._last_target_speed = dp_pred_traj.get('target_speed', None)
 			if self._last_target_speed is not None:
@@ -3277,7 +3455,47 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			self.last_energy_debug = {}
+			self.last_branch_condition_debug = {
+				'traj_branch_condition_enabled': bool(getattr(self.net, 'use_traj_branch_condition', False)),
+				'traj_branch_condition_scale': float(getattr(self.net, 'traj_branch_condition_scale', 0.0) or 0.0),
+				'traj_branch_condition_detach': bool(getattr(self.net, 'traj_branch_condition_detach', False)),
+				'traj_window_condition_names': list(
+					getattr(self.net, 'traj_window_condition_names', ('none', 'merge', 'junction', 'borrow'))
+				),
+				'traj_phase_condition_names': list(
+					getattr(self.net, 'traj_phase_condition_names', ('yld', 'go'))
+				),
+				'traj_phase_energy_condition_names': list(
+					getattr(self.net, 'traj_phase_energy_condition_names', ('phase_energy_yld', 'phase_energy_go'))
+				),
+			}
 			target_speed_profile_list = None
+			for semantic_key in [
+				'traj_branch_condition_probs',
+				'traj_window_condition_probs',
+				'traj_phase_condition_probs',
+				'traj_phase_energy_summary',
+				'lane_dir_relation_probs',
+			]:
+				semantic_value = dp_pred_traj.get(semantic_key)
+				if semantic_value is None:
+					continue
+				semantic_array = np.asarray(semantic_value).reshape(-1)
+				if semantic_array.size > 0:
+					self.last_branch_condition_debug[semantic_key] = semantic_array.astype(np.float32).tolist()
+			traj_borrow_time_condition = dp_pred_traj.get('traj_borrow_time_condition')
+			if traj_borrow_time_condition is not None:
+				traj_borrow_time_condition = np.asarray(traj_borrow_time_condition).reshape(-1)
+				if traj_borrow_time_condition.size > 0:
+					self.last_branch_condition_debug['traj_borrow_time_condition'] = float(traj_borrow_time_condition[0])
+			self.last_branch_condition_debug['prev_lane_dir_relation_probs'] = (
+				self.prev_lane_dir_relation_probs.astype(np.float32).tolist()
+			)
+			self.last_branch_condition_debug['borrow_candidate_start_time_s'] = (
+				None if self.borrow_candidate_start_time_s is None else float(self.borrow_candidate_start_time_s)
+			)
+			self.last_branch_condition_debug['borrow_latched'] = bool(self.borrow_latched)
+			self.last_branch_condition_debug['borrow_observed_time_s'] = float(self.borrow_observed_time_s)
 			for energy_key in ['energy_front', 'energy_left', 'energy_right',
 								'energy_pedestrian', 'energy_offroad', 'energy_route']:
 				energy_value = dp_pred_traj.get(energy_key)
@@ -3313,8 +3531,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.last_energy_debug['speed_energy_ref_speeds'] = speed_energy_ref_speeds.tolist()
 			for scalar_key in [
 				'merge_active_prob',
+				'junction_active_prob',
+				'borrow_active_prob',
 				'cross_active_prob',
 				'merge_active_logits',
+				'junction_active_logits',
+				'borrow_active_logits',
 				'cross_active_logits',
 			]:
 				scalar_value = dp_pred_traj.get(f'speed_energy_{scalar_key}')
@@ -3322,10 +3544,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					continue
 				scalar_array = np.asarray(scalar_value).reshape(-1)
 				if scalar_array.size > 0:
-					self.last_energy_debug[f'speed_energy_{scalar_key}'] = float(scalar_array[0])
+					self.last_branch_condition_debug[f'speed_energy_{scalar_key}'] = float(scalar_array[0])
 			for raw_curve_key in [
 				'merge_yld',
 				'merge_go',
+				'junction_yld',
+				'junction_go',
+				'borrow_yld',
+				'borrow_go',
 				'cross_yld',
 				'cross_go',
 			]:
@@ -3334,7 +3560,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					continue
 				raw_curve_array = np.asarray(raw_curve_value).reshape(-1)
 				if raw_curve_array.size > 0:
-					self.last_energy_debug[f'speed_energy_{raw_curve_key}'] = raw_curve_array.astype(np.float32).tolist()
+					self.last_branch_condition_debug[f'speed_energy_{raw_curve_key}'] = raw_curve_array.astype(np.float32).tolist()
 			speed_energy_curves = {}
 			speed_energy_total_curve = None
 			for speed_energy_key in ['chase', 'merge', 'cross', 'pedestrian']:
@@ -3414,8 +3640,27 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				if total_curve is not None:
 					if 'speed_energy_ref_total' not in self.last_energy_debug:
 						self.last_energy_debug['speed_energy_ref_total'] = total_curve.astype(np.float32).tolist()
-			elif (
-				speed_energy_ref_speeds is not None
+			for ref_curve_key in [
+				'merge_yld',
+				'merge_go',
+				'junction_yld',
+				'junction_go',
+				'borrow_yld',
+				'borrow_go',
+				'cross_yld',
+				'cross_go',
+			]:
+				ref_curve_value = dp_pred_traj.get(f'speed_energy_ref_{ref_curve_key}')
+				if ref_curve_value is None:
+					continue
+				ref_curve_array = np.asarray(ref_curve_value).reshape(-1)
+				if ref_curve_array.size > 0:
+					self.last_branch_condition_debug[f'speed_energy_ref_{ref_curve_key}'] = (
+						ref_curve_array.astype(np.float32).tolist()
+					)
+			if (
+				len(speed_energy_ref_curves) == 0
+				and speed_energy_ref_speeds is not None
 				and speed_energy_ref_speeds.size > 0
 				and speed_energy_samples is not None
 				and speed_energy_samples.size > 0
@@ -3627,8 +3872,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stuck_detector': int(self.stuck_detector),
 				'stuck_helper': int(self.stuck_helper),
 				'stuck_helper_active_state': bool(self.stuck_helper_active),
+				'stuck_helper_mode': self.stuck_helper_mode,
 				'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
 				'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
+				'stuck_helper_in_startup_zone': bool(self.stuck_helper_in_startup_zone),
+				'stuck_helper_distance_from_start_m': float(self.stuck_helper_distance_from_start_m),
+				'stuck_helper_startup_distance_m': float(self.stuck_helper_startup_distance_m),
+				'stuck_helper_startup_threshold': int(self.stuck_helper_startup_threshold),
+				'stuck_helper_poststart_threshold': int(self.stuck_helper_poststart_threshold),
+				'stuck_helper_startup_reference_xy': (
+					self.stuck_helper_startup_reference_xy.tolist()
+					if isinstance(self.stuck_helper_startup_reference_xy, np.ndarray)
+					else self.stuck_helper_startup_reference_xy
+				),
 				'force_move': int(self.force_move),
 				'traffic_light_semantic_state': semantic_debug.get('traffic_light_state'),
 				'traffic_light_semantic_block_force_move': bool(semantic_debug.get('traffic_light_block_force_move', False)),
@@ -3654,7 +3910,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_semantic_max_apply_events': int(semantic_debug.get('stop_sign_max_apply_events', 0)),
 				'stop_sign_semantic_arm_speed_ok': bool(semantic_debug.get('stop_sign_arm_speed_ok', False)),
 				'stuck_helper_active': bool(semantic_debug.get('stuck_helper_active', False)),
+				'stuck_helper_mode_tick': semantic_debug.get('stuck_helper_mode'),
 				'stuck_helper_frames_remaining': int(semantic_debug.get('stuck_helper_frames_remaining', 0)),
+				'stuck_helper_in_startup_zone_tick': bool(semantic_debug.get('stuck_helper_in_startup_zone', False)),
+				'stuck_helper_distance_from_start_m_tick': semantic_debug.get('stuck_helper_distance_from_start_m'),
 				'force_move_blocked_reason': semantic_debug.get('force_move_blocked_reason'),
 				'planner_wants_stop_for_force_move': bool(semantic_debug.get('planner_wants_stop', False)),
 			}
@@ -3719,10 +3978,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'target_point_raw_world': tick_data['target_point_raw_world'].tolist() if isinstance(tick_data.get('target_point_raw_world'), np.ndarray) else tick_data.get('target_point_raw_world'),
 				'next_target_point_raw_world': tick_data['next_target_point_raw_world'].tolist() if isinstance(tick_data.get('next_target_point_raw_world'), np.ndarray) else tick_data.get('next_target_point_raw_world'),
 				'tick_stuck_helper_active': bool(tick_data.get('stuck_helper_active', False)),
+				'tick_stuck_helper_mode': tick_data.get('stuck_helper_mode'),
 				'tick_stuck_helper_frames_remaining': int(tick_data.get('stuck_helper_frames_remaining', 0)),
 				'tick_stuck_helper_heading_delta_deg': float(tick_data.get('stuck_helper_heading_delta_deg', 0.0)),
 				'tick_stuck_helper_release_heading_deg': float(tick_data.get('stuck_helper_release_heading_deg', 0.0)),
 				'tick_stuck_helper_threshold': int(tick_data.get('stuck_helper_threshold', 0)),
+				'tick_stuck_helper_in_startup_zone': bool(tick_data.get('stuck_helper_in_startup_zone', False)),
+				'tick_stuck_helper_distance_from_start_m': float(tick_data.get('stuck_helper_distance_from_start_m', 0.0)),
+				'tick_stuck_helper_startup_distance_m': float(tick_data.get('stuck_helper_startup_distance_m', 0.0)),
+				'tick_stuck_helper_startup_threshold': int(tick_data.get('stuck_helper_startup_threshold', 0)),
+				'tick_stuck_helper_poststart_threshold': int(tick_data.get('stuck_helper_poststart_threshold', 0)),
+				'tick_stuck_helper_startup_reference_xy': tick_data.get('stuck_helper_startup_reference_xy'),
 				'tick_stuck_helper_target_points_ego': tick_data.get('stuck_helper_target_points_ego'),
 				'tick_stuck_helper_target_points_world': tick_data.get('stuck_helper_target_points_world'),
 				'model_route_pred_ego': self.last_route_pred.tolist() if isinstance(self.last_route_pred, np.ndarray) else self.last_route_pred,
@@ -3756,6 +4022,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.pid_metadata['model_dp_traj_last'] = self.last_dp_pred_traj[-1].tolist()
 			for energy_key, energy_value in self.last_energy_debug.items():
 				self.pid_metadata[energy_key] = self._jsonify_debug_value(energy_value)
+			for branch_key, branch_value in self.last_branch_condition_debug.items():
+				self.pid_metadata[branch_key] = self._jsonify_debug_value(branch_value)
+			for semantic_key, semantic_value in self.last_semantic_debug.items():
+				self.pid_metadata[semantic_key] = self._jsonify_debug_value(semantic_value)
 			for input_key, input_value in self.last_model_input_debug.items():
 				self.pid_metadata[input_key] = self._jsonify_debug_value(input_value)
 			for speed_key, speed_value in self.last_speed_debug.items():
@@ -3933,17 +4203,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		outfile.close()
 
 	def _compose_debug_visualization(self, rgb_img, bev_img):
-		left = cv2.resize(rgb_img, (800, 600))
-		right = cv2.resize(bev_img, (800, 600))
-
-		overlay = right.copy()
-		panel_top = 290
-		cv2.rectangle(overlay, (20, panel_top), (780, 580), (20, 20, 20), -1)
-		right = cv2.addWeighted(overlay, 0.45, right, 0.55, 0.0)
+		left_img = cv2.resize(rgb_img, (800, 600))
+		right_img = cv2.resize(bev_img, (800, 600))
 
 		speed_mps = float(self.pid_metadata.get('speed', 0.0))
 		command_value = self.pid_metadata.get('command_value', 'N/A')
 		command_text = self.pid_metadata.get('command_text', 'unknown')
+		cond_enabled = int(bool(self.pid_metadata.get('traj_branch_condition_enabled', False)))
+		cond_scale = self._format_debug_value(self.pid_metadata.get('traj_branch_condition_scale'), '.1f')
+		cond_detach = int(bool(self.pid_metadata.get('traj_branch_condition_detach', False)))
+		merge_active_prob = self._format_debug_value(self.pid_metadata.get('speed_energy_merge_active_prob'), '.2f')
+		junction_active_prob = self._format_debug_value(self.pid_metadata.get('speed_energy_junction_active_prob'), '.2f')
+		borrow_active_prob = self._format_debug_value(self.pid_metadata.get('speed_energy_borrow_active_prob'), '.2f')
+		merge_yld_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_merge_yld'), '.2f')
+		merge_go_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_merge_go'), '.2f')
+		junction_yld_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_junction_yld'), '.2f')
+		junction_go_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_junction_go'), '.2f')
+		borrow_yld_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_borrow_yld'), '.2f')
+		borrow_go_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_borrow_go'), '.2f')
 
 		left_status_lines = [
 			f"frm: {self.step}",
@@ -3954,6 +4231,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"vd(cap): {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
 			f"Estg: {self.pid_metadata.get('stage1_energy_control_mode', 'off')}/{int(bool(self.pid_metadata.get('stage1_energy_speed_control_active', False)))}",
 			f"dV(E): {self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')}",
+			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
+			f"v_tgt: {self._format_debug_value(self.pid_metadata.get('stage1_energy_target_speed_ms'), '.1f')} ({self.pid_metadata.get('stage1_energy_target_source', 'NA')})",
+			f"dE/dv,dV: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}",
+			f"dEc/g/x/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_chase_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_merge_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_cross_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_pedestrian_dedv'), '.2f')}",
+			f"E*: {self._format_energy_peak_with_speed()}",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
 			f"thr: {float(self.pid_metadata.get('throttle', 0.0)):.2f}",
 			f"brk: {float(self.pid_metadata.get('brake', 0.0)):.2f}",
@@ -3967,6 +4249,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"herr: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.1f}",
 			f"sidx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
 			f"sctl: {float(self.pid_metadata.get('steer_controller', 0.0)):.2f}",
+			f"cond cfg: {cond_enabled} nmjb+yg+bt",
+			f"cond sc/dt: {cond_scale}/{cond_detach}",
+			f"act m/j/b: {merge_active_prob}/{junction_active_prob}/{borrow_active_prob}",
+			f"m y/g@h: {merge_yld_head}/{merge_go_head}",
+			f"j y/g@h: {junction_yld_head}/{junction_go_head}",
+			f"b y/g@h: {borrow_yld_head}/{borrow_go_head}",
+			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
 		if self.last_target_point is not None:
@@ -3979,20 +4268,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 
 		right_status_lines = [
-			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
-			f"v_tgt: {self._format_debug_value(self.pid_metadata.get('stage1_energy_target_speed_ms'), '.1f')} ({self.pid_metadata.get('stage1_energy_target_source', 'NA')})",
-			f"dE/dv,dV: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}",
-			f"dEc/g/x/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_chase_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_merge_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_cross_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_pedestrian_dedv'), '.2f')}",
 			f"pred h/1/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')} m/s",
 			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=7)}",
-			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.1f', max_items=3)}",
-			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.1f', max_items=7)}",
-			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.1f', max_items=7)}",
-			f"Eg: {self._format_debug_curve(self.pid_metadata.get('speed_energy_merge'), fmt='.1f', max_items=7)}",
-			f"Ex: {self._format_debug_curve(self.pid_metadata.get('speed_energy_cross'), fmt='.1f', max_items=7)}",
-			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.1f', max_items=7)}",
-			f"E*: {self._format_energy_peak_with_speed()}",
-			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
+			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.3f', max_items=3)}",
+			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.3f', max_items=7)}",
+			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.3f', max_items=7)}",
+			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.3f', max_items=7)}",
+			f"Em y: {self._format_debug_curve(self.pid_metadata.get('speed_energy_merge_yld'), fmt='.3f', max_items=7)}",
+			f"Em g: {self._format_debug_curve(self.pid_metadata.get('speed_energy_merge_go'), fmt='.3f', max_items=7)}",
+			f"Ej y: {self._format_debug_curve(self.pid_metadata.get('speed_energy_junction_yld'), fmt='.3f', max_items=7)}",
+			f"Ej g: {self._format_debug_curve(self.pid_metadata.get('speed_energy_junction_go'), fmt='.3f', max_items=7)}",
+			f"Eb y: {self._format_debug_curve(self.pid_metadata.get('speed_energy_borrow_yld'), fmt='.3f', max_items=7)}",
+			f"Eb g: {self._format_debug_curve(self.pid_metadata.get('speed_energy_borrow_go'), fmt='.3f', max_items=7)}",
+			f"cw[nmjb]: {self._format_debug_curve(self.pid_metadata.get('traj_window_condition_probs'), fmt='.2f', max_items=4)}",
+			f"cp[yg]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
+			f"ce[yg]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_phase_energy_summary'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
 		]
 
 		line_gap = 18
@@ -4000,7 +4290,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		col1_x = 26
 		col2_x = 220
 		col3_x = 415
+		panel_top = 290
 		start_y = panel_top + 28
+		max_line_count = max(len(left_status_lines), len(mid_status_lines), len(right_status_lines))
+		panel_bottom = max(580, start_y + max_line_count * line_gap + 12)
+		canvas_height = max(600, panel_bottom + 20)
+		left = np.zeros((canvas_height, 800, 3), dtype=np.uint8)
+		right = np.zeros((canvas_height, 800, 3), dtype=np.uint8)
+		left[:600] = left_img
+		right[:600] = right_img
+		overlay = right.copy()
+		cv2.rectangle(overlay, (20, panel_top), (780, panel_bottom), (20, 20, 20), -1)
+		right = cv2.addWeighted(overlay, 0.45, right, 0.55, 0.0)
 
 		for idx, line in enumerate(left_status_lines):
 			y = start_y + idx * line_gap
@@ -4041,7 +4342,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			)
 			legend_x += 145
 
-		canvas = np.zeros((600, 1600, 3), dtype=np.uint8)
+		canvas = np.zeros((canvas_height, 1600, 3), dtype=np.uint8)
 		canvas[:, :800] = left
 		canvas[:, 800:] = right
 		cv2.putText(canvas, "RGB", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)

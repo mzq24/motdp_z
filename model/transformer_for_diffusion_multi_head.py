@@ -1753,10 +1753,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.history_encoder = HistoryEncoder(status_dim, n_emb)
         self.traj_window_condition_dim = 4
         self.traj_phase_condition_dim = 2
+        self.traj_phase_energy_dim = 2
         self.traj_borrow_aux_dim = 1
         self.traj_branch_condition_dim = (
             self.traj_window_condition_dim
             + self.traj_phase_condition_dim
+            + self.traj_phase_energy_dim
             + self.traj_borrow_aux_dim
         )
         self.traj_window_condition_proj = nn.Sequential(
@@ -1766,6 +1768,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         self.traj_phase_condition_proj = nn.Sequential(
             nn.Linear(self.traj_phase_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_phase_energy_proj = nn.Sequential(
+            nn.Linear(self.traj_phase_energy_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
@@ -1885,6 +1892,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.speed_energy_merge_active_head = _make_speed_energy_active_head()
             self.speed_energy_junction_active_head = _make_speed_energy_active_head()
             self.speed_energy_borrow_active_head = _make_speed_energy_active_head()
+            self.speed_energy_lane_dir_relation_head = nn.Sequential(
+                nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, 2),
+            )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -2131,6 +2142,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'merge_active_logits': self.speed_energy_merge_active_head(active_input).squeeze(-1),
             'junction_active_logits': self.speed_energy_junction_active_head(active_input).squeeze(-1),
             'borrow_active_logits': self.speed_energy_borrow_active_head(active_input).squeeze(-1),
+            'lane_dir_relation_logits': self.speed_energy_lane_dir_relation_head(active_input),
         }
 
     def _forward_traj_energy_context(
@@ -2234,6 +2246,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         transfuser_lidar_bev: Optional[torch.Tensor] = None,
         branch_condition: Optional[torch.Tensor] = None,
         branch_condition_scale: float = 1.0,
+        branch_condition_schedule: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Ego denoising path with joint trajectory+route waypoint diffusion.
@@ -2278,6 +2291,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         wp_emb = self._embed_waypoint_tokens(traj_points)
         diff_query = self.diff_mode_query.expand(B, T_traj, -1)
         traj_emb = wp_emb + diff_query + conditioning.unsqueeze(1)
+        branch_cond_emb = None
         if branch_condition is not None:
             branch_condition = branch_condition.to(device=device, dtype=model_dtype)
             if branch_condition.dim() != 2 or branch_condition.shape[-1] != self.traj_branch_condition_dim:
@@ -2285,20 +2299,39 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     "forward_ego expects branch_condition as "
                     f"(B, {self.traj_branch_condition_dim}), got {branch_condition.shape}"
                 )
+            if branch_condition_schedule is None:
+                branch_condition_schedule = torch.ones(B, 4, device=device, dtype=model_dtype)
+            else:
+                branch_condition_schedule = branch_condition_schedule.to(device=device, dtype=model_dtype)
+                if branch_condition_schedule.dim() != 2 or branch_condition_schedule.shape[-1] != 4:
+                    raise ValueError(
+                        "forward_ego expects branch_condition_schedule as "
+                        f"(B, 4), got {branch_condition_schedule.shape}"
+                    )
             window_cond = branch_condition[:, :self.traj_window_condition_dim]
             phase_start = self.traj_window_condition_dim
             phase_end = phase_start + self.traj_phase_condition_dim
             phase_cond = branch_condition[:, phase_start:phase_end]
-            borrow_aux = branch_condition[:, phase_end:]
+            energy_start = phase_end
+            energy_end = energy_start + self.traj_phase_energy_dim
+            phase_energy_cond = branch_condition[:, energy_start:energy_end]
+            borrow_aux = branch_condition[:, energy_end:]
+            gate_window = branch_condition_schedule[:, 0:1]
+            gate_phase = branch_condition_schedule[:, 1:2]
+            gate_phase_energy = branch_condition_schedule[:, 2:3]
+            gate_borrow = branch_condition_schedule[:, 3:4]
             branch_cond_emb = (
-                self.traj_window_condition_proj(window_cond)
-                + self.traj_phase_condition_proj(phase_cond)
-                + self.traj_borrow_aux_proj(borrow_aux)
+                self.traj_window_condition_proj(window_cond) * gate_window
+                + self.traj_phase_condition_proj(phase_cond) * gate_phase
+                + self.traj_phase_energy_proj(phase_energy_cond) * gate_phase_energy
+                + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
             ) * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)
         traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
 
         speed_emb = self.speed_query.expand(B, -1, -1) + conditioning.unsqueeze(1)
+        if branch_cond_emb is not None:
+            speed_emb = speed_emb + branch_cond_emb.unsqueeze(1)
         speed_emb = self.pre_decoder_norm(self.drop(speed_emb))
 
         route_wp_emb = self._embed_route_waypoint_tokens(route_points)
