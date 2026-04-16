@@ -265,6 +265,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.cls_loss_weight = config.get('cls_loss_weight', 0.5)
         self.reg_loss_weight = config.get('reg_loss_weight', 1.0)
         self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
+        self.route_final_loss_weight = diffusion_cfg.get('route_final_loss_weight', 1.0)
         self.energy_loss_weight = route_b_cfg.get('energy_loss_weight', 1.0)
         self.speed_loss_weight = route_b_cfg.get('speed_loss_weight', 1.0)
         self.speed_profile_loss_weight = route_b_cfg.get('speed_profile_loss_weight', 1.0)
@@ -1582,7 +1583,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_fde = self._reduce_per_sample(
                 F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='none')
             )
-            route_loss = self._masked_batch_mean(route_recon + route_fde, good_route_mask)
+            route_loss = self._masked_batch_mean(
+                route_recon + self.route_final_loss_weight * route_fde,
+                good_route_mask,
+            )
 
         # Speed loss: two-hot cross-entropy
         speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -2108,6 +2112,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if route_gt is not None and route_pred is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
+            route_loss = route_loss + self.route_final_loss_weight * F.l1_loss(
+                route_pred[:, -1],
+                route_gt[:, -1],
+                reduction='mean',
+            )
 
         # Alignment loss: evaluate diffusion prediction with FROZEN energy heads
         # Goal: push diffusion decoder to generate trajectories that energy heads rate as safe.
@@ -2466,7 +2475,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if route_gt is not None and route_pred is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
             # FDE: extra weight on final route point
-            route_loss = route_loss + F.l1_loss(route_pred[:, -1], route_gt[:, -1], reduction='mean')
+            route_loss = route_loss + self.route_final_loss_weight * F.l1_loss(
+                route_pred[:, -1],
+                route_gt[:, -1],
+                reduction='mean',
+            )
 
         # ========== Alignment Loss ==========
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
