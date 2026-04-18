@@ -127,12 +127,15 @@ python scripts/build_feature_cache_fp16.py --dataset_root /path/to/pdm_lite/trai
   - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16`
 - 全局 split 摘要：
   - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16/split_summary.json`
+- shard active 小汇总（只统计 merge / borrow / junction active，不读其他 label）：
+  - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16/stage1_active_stats.summary.json`
 - 单 shard 目录示例：
   - `/workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_stage1_shards_16/shard_11_of_16`
 - 单 shard 常用文件：
   - `samples_packed.pkl`
   - `split_meta.json`
   - `stage1_relabel.log`
+  - `stage1_active_stats.json`
 
 ### Scene-level train / val split
 
@@ -149,9 +152,13 @@ python scripts/build_feature_cache_fp16.py --dataset_root /path/to/pdm_lite/trai
 ### 当前排查约定
 
 - 想确认 shard 切分是否正确：先看 `split_summary.json` 和单 shard 的 `split_meta.json`
+- 想快速看 shard 级别 merge / borrow / junction active 分布：先看
+  `stage1_active_stats.summary.json`，再按需打开单 shard 的 `stage1_active_stats.json`
 - 想确认 full relabeling 是否已经 merge 回总包：先看 `samples_packed.stage1_merged.pkl`
   的时间戳，再用少量 sample 对照 shard
 - 想看 merge / borrow / junction 的总量：先看 `stage1_episode_stats.json`
+- 想看 unified `conflict_area` 的 family/issue 分布：
+  - 先导出并查看 `export_stage1_conflict_area_stats.py` 的 summary json
 - 想看 train / val 是否继承了 full relabeling：优先对比 `train/val` 的
   `stage1_episode_stats.json`
 

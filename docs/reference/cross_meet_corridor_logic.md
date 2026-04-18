@@ -519,6 +519,122 @@ So the practical fallback is:
 
 The main stability concern is not blocker localization anymore.
 
+## 9. Unified Conflict Framework Scaffold
+
+- `precompute_semantic_labels.py` 已经开始接统一 `conflict_area` 骨架层，先不改 energy。
+- 当前统一层直接从 route-level area/window 生成 unified conflict window，不再直接继承旧
+  `borrow_cross_episode / merge_episode / junction_cross_episode` 的 active。
+- 旧 family episode 仍然保留，但当前角色是：
+  - baseline 对照
+  - 回归检查
+  - debug 比较
+- 当前统一层只先回答：
+  - 当前帧是否处于 conflict area window
+  - 当前主 family 是谁
+  - 当前粗方向是什么
+- 当前粗方向的临时映射是：
+  - `borrow -> opposite`
+  - `merge -> same`
+  - `junction -> none`
+- 如果某个 family 已经 active，但缺少 area/source 元数据：
+  - 当前先记录为 `conflict_area` issue
+  - 不直接在这层 hard crash
+- 当前统一层已经按 family 分三条 area 驱动路径：
+  - `borrow`
+    - 基于 `event_name + scene_borrow_context + corridor`
+    - 再从 borrow cover 在 corridor progress 上提纯 `conflict area`
+  - `merge`
+    - 基于 future conflict points -> merge area
+  - `junction`
+    - 基于 conflict history cluster -> junction local area
+- 当前统一层的 family 选择优先级暂定：
+  - `borrow > merge > junction`
+- 这是框架层，不是最终语义层：
+  - `borrow conflict area` 后面还要从 corridor 中提纯
+  - `merge / junction direction` 后面还要改成 area-based approach direction
+
+## 8.5 Borrow decoupling and conflict-area-based direction
+
+Recent review suggests that the current interaction-family split is mixing two
+different questions:
+
+- what conflict region ego is really approaching
+- what the actor's current local yaw / motion looks like before reaching that
+  region
+
+This is especially fragile for:
+
+- pre-turn ego states
+- opposite-turn junction conflicts
+- borrow scenes where the current local heading is not the right proxy for the
+  eventual corridor competition
+
+### Current issue
+
+`_interaction_signal_from_candidate(...)` still uses a local heading-angle test:
+
+- `same_direction` if angle `<= 45 deg`
+- `cross_direction` if angle `>= 70 deg`
+- the middle band still falls into merge-like handling
+
+As a result:
+
+- `merge` is not purely "same direction"
+- `borrow_cross_meet` still depends on first being classified as a
+  cross-direction candidate
+- the family split can be unstable before the true conflict region
+
+### Agreed direction
+
+#### Borrow should not conceptually depend on generic cross-family routing
+
+For:
+
+- `ConstructionObstacleTwoWays`
+- `AccidentTwoWays`
+
+the stable geometry is already scene-level:
+
+- `event_name`
+- `scene_borrow_context`
+- corridor `start/end`
+- `context_frame_id`
+
+So long-borrow labeling should conceptually be treated as a scene-level
+corridor problem, not as a generic cross-family subtype that first relies on a
+local angle test.
+
+#### Direction should be defined relative to the conflict area
+
+Instead of using:
+
+- current actor yaw / motion vs current local ego route heading
+
+the more stable definition is:
+
+- ego approach direction **into the conflict area**
+- background actor approach direction **into the same conflict area**
+
+using the conflict-region geometry itself:
+
+- `borrow`: corridor
+- `merge`: merge area
+- `junction`: conflict circle / local junction area
+
+This gives a more stable auxiliary direction notion for later conflict labels,
+for example:
+
+- `same`
+- `opposite`
+- `cross` / `none`
+
+depending on the final auxiliary-label design.
+
+The key idea is:
+
+- local heading is only a weak proxy
+- conflict-area approach direction is the actual quantity we care about
+
 The main remaining sensitivity is:
 
 - how we define "slowdown starts"
@@ -676,6 +792,178 @@ In practice this means:
   - route-based `merge_active`
   - corridor-based `borrow_cross_active`
   while still using its own local cross-conflict geometry
+
+### 9.3 Junction should also become conflict-area-based
+
+For junction, the remaining direction logic should follow the same overall
+principle as merge:
+
+- cover / conflict-point detection remains the evidence source
+- conflict area gets explicit `start/end`
+- direction should be derived from approach into / through that conflict area
+  instead of current local heading alone
+
+Working interpretation:
+
+- `junction_active` should be built from the conflict area itself
+- `junction + left` from raw labels / command is useful as a validation signal
+  or scene prior
+- but it should not be treated as the only hard condition for a junction
+  conflict window
+
+Reason:
+
+- raw `junction` and `command == LEFT` signals can lag slightly in time
+- the meaningful event is whether ego and another actor compete around the
+  conflict area, not whether the left-turn metadata has already fired exactly
+  on the same frame
+
+Important note:
+
+- `junction + left` can still behave merge-like in some cases
+- a representative example is ego left turn vs opposite right-turn actor
+  competing for the same downstream lane
+
+So future junction labeling should not assume:
+
+- `junction_left_cross` and `merge` are always separate
+
+Instead, the cleaner split is:
+
+- family / area geometry
+- conflict direction
+- whether the downstream lane competition is merge-like
+
+## 10. Borrow corridor vs borrow conflict area
+
+For long two-way borrow scenes, the current scene-level corridor is already
+quite stable, but it should be treated as the **larger maneuver region**, not
+as the final conflict region itself.
+
+### 10.1 Corridor is the large maneuver frame
+
+Current scene-level borrow corridor is still useful as the main maneuver
+geometry because it gives stable:
+
+- `borrow_start_world_xy`
+- `borrow_end_world_xy`
+- `borrow_distance_m`
+- `dStart / dEnd`
+- borrow active / go timing
+
+So the corridor is not the problem. It remains the right outer frame for the
+borrow maneuver.
+
+### 10.2 Current end is slightly too conservative
+
+The current corridor-end logic tends to choose a late recovery point:
+
+- first find the borrow peak
+- then search later recovery-side points
+- then fall back to a relatively late extra-route point if needed
+
+Working hypothesis:
+
+- for the maneuver corridor end, a better definition may be:
+  - after the borrow peak, take the **first** point whose lateral shift has
+    recovered sufficiently close to the original lane
+
+This should place the corridor end closer to the real re-entry region, instead
+of drifting too far into the extra tail.
+
+### 10.3 Conflict area should be a subset of the corridor
+
+Important distinction:
+
+- `corridor`
+  - the full borrowed-lane maneuver region
+- `conflict area`
+  - only the subsegment where the opposite-direction actor actually occupies or
+    competes for the borrowed lane
+
+Proposed borrow conflict-area definition:
+
+- project bbox cover onto the borrow corridor progress axis
+- `conflict_start = min(progress of cover overlap)`
+- `conflict_end = max(progress of cover overlap)`
+
+Interpretation:
+
+- the full corridor includes:
+  - entering the borrowed lane
+  - traversing the conflict region
+  - returning to the original lane
+- the conflict area should include only:
+  - the pure opposite-lane competition zone
+
+This is the cleaner geometry source for:
+
+- `conflict_area_active`
+- conflict-direction labels
+- more precise `yld/go` timing
+
+In short:
+
+- borrow corridor = large maneuver frame
+- borrow conflict area = tighter causal subregion inside that corridor
+
+## 11. Merge direction should be defined after the merge area
+
+For merge, the current geometry stack is already mostly acceptable:
+
+- cover is usable
+- current same-direction blocker becoming `follow_chase` is expected
+- future conflict points are the right source for merge-area construction
+- merge-area `start` is already good
+- merge-area `end + 3 m` is not the main problem
+
+The remaining weak point is the direction definition.
+
+### 11.1 Current issue
+
+Current direction logic still relies too much on local heading / local angle
+near the current cover or future candidate.
+
+This is fragile because:
+
+- the route may still be in the slanted merge-in segment
+- local heading there is not the same as the true downstream merged-lane
+  direction
+- using current local heading can therefore make merge-vs-cross distinction
+  less stable than it should be
+
+### 11.2 Agreed direction
+
+The preferred direction for merge should be derived from the downstream route
+**after** the merge area, not inside the slanted approach region.
+
+Recommended first version:
+
+- keep merge-area construction as it is:
+  - future conflict points
+  - clustered into merge area
+  - area end still uses the existing `+3 m` post margin
+- define merge downstream heading from route tangent samples taken after
+  `merge_area_end`
+
+Suggested window:
+
+- preferred: `merge_area_end -> merge_area_end + 5 m`
+- fallback: `merge_area_end -> merge_area_end + 3 m` if route is too short
+
+### 11.3 Practical interpretation
+
+This means:
+
+- merge area still comes from cover + future conflict points
+- but merge direction should come from the lane ego is actually merging into
+- not from the slanted segment while ego is still entering that lane
+
+The expected benefit is:
+
+- cleaner merge direction
+- less contamination from slanted approach headings
+- more stable future auxiliary labels such as conflict direction
 
 So older sessions may remember that "junction cross had go/yld ideas already".
 That memory is correct at the debug / formula level, but not at the stable

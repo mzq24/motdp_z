@@ -18,6 +18,19 @@
 - 训练和推理都高度依赖轨迹归一化统计、route/global stats、anchor 文件与 config 对齐。
 - `MoT-DP` 里的稳定结论优先沉淀在这里，不再散落在 session 对话里。
 
+命名上需要注意：
+
+- `Route B` 更适合指当前已经实现的主线 planner
+- `Stage1+` 更适合指 route-progress consistency / stronger semantic control
+  这类下一步扩展
+- `Stage2` 更适合指更后面的 semantic refinement / relation decoupling
+
+所以：
+
+- 不是所有 branch / progress / multi-step 设想都应该直接叫成 `Route B`
+- 当前已经落地的是 hierarchical branch-conditioned Route B
+- `traj_from_route_progress` 仍然属于 Stage1+ 方向，不是当前 Route B 训练主链
+
 ## 常用基础设施
 
 - `new_hpc` 常用 repo 路径：`/workspace1/z_project/code/motdp_z`
@@ -159,6 +172,63 @@
     - `route_distance_m <= 15`
     - 只影响 future-driven episode 的 **start**
     - 不影响已经开始的 episode 延续
+  - 另外，最近对 `merge / junction / borrow` 的 candidate split 也有了新的
+    认知：
+    - 当前 `_interaction_signal_from_candidate(...)` 仍然 heavily 依赖
+      local heading-angle 分类：
+      - `<= 45 deg` 视为 same-direction
+      - `>= 70 deg` 视为 cross-direction
+      - 中间角度仍会落到 merge-like 处理
+    - 这意味着当前 `merge` 不是纯粹的 same-direction family
+    - `borrow_cross_meet` 的 candidate subtype 也仍然会先经过 cross-direction
+      路由
+    - 更合理的长期方向是：
+      - long borrow 直接基于
+        `event_name + scene_borrow_context + corridor`
+      - auxiliary `direction` 不再用当前局部 heading 去定义
+      - 而改成基于 conflict-area 的 approach direction：
+    - `borrow`: corridor
+    - `merge`: merge area
+    - `junction`: conflict circle / local conflict area
+      - 也就是比较 ego 与 bg actor **接近同一 conflict area 的方向**
+        ，而不是比较它们在当前帧局部的 yaw
+    - 对 `merge` 本身，当前也进一步收敛出一个更稳的 direction 定义：
+      - merge area 继续由 future conflict points 聚出来
+      - area `start` / `end(+3m)` 目前整体可接受
+      - 真正该改的是 direction 的取法
+      - merge direction 更适合取自 `merge_area_end` 之后的 downstream
+        route heading，而不是 merge 斜线段里的局部 heading
+      - 当前更倾向：
+        - 默认看 `area_end -> area_end + 5m`
+        - route 不够长时 fallback 到 `+3m`
+    - 对 `junction` 也有类似的收敛：
+      - cover / conflict point 仍然是 evidence
+      - 但最终应该落到显式 conflict area `start/end`
+      - junction 的 direction 也应基于 conflict area 来定义
+      - `junction + left` 更适合作为 scene prior / validation signal
+        ，不该当成唯一的 hard 条件
+      - 因为 raw `junction` 和 `command == LEFT` 在时间上可能有轻微滞后
+      - 同时，`junction + left` 也可能出现 merge-like downstream lane
+        competition，例如 ego 左转 vs 对向右转并入同一出口 lane
+  - 当前代码里也开始接一个统一 `conflict_area` 骨架层：
+    - 直接从新的 route-level area/window 生成 unified conflict window
+    - 不再直接继承旧 `borrow / merge / junction episode` 的 active
+    - 旧 episode 先保留作 baseline / 回归 / 对照
+    - 先提供统一的：
+      - `family`
+      - `dir`
+      - `active`
+      - `start/end`
+    - 其中当前的粗 direction 临时映射为：
+      - `borrow -> opposite`
+      - `merge -> same`
+      - `junction -> none`
+    - 如果某个 family 已经 active，但缺 area/source 元数据：
+      - 当前先记录 issue
+      - 不在这层直接 hard crash
+    - 这层是骨架，不是最终 conflict-area 语义：
+      - `borrow conflict area` 后面还要从 corridor 里再提纯
+      - `merge / junction direction` 后面还要改成 area-based approach direction
 
 ## 推荐工作流
 

@@ -87,6 +87,11 @@ FAST_FIELDS = (
     'speed_risk_ped_values',
     'speed_cross_wait_time_s',
     'speed_cross_wait_valid',
+    'conflict_area_family',
+    'conflict_area_dir',
+    'conflict_area_active',
+    'conflict_area_start_frame',
+    'conflict_area_end_frame',
     'junction_cross_episode_id',
     'junction_cross_episode_active',
     'junction_cross_episode_start_frame',
@@ -209,6 +214,11 @@ STAGE1_SPEED_FIELDS = (
     'speed_risk_ped_values',
     'speed_cross_wait_time_s',
     'speed_cross_wait_valid',
+    'conflict_area_family',
+    'conflict_area_dir',
+    'conflict_area_active',
+    'conflict_area_start_frame',
+    'conflict_area_end_frame',
     'junction_cross_episode_id',
     'junction_cross_episode_active',
     'junction_cross_episode_start_frame',
@@ -237,6 +247,26 @@ CROSS_DECISION_PHASE_TO_CODE = {
     'none': 0,
     'yld': 1,
     'go': 2,
+}
+
+CONFLICT_FAMILY_TO_CODE = {
+    'none': 0,
+    'borrow': 1,
+    'merge': 2,
+    'junction': 3,
+}
+
+CONFLICT_DIR_TO_CODE = {
+    'none': 0,
+    'same': 1,
+    'opposite': 2,
+    'cross': 3,
+}
+
+CONFLICT_FAMILY_PRIORITY = {
+    'borrow': 0,
+    'merge': 1,
+    'junction': 2,
 }
 
 
@@ -3420,6 +3450,60 @@ def _default_junction_cross_episode_debug():
     }
 
 
+def _default_conflict_area_debug():
+    return {
+        'family': 'none',
+        'family_code': int(CONFLICT_FAMILY_TO_CODE['none']),
+        'dir': 'none',
+        'dir_code': int(CONFLICT_DIR_TO_CODE['none']),
+        'active': 0.0,
+        'start_frame': -1,
+        'end_frame': -1,
+        'frame_role': 'none',
+        'source': 'none',
+        'source_episode_id': -1,
+        'source_priority': -1,
+        'selection_reason': 'none',
+        'active_families': [],
+        'active_family_count': 0,
+        'issue_count': 0,
+        'issue_families': [],
+        'missing_reason': 'none',
+        'area_type': 'none',
+        'area_start_s_m': np.nan,
+        'area_end_s_m': np.nan,
+        'area_center_world_xy': [],
+        'area_radius_m': np.nan,
+        'borrow_start_world_xy': [],
+        'borrow_end_world_xy': [],
+        'borrow_distance_m': np.nan,
+    }
+
+
+def _set_stage1_conflict_area_defaults(sample):
+    sample['conflict_area_family'] = np.int64(CONFLICT_FAMILY_TO_CODE['none'])
+    sample['conflict_area_dir'] = np.int64(CONFLICT_DIR_TO_CODE['none'])
+    sample['conflict_area_active'] = np.float32(0.0)
+    sample['conflict_area_start_frame'] = np.int64(-1)
+    sample['conflict_area_end_frame'] = np.int64(-1)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['conflict_area'] = _default_conflict_area_debug()
+
+
+def _set_stage1_conflict_area_annotation(sample, conflict_info):
+    family = str(conflict_info.get('family', 'none'))
+    direction = str(conflict_info.get('dir', 'none'))
+    sample['conflict_area_family'] = np.int64(CONFLICT_FAMILY_TO_CODE.get(family, 0))
+    sample['conflict_area_dir'] = np.int64(CONFLICT_DIR_TO_CODE.get(direction, 0))
+    sample['conflict_area_active'] = np.float32(float(conflict_info.get('active', 0.0)))
+    sample['conflict_area_start_frame'] = np.int64(int(conflict_info.get('start_frame', -1)))
+    sample['conflict_area_end_frame'] = np.int64(int(conflict_info.get('end_frame', -1)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['conflict_area'] = _to_stage1_debug_python(dict(conflict_info))
+
+
 def _set_stage1_junction_cross_defaults(sample):
     sample['junction_cross_episode_id'] = np.int64(-1)
     sample['junction_cross_episode_active'] = np.float32(0.0)
@@ -3458,6 +3542,408 @@ def _set_stage1_merge_defaults(sample):
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['merge_episode'] = _default_merge_episode_debug()
+
+
+def _conflict_area_issue(sample, family, reason, **extra):
+    payload = {
+        'issue': 1,
+        'family': str(family),
+        'reason': str(reason),
+        'base_dir': str(sample.get('base_dir', 'unknown')),
+        'frame_id': int(sample.get('frame_id', -1)),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _cover_is_borrow_cross_meet(cover):
+    return int((cover or {}).get('exists', 0.0)) > 0 and _cover_interaction_subtype(cover) == 'borrow_cross_meet'
+
+
+def _route_heading_at_progress(route_local, progress_m):
+    route_poly = _route_with_origin(route_local)
+    if route_poly is None or route_poly.shape[0] < 2:
+        return np.nan
+    dense_route, dense_s = _interpolate_route_with_arclength(route_poly, step_m=0.25)
+    if dense_route.ndim != 2 or dense_route.shape[0] < 2 or dense_s.ndim != 1 or dense_s.shape[0] != dense_route.shape[0]:
+        return np.nan
+    progress_m = float(progress_m)
+    total_s = float(dense_s[-1]) if dense_s.size > 0 else 0.0
+    if not np.isfinite(progress_m):
+        return np.nan
+    progress_m = float(np.clip(progress_m, 0.0, total_s))
+    idx = int(np.searchsorted(dense_s, progress_m, side='left'))
+    idx = int(np.clip(idx, 0, dense_route.shape[0] - 1))
+    heading = _route_heading_at_idx(dense_route, idx)
+    return float(heading) if heading is not None else np.nan
+
+
+def _build_route_conflict_records(samples, route_sample_indices):
+    ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
+    records = []
+    for sample_idx in ordered_indices:
+        sample = samples[int(sample_idx)]
+        stage1_debug = sample.get('stage1_speed_debug') or {}
+        base_dir, _ = _resolve_feature_frame_info(sample)
+        event_name = str(base_dir).split('/', 1)[0] if isinstance(base_dir, str) and base_dir else ''
+        records.append({
+            'sample_idx': int(sample_idx),
+            'frame_id': int(sample.get('frame_id', -1)),
+            'base_dir': str(base_dir or ''),
+            'event_name': str(event_name),
+            'route_local': np.asarray(sample.get('route', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+            'current_cover': stage1_debug.get('current_cover') or {},
+            'future_cover': stage1_debug.get('future_cover') or {},
+            'speed_curve_future_cover': stage1_debug.get('speed_curve_future_cover') or {},
+            'merge_motion': stage1_debug.get('merge_motion') or {},
+            'borrow_motion': stage1_debug.get('borrow_motion') or {},
+            'scene_borrow_context': stage1_debug.get('scene_borrow_context') or {},
+            'stage1_speed_debug': stage1_debug if isinstance(stage1_debug, dict) else {},
+        })
+    return records
+
+
+def _record_scene_front_s(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    front_s = float(merge_motion.get('scene_route_front_s_m', np.nan))
+    return float(front_s) if np.isfinite(front_s) else np.nan
+
+
+def _record_scene_rear_s(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    rear_s = float(merge_motion.get('scene_route_rear_s_m', np.nan))
+    return float(rear_s) if np.isfinite(rear_s) else np.nan
+
+
+def _borrow_record_conflict_progresses(record):
+    scene_borrow_context = (record or {}).get('scene_borrow_context') or {}
+    borrow_motion = (record or {}).get('borrow_motion') or {}
+    if float(scene_borrow_context.get('valid', 0.0)) <= 0.5 or float(scene_borrow_context.get('ready', 0.0)) <= 0.5:
+        return []
+    borrow_distance_m = float(scene_borrow_context.get('borrow_distance_m', np.nan))
+    borrow_start_distance_m = float(borrow_motion.get('borrow_start_distance_m', np.nan))
+    if not np.isfinite(borrow_distance_m) or borrow_distance_m <= 1e-3 or not np.isfinite(borrow_start_distance_m):
+        return []
+    progresses = []
+    for cover_key in ('current_cover', 'future_cover'):
+        cover = (record or {}).get(cover_key) or {}
+        if not _cover_is_borrow_cross_meet(cover):
+            continue
+        route_distance_m = float(cover.get('route_distance_m', np.nan))
+        if not np.isfinite(route_distance_m):
+            continue
+        progress_m = float(route_distance_m - borrow_start_distance_m)
+        if progress_m < -0.5 or progress_m > float(borrow_distance_m) + 0.5:
+            continue
+        progresses.append(float(np.clip(progress_m, 0.0, float(borrow_distance_m))))
+    return progresses
+
+
+def _borrow_conflict_end_distance_m(record, conflict_end_progress_m):
+    scene_borrow_context = (record or {}).get('scene_borrow_context') or {}
+    borrow_motion = (record or {}).get('borrow_motion') or {}
+    borrow_distance_m = float(scene_borrow_context.get('borrow_distance_m', np.nan))
+    borrow_end_distance_m = float(borrow_motion.get('borrow_end_distance_m', np.nan))
+    if not np.isfinite(borrow_distance_m) or not np.isfinite(borrow_end_distance_m):
+        return np.nan
+    tail_after_conflict_m = max(float(borrow_distance_m) - float(conflict_end_progress_m), 0.0)
+    return float(borrow_end_distance_m - tail_after_conflict_m)
+
+
+def _build_borrow_conflict_windows(records, samples):
+    windows = []
+    issues = []
+    if not records:
+        return windows, issues
+    event_name = str(records[0].get('event_name', ''))
+    if event_name not in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}:
+        return windows, issues
+
+    scene_borrow_context = None
+    for record in records:
+        ctx = record.get('scene_borrow_context') or {}
+        if float(ctx.get('valid', 0.0)) > 0.5 and float(ctx.get('ready', 0.0)) > 0.5:
+            scene_borrow_context = ctx
+            break
+    if scene_borrow_context is None:
+        issues.append(_conflict_area_issue(samples[records[0]['sample_idx']], 'borrow', 'missing_scene_borrow_context'))
+        return windows, issues
+
+    progress_by_pos = {}
+    all_progress = []
+    for pos, record in enumerate(records):
+        progresses = _borrow_record_conflict_progresses(record)
+        if not progresses:
+            continue
+        progress_by_pos[int(pos)] = [float(v) for v in progresses]
+        all_progress.extend(progresses)
+    if not all_progress:
+        issues.append(_conflict_area_issue(samples[records[0]['sample_idx']], 'borrow', 'missing_borrow_conflict_progress_span'))
+        return windows, issues
+
+    conflict_start_progress_m = float(min(all_progress))
+    conflict_end_progress_m = float(max(all_progress))
+    candidate_positions = sorted(progress_by_pos.keys())
+    front_candidates = []
+    for pos in candidate_positions:
+        front_s = _record_scene_front_s(records[pos])
+        if np.isfinite(front_s):
+            front_candidates.append((float(front_s), int(pos)))
+    start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))[1] if front_candidates else int(candidate_positions[0])
+
+    end_pos = None
+    for pos in range(int(start_pos), len(records)):
+        dist_to_conflict_end_m = _borrow_conflict_end_distance_m(records[pos], conflict_end_progress_m)
+        if np.isfinite(dist_to_conflict_end_m) and dist_to_conflict_end_m <= 0.5:
+            end_pos = int(pos)
+            break
+    if end_pos is None:
+        issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'borrow', 'missing_borrow_conflict_end'))
+        return windows, issues
+
+    windows.append({
+        'family': 'borrow',
+        'family_code': int(CONFLICT_FAMILY_TO_CODE['borrow']),
+        'dir': 'opposite',
+        'dir_code': int(CONFLICT_DIR_TO_CODE['opposite']),
+        'source': 'borrow_conflict_area',
+        'source_episode_id': 0,
+        'source_priority': int(CONFLICT_FAMILY_PRIORITY['borrow']),
+        'area_type': 'corridor_subset',
+        'start_pos': int(start_pos),
+        'end_pos': int(end_pos),
+        'start_frame': int(records[start_pos]['frame_id']),
+        'end_frame': int(records[end_pos]['frame_id']),
+        'borrow_start_world_xy': list(scene_borrow_context.get('borrow_start_world_xy', [])),
+        'borrow_end_world_xy': list(scene_borrow_context.get('borrow_end_world_xy', [])),
+        'borrow_distance_m': float(scene_borrow_context.get('borrow_distance_m', np.nan)),
+        'borrow_conflict_start_progress_m': float(conflict_start_progress_m),
+        'borrow_conflict_end_progress_m': float(conflict_end_progress_m),
+    })
+    return windows, issues
+
+
+def _merge_direction_heading_rad(records, start_pos, merge_area_end_s_m):
+    front_s = _merge_record_scene_front_s(records[int(start_pos)])
+    route_local = np.asarray(records[int(start_pos)].get('route_local', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    if not np.isfinite(front_s):
+        return np.nan
+    distance_to_area_end_m = max(float(merge_area_end_s_m) - float(front_s), 0.0)
+    heading = _route_heading_at_progress(route_local, distance_to_area_end_m + 5.0)
+    if np.isfinite(heading):
+        return float(heading)
+    return float(_route_heading_at_progress(route_local, distance_to_area_end_m + 3.0))
+
+
+def _build_merge_conflict_windows(records, samples):
+    windows = []
+    issues = []
+    num_records = len(records)
+    pos = 0
+    source_episode_id = 0
+    while pos < num_records:
+        start_scan_pos = None
+        while pos < num_records:
+            if np.isfinite(_merge_record_conflict_s(records[pos])):
+                start_scan_pos = int(pos)
+                break
+            pos += 1
+        if start_scan_pos is None:
+            break
+
+        candidate_positions = _merge_collect_conflict_candidate_positions(records, start_scan_pos)
+        area_info = _merge_resolve_conflict_area(records, candidate_positions)
+        if area_info is None:
+            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'missing_merge_conflict_cluster'))
+            pos = int(start_scan_pos) + 1
+            continue
+
+        future_merge_positions = [int(p) for p in area_info.get('inlier_positions', [])]
+        conflict_s_values = [
+            float(_merge_record_conflict_s(records[int(p)]))
+            for p in future_merge_positions
+            if np.isfinite(_merge_record_conflict_s(records[int(p)]))
+        ]
+        if not future_merge_positions or not conflict_s_values:
+            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'missing_merge_conflict_points'))
+            pos = int(start_scan_pos) + 1
+            continue
+
+        eligible_start_positions = [
+            int(p) for p in future_merge_positions
+            if not _current_follow_chase_start_gate(records[int(p)])
+        ]
+        if not eligible_start_positions:
+            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'merge_start_blocked_by_current_follow_chase'))
+            pos = int(max(future_merge_positions)) + 1
+            continue
+
+        front_candidates = []
+        for p in eligible_start_positions:
+            front_s = _merge_record_scene_front_s(records[int(p)])
+            if np.isfinite(front_s):
+                front_candidates.append((float(front_s), int(p)))
+        start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))[1] if front_candidates else int(min(eligible_start_positions))
+
+        merge_area_start_s_m = float(area_info['first_conflict_s_m'])
+        merge_area_end_s_m = float(area_info['last_conflict_s_m'] + float(STAGE1_MERGE_AREA_POST_MARGIN_M))
+
+        end_pos = None
+        for scan_pos in range(int(start_pos), num_records):
+            if _merge_record_passed_area(records[scan_pos], merge_area_end_s_m):
+                end_pos = int(scan_pos)
+                break
+        if end_pos is None:
+            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'merge', 'missing_merge_end'))
+            pos = int(max(future_merge_positions)) + 1
+            continue
+
+        windows.append({
+            'family': 'merge',
+            'family_code': int(CONFLICT_FAMILY_TO_CODE['merge']),
+            'dir': 'same',
+            'dir_code': int(CONFLICT_DIR_TO_CODE['same']),
+            'source': 'merge_area',
+            'source_episode_id': int(source_episode_id),
+            'source_priority': int(CONFLICT_FAMILY_PRIORITY['merge']),
+            'area_type': 's_interval',
+            'start_pos': int(start_pos),
+            'end_pos': int(end_pos),
+            'start_frame': int(records[start_pos]['frame_id']),
+            'end_frame': int(records[end_pos]['frame_id']),
+            'area_start_s_m': float(merge_area_start_s_m),
+            'area_end_s_m': float(merge_area_end_s_m),
+            'merge_area_first_conflict_s_m': float(area_info['first_conflict_s_m']),
+            'merge_area_last_conflict_s_m': float(area_info['last_conflict_s_m']),
+            'merge_direction_heading_rad': _merge_direction_heading_rad(records, start_pos, merge_area_end_s_m),
+        })
+        source_episode_id += 1
+        pos = int(end_pos) + 1
+
+    return windows, issues
+
+
+def _build_junction_conflict_windows(records, samples):
+    windows = []
+    issues = []
+    source_episode_id = 0
+    prev_end_pos = -1
+    for cluster in _junction_cluster_conflict_candidates(records):
+        cluster_positions = sorted(
+            int(item['pos']) for item in cluster['items']
+            if int(item['pos']) > int(prev_end_pos)
+        )
+        cluster_positions = [
+            int(pos) for pos in cluster_positions
+            if not _current_follow_chase_start_gate(records[int(pos)])
+        ]
+        if not cluster_positions:
+            issues.append(_conflict_area_issue(samples[records[max(int(prev_end_pos) + 1, 0)]['sample_idx']], 'junction', 'junction_start_blocked_by_current_follow_chase'))
+            continue
+
+        front_candidates = []
+        for pos in cluster_positions:
+            front_s = _record_scene_front_s(records[pos])
+            if np.isfinite(front_s):
+                front_candidates.append((float(front_s), int(pos)))
+        if not front_candidates:
+            issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_route_progress'))
+            continue
+
+        area_start_s_m = float(min(item[0] for item in front_candidates))
+        area_end_s_m = float(max(item[0] for item in front_candidates))
+        start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))[1]
+
+        end_pos = None
+        for pos in range(int(start_pos), len(records)):
+            front_s = _record_scene_front_s(records[pos])
+            if np.isfinite(front_s) and float(front_s) >= float(area_end_s_m):
+                end_pos = int(pos)
+                break
+        if end_pos is None:
+            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_end'))
+            continue
+
+        center_xy = np.asarray(cluster.get('center_xy', []), dtype=np.float32).reshape(-1)
+        radius_m = float(cluster.get('radius_m', np.nan))
+        if center_xy.size < 2 or not np.all(np.isfinite(center_xy[:2])) or not np.isfinite(radius_m):
+            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_area_geometry'))
+            continue
+
+        windows.append({
+            'family': 'junction',
+            'family_code': int(CONFLICT_FAMILY_TO_CODE['junction']),
+            'dir': 'none',
+            'dir_code': int(CONFLICT_DIR_TO_CODE['none']),
+            'source': 'junction_conflict_area',
+            'source_episode_id': int(source_episode_id),
+            'source_priority': int(CONFLICT_FAMILY_PRIORITY['junction']),
+            'area_type': 'circle',
+            'start_pos': int(start_pos),
+            'end_pos': int(end_pos),
+            'start_frame': int(records[start_pos]['frame_id']),
+            'end_frame': int(records[end_pos]['frame_id']),
+            'area_start_s_m': float(area_start_s_m),
+            'area_end_s_m': float(area_end_s_m),
+            'area_center_world_xy': center_xy[:2].astype(float).tolist(),
+            'area_radius_m': float(radius_m),
+            'candidate_frame_count': int(len(cluster_positions)),
+        })
+        prev_end_pos = int(end_pos)
+        source_episode_id += 1
+    return windows, issues
+
+
+def _conflict_window_frame_role(window, pos):
+    if int(pos) == int(window.get('start_pos', -1)):
+        return 'start'
+    if int(pos) == int(window.get('end_pos', -1)):
+        return 'end'
+    return 'active'
+
+
+def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
+    records = _build_route_conflict_records(samples, route_sample_indices)
+    if not records:
+        return
+
+    for record in records:
+        sample = samples[int(record['sample_idx'])]
+        _set_stage1_conflict_area_defaults(sample)
+
+    borrow_windows, borrow_issues = _build_borrow_conflict_windows(records, samples)
+    merge_windows, merge_issues = _build_merge_conflict_windows(records, samples)
+    junction_windows, junction_issues = _build_junction_conflict_windows(records, samples)
+    route_windows = borrow_windows + merge_windows + junction_windows
+    route_issues = borrow_issues + merge_issues + junction_issues
+
+    for pos, record in enumerate(records):
+        sample = samples[int(record['sample_idx'])]
+        active_windows = [
+            dict(window) for window in route_windows
+            if int(window.get('start_pos', -1)) <= int(pos) <= int(window.get('end_pos', -1))
+        ]
+        if active_windows:
+            active_windows.sort(key=lambda item: (int(item.get('source_priority', 99)), str(item.get('family', 'none'))))
+            selected = dict(active_windows[0])
+            selected['active'] = 1.0
+            selected['frame_role'] = _conflict_window_frame_role(selected, pos)
+            selected['active_families'] = [str(item.get('family', 'none')) for item in active_windows]
+            selected['active_family_count'] = int(len(active_windows))
+            selected['selection_reason'] = 'single_active_family' if len(active_windows) == 1 else 'priority'
+            selected['issue_count'] = int(len(route_issues))
+            selected['issue_families'] = [str(item.get('family', 'none')) for item in route_issues]
+            selected['missing_reason'] = str(route_issues[0].get('reason', 'none')) if route_issues else 'none'
+            _set_stage1_conflict_area_annotation(sample, selected)
+            continue
+
+        info = _default_conflict_area_debug()
+        if route_issues:
+            info['issue_count'] = int(len(route_issues))
+            info['issue_families'] = [str(item.get('family', 'none')) for item in route_issues]
+            info['missing_reason'] = str(route_issues[0].get('reason', 'unknown'))
+            info['selection_reason'] = 'issue_only'
+        _set_stage1_conflict_area_annotation(sample, info)
 
 
 def _has_stage1_speed_fields(sample):
@@ -3513,6 +3999,7 @@ def _set_stage1_speed_fallback(sample):
         scene_borrow_context=None,
         borrow_motion=None,
     )
+    _set_stage1_conflict_area_defaults(sample)
     _set_stage1_junction_cross_defaults(sample)
     _set_stage1_borrow_cross_defaults(sample)
     _set_stage1_merge_defaults(sample)
@@ -5338,6 +5825,7 @@ def precompute(
             _gate_route_stage1_junction_speed_risks(samples, route_sample_indices)
             _gate_route_stage1_borrow_speed_risks(samples, route_sample_indices)
             _gate_route_stage1_merge_speed_risks(samples, route_sample_indices)
+            _annotate_route_stage1_conflict_areas(samples, route_sample_indices)
             dirty_since_checkpoint = True
             _maybe_checkpoint(phase='stage1_speed')
             route_total_s = float(time.perf_counter() - route_total_start)
