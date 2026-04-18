@@ -319,6 +319,30 @@ def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range
     return local_xy[0]
 
 
+def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_range, y_range):
+    if route_xy is None:
+        return
+    pt = _sample_route_point_at_s(route_xy, progress_m)
+    if pt is None:
+        return
+    pt_px = _local_to_canvas(np.asarray(pt, dtype=np.float32)[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
+    if pt_px.shape != (1, 2):
+        return
+    px = tuple(pt_px[0])
+    cv2.circle(canvas, px, 8, color, -1, cv2.LINE_AA)
+    cv2.circle(canvas, px, 14, color, 2, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        str(label),
+        (px[0] + 10, px[1] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def _find_box_by_id(boxes, actor_id):
     if actor_id is None:
         return None
@@ -450,6 +474,24 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
             if len(seg_pts) >= 2:
                 seg_px = _local_to_canvas(np.asarray(seg_pts, dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
                 cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
+            _draw_route_progress_marker(
+                canvas,
+                route_xy,
+                area_start_s,
+                (0, 170, 0),
+                "area_s",
+                x_range,
+                y_range,
+            )
+            _draw_route_progress_marker(
+                canvas,
+                route_xy,
+                area_end_s,
+                (30, 120, 30),
+                "area_e",
+                x_range,
+                y_range,
+            )
 
     area_type = str(conflict_area.get("area_type", "none"))
     if area_type == "circle":
@@ -515,6 +557,7 @@ def _build_text_panel(sample, current_meas):
         f"speed={speed:.2f}  cmd={COMMAND_MAP.get(int(cmd_id), str(cmd_id)) if cmd_id is not None else 'NA'}  junction={junction_flag}",
         f"conflict family={CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
         f"conflict start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
+        f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
         f"conflict src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')} reason={conflict_area.get('selection_reason', 'none')}",
         f"issue_count={issue_count} issue_families={issue_families}",
         f"missing_reason={conflict_area.get('missing_reason', 'none')}",
