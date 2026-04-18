@@ -2011,6 +2011,142 @@ def _empty_two_way_borrow_context(
     }
 
 
+def _build_accident_scene_global_vehicle_cluster(
+    frame_records,
+    stop_speed_thresh_mps=0.1,
+    link_distance_m=12.0,
+    min_cluster_size=3,
+):
+    actor_obs = {}
+    for record in frame_records or []:
+        current_meas = record.get("current_meas")
+        ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
+        if ego_matrix_current is None:
+            continue
+        for box in record.get("current_boxes") or []:
+            actor_id = box.get("id", None)
+            if actor_id is None or not _two_way_blocker_box_allowed(
+                box,
+                event_name="AccidentTwoWays",
+                stop_speed_thresh_mps=stop_speed_thresh_mps,
+            ):
+                continue
+            world_xy = _box_world_xy(box, ego_matrix_current=ego_matrix_current)
+            if world_xy is None:
+                continue
+            obs = actor_obs.setdefault(int(actor_id), {
+                "actor_id": int(actor_id),
+                "actor_class": str(_box_class_name(box)),
+                "world_x": [],
+                "world_y": [],
+                "frame_ids": [],
+            })
+            obs["world_x"].append(float(world_xy[0]))
+            obs["world_y"].append(float(world_xy[1]))
+            obs["frame_ids"].append(int(record.get("frame_id", -1)))
+
+    actor_nodes = []
+    for actor_id, obs in actor_obs.items():
+        if len(obs["frame_ids"]) <= 0:
+            continue
+        mean_x = float(np.mean(np.asarray(obs["world_x"], dtype=np.float32)))
+        mean_y = float(np.mean(np.asarray(obs["world_y"], dtype=np.float32)))
+        actor_nodes.append({
+            "actor_id": int(actor_id),
+            "actor_class": str(obs["actor_class"]),
+            "obs_count": int(len(obs["frame_ids"])),
+            "first_frame": int(min(obs["frame_ids"])),
+            "last_frame": int(max(obs["frame_ids"])),
+            "mean_world_xy": [mean_x, mean_y],
+        })
+    if not actor_nodes:
+        return None
+
+    visited = set()
+    clusters = []
+    for node in actor_nodes:
+        actor_id = int(node["actor_id"])
+        if actor_id in visited:
+            continue
+        stack = [actor_id]
+        component_ids = []
+        while stack:
+            cur = int(stack.pop())
+            if cur in visited:
+                continue
+            visited.add(cur)
+            component_ids.append(cur)
+            cur_node = next(item for item in actor_nodes if int(item["actor_id"]) == cur)
+            cur_xy = np.asarray(cur_node["mean_world_xy"], dtype=np.float32)
+            for other in actor_nodes:
+                other_id = int(other["actor_id"])
+                if other_id in visited or other_id == cur:
+                    continue
+                other_xy = np.asarray(other["mean_world_xy"], dtype=np.float32)
+                if float(np.linalg.norm(cur_xy - other_xy)) <= float(link_distance_m):
+                    stack.append(other_id)
+        component = [item for item in actor_nodes if int(item["actor_id"]) in component_ids]
+        if len(component) < int(min_cluster_size):
+            continue
+        total_obs = int(sum(int(item["obs_count"]) for item in component))
+        first_frame = int(min(int(item["first_frame"]) for item in component))
+        clusters.append({
+            "actor_ids": [int(item["actor_id"]) for item in component],
+            "actor_classes": [str(item["actor_class"]) for item in component],
+            "actor_count": int(len(component)),
+            "total_obs": int(total_obs),
+            "first_frame": int(first_frame),
+        })
+    if not clusters:
+        return None
+
+    clusters.sort(key=lambda item: (-int(item["total_obs"]), -int(item["actor_count"]), int(item["first_frame"]), item["actor_ids"]))
+    return dict(clusters[0])
+
+
+def _find_best_two_way_cluster_candidate(
+    route_candidates,
+    frame_records,
+    cluster_actor_ids,
+    lateral_thresh_m=5.0,
+):
+    cluster_actor_ids = {int(actor_id) for actor_id in (cluster_actor_ids or [])}
+    if not cluster_actor_ids:
+        return None
+
+    best_candidate = None
+    for route_candidate in route_candidates:
+        record = frame_records[int(route_candidate["record_idx"])]
+        ego_matrix_current = None if record.get("current_meas") is None else record["current_meas"].get("ego_matrix", None)
+        for box in record.get("current_boxes") or []:
+            actor_id = box.get("id", None)
+            if actor_id is None or int(actor_id) not in cluster_actor_ids:
+                continue
+            pos = box.get("position", None)
+            if pos is None or len(pos) < 2:
+                continue
+            local_x = float(pos[0])
+            local_y = float(pos[1])
+            if local_x <= 0.0 or float(abs(local_y)) > float(lateral_thresh_m):
+                continue
+            world_xy = _box_world_xy(box, ego_matrix_current=ego_matrix_current)
+            candidate = {
+                "score": (float(local_x), float(abs(local_y)), -int(route_candidate["frame_id"])),
+                "record_idx": int(route_candidate["record_idx"]),
+                "frame_id": int(route_candidate["frame_id"]),
+                "actor_id": int(actor_id),
+                "actor_class": str(_box_class_name(box)),
+                "local_x": float(local_x),
+                "local_y": float(local_y),
+                "world_xy": [] if world_xy is None else np.asarray(world_xy, dtype=np.float32).astype(float).tolist(),
+                "geom": dict(route_candidate["geom"]),
+                "priority": int(route_candidate["priority"]),
+            }
+            if best_candidate is None or candidate["score"] < best_candidate["score"]:
+                best_candidate = candidate
+    return best_candidate
+
+
 def _build_event_two_way_borrow_context(
     frame_records,
     event_name=None,
@@ -2027,6 +2163,10 @@ def _build_event_two_way_borrow_context(
 ):
     if not _is_two_way_event_corridor_scene_context(event_name=event_name):
         return None
+    event_name = str(event_name or "")
+    scene_global_cluster = None
+    if event_name == "AccidentTwoWays":
+        scene_global_cluster = _build_accident_scene_global_vehicle_cluster(frame_records)
 
     def _best_borrow_geom_for_route(route_local):
         best_geom = None
@@ -2085,35 +2225,56 @@ def _build_event_two_way_borrow_context(
             route_candidate_count=0,
         )
 
+    primary_cluster_candidate = None
+    if scene_global_cluster is not None:
+        primary_cluster_candidate = _find_best_two_way_cluster_candidate(
+            route_candidates,
+            frame_records,
+            scene_global_cluster.get("actor_ids", []),
+            lateral_thresh_m=max(float(blocker_pre_shift_lateral_thresh), 5.0),
+        )
+
     seed_actor = None
-    for route_candidate in sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"]))):
-        record = frame_records[int(route_candidate["record_idx"])]
-        eligible_boxes = []
-        for box in record.get("current_boxes") or []:
-            actor_id = box.get("id", None)
-            if actor_id is None or not _two_way_blocker_box_allowed(box, event_name=event_name):
-                continue
-            pos = box.get("position", None)
-            if pos is None or len(pos) < 2:
-                continue
-            local_x = float(pos[0])
-            local_y = float(pos[1])
-            if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
-                continue
-            eligible_boxes.append((float(local_x), float(abs(local_y)), int(actor_id), box))
-        if not eligible_boxes:
-            continue
-        eligible_boxes.sort(key=lambda item: (item[0], item[1], item[2]))
-        _, _, actor_id, seed_box = eligible_boxes[0]
-        seed_world_xy = _box_world_xy(seed_box, ego_matrix_current=record.get("current_meas", {}).get("ego_matrix", None))
+    if primary_cluster_candidate is not None:
         seed_actor = {
-            "actor_id": int(actor_id),
-            "actor_class": str(_box_class_name(seed_box)),
-            "seed_frame_id": int(route_candidate["frame_id"]),
-            "seed_priority": int(route_candidate["priority"]),
-            "seed_world_xy": [] if seed_world_xy is None else np.asarray(seed_world_xy, dtype=np.float32).astype(float).tolist(),
+            "actor_id": int(primary_cluster_candidate["actor_id"]),
+            "actor_class": str(primary_cluster_candidate["actor_class"]),
+            "seed_frame_id": int(primary_cluster_candidate["frame_id"]),
+            "seed_priority": int(primary_cluster_candidate.get("priority", -1)),
+            "seed_world_xy": list(primary_cluster_candidate.get("world_xy", [])),
+            "seed_source": "scene_global_cluster",
+            "cluster_actor_ids": list(scene_global_cluster.get("actor_ids", [])),
         }
-        break
+    else:
+        for route_candidate in sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"]))):
+            record = frame_records[int(route_candidate["record_idx"])]
+            eligible_boxes = []
+            for box in record.get("current_boxes") or []:
+                actor_id = box.get("id", None)
+                if actor_id is None or not _two_way_blocker_box_allowed(box, event_name=event_name):
+                    continue
+                pos = box.get("position", None)
+                if pos is None or len(pos) < 2:
+                    continue
+                local_x = float(pos[0])
+                local_y = float(pos[1])
+                if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
+                    continue
+                eligible_boxes.append((float(local_x), float(abs(local_y)), int(actor_id), box))
+            if not eligible_boxes:
+                continue
+            eligible_boxes.sort(key=lambda item: (item[0], item[1], item[2]))
+            _, _, actor_id, seed_box = eligible_boxes[0]
+            seed_world_xy = _box_world_xy(seed_box, ego_matrix_current=record.get("current_meas", {}).get("ego_matrix", None))
+            seed_actor = {
+                "actor_id": int(actor_id),
+                "actor_class": str(_box_class_name(seed_box)),
+                "seed_frame_id": int(route_candidate["frame_id"]),
+                "seed_priority": int(route_candidate["priority"]),
+                "seed_world_xy": [] if seed_world_xy is None else np.asarray(seed_world_xy, dtype=np.float32).astype(float).tolist(),
+                "seed_source": "route_candidate",
+            }
+            break
     if seed_actor is None:
         return _empty_two_way_borrow_context(
             event_name=event_name,
@@ -2157,7 +2318,7 @@ def _build_event_two_way_borrow_context(
                 if best_fallback is None or candidate["score"] < best_fallback["score"]:
                     best_fallback = candidate
 
-    best_candidate = best_strict if best_strict is not None else best_fallback
+    best_candidate = primary_cluster_candidate if primary_cluster_candidate is not None else (best_strict if best_strict is not None else best_fallback)
     if best_candidate is None:
         return _empty_two_way_borrow_context(
             event_name=event_name,
@@ -2341,6 +2502,10 @@ def _build_event_two_way_borrow_context(
         "blocking_actor_local_y_m": float(best_candidate["local_y"]),
         "seed_frame_id": int(seed_actor.get("seed_frame_id", -1)),
         "seed_priority": int(seed_actor.get("seed_priority", -1)),
+        "seed_source": str(seed_actor.get("seed_source", "route_candidate")),
+        "scene_global_cluster_actor_ids": list(scene_global_cluster.get("actor_ids", [])) if scene_global_cluster is not None else [],
+        "scene_global_cluster_actor_count": int(scene_global_cluster.get("actor_count", 0)) if scene_global_cluster is not None else 0,
+        "scene_global_cluster_total_obs": int(scene_global_cluster.get("total_obs", 0)) if scene_global_cluster is not None else 0,
         "route_return_abs_m": float(borrow_geom.get("return_abs_m", np.nan)),
         "blocked_frame_id": -1,
     }
