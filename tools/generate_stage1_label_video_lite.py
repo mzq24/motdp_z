@@ -123,6 +123,29 @@ def _select_route_samples(samples, route_name=None, scene_name=None, index=None)
     return route_name, route_samples
 
 
+def _load_route_requests(list_path):
+    requests = []
+    with open(list_path, "r", encoding="utf-8") as f:
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 1:
+                requests.append({"scene_name": None, "route_name": parts[0]})
+                continue
+            if len(parts) == 2:
+                requests.append({"scene_name": parts[0], "route_name": parts[1]})
+                continue
+            raise ValueError(
+                f"Invalid route list line {lineno} in {list_path}: expected "
+                "'route_name' or 'scene_name route_name', got: {raw_line.rstrip()}"
+            )
+    if not requests:
+        raise ValueError(f"No valid route requests found in {list_path}")
+    return requests
+
+
 def _load_scene_rgb(image_root, base_dir, frame_str):
     rgb_candidates = [
         os.path.join(image_root, base_dir, "rgb", f"{frame_str}.jpg"),
@@ -224,6 +247,78 @@ def _draw_box(canvas, box, color, x_range, y_range, thickness=2):
         cv2.polylines(canvas, [corners_px], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
 
 
+def _draw_box_center_label(canvas, box, label, color, x_range, y_range):
+    pos = box.get("position", None)
+    if pos is None or len(pos) < 2:
+        return
+    center = np.asarray([[float(pos[0]), float(pos[1])]], dtype=np.float32)
+    center_px = _local_to_canvas(center, canvas.shape[1], canvas.shape[0], x_range, y_range)
+    if center_px.shape != (1, 2):
+        return
+    px = tuple(center_px[0])
+    cv2.circle(canvas, px, 5, color, -1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        str(label),
+        (px[0] + 8, px[1] - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_cover_route_point(canvas, cover, color, label, x_range, y_range):
+    route_point = np.asarray((cover or {}).get("route_point_local_xy", []), dtype=np.float32)
+    if route_point.shape != (2,):
+        return
+    route_px = _local_to_canvas(route_point[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
+    if route_px.shape != (1, 2):
+        return
+    px = tuple(route_px[0])
+    cv2.drawMarker(canvas, px, color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=16, thickness=2)
+    cv2.putText(
+        canvas,
+        str(label),
+        (px[0] + 8, px[1] + 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range, y_range):
+    world_xy = np.asarray((cover or {}).get("scene_route_conflict_world_xy", []), dtype=np.float32)
+    if world_xy.shape != (2,) or ego_matrix is None:
+        return None
+    local_xy = _transform_points_world_xyz_to_local(
+        np.array([[world_xy[0], world_xy[1], 0.0]], dtype=np.float32),
+        ego_matrix,
+    )
+    if local_xy.shape != (1, 2):
+        return None
+    px = _local_to_canvas(local_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
+    if px.shape != (1, 2):
+        return None
+    point_px = tuple(px[0])
+    cv2.drawMarker(canvas, point_px, color, markerType=cv2.MARKER_STAR, markerSize=22, thickness=2)
+    cv2.circle(canvas, point_px, 10, color, 1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        str(label),
+        (point_px[0] + 10, point_px[1] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    return local_xy[0]
+
+
 def _find_box_by_id(boxes, actor_id):
     if actor_id is None:
         return None
@@ -298,13 +393,50 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
     future_cover = stage1_debug.get("future_cover") or {}
     conflict_area = stage1_debug.get("conflict_area") or {}
     scene_borrow_context = stage1_debug.get("scene_borrow_context") or {}
+    ego_matrix = None if current_meas is None else current_meas.get("ego_matrix", None)
 
     current_box = _find_box_by_id(current_boxes, current_cover.get("actor_id"))
     future_box = _find_box_by_id(current_boxes, future_cover.get("actor_id"))
     if current_box is not None:
         _draw_box(canvas, current_box, color=(0, 0, 255), x_range=x_range, y_range=y_range, thickness=3)
+        _draw_box_center_label(
+            canvas,
+            current_box,
+            f"CUR {int(current_cover.get('actor_id', -1))}",
+            (0, 0, 255),
+            x_range,
+            y_range,
+        )
     if future_box is not None:
         _draw_box(canvas, future_box, color=(0, 165, 255), x_range=x_range, y_range=y_range, thickness=3)
+        _draw_box_center_label(
+            canvas,
+            future_box,
+            f"FUT {int(future_cover.get('actor_id', -1))}",
+            (0, 165, 255),
+            x_range,
+            y_range,
+        )
+    _draw_cover_route_point(canvas, current_cover, (0, 0, 255), "cur_pt", x_range, y_range)
+    _draw_cover_route_point(canvas, future_cover, (0, 165, 255), "fut_pt", x_range, y_range)
+    current_collision_local = _draw_cover_collision_point(
+        canvas, current_cover, ego_matrix, (180, 0, 255), "cur_cp", x_range, y_range
+    )
+    future_collision_local = _draw_cover_collision_point(
+        canvas, future_cover, ego_matrix, (0, 140, 255), "fut_cp", x_range, y_range
+    )
+    if current_box is not None and current_collision_local is not None:
+        box_center = np.asarray([[float(current_box["position"][0]), float(current_box["position"][1])]], dtype=np.float32)
+        box_px = _local_to_canvas(box_center, canvas.shape[1], canvas.shape[0], x_range, y_range)
+        cp_px = _local_to_canvas(current_collision_local[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
+        if box_px.shape == (1, 2) and cp_px.shape == (1, 2):
+            cv2.line(canvas, tuple(box_px[0]), tuple(cp_px[0]), (180, 0, 255), 2, cv2.LINE_AA)
+    if future_box is not None and future_collision_local is not None:
+        box_center = np.asarray([[float(future_box["position"][0]), float(future_box["position"][1])]], dtype=np.float32)
+        box_px = _local_to_canvas(box_center, canvas.shape[1], canvas.shape[0], x_range, y_range)
+        cp_px = _local_to_canvas(future_collision_local[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
+        if box_px.shape == (1, 2) and cp_px.shape == (1, 2):
+            cv2.line(canvas, tuple(box_px[0]), tuple(cp_px[0]), (0, 140, 255), 2, cv2.LINE_AA)
 
     if route_xy.shape[0] >= 2:
         area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
@@ -337,7 +469,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
 
     borrow_start_world_xy = np.asarray(conflict_area.get("borrow_start_world_xy", []), dtype=np.float32)
     borrow_end_world_xy = np.asarray(conflict_area.get("borrow_end_world_xy", []), dtype=np.float32)
-    ego_matrix = None if current_meas is None else current_meas.get("ego_matrix", None)
     if ego_matrix is not None and borrow_start_world_xy.shape == (2,) and borrow_end_world_xy.shape == (2,):
         borrow_world = np.array(
             [
@@ -393,7 +524,7 @@ def _build_text_panel(sample, current_meas):
         f"old junction active={int(float(sample.get('junction_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('junction_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('junction_cross_episode_end_frame', -1))}",
         "",
         f"current: name={_cover_name(current_cover)} subtype={_cover_subtype(current_cover)} actor={_fmt_int(current_cover.get('actor_id', -1))}",
-        f"current: dist={_fmt_float(current_cover.get('distance', np.nan))} route_d={_fmt_float(current_cover.get('route_distance_m', np.nan))}",
+        f"current: dist={_fmt_float(current_cover.get('distance', np.nan))} route_d={_fmt_float(current_cover.get('route_distance_m', np.nan))} cp_s={_fmt_float(current_cover.get('scene_route_conflict_s_m', np.nan))}",
         f"future : name={_cover_name(future_cover)} subtype={_cover_subtype(future_cover)} actor={_fmt_int(future_cover.get('actor_id', -1))}",
         f"future : dE={_fmt_float(future_cover.get('d_ego', np.nan))} dB={_fmt_float(future_cover.get('d_bg', np.nan))} route_d={_fmt_float(future_cover.get('route_distance_m', np.nan))}",
         f"future : conflict_s={_fmt_float(future_cover.get('scene_route_conflict_s_m', np.nan))}",
@@ -403,26 +534,96 @@ def _build_text_panel(sample, current_meas):
         f"junc dbg  : episode={_fmt_int(junction_episode.get('episode_id', -1))} candidates={_fmt_int(junction_episode.get('candidate_frame_count', 0))}",
     ]
 
-    y = 28
+    y = 34
     for line in lines:
         if line == "":
-            y += 12
+            y += 16
             continue
-        cv2.putText(panel, line, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (25, 25, 25), 1, cv2.LINE_AA)
-        y += 27
-        if y >= panel.shape[0] - 20:
+        cv2.putText(panel, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (25, 25, 25), 2, cv2.LINE_AA)
+        y += 33
+        if y >= panel.shape[0] - 24:
             break
     return panel
 
 
+def _fit_to_canvas(image, canvas_w, canvas_h, bg_color=(245, 245, 245)):
+    src_h, src_w = image.shape[:2]
+    if src_h <= 0 or src_w <= 0:
+        return np.full((canvas_h, canvas_w, 3), bg_color, dtype=np.uint8)
+    scale = min(float(canvas_w) / max(src_w, 1), float(canvas_h) / max(src_h, 1))
+    new_w = max(int(round(src_w * scale)), 1)
+    new_h = max(int(round(src_h * scale)), 1)
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((canvas_h, canvas_w, 3), bg_color, dtype=np.uint8)
+    off_x = (canvas_w - new_w) // 2
+    off_y = (canvas_h - new_h) // 2
+    canvas[off_y:off_y + new_h, off_x:off_x + new_w] = resized
+    return canvas
+
+
 def _compose_frame(rgb, bev_panel, text_panel):
-    target_h = 900
-    rgb_h, rgb_w = rgb.shape[:2]
-    rgb_resized = cv2.resize(rgb, (int(rgb_w * target_h / max(rgb_h, 1)), target_h), interpolation=cv2.INTER_LINEAR)
-    bev_resized = cv2.resize(bev_panel, (760, 520), interpolation=cv2.INTER_LINEAR)
-    text_resized = cv2.resize(text_panel, (760, target_h - 520), interpolation=cv2.INTER_LINEAR)
+    target_h = 960
+    right_w = 960
+    left_w = 960
+    rgb_resized = _fit_to_canvas(rgb, left_w, target_h, bg_color=(0, 0, 0))
+    bev_resized = cv2.resize(bev_panel, (right_w, 540), interpolation=cv2.INTER_LINEAR)
+    text_resized = cv2.resize(text_panel, (right_w, target_h - 540), interpolation=cv2.INTER_LINEAR)
     right = np.concatenate([bev_resized, text_resized], axis=0)
     return np.concatenate([rgb_resized, right], axis=1)
+
+
+def _selection_name(scene_name, route_name):
+    return route_name if scene_name is None else f"{scene_name}_{route_name}"
+
+
+def _default_output_dir():
+    return Path(__file__).resolve().parents[1] / "visualizations" / "stage1_label_videos"
+
+
+def _resolve_output_path(scene_name, route_name, output=None, output_dir=None):
+    selection_name = _selection_name(scene_name, route_name)
+    safe_name = selection_name.replace("/", "_")
+    if output is not None:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return output_path
+    if output_dir is None:
+        output_dir = _default_output_dir()
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{safe_name}.mp4"
+
+
+def _render_route_video(route_name, route_samples, image_data_root, fps, x_range, y_range, output_path):
+    writer = None
+    for sample in route_samples:
+        base_dir, frame_str = _resolve_feature_frame_info(sample)
+        if base_dir is None or frame_str is None:
+            raise RuntimeError(
+                f"Missing base_dir/frame_str for route_name={route_name} "
+                f"frame_id={sample.get('frame_id')}"
+            )
+        current_boxes = _load_json_gz_if_exists(
+            os.path.join(image_data_root, base_dir, "boxes", f"{frame_str}.json.gz")
+        ) or []
+        current_meas = _load_json_gz_if_exists(
+            os.path.join(image_data_root, base_dir, "measurements", f"{frame_str}.json.gz")
+        ) or {}
+        rgb = _load_scene_rgb(image_data_root, base_dir, frame_str)
+        bev_panel = _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range)
+        text_panel = _build_text_panel(sample, current_meas)
+        frame = _compose_frame(rgb, bev_panel, text_panel)
+
+        if writer is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(output_path), fourcc, float(fps), (frame.shape[1], frame.shape[0]))
+            if not writer.isOpened():
+                raise RuntimeError(f"Failed to open video writer: {output_path}")
+        writer.write(frame)
+
+    if writer is not None:
+        writer.release()
 
 
 def main():
@@ -433,11 +634,23 @@ def main():
     parser.add_argument("--route_name", type=str, default=None)
     parser.add_argument("--scene_name", type=str, default=None)
     parser.add_argument("--index", type=int, default=None)
+    parser.add_argument(
+        "--route_list_txt",
+        type=str,
+        default=None,
+        help="Batch mode. Text file with one route per line: 'route_name' or 'scene_name route_name'.",
+    )
     parser.add_argument("--frame_start", type=int, default=None)
     parser.add_argument("--frame_end", type=int, default=None)
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory for batch outputs when --route_list_txt is used.",
+    )
     parser.add_argument("--x_range", type=float, nargs=2, default=[-15.0, 55.0])
     parser.add_argument("--y_range", type=float, nargs=2, default=[-18.0, 18.0])
     args = parser.parse_args()
@@ -448,54 +661,57 @@ def main():
     if not isinstance(samples, list):
         raise TypeError(f"Expected list in {packed_path}, got {type(samples).__name__}")
 
-    route_name, route_samples = _select_route_samples(
-        samples,
-        route_name=args.route_name,
-        scene_name=args.scene_name,
-        index=args.index,
-    )
-
-    if args.frame_start is not None:
-        route_samples = [s for s in route_samples if int(s.get("frame_id", -1)) >= int(args.frame_start)]
-    if args.frame_end is not None:
-        route_samples = [s for s in route_samples if int(s.get("frame_id", -1)) <= int(args.frame_end)]
-    if args.max_frames is not None:
-        route_samples = route_samples[: max(int(args.max_frames), 0)]
-    if not route_samples:
-        raise ValueError("No samples left after frame filtering.")
-
-    selection_name = route_name if args.scene_name is None else f"{args.scene_name}_{route_name}"
-    if args.output is None:
-        safe_name = selection_name.replace("/", "_")
-        output_dir = Path(__file__).resolve().parents[1] / "visualizations" / "stage1_label_videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{safe_name}.mp4"
+    if args.route_list_txt is not None:
+        if args.route_name is not None or args.scene_name is not None or args.index is not None:
+            raise ValueError("--route_list_txt cannot be combined with --route_name / --scene_name / --index")
+        if args.output is not None:
+            raise ValueError("Use --output_dir instead of --output in batch mode.")
+        requests = _load_route_requests(args.route_list_txt)
     else:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        requests = [{
+            "scene_name": args.scene_name,
+            "route_name": args.route_name,
+            "index": args.index,
+        }]
 
-    writer = None
-    for sample in route_samples:
-        base_dir, frame_str = _resolve_feature_frame_info(sample)
-        if base_dir is None or frame_str is None:
-            raise RuntimeError(f"Missing base_dir/frame_str for route_name={route_name} frame_id={sample.get('frame_id')}")
-        current_boxes = _load_json_gz_if_exists(os.path.join(args.image_data_root, base_dir, "boxes", f"{frame_str}.json.gz")) or []
-        current_meas = _load_json_gz_if_exists(os.path.join(args.image_data_root, base_dir, "measurements", f"{frame_str}.json.gz")) or {}
-        rgb = _load_scene_rgb(args.image_data_root, base_dir, frame_str)
-        bev_panel = _build_bev_panel(sample, current_boxes, current_meas, args.x_range, args.y_range)
-        text_panel = _build_text_panel(sample, current_meas)
-        frame = _compose_frame(rgb, bev_panel, text_panel)
+    generated = []
+    for req in requests:
+        route_name, route_samples = _select_route_samples(
+            samples,
+            route_name=req.get("route_name"),
+            scene_name=req.get("scene_name"),
+            index=req.get("index"),
+        )
 
-        if writer is None:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(output_path), fourcc, float(args.fps), (frame.shape[1], frame.shape[0]))
-            if not writer.isOpened():
-                raise RuntimeError(f"Failed to open video writer: {output_path}")
-        writer.write(frame)
+        if args.frame_start is not None:
+            route_samples = [s for s in route_samples if int(s.get("frame_id", -1)) >= int(args.frame_start)]
+        if args.frame_end is not None:
+            route_samples = [s for s in route_samples if int(s.get("frame_id", -1)) <= int(args.frame_end)]
+        if args.max_frames is not None:
+            route_samples = route_samples[: max(int(args.max_frames), 0)]
+        if not route_samples:
+            raise ValueError(f"No samples left after frame filtering for route_name={route_name}")
 
-    if writer is not None:
-        writer.release()
-    print(f"Saved lightweight stage1 label video to {output_path}")
+        output_path = _resolve_output_path(
+            scene_name=req.get("scene_name"),
+            route_name=route_name,
+            output=args.output if len(requests) == 1 else None,
+            output_dir=args.output_dir,
+        )
+        _render_route_video(
+            route_name=route_name,
+            route_samples=route_samples,
+            image_data_root=args.image_data_root,
+            fps=args.fps,
+            x_range=args.x_range,
+            y_range=args.y_range,
+            output_path=output_path,
+        )
+        generated.append(str(output_path))
+        print(f"Saved lightweight stage1 label video to {output_path}")
+
+    if len(generated) > 1:
+        print(f"Generated {len(generated)} videos from one packed load.")
 
 
 if __name__ == "__main__":
