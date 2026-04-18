@@ -3666,7 +3666,7 @@ def _build_borrow_conflict_windows(records, samples):
             scene_borrow_context = ctx
             break
     if scene_borrow_context is None:
-        issues.append(_conflict_area_issue(samples[records[0]['sample_idx']], 'borrow', 'missing_scene_borrow_context'))
+        issues.append(_conflict_area_issue(samples[records[0]['sample_idx']], 'borrow', 'missing_scene_borrow_context', pos=0))
         return windows, issues
 
     progress_by_pos = {}
@@ -3678,7 +3678,7 @@ def _build_borrow_conflict_windows(records, samples):
         progress_by_pos[int(pos)] = [float(v) for v in progresses]
         all_progress.extend(progresses)
     if not all_progress:
-        issues.append(_conflict_area_issue(samples[records[0]['sample_idx']], 'borrow', 'missing_borrow_conflict_progress_span'))
+        issues.append(_conflict_area_issue(samples[records[0]['sample_idx']], 'borrow', 'missing_borrow_conflict_progress_span', pos=0))
         return windows, issues
 
     conflict_start_progress_m = float(min(all_progress))
@@ -3698,7 +3698,7 @@ def _build_borrow_conflict_windows(records, samples):
             end_pos = int(pos)
             break
     if end_pos is None:
-        issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'borrow', 'missing_borrow_conflict_end'))
+        issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'borrow', 'missing_borrow_conflict_end', pos=int(start_pos)))
         return windows, issues
 
     windows.append({
@@ -3752,9 +3752,14 @@ def _build_merge_conflict_windows(records, samples):
             break
 
         candidate_positions = _merge_collect_conflict_candidate_positions(records, start_scan_pos)
+        if len(candidate_positions) < int(STAGE1_MERGE_START_CONFIRM_FRAMES):
+            # Weak or isolated future merge hints are common; they are not actionable
+            # conflict-area failures and should not be recorded as per-route issues.
+            pos = int(start_scan_pos) + 1
+            continue
         area_info = _merge_resolve_conflict_area(records, candidate_positions)
         if area_info is None:
-            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'missing_merge_conflict_cluster'))
+            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'missing_merge_conflict_cluster', pos=int(start_scan_pos)))
             pos = int(start_scan_pos) + 1
             continue
 
@@ -3765,7 +3770,7 @@ def _build_merge_conflict_windows(records, samples):
             if np.isfinite(_merge_record_conflict_s(records[int(p)]))
         ]
         if not future_merge_positions or not conflict_s_values:
-            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'missing_merge_conflict_points'))
+            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'missing_merge_conflict_points', pos=int(start_scan_pos)))
             pos = int(start_scan_pos) + 1
             continue
 
@@ -3774,7 +3779,7 @@ def _build_merge_conflict_windows(records, samples):
             if not _current_follow_chase_start_gate(records[int(p)])
         ]
         if not eligible_start_positions:
-            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'merge_start_blocked_by_current_follow_chase'))
+            issues.append(_conflict_area_issue(samples[records[start_scan_pos]['sample_idx']], 'merge', 'merge_start_blocked_by_current_follow_chase', pos=int(start_scan_pos)))
             pos = int(max(future_merge_positions)) + 1
             continue
 
@@ -3794,7 +3799,7 @@ def _build_merge_conflict_windows(records, samples):
                 end_pos = int(scan_pos)
                 break
         if end_pos is None:
-            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'merge', 'missing_merge_end'))
+            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'merge', 'missing_merge_end', pos=int(start_pos)))
             pos = int(max(future_merge_positions)) + 1
             continue
 
@@ -3838,7 +3843,8 @@ def _build_junction_conflict_windows(records, samples):
             if not _current_follow_chase_start_gate(records[int(pos)])
         ]
         if not cluster_positions:
-            issues.append(_conflict_area_issue(samples[records[max(int(prev_end_pos) + 1, 0)]['sample_idx']], 'junction', 'junction_start_blocked_by_current_follow_chase'))
+            issue_pos = int(max(int(prev_end_pos) + 1, 0))
+            issues.append(_conflict_area_issue(samples[records[issue_pos]['sample_idx']], 'junction', 'junction_start_blocked_by_current_follow_chase', pos=issue_pos))
             continue
 
         front_candidates = []
@@ -3847,7 +3853,7 @@ def _build_junction_conflict_windows(records, samples):
             if np.isfinite(front_s):
                 front_candidates.append((float(front_s), int(pos)))
         if not front_candidates:
-            issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_route_progress'))
+            issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_route_progress', pos=int(cluster_positions[0])))
             continue
 
         area_start_s_m = float(min(item[0] for item in front_candidates))
@@ -3861,13 +3867,13 @@ def _build_junction_conflict_windows(records, samples):
                 end_pos = int(pos)
                 break
         if end_pos is None:
-            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_end'))
+            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_end', pos=int(start_pos)))
             continue
 
         center_xy = np.asarray(cluster.get('center_xy', []), dtype=np.float32).reshape(-1)
         radius_m = float(cluster.get('radius_m', np.nan))
         if center_xy.size < 2 or not np.all(np.isfinite(center_xy[:2])) or not np.isfinite(radius_m):
-            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_area_geometry'))
+            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_area_geometry', pos=int(start_pos)))
             continue
 
         windows.append({
@@ -3916,9 +3922,15 @@ def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
     junction_windows, junction_issues = _build_junction_conflict_windows(records, samples)
     route_windows = borrow_windows + merge_windows + junction_windows
     route_issues = borrow_issues + merge_issues + junction_issues
+    issues_by_pos = {}
+    for issue in route_issues:
+        issue_pos = int(issue.get('pos', -1))
+        if 0 <= issue_pos < len(records):
+            issues_by_pos.setdefault(issue_pos, []).append(dict(issue))
 
     for pos, record in enumerate(records):
         sample = samples[int(record['sample_idx'])]
+        frame_issues = issues_by_pos.get(int(pos), [])
         active_windows = [
             dict(window) for window in route_windows
             if int(window.get('start_pos', -1)) <= int(pos) <= int(window.get('end_pos', -1))
@@ -3931,17 +3943,17 @@ def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
             selected['active_families'] = [str(item.get('family', 'none')) for item in active_windows]
             selected['active_family_count'] = int(len(active_windows))
             selected['selection_reason'] = 'single_active_family' if len(active_windows) == 1 else 'priority'
-            selected['issue_count'] = int(len(route_issues))
-            selected['issue_families'] = [str(item.get('family', 'none')) for item in route_issues]
-            selected['missing_reason'] = str(route_issues[0].get('reason', 'none')) if route_issues else 'none'
+            selected['issue_count'] = int(len(frame_issues))
+            selected['issue_families'] = [str(item.get('family', 'none')) for item in frame_issues]
+            selected['missing_reason'] = str(frame_issues[0].get('reason', 'none')) if frame_issues else 'none'
             _set_stage1_conflict_area_annotation(sample, selected)
             continue
 
         info = _default_conflict_area_debug()
-        if route_issues:
-            info['issue_count'] = int(len(route_issues))
-            info['issue_families'] = [str(item.get('family', 'none')) for item in route_issues]
-            info['missing_reason'] = str(route_issues[0].get('reason', 'unknown'))
+        if frame_issues:
+            info['issue_count'] = int(len(frame_issues))
+            info['issue_families'] = [str(item.get('family', 'none')) for item in frame_issues]
+            info['missing_reason'] = str(frame_issues[0].get('reason', 'unknown'))
             info['selection_reason'] = 'issue_only'
         _set_stage1_conflict_area_annotation(sample, info)
 
