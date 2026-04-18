@@ -174,6 +174,14 @@ def _transform_points_world_xyz_to_local(points_xyz, ego_matrix):
     return local[:, :2].astype(np.float32)
 
 
+def _transform_points_world_xy_to_local(points_xy, ego_matrix):
+    pts = np.asarray(points_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return np.zeros((0, 2), dtype=np.float32)
+    pts_xyz = np.concatenate([pts[:, :2], np.zeros((pts.shape[0], 1), dtype=np.float32)], axis=1)
+    return _transform_points_world_xyz_to_local(pts_xyz, ego_matrix)
+
+
 def _route_with_origin(route):
     route = np.asarray(route, dtype=np.float32)
     if route.ndim != 2 or route.shape[0] == 0 or route.shape[1] != 2:
@@ -200,6 +208,16 @@ def _interpolate_route_with_arclength(route_xy, step_m=0.25):
 
 def _sample_route_point_at_s(route_xy, progress_m):
     dense, dense_s = _interpolate_route_with_arclength(_route_with_origin(route_xy), step_m=0.25)
+    if dense.shape[0] == 0 or dense_s.shape[0] == 0:
+        return None
+    progress_m = float(np.clip(float(progress_m), 0.0, float(dense_s[-1])))
+    idx = int(np.searchsorted(dense_s, progress_m, side="left"))
+    idx = int(np.clip(idx, 0, dense.shape[0] - 1))
+    return dense[idx]
+
+
+def _sample_polyline_point_at_s(poly_xy, progress_m):
+    dense, dense_s = _interpolate_route_with_arclength(np.asarray(poly_xy, dtype=np.float32), step_m=0.25)
     if dense.shape[0] == 0 or dense_s.shape[0] == 0:
         return None
     progress_m = float(np.clip(float(progress_m), 0.0, float(dense_s[-1])))
@@ -319,13 +337,11 @@ def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range
     return local_xy[0]
 
 
-def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_range, y_range):
-    if route_xy is None:
+def _draw_local_point_marker(canvas, local_xy, color, label, x_range, y_range):
+    local_xy = np.asarray(local_xy, dtype=np.float32)
+    if local_xy.shape != (2,):
         return
-    pt = _sample_route_point_at_s(route_xy, progress_m)
-    if pt is None:
-        return
-    pt_px = _local_to_canvas(np.asarray(pt, dtype=np.float32)[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
+    pt_px = _local_to_canvas(local_xy[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
     if pt_px.shape != (1, 2):
         return
     px = tuple(pt_px[0])
@@ -341,6 +357,57 @@ def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_ra
         2,
         cv2.LINE_AA,
     )
+
+
+def _draw_cross_labeled_marker(canvas, local_xy, color, label, x_range, y_range):
+    local_xy = np.asarray(local_xy, dtype=np.float32)
+    if local_xy.shape != (2,):
+        return
+    pt_px = _local_to_canvas(local_xy[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
+    if pt_px.shape != (1, 2):
+        return
+    px = tuple(pt_px[0])
+    cv2.circle(canvas, px, 6, color, -1, cv2.LINE_AA)
+    cv2.circle(canvas, px, 11, color, 1, cv2.LINE_AA)
+    cv2.drawMarker(canvas, px, color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=12, thickness=2)
+    cv2.putText(
+        canvas,
+        str(label),
+        (px[0] + 8, px[1] - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_range, y_range):
+    if route_xy is None:
+        return
+    pt = _sample_route_point_at_s(route_xy, progress_m)
+    if pt is None:
+        return
+    _draw_local_point_marker(canvas, pt, color, label, x_range, y_range)
+
+
+def _draw_panel_header(panel, title, subtitle=None, bg_color=(28, 38, 54), fg_color=(245, 245, 245)):
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 40), bg_color, -1, cv2.LINE_AA)
+    cv2.putText(panel, str(title), (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.70, fg_color, 2, cv2.LINE_AA)
+    if subtitle:
+        cv2.putText(panel, str(subtitle), (panel.shape[1] - 250, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+
+
+def _draw_text_section(panel, y, title, lines, color):
+    cv2.rectangle(panel, (10, y), (panel.shape[1] - 10, y + 26), color, -1, cv2.LINE_AA)
+    cv2.putText(panel, str(title), (18, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (248, 248, 248), 1, cv2.LINE_AA)
+    y += 38
+    for line in lines:
+        cv2.putText(panel, str(line), (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (28, 28, 28), 1, cv2.LINE_AA)
+        y += 28
+        if y >= panel.shape[0] - 24:
+            break
+    return y + 8
 
 
 def _find_box_by_id(boxes, actor_id):
@@ -385,20 +452,32 @@ def _fmt_int(x):
 
 
 def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
-    canvas = np.full((760, 760, 3), 250, dtype=np.uint8)
+    canvas = np.full((760, 760, 3), 248, dtype=np.uint8)
     route = np.asarray(sample.get("route", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
     route_xy = _route_with_origin(route)
+    family_code = int(sample.get("conflict_area_family", 0))
+    frame_role = str(((sample.get("stage1_speed_debug") or {}).get("conflict_area") or {}).get("frame_role", "none"))
+    _draw_panel_header(
+        canvas,
+        "BEV / Route / Conflict",
+        f"{CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))} | {frame_role}",
+    )
 
     for x in np.arange(x_range[0], x_range[1] + 1e-3, 5.0):
         pts = np.array([[x, y_range[0]], [x, y_range[1]]], dtype=np.float32)
         px = _local_to_canvas(pts, canvas.shape[1], canvas.shape[0], x_range, y_range)
-        cv2.line(canvas, tuple(px[0]), tuple(px[1]), (232, 232, 232), 1, cv2.LINE_AA)
+        cv2.line(canvas, tuple(px[0]), tuple(px[1]), (234, 234, 234), 1, cv2.LINE_AA)
     for y in np.arange(y_range[0], y_range[1] + 1e-3, 5.0):
         pts = np.array([[x_range[0], y], [x_range[1], y]], dtype=np.float32)
         px = _local_to_canvas(pts, canvas.shape[1], canvas.shape[0], x_range, y_range)
-        cv2.line(canvas, tuple(px[0]), tuple(px[1]), (232, 232, 232), 1, cv2.LINE_AA)
+        cv2.line(canvas, tuple(px[0]), tuple(px[1]), (234, 234, 234), 1, cv2.LINE_AA)
 
     if route_xy.shape[0] >= 2:
+        route_dense, _ = _interpolate_route_with_arclength(route_xy, step_m=0.5)
+        if route_dense.shape[0] > 0:
+            dense_px = _local_to_canvas(route_dense, canvas.shape[1], canvas.shape[0], x_range, y_range)
+            for pt in dense_px:
+                cv2.circle(canvas, tuple(pt), 1, (214, 214, 214), -1, cv2.LINE_AA)
         route_px = _local_to_canvas(route_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
         cv2.polylines(canvas, [route_px], isClosed=False, color=(30, 30, 30), thickness=3, lineType=cv2.LINE_AA)
 
@@ -462,7 +541,50 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
         if box_px.shape == (1, 2) and cp_px.shape == (1, 2):
             cv2.line(canvas, tuple(box_px[0]), tuple(cp_px[0]), (0, 140, 255), 2, cv2.LINE_AA)
 
-    if route_xy.shape[0] >= 2:
+    borrow_area_drawn = False
+    if ego_matrix is not None:
+        corridor_world_xy = np.asarray(scene_borrow_context.get("borrow_segment_world_xy", []), dtype=np.float32)
+        if corridor_world_xy.ndim == 2 and corridor_world_xy.shape[0] >= 2 and corridor_world_xy.shape[1] == 2:
+            corridor_local_xy = _transform_points_world_xy_to_local(corridor_world_xy, ego_matrix)
+            if corridor_local_xy.shape[0] >= 2:
+                corridor_px = _local_to_canvas(corridor_local_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
+                cv2.polylines(canvas, [corridor_px], isClosed=False, color=(0, 135, 180), thickness=3, lineType=cv2.LINE_AA)
+
+                corridor_start_world_xy = np.asarray(scene_borrow_context.get("borrow_start_world_xy", []), dtype=np.float32)
+                corridor_end_world_xy = np.asarray(scene_borrow_context.get("borrow_end_world_xy", []), dtype=np.float32)
+                if corridor_start_world_xy.shape == (2,):
+                    start_local_xy = _transform_points_world_xy_to_local(corridor_start_world_xy[None, :], ego_matrix)
+                    if start_local_xy.shape == (1, 2):
+                        _draw_cross_labeled_marker(canvas, start_local_xy[0], (0, 120, 210), "start", x_range, y_range)
+                if corridor_end_world_xy.shape == (2,):
+                    end_local_xy = _transform_points_world_xy_to_local(corridor_end_world_xy[None, :], ego_matrix)
+                    if end_local_xy.shape == (1, 2):
+                        _draw_cross_labeled_marker(canvas, end_local_xy[0], (255, 200, 0), "end", x_range, y_range)
+
+                conflict_start_progress_m = float(conflict_area.get("borrow_conflict_start_progress_m", np.nan))
+                conflict_end_progress_m = float(conflict_area.get("borrow_conflict_end_progress_m", np.nan))
+                if np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
+                    area_start_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_start_progress_m)
+                    area_end_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_end_progress_m)
+                    if area_start_local is not None:
+                        _draw_local_point_marker(canvas, area_start_local, (0, 180, 0), "area_s", x_range, y_range)
+                    if area_end_local is not None:
+                        _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
+                    seg_pts = []
+                    for s in np.linspace(
+                        conflict_start_progress_m,
+                        conflict_end_progress_m,
+                        num=max(int((conflict_end_progress_m - conflict_start_progress_m) / 0.5) + 2, 2),
+                    ):
+                        pt = _sample_polyline_point_at_s(corridor_local_xy, s)
+                        if pt is not None:
+                            seg_pts.append(pt)
+                    if len(seg_pts) >= 2:
+                        seg_px = _local_to_canvas(np.asarray(seg_pts, dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
+                        cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
+                        borrow_area_drawn = True
+
+    if route_xy.shape[0] >= 2 and not borrow_area_drawn:
         area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
         area_end_s = float(conflict_area.get("area_end_s_m", np.nan))
         if np.isfinite(area_start_s) and np.isfinite(area_end_s) and area_end_s >= area_start_s:
@@ -509,21 +631,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
                 radius_px = int(max(radius_m * scale_x, 2.0))
                 cv2.circle(canvas, tuple(center_px), radius_px, (180, 0, 180), 3, cv2.LINE_AA)
 
-    borrow_start_world_xy = np.asarray(conflict_area.get("borrow_start_world_xy", []), dtype=np.float32)
-    borrow_end_world_xy = np.asarray(conflict_area.get("borrow_end_world_xy", []), dtype=np.float32)
-    if ego_matrix is not None and borrow_start_world_xy.shape == (2,) and borrow_end_world_xy.shape == (2,):
-        borrow_world = np.array(
-            [
-                [borrow_start_world_xy[0], borrow_start_world_xy[1], 0.0],
-                [borrow_end_world_xy[0], borrow_end_world_xy[1], 0.0],
-            ],
-            dtype=np.float32,
-        )
-        borrow_local = _transform_points_world_xyz_to_local(borrow_world, ego_matrix)
-        if borrow_local.shape == (2, 2):
-            borrow_px = _local_to_canvas(borrow_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
-            cv2.line(canvas, tuple(borrow_px[0]), tuple(borrow_px[1]), (0, 150, 0), 2, cv2.LINE_AA)
-
     return canvas
 
 
@@ -550,42 +657,67 @@ def _build_text_panel(sample, current_meas):
     dir_code = int(sample.get("conflict_area_dir", 0))
     issue_count = int(conflict_area.get("issue_count", 0))
     issue_families = ",".join(str(x) for x in conflict_area.get("issue_families", [])) or "none"
-
-    lines = [
-        f"{event_name} | frame {int(sample.get('frame_id', -1)):04d}",
-        route_name,
-        f"speed={speed:.2f}  cmd={COMMAND_MAP.get(int(cmd_id), str(cmd_id)) if cmd_id is not None else 'NA'}  junction={junction_flag}",
-        f"conflict family={CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
-        f"conflict start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
-        f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
-        f"conflict src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')} reason={conflict_area.get('selection_reason', 'none')}",
-        f"issue_count={issue_count} issue_families={issue_families}",
-        f"missing_reason={conflict_area.get('missing_reason', 'none')}",
-        "",
-        f"old borrow active={int(float(sample.get('borrow_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('borrow_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('borrow_cross_episode_end_frame', -1))} go={_fmt_int(sample.get('borrow_cross_go_frame', -1))}",
-        f"old merge active={int(float(sample.get('merge_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('merge_episode_start_frame', -1))} end={_fmt_int(sample.get('merge_episode_end_frame', -1))} go={_fmt_int(sample.get('merge_go_frame', -1))}",
-        f"old junction active={int(float(sample.get('junction_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('junction_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('junction_cross_episode_end_frame', -1))}",
-        "",
-        f"current: name={_cover_name(current_cover)} subtype={_cover_subtype(current_cover)} actor={_fmt_int(current_cover.get('actor_id', -1))}",
-        f"current: dist={_fmt_float(current_cover.get('distance', np.nan))} route_d={_fmt_float(current_cover.get('route_distance_m', np.nan))} cp_s={_fmt_float(current_cover.get('scene_route_conflict_s_m', np.nan))}",
-        f"future : name={_cover_name(future_cover)} subtype={_cover_subtype(future_cover)} actor={_fmt_int(future_cover.get('actor_id', -1))}",
-        f"future : dE={_fmt_float(future_cover.get('d_ego', np.nan))} dB={_fmt_float(future_cover.get('d_bg', np.nan))} route_d={_fmt_float(future_cover.get('route_distance_m', np.nan))}",
-        f"future : conflict_s={_fmt_float(future_cover.get('scene_route_conflict_s_m', np.nan))}",
-        "",
-        f"borrow dbg: phase={borrow_episode.get('phase', 'none')} ctx={_fmt_int(sample.get('borrow_cross_context_frame', -1))} t={_fmt_float(sample.get('borrow_cross_active_time_s', np.nan))}",
-        f"merge dbg : phase={merge_episode.get('phase', 'none')} no_go={_fmt_int(sample.get('merge_episode_no_go', 0))} hold={_fmt_float(sample.get('merge_hold', np.nan))}",
-        f"junc dbg  : episode={_fmt_int(junction_episode.get('episode_id', -1))} candidates={_fmt_int(junction_episode.get('candidate_frame_count', 0))}",
-    ]
-
-    y = 34
-    for line in lines:
-        if line == "":
-            y += 16
-            continue
-        cv2.putText(panel, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (25, 25, 25), 2, cv2.LINE_AA)
-        y += 33
-        if y >= panel.shape[0] - 24:
-            break
+    _draw_panel_header(panel, f"{event_name} | frame {int(sample.get('frame_id', -1)):04d}", route_name)
+    y = 62
+    y = _draw_text_section(
+        panel,
+        y,
+        "Scene",
+        [
+            f"speed={speed:.2f}  cmd={COMMAND_MAP.get(int(cmd_id), str(cmd_id)) if cmd_id is not None else 'NA'}  junction={junction_flag}",
+        ],
+        (58, 80, 116),
+    )
+    y = _draw_text_section(
+        panel,
+        y,
+        "Conflict",
+        [
+            f"family={CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
+            f"frame start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
+            f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
+            f"borrow prog s={_fmt_float(conflict_area.get('borrow_conflict_start_progress_m', np.nan))} e={_fmt_float(conflict_area.get('borrow_conflict_end_progress_m', np.nan))}",
+            f"src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')} reason={conflict_area.get('selection_reason', 'none')}",
+            f"issue_count={issue_count} issue_families={issue_families}",
+            f"missing_reason={conflict_area.get('missing_reason', 'none')}",
+        ],
+        (56, 122, 78),
+    )
+    y = _draw_text_section(
+        panel,
+        y,
+        "Legacy Episodes",
+        [
+            f"borrow active={int(float(sample.get('borrow_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('borrow_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('borrow_cross_episode_end_frame', -1))} go={_fmt_int(sample.get('borrow_cross_go_frame', -1))}",
+            f"merge  active={int(float(sample.get('merge_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('merge_episode_start_frame', -1))} end={_fmt_int(sample.get('merge_episode_end_frame', -1))} go={_fmt_int(sample.get('merge_go_frame', -1))}",
+            f"junc   active={int(float(sample.get('junction_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('junction_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('junction_cross_episode_end_frame', -1))}",
+        ],
+        (120, 90, 44),
+    )
+    y = _draw_text_section(
+        panel,
+        y,
+        "Cover",
+        [
+            f"current: name={_cover_name(current_cover)} subtype={_cover_subtype(current_cover)} actor={_fmt_int(current_cover.get('actor_id', -1))}",
+            f"current: dist={_fmt_float(current_cover.get('distance', np.nan))} route_d={_fmt_float(current_cover.get('route_distance_m', np.nan))} cp_s={_fmt_float(current_cover.get('scene_route_conflict_s_m', np.nan))}",
+            f"future : name={_cover_name(future_cover)} subtype={_cover_subtype(future_cover)} actor={_fmt_int(future_cover.get('actor_id', -1))}",
+            f"future : dE={_fmt_float(future_cover.get('d_ego', np.nan))} dB={_fmt_float(future_cover.get('d_bg', np.nan))} route_d={_fmt_float(future_cover.get('route_distance_m', np.nan))}",
+            f"future : conflict_s={_fmt_float(future_cover.get('scene_route_conflict_s_m', np.nan))}",
+        ],
+        (112, 74, 136),
+    )
+    _draw_text_section(
+        panel,
+        y,
+        "Debug",
+        [
+            f"borrow dbg: phase={borrow_episode.get('phase', 'none')} ctx={_fmt_int(sample.get('borrow_cross_context_frame', -1))} t={_fmt_float(sample.get('borrow_cross_active_time_s', np.nan))}",
+            f"merge dbg : phase={merge_episode.get('phase', 'none')} no_go={_fmt_int(sample.get('merge_episode_no_go', 0))} hold={_fmt_float(sample.get('merge_hold', np.nan))}",
+            f"junc dbg  : episode={_fmt_int(junction_episode.get('episode_id', -1))} candidates={_fmt_int(junction_episode.get('candidate_frame_count', 0))}",
+        ],
+        (86, 86, 86),
+    )
     return panel
 
 
@@ -612,7 +744,10 @@ def _compose_frame(rgb, bev_panel, text_panel):
     bev_resized = cv2.resize(bev_panel, (right_w, 540), interpolation=cv2.INTER_LINEAR)
     text_resized = cv2.resize(text_panel, (right_w, target_h - 540), interpolation=cv2.INTER_LINEAR)
     right = np.concatenate([bev_resized, text_resized], axis=0)
-    return np.concatenate([rgb_resized, right], axis=1)
+    gutter = np.full((target_h, 12, 3), 238, dtype=np.uint8)
+    frame = np.concatenate([rgb_resized, gutter, right], axis=1)
+    cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), (225, 225, 225), 1, cv2.LINE_AA)
+    return frame
 
 
 def _selection_name(scene_name, route_name):
