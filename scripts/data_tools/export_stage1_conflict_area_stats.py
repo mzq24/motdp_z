@@ -81,6 +81,7 @@ def _summarize_conflict_area(samples: List[Dict[str, Any]], grouped_scenes: List
     issue_frames = 0
     issue_scenes_by_family: Counter = Counter()
     missing_reason_counts: Counter = Counter()
+    topology_override_counts: Counter = Counter()
 
     for scene, indices in grouped_scenes:
         event_name = _event_name_from_scene(scene)
@@ -107,6 +108,9 @@ def _summarize_conflict_area(samples: List[Dict[str, Any]], grouped_scenes: List
                 reason = str(conflict_debug.get("missing_reason", "none"))
                 if reason and reason != "none":
                     scene_missing_reasons.add(reason)
+                topology_override = str(conflict_debug.get("topology_override", "none"))
+                if topology_override and topology_override != "none":
+                    topology_override_counts[topology_override] += 1
 
         for family in scene_active_families:
             active_scenes_by_family[family] += 1
@@ -130,6 +134,7 @@ def _summarize_conflict_area(samples: List[Dict[str, Any]], grouped_scenes: List
         "issue_frames": int(issue_frames),
         "issue_scenes_by_family": dict(sorted(issue_scenes_by_family.items())),
         "missing_reason_counts": dict(sorted(missing_reason_counts.items())),
+        "topology_override_counts": dict(sorted(topology_override_counts.items())),
     }
 
 

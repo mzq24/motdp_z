@@ -182,6 +182,31 @@ def _transform_points_world_xy_to_local(points_xy, ego_matrix):
     return _transform_points_world_xyz_to_local(pts_xyz, ego_matrix)
 
 
+def _transform_world_points_to_local_xy(points_world, ego_matrix):
+    pts = np.asarray(points_world, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if pts.shape[1] >= 3:
+        return _transform_points_world_xyz_to_local(pts[:, :3], ego_matrix)
+    if pts.shape[1] >= 2:
+        return _transform_points_world_xy_to_local(pts[:, :2], ego_matrix)
+    return np.zeros((0, 2), dtype=np.float32)
+
+
+def _transform_single_world_point_to_local_xy(world_xyz, world_xy, ego_matrix):
+    xyz = np.asarray(world_xyz, dtype=np.float32).reshape(-1)
+    if xyz.size >= 3 and np.all(np.isfinite(xyz[:3])):
+        local_xy = _transform_points_world_xyz_to_local(xyz[:3][None, :], ego_matrix)
+        if local_xy.shape == (1, 2):
+            return local_xy[0]
+    xy = np.asarray(world_xy, dtype=np.float32).reshape(-1)
+    if xy.size >= 2 and np.all(np.isfinite(xy[:2])):
+        local_xy = _transform_points_world_xy_to_local(xy[:2][None, :], ego_matrix)
+        if local_xy.shape == (1, 2):
+            return local_xy[0]
+    return None
+
+
 def _route_with_origin(route):
     route = np.asarray(route, dtype=np.float32)
     if route.ndim != 2 or route.shape[0] == 0 or route.shape[1] != 2:
@@ -393,18 +418,18 @@ def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_ra
 
 def _draw_panel_header(panel, title, subtitle=None, bg_color=(28, 38, 54), fg_color=(245, 245, 245)):
     cv2.rectangle(panel, (0, 0), (panel.shape[1], 40), bg_color, -1, cv2.LINE_AA)
-    cv2.putText(panel, str(title), (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.70, fg_color, 2, cv2.LINE_AA)
+    cv2.putText(panel, str(title), (14, 26), cv2.FONT_HERSHEY_DUPLEX, 0.70, fg_color, 1, cv2.LINE_AA)
     if subtitle:
-        cv2.putText(panel, str(subtitle), (panel.shape[1] - 250, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(panel, str(subtitle), (panel.shape[1] - 250, 26), cv2.FONT_HERSHEY_DUPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
 
 
-def _draw_text_section(panel, y, title, lines, color):
-    cv2.rectangle(panel, (10, y), (panel.shape[1] - 10, y + 26), color, -1, cv2.LINE_AA)
-    cv2.putText(panel, str(title), (18, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (248, 248, 248), 1, cv2.LINE_AA)
+def _draw_text_section(panel, x, y, width, title, lines, color):
+    cv2.rectangle(panel, (x, y), (x + width, y + 26), color, -1, cv2.LINE_AA)
+    cv2.putText(panel, str(title), (x + 10, y + 18), cv2.FONT_HERSHEY_DUPLEX, 0.50, (248, 248, 248), 1, cv2.LINE_AA)
     y += 38
     for line in lines:
-        cv2.putText(panel, str(line), (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (28, 28, 28), 1, cv2.LINE_AA)
-        y += 28
+        cv2.putText(panel, str(line), (x + 10, y), cv2.FONT_HERSHEY_DUPLEX, 0.50, (28, 28, 28), 1, cv2.LINE_AA)
+        y += 24
         if y >= panel.shape[0] - 24:
             break
     return y + 8
@@ -543,46 +568,52 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
 
     borrow_area_drawn = False
     if ego_matrix is not None:
-        corridor_world_xy = np.asarray(scene_borrow_context.get("borrow_segment_world_xy", []), dtype=np.float32)
-        if corridor_world_xy.ndim == 2 and corridor_world_xy.shape[0] >= 2 and corridor_world_xy.shape[1] == 2:
-            corridor_local_xy = _transform_points_world_xy_to_local(corridor_world_xy, ego_matrix)
-            if corridor_local_xy.shape[0] >= 2:
-                corridor_px = _local_to_canvas(corridor_local_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
-                cv2.polylines(canvas, [corridor_px], isClosed=False, color=(0, 135, 180), thickness=3, lineType=cv2.LINE_AA)
+        corridor_world = np.asarray(scene_borrow_context.get("borrow_segment_world_xyz", []), dtype=np.float32)
+        if corridor_world.ndim != 2 or corridor_world.shape[0] < 2 or corridor_world.shape[1] < 3:
+            corridor_world = np.asarray(scene_borrow_context.get("borrow_segment_world_xy", []), dtype=np.float32)
+        corridor_local_xy = _transform_world_points_to_local_xy(corridor_world, ego_matrix)
+        if corridor_local_xy.shape[0] >= 2:
+            corridor_px = _local_to_canvas(corridor_local_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
+            cv2.polylines(canvas, [corridor_px], isClosed=False, color=(0, 135, 180), thickness=3, lineType=cv2.LINE_AA)
 
-                corridor_start_world_xy = np.asarray(scene_borrow_context.get("borrow_start_world_xy", []), dtype=np.float32)
-                corridor_end_world_xy = np.asarray(scene_borrow_context.get("borrow_end_world_xy", []), dtype=np.float32)
-                if corridor_start_world_xy.shape == (2,):
-                    start_local_xy = _transform_points_world_xy_to_local(corridor_start_world_xy[None, :], ego_matrix)
-                    if start_local_xy.shape == (1, 2):
-                        _draw_cross_labeled_marker(canvas, start_local_xy[0], (0, 120, 210), "start", x_range, y_range)
-                if corridor_end_world_xy.shape == (2,):
-                    end_local_xy = _transform_points_world_xy_to_local(corridor_end_world_xy[None, :], ego_matrix)
-                    if end_local_xy.shape == (1, 2):
-                        _draw_cross_labeled_marker(canvas, end_local_xy[0], (255, 200, 0), "end", x_range, y_range)
+            start_local_xy = _transform_single_world_point_to_local_xy(
+                scene_borrow_context.get("borrow_start_world_xyz", []),
+                scene_borrow_context.get("borrow_start_world_xy", []),
+                ego_matrix,
+            )
+            if start_local_xy is not None:
+                _draw_cross_labeled_marker(canvas, start_local_xy, (0, 120, 210), "start", x_range, y_range)
 
-                conflict_start_progress_m = float(conflict_area.get("borrow_conflict_start_progress_m", np.nan))
-                conflict_end_progress_m = float(conflict_area.get("borrow_conflict_end_progress_m", np.nan))
-                if np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
-                    area_start_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_start_progress_m)
-                    area_end_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_end_progress_m)
-                    if area_start_local is not None:
-                        _draw_local_point_marker(canvas, area_start_local, (0, 180, 0), "area_s", x_range, y_range)
-                    if area_end_local is not None:
-                        _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
-                    seg_pts = []
-                    for s in np.linspace(
-                        conflict_start_progress_m,
-                        conflict_end_progress_m,
-                        num=max(int((conflict_end_progress_m - conflict_start_progress_m) / 0.5) + 2, 2),
-                    ):
-                        pt = _sample_polyline_point_at_s(corridor_local_xy, s)
-                        if pt is not None:
-                            seg_pts.append(pt)
-                    if len(seg_pts) >= 2:
-                        seg_px = _local_to_canvas(np.asarray(seg_pts, dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
-                        cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
-                        borrow_area_drawn = True
+            end_local_xy = _transform_single_world_point_to_local_xy(
+                scene_borrow_context.get("borrow_end_world_xyz", []),
+                scene_borrow_context.get("borrow_end_world_xy", []),
+                ego_matrix,
+            )
+            if end_local_xy is not None:
+                _draw_cross_labeled_marker(canvas, end_local_xy, (255, 200, 0), "end", x_range, y_range)
+
+            conflict_start_progress_m = float(conflict_area.get("borrow_conflict_start_progress_m", np.nan))
+            conflict_end_progress_m = float(conflict_area.get("borrow_conflict_end_progress_m", np.nan))
+            if np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
+                area_start_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_start_progress_m)
+                area_end_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_end_progress_m)
+                if area_start_local is not None:
+                    _draw_local_point_marker(canvas, area_start_local, (0, 180, 0), "area_s", x_range, y_range)
+                if area_end_local is not None:
+                    _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
+                seg_pts = []
+                for s in np.linspace(
+                    conflict_start_progress_m,
+                    conflict_end_progress_m,
+                    num=max(int((conflict_end_progress_m - conflict_start_progress_m) / 0.5) + 2, 2),
+                ):
+                    pt = _sample_polyline_point_at_s(corridor_local_xy, s)
+                    if pt is not None:
+                        seg_pts.append(pt)
+                if len(seg_pts) >= 2:
+                    seg_px = _local_to_canvas(np.asarray(seg_pts, dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
+                    cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
+                    borrow_area_drawn = True
 
     if route_xy.shape[0] >= 2 and not borrow_area_drawn:
         area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
@@ -635,7 +666,7 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
 
 
 def _build_text_panel(sample, current_meas):
-    panel = np.full((760, 720, 3), 248, dtype=np.uint8)
+    panel = np.full((460, 960, 3), 248, dtype=np.uint8)
     stage1_debug = sample.get("stage1_speed_debug") or {}
     current_cover = stage1_debug.get("current_cover") or {}
     future_cover = stage1_debug.get("future_cover") or {}
@@ -658,19 +689,28 @@ def _build_text_panel(sample, current_meas):
     issue_count = int(conflict_area.get("issue_count", 0))
     issue_families = ",".join(str(x) for x in conflict_area.get("issue_families", [])) or "none"
     _draw_panel_header(panel, f"{event_name} | frame {int(sample.get('frame_id', -1)):04d}", route_name)
-    y = 62
-    y = _draw_text_section(
+    col_gap = 18
+    col_x0 = 10
+    col_w = (panel.shape[1] - col_gap - 30) // 2
+    col_x1 = col_x0 + col_w + col_gap
+    y_left = 58
+    y_right = 58
+    y_left = _draw_text_section(
         panel,
-        y,
+        col_x0,
+        y_left,
+        col_w,
         "Scene",
         [
             f"speed={speed:.2f}  cmd={COMMAND_MAP.get(int(cmd_id), str(cmd_id)) if cmd_id is not None else 'NA'}  junction={junction_flag}",
         ],
         (58, 80, 116),
     )
-    y = _draw_text_section(
+    y_left = _draw_text_section(
         panel,
-        y,
+        col_x0,
+        y_left,
+        col_w,
         "Conflict",
         [
             f"family={CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
@@ -683,9 +723,11 @@ def _build_text_panel(sample, current_meas):
         ],
         (56, 122, 78),
     )
-    y = _draw_text_section(
+    _draw_text_section(
         panel,
-        y,
+        col_x0,
+        y_left,
+        col_w,
         "Legacy Episodes",
         [
             f"borrow active={int(float(sample.get('borrow_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('borrow_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('borrow_cross_episode_end_frame', -1))} go={_fmt_int(sample.get('borrow_cross_go_frame', -1))}",
@@ -694,9 +736,11 @@ def _build_text_panel(sample, current_meas):
         ],
         (120, 90, 44),
     )
-    y = _draw_text_section(
+    y_right = _draw_text_section(
         panel,
-        y,
+        col_x1,
+        y_right,
+        col_w,
         "Cover",
         [
             f"current: name={_cover_name(current_cover)} subtype={_cover_subtype(current_cover)} actor={_fmt_int(current_cover.get('actor_id', -1))}",
@@ -709,7 +753,9 @@ def _build_text_panel(sample, current_meas):
     )
     _draw_text_section(
         panel,
-        y,
+        col_x1,
+        y_right,
+        col_w,
         "Debug",
         [
             f"borrow dbg: phase={borrow_episode.get('phase', 'none')} ctx={_fmt_int(sample.get('borrow_cross_context_frame', -1))} t={_fmt_float(sample.get('borrow_cross_active_time_s', np.nan))}",
@@ -740,9 +786,10 @@ def _compose_frame(rgb, bev_panel, text_panel):
     target_h = 960
     right_w = 960
     left_w = 960
+    bev_h = 500
     rgb_resized = _fit_to_canvas(rgb, left_w, target_h, bg_color=(0, 0, 0))
-    bev_resized = cv2.resize(bev_panel, (right_w, 540), interpolation=cv2.INTER_LINEAR)
-    text_resized = cv2.resize(text_panel, (right_w, target_h - 540), interpolation=cv2.INTER_LINEAR)
+    bev_resized = cv2.resize(bev_panel, (right_w, bev_h), interpolation=cv2.INTER_LINEAR)
+    text_resized = cv2.resize(text_panel, (right_w, target_h - bev_h), interpolation=cv2.INTER_LINEAR)
     right = np.concatenate([bev_resized, text_resized], axis=0)
     gutter = np.full((target_h, 12, 3), 238, dtype=np.uint8)
     frame = np.concatenate([rgb_resized, gutter, right], axis=1)

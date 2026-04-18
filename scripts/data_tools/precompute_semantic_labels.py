@@ -161,6 +161,12 @@ NO_ROUTE_EXTENSION_SCENES = {'HazardAtSideLane'}
 TWOWAY_START_LATERAL_THRESH_M = 0.5
 TWOWAY_RETURN_TAIL_POINTS = 12
 TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX = 10
+TWOWAY_BORROW_ONEWAY_ROUTE_OVERRIDES = {
+    "Town13_Rep0_1313_0_route0_11_09_06_18_06",
+    "Town13_Rep0_1313_1_route0_11_08_23_22_02",
+    "Town13_Rep0_1315_0_route0_11_09_00_34_48",
+    "Town13_Rep0_1315_1_route0_11_09_06_09_23",
+}
 STAGE1_SPEED_OFFSETS_MPS = np.asarray([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=np.float32)
 STAGE1_MERGE_GRACE_FRAMES = 4
 STAGE1_MERGE_START_CONFIRM_FRAMES = 2
@@ -3728,6 +3734,7 @@ def _conflict_area_issue(sample, family, reason, **extra):
         'family': str(family),
         'reason': str(reason),
         'base_dir': str(sample.get('base_dir', 'unknown')),
+        'route_name': str(sample.get('route_name', 'unknown')),
         'frame_id': int(sample.get('frame_id', -1)),
     }
     payload.update(extra)
@@ -3944,12 +3951,13 @@ def _borrow_conflict_dir_info(records, start_pos, end_pos, conflict_start_progre
             'dir': 'opposite',
             'dir_code': int(CONFLICT_DIR_TO_CODE['opposite']),
             'dir_source': 'family_fallback',
-            'dir_angle_deg': np.nan,
-            'route_heading_deg': np.nan,
-            'actor_heading_deg': np.nan,
-            'dir_cover_key': 'none',
-            'dir_frame_id': -1,
-        }
+        'dir_angle_deg': np.nan,
+        'route_heading_deg': np.nan,
+        'actor_heading_deg': np.nan,
+        'dir_cover_key': 'none',
+        'dir_frame_id': -1,
+        'topology_override': 'none',
+    }
     record = records[int(selected['pos'])]
     route_heading_rad = _borrow_route_heading_rad_from_conflict_area(
         record,
@@ -4125,6 +4133,21 @@ def _build_borrow_conflict_windows(records, samples):
         return windows, issues
     event_name = str(records[0].get('event_name', ''))
     if event_name not in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}:
+        return windows, issues
+    route_name = str(samples[records[0]['sample_idx']].get('route_name', 'unknown'))
+    if (
+        event_name == "ConstructionObstacleTwoWays" and
+        route_name in TWOWAY_BORROW_ONEWAY_ROUTE_OVERRIDES
+    ):
+        issues.append(
+            _conflict_area_issue(
+                samples[records[0]['sample_idx']],
+                'borrow',
+                'construction_oneway_topology_override',
+                pos=0,
+                topology_override='oneway',
+            )
+        )
         return windows, issues
 
     scene_borrow_context = None
@@ -4453,6 +4476,7 @@ def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
             selected['issue_count'] = int(len(frame_issues))
             selected['issue_families'] = [str(item.get('family', 'none')) for item in frame_issues]
             selected['missing_reason'] = str(frame_issues[0].get('reason', 'none')) if frame_issues else 'none'
+            selected['topology_override'] = str(frame_issues[0].get('topology_override', 'none')) if frame_issues else 'none'
             _set_stage1_conflict_area_annotation(sample, selected)
             continue
 
@@ -4462,6 +4486,7 @@ def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
             info['issue_families'] = [str(item.get('family', 'none')) for item in frame_issues]
             info['missing_reason'] = str(frame_issues[0].get('reason', 'unknown'))
             info['selection_reason'] = 'issue_only'
+            info['topology_override'] = str(frame_issues[0].get('topology_override', 'none'))
         _set_stage1_conflict_area_annotation(sample, info)
 
 
