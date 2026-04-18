@@ -153,6 +153,8 @@ RIGHT_COMMAND_ID = 2
 LANE_FOLLOW_COMMAND_ID = 4
 INTERACTION_SAME_DIR_ANGLE_THRESH_DEG = 45.0
 INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG = 70.0
+CONFLICT_DIR_SAME_MAX_ANGLE_DEG = 45.0
+CONFLICT_DIR_OPPOSITE_MIN_ANGLE_DEG = 135.0
 MERGE_DEBUG_MIN_DEGO_M = 1.0
 MERGE_DEBUG_MIN_GO_DENOM_S = 0.10
 NO_ROUTE_EXTENSION_SCENES = {'HazardAtSideLane'}
@@ -2011,12 +2013,14 @@ def _empty_two_way_borrow_context(
     }
 
 
-def _build_accident_scene_global_vehicle_cluster(
+def _build_scene_global_two_way_blocker_cluster(
     frame_records,
+    event_name=None,
     stop_speed_thresh_mps=0.1,
     link_distance_m=12.0,
     min_cluster_size=3,
 ):
+    event_name = str(event_name or "")
     actor_obs = {}
     for record in frame_records or []:
         current_meas = record.get("current_meas")
@@ -2027,7 +2031,7 @@ def _build_accident_scene_global_vehicle_cluster(
             actor_id = box.get("id", None)
             if actor_id is None or not _two_way_blocker_box_allowed(
                 box,
-                event_name="AccidentTwoWays",
+                event_name=event_name,
                 stop_speed_thresh_mps=stop_speed_thresh_mps,
             ):
                 continue
@@ -2165,8 +2169,11 @@ def _build_event_two_way_borrow_context(
         return None
     event_name = str(event_name or "")
     scene_global_cluster = None
-    if event_name == "AccidentTwoWays":
-        scene_global_cluster = _build_accident_scene_global_vehicle_cluster(frame_records)
+    if event_name in {"AccidentTwoWays", "ConstructionObstacleTwoWays"}:
+        scene_global_cluster = _build_scene_global_two_way_blocker_cluster(
+            frame_records,
+            event_name=event_name,
+        )
 
     def _best_borrow_geom_for_route(route_local):
         best_geom = None
@@ -3642,6 +3649,12 @@ def _default_conflict_area_debug():
         'borrow_start_world_xy': [],
         'borrow_end_world_xy': [],
         'borrow_distance_m': np.nan,
+        'dir_source': 'none',
+        'dir_angle_deg': np.nan,
+        'route_heading_deg': np.nan,
+        'actor_heading_deg': np.nan,
+        'dir_cover_key': 'none',
+        'dir_frame_id': -1,
     }
 
 
@@ -3741,6 +3754,296 @@ def _route_heading_at_progress(route_local, progress_m):
     idx = int(np.clip(idx, 0, dense_route.shape[0] - 1))
     heading = _route_heading_at_idx(dense_route, idx)
     return float(heading) if heading is not None else np.nan
+
+
+def _cover_actor_heading_rad(cover):
+    interaction = ((cover or {}).get('interaction') or {})
+    try:
+        actor_heading_deg = float(interaction.get('actor_heading_deg', np.nan))
+    except Exception:
+        actor_heading_deg = np.nan
+    if not np.isfinite(actor_heading_deg):
+        return np.nan
+    return float(np.radians(actor_heading_deg))
+
+
+def _conflict_dir_from_headings(route_heading_rad, actor_heading_rad):
+    if not np.isfinite(route_heading_rad) or not np.isfinite(actor_heading_rad):
+        return 'none', np.nan
+    angle_deg = abs(_heading_to_deg(float(actor_heading_rad) - float(route_heading_rad)))
+    if angle_deg <= float(CONFLICT_DIR_SAME_MAX_ANGLE_DEG):
+        return 'same', float(angle_deg)
+    if angle_deg >= float(CONFLICT_DIR_OPPOSITE_MIN_ANGLE_DEG):
+        return 'opposite', float(angle_deg)
+    return 'cross', float(angle_deg)
+
+
+def _record_family_cover_candidates(
+    record,
+    family,
+    area_start_s_m=np.nan,
+    area_end_s_m=np.nan,
+    borrow_conflict_start_progress_m=np.nan,
+    borrow_conflict_end_progress_m=np.nan,
+):
+    family = str(family or 'none')
+    candidates = []
+    for cover_key in ('current_cover', 'future_cover'):
+        cover = (record or {}).get(cover_key) or {}
+        if int(cover.get('exists', 0.0)) <= 0:
+            continue
+        actor_heading_rad = _cover_actor_heading_rad(cover)
+        if not np.isfinite(actor_heading_rad):
+            continue
+        keep = False
+        progress_value = np.nan
+        if family == 'borrow':
+            if _cover_is_borrow_cross_meet(cover):
+                borrow_motion = (record or {}).get('borrow_motion') or {}
+                borrow_start_distance_m = float(borrow_motion.get('borrow_start_distance_m', np.nan))
+                route_distance_m = float(cover.get('route_distance_m', np.nan))
+                if np.isfinite(borrow_start_distance_m) and np.isfinite(route_distance_m):
+                    progress_value = float(route_distance_m - borrow_start_distance_m)
+                    if (
+                        not np.isfinite(borrow_conflict_start_progress_m) or
+                        not np.isfinite(borrow_conflict_end_progress_m) or
+                        (
+                            progress_value >= float(borrow_conflict_start_progress_m) - 0.5 and
+                            progress_value <= float(borrow_conflict_end_progress_m) + 0.5
+                        )
+                    ):
+                        keep = True
+        elif family == 'merge':
+            if _cover_is_merge_meet(cover) or _cover_is_chase(cover):
+                progress_value = float(cover.get('scene_route_conflict_s_m', np.nan))
+                if (
+                    not np.isfinite(area_start_s_m) or
+                    not np.isfinite(area_end_s_m) or
+                    (
+                        np.isfinite(progress_value) and
+                        progress_value >= float(area_start_s_m) - 2.0 and
+                        progress_value <= float(area_end_s_m) + 2.0
+                    )
+                ):
+                    keep = True
+        elif family == 'junction':
+            subtype = _cover_interaction_subtype(cover)
+            if _cover_is_cross_like(cover) and subtype != 'borrow_cross_meet':
+                progress_value = float(cover.get('scene_route_conflict_s_m', np.nan))
+                if (
+                    not np.isfinite(area_start_s_m) or
+                    not np.isfinite(area_end_s_m) or
+                    (
+                        np.isfinite(progress_value) and
+                        progress_value >= float(area_start_s_m) - 2.0 and
+                        progress_value <= float(area_end_s_m) + 2.0
+                    )
+                ):
+                    keep = True
+        if not keep:
+            continue
+        candidates.append({
+            'cover_key': str(cover_key),
+            'cover': dict(cover),
+            'actor_heading_rad': float(actor_heading_rad),
+            'progress_value': float(progress_value) if np.isfinite(progress_value) else np.nan,
+        })
+    return candidates
+
+
+def _select_conflict_dir_cover_candidate(
+    records,
+    start_pos,
+    end_pos,
+    family,
+    area_start_s_m=np.nan,
+    area_end_s_m=np.nan,
+    borrow_conflict_start_progress_m=np.nan,
+    borrow_conflict_end_progress_m=np.nan,
+):
+    family = str(family or 'none')
+    if family == 'borrow' and np.isfinite(borrow_conflict_start_progress_m) and np.isfinite(borrow_conflict_end_progress_m):
+        target_progress = 0.5 * (float(borrow_conflict_start_progress_m) + float(borrow_conflict_end_progress_m))
+    elif np.isfinite(area_start_s_m) and np.isfinite(area_end_s_m):
+        target_progress = 0.5 * (float(area_start_s_m) + float(area_end_s_m))
+    else:
+        target_progress = np.nan
+
+    best = None
+    for pos in range(int(start_pos), int(end_pos) + 1):
+        record = records[int(pos)]
+        candidates = _record_family_cover_candidates(
+            record,
+            family=family,
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+            borrow_conflict_start_progress_m=borrow_conflict_start_progress_m,
+            borrow_conflict_end_progress_m=borrow_conflict_end_progress_m,
+        )
+        for item in candidates:
+            progress_value = float(item.get('progress_value', np.nan))
+            dist_to_target = abs(progress_value - float(target_progress)) if np.isfinite(progress_value) and np.isfinite(target_progress) else np.inf
+            cover_key = str(item.get('cover_key', 'future_cover'))
+            cover_rank = 0 if cover_key == 'current_cover' else 1
+            score = (float(dist_to_target), int(cover_rank), int(pos))
+            payload = dict(item)
+            payload['pos'] = int(pos)
+            payload['score'] = score
+            if best is None or score < best['score']:
+                best = payload
+    return best
+
+
+def _borrow_route_heading_rad_from_conflict_area(record, conflict_start_progress_m, conflict_end_progress_m):
+    borrow_motion = (record or {}).get('borrow_motion') or {}
+    borrow_start_distance_m = float(borrow_motion.get('borrow_start_distance_m', np.nan))
+    route_local = np.asarray((record or {}).get('route_local', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    if not np.isfinite(borrow_start_distance_m):
+        return np.nan
+    if not np.isfinite(conflict_start_progress_m) or not np.isfinite(conflict_end_progress_m):
+        return np.nan
+    local_start_s = float(borrow_start_distance_m) + float(conflict_start_progress_m)
+    local_end_s = float(borrow_start_distance_m) + float(conflict_end_progress_m)
+    heading = _route_heading_at_progress(route_local, 0.5 * (local_start_s + local_end_s))
+    return float(heading) if np.isfinite(heading) else np.nan
+
+
+def _junction_route_heading_rad_from_conflict_area(record, area_start_s_m, area_end_s_m):
+    front_s = _record_scene_front_s(record)
+    route_local = np.asarray((record or {}).get('route_local', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    if not np.isfinite(front_s) or not np.isfinite(area_start_s_m) or not np.isfinite(area_end_s_m):
+        return np.nan
+    local_mid_s = 0.5 * (float(area_start_s_m) + float(area_end_s_m)) - float(front_s)
+    heading = _route_heading_at_progress(route_local, local_mid_s)
+    return float(heading) if np.isfinite(heading) else np.nan
+
+
+def _merge_route_heading_rad_from_conflict_area(record, merge_area_end_s_m):
+    front_s = _record_scene_front_s(record)
+    route_local = np.asarray((record or {}).get('route_local', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    if not np.isfinite(front_s):
+        return np.nan
+    distance_to_area_end_m = max(float(merge_area_end_s_m) - float(front_s), 0.0)
+    heading = _route_heading_at_progress(route_local, distance_to_area_end_m + 5.0)
+    if np.isfinite(heading):
+        return float(heading)
+    return float(_route_heading_at_progress(route_local, distance_to_area_end_m + 3.0))
+
+
+def _borrow_conflict_dir_info(records, start_pos, end_pos, conflict_start_progress_m, conflict_end_progress_m):
+    selected = _select_conflict_dir_cover_candidate(
+        records,
+        start_pos=start_pos,
+        end_pos=end_pos,
+        family='borrow',
+        borrow_conflict_start_progress_m=conflict_start_progress_m,
+        borrow_conflict_end_progress_m=conflict_end_progress_m,
+    )
+    if selected is None:
+        return {
+            'dir': 'opposite',
+            'dir_code': int(CONFLICT_DIR_TO_CODE['opposite']),
+            'dir_source': 'family_fallback',
+            'dir_angle_deg': np.nan,
+            'route_heading_deg': np.nan,
+            'actor_heading_deg': np.nan,
+            'dir_cover_key': 'none',
+            'dir_frame_id': -1,
+        }
+    record = records[int(selected['pos'])]
+    route_heading_rad = _borrow_route_heading_rad_from_conflict_area(
+        record,
+        conflict_start_progress_m=conflict_start_progress_m,
+        conflict_end_progress_m=conflict_end_progress_m,
+    )
+    actor_heading_rad = float(selected['actor_heading_rad'])
+    direction, angle_deg = _conflict_dir_from_headings(route_heading_rad, actor_heading_rad)
+    if direction == 'none':
+        direction = 'opposite'
+    return {
+        'dir': str(direction),
+        'dir_code': int(CONFLICT_DIR_TO_CODE.get(direction, CONFLICT_DIR_TO_CODE['opposite'])),
+        'dir_source': 'borrow_cover_vs_conflict_area',
+        'dir_angle_deg': float(angle_deg) if np.isfinite(angle_deg) else np.nan,
+        'route_heading_deg': _heading_to_deg(route_heading_rad) if np.isfinite(route_heading_rad) else np.nan,
+        'actor_heading_deg': _heading_to_deg(actor_heading_rad) if np.isfinite(actor_heading_rad) else np.nan,
+        'dir_cover_key': str(selected.get('cover_key', 'none')),
+        'dir_frame_id': int(records[int(selected['pos'])].get('frame_id', -1)),
+    }
+
+
+def _merge_conflict_dir_info(records, start_pos, end_pos, merge_area_start_s_m, merge_area_end_s_m):
+    selected = _select_conflict_dir_cover_candidate(
+        records,
+        start_pos=start_pos,
+        end_pos=end_pos,
+        family='merge',
+        area_start_s_m=merge_area_start_s_m,
+        area_end_s_m=merge_area_end_s_m,
+    )
+    if selected is None:
+        return {
+            'dir': 'same',
+            'dir_code': int(CONFLICT_DIR_TO_CODE['same']),
+            'dir_source': 'family_fallback',
+            'dir_angle_deg': np.nan,
+            'route_heading_deg': np.nan,
+            'actor_heading_deg': np.nan,
+            'dir_cover_key': 'none',
+            'dir_frame_id': -1,
+        }
+    record = records[int(selected['pos'])]
+    route_heading_rad = _merge_route_heading_rad_from_conflict_area(record, merge_area_end_s_m)
+    actor_heading_rad = float(selected['actor_heading_rad'])
+    direction, angle_deg = _conflict_dir_from_headings(route_heading_rad, actor_heading_rad)
+    if direction == 'none':
+        direction = 'same'
+    return {
+        'dir': str(direction),
+        'dir_code': int(CONFLICT_DIR_TO_CODE.get(direction, CONFLICT_DIR_TO_CODE['same'])),
+        'dir_source': 'merge_cover_vs_downstream_route',
+        'dir_angle_deg': float(angle_deg) if np.isfinite(angle_deg) else np.nan,
+        'route_heading_deg': _heading_to_deg(route_heading_rad) if np.isfinite(route_heading_rad) else np.nan,
+        'actor_heading_deg': _heading_to_deg(actor_heading_rad) if np.isfinite(actor_heading_rad) else np.nan,
+        'dir_cover_key': str(selected.get('cover_key', 'none')),
+        'dir_frame_id': int(records[int(selected['pos'])].get('frame_id', -1)),
+    }
+
+
+def _junction_conflict_dir_info(records, start_pos, end_pos, area_start_s_m, area_end_s_m):
+    selected = _select_conflict_dir_cover_candidate(
+        records,
+        start_pos=start_pos,
+        end_pos=end_pos,
+        family='junction',
+        area_start_s_m=area_start_s_m,
+        area_end_s_m=area_end_s_m,
+    )
+    if selected is None:
+        return {
+            'dir': 'none',
+            'dir_code': int(CONFLICT_DIR_TO_CODE['none']),
+            'dir_source': 'family_fallback',
+            'dir_angle_deg': np.nan,
+            'route_heading_deg': np.nan,
+            'actor_heading_deg': np.nan,
+            'dir_cover_key': 'none',
+            'dir_frame_id': -1,
+        }
+    record = records[int(selected['pos'])]
+    route_heading_rad = _junction_route_heading_rad_from_conflict_area(record, area_start_s_m, area_end_s_m)
+    actor_heading_rad = float(selected['actor_heading_rad'])
+    direction, angle_deg = _conflict_dir_from_headings(route_heading_rad, actor_heading_rad)
+    return {
+        'dir': str(direction),
+        'dir_code': int(CONFLICT_DIR_TO_CODE.get(direction, CONFLICT_DIR_TO_CODE['none'])),
+        'dir_source': 'junction_cover_vs_conflict_area',
+        'dir_angle_deg': float(angle_deg) if np.isfinite(angle_deg) else np.nan,
+        'route_heading_deg': _heading_to_deg(route_heading_rad) if np.isfinite(route_heading_rad) else np.nan,
+        'actor_heading_deg': _heading_to_deg(actor_heading_rad) if np.isfinite(actor_heading_rad) else np.nan,
+        'dir_cover_key': str(selected.get('cover_key', 'none')),
+        'dir_frame_id': int(records[int(selected['pos'])].get('frame_id', -1)),
+    }
 
 
 def _build_route_conflict_records(samples, route_sample_indices):
@@ -3866,11 +4169,18 @@ def _build_borrow_conflict_windows(records, samples):
         issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'borrow', 'missing_borrow_conflict_end', pos=int(start_pos)))
         return windows, issues
 
+    dir_info = _borrow_conflict_dir_info(
+        records,
+        start_pos=start_pos,
+        end_pos=end_pos,
+        conflict_start_progress_m=conflict_start_progress_m,
+        conflict_end_progress_m=conflict_end_progress_m,
+    )
     windows.append({
         'family': 'borrow',
         'family_code': int(CONFLICT_FAMILY_TO_CODE['borrow']),
-        'dir': 'opposite',
-        'dir_code': int(CONFLICT_DIR_TO_CODE['opposite']),
+        'dir': str(dir_info.get('dir', 'opposite')),
+        'dir_code': int(dir_info.get('dir_code', CONFLICT_DIR_TO_CODE['opposite'])),
         'source': 'borrow_conflict_area',
         'source_episode_id': 0,
         'source_priority': int(CONFLICT_FAMILY_PRIORITY['borrow']),
@@ -3884,6 +4194,12 @@ def _build_borrow_conflict_windows(records, samples):
         'borrow_distance_m': float(scene_borrow_context.get('borrow_distance_m', np.nan)),
         'borrow_conflict_start_progress_m': float(conflict_start_progress_m),
         'borrow_conflict_end_progress_m': float(conflict_end_progress_m),
+        'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
+        'dir_angle_deg': float(dir_info.get('dir_angle_deg', np.nan)),
+        'route_heading_deg': float(dir_info.get('route_heading_deg', np.nan)),
+        'actor_heading_deg': float(dir_info.get('actor_heading_deg', np.nan)),
+        'dir_cover_key': str(dir_info.get('dir_cover_key', 'none')),
+        'dir_frame_id': int(dir_info.get('dir_frame_id', -1)),
     })
     return windows, issues
 
@@ -3968,11 +4284,18 @@ def _build_merge_conflict_windows(records, samples):
             pos = int(max(future_merge_positions)) + 1
             continue
 
+        dir_info = _merge_conflict_dir_info(
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            merge_area_start_s_m=merge_area_start_s_m,
+            merge_area_end_s_m=merge_area_end_s_m,
+        )
         windows.append({
             'family': 'merge',
             'family_code': int(CONFLICT_FAMILY_TO_CODE['merge']),
-            'dir': 'same',
-            'dir_code': int(CONFLICT_DIR_TO_CODE['same']),
+            'dir': str(dir_info.get('dir', 'same')),
+            'dir_code': int(dir_info.get('dir_code', CONFLICT_DIR_TO_CODE['same'])),
             'source': 'merge_area',
             'source_episode_id': int(source_episode_id),
             'source_priority': int(CONFLICT_FAMILY_PRIORITY['merge']),
@@ -3985,7 +4308,13 @@ def _build_merge_conflict_windows(records, samples):
             'area_end_s_m': float(merge_area_end_s_m),
             'merge_area_first_conflict_s_m': float(area_info['first_conflict_s_m']),
             'merge_area_last_conflict_s_m': float(area_info['last_conflict_s_m']),
-            'merge_direction_heading_rad': _merge_direction_heading_rad(records, start_pos, merge_area_end_s_m),
+            'merge_direction_heading_rad': float(np.radians(dir_info.get('route_heading_deg', np.nan))) if np.isfinite(float(dir_info.get('route_heading_deg', np.nan))) else np.nan,
+            'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
+            'dir_angle_deg': float(dir_info.get('dir_angle_deg', np.nan)),
+            'route_heading_deg': float(dir_info.get('route_heading_deg', np.nan)),
+            'actor_heading_deg': float(dir_info.get('actor_heading_deg', np.nan)),
+            'dir_cover_key': str(dir_info.get('dir_cover_key', 'none')),
+            'dir_frame_id': int(dir_info.get('dir_frame_id', -1)),
         })
         source_episode_id += 1
         pos = int(end_pos) + 1
@@ -4041,11 +4370,18 @@ def _build_junction_conflict_windows(records, samples):
             issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_area_geometry', pos=int(start_pos)))
             continue
 
+        dir_info = _junction_conflict_dir_info(
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+        )
         windows.append({
             'family': 'junction',
             'family_code': int(CONFLICT_FAMILY_TO_CODE['junction']),
-            'dir': 'none',
-            'dir_code': int(CONFLICT_DIR_TO_CODE['none']),
+            'dir': str(dir_info.get('dir', 'none')),
+            'dir_code': int(dir_info.get('dir_code', CONFLICT_DIR_TO_CODE['none'])),
             'source': 'junction_conflict_area',
             'source_episode_id': int(source_episode_id),
             'source_priority': int(CONFLICT_FAMILY_PRIORITY['junction']),
@@ -4059,6 +4395,12 @@ def _build_junction_conflict_windows(records, samples):
             'area_center_world_xy': center_xy[:2].astype(float).tolist(),
             'area_radius_m': float(radius_m),
             'candidate_frame_count': int(len(cluster_positions)),
+            'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
+            'dir_angle_deg': float(dir_info.get('dir_angle_deg', np.nan)),
+            'route_heading_deg': float(dir_info.get('route_heading_deg', np.nan)),
+            'actor_heading_deg': float(dir_info.get('actor_heading_deg', np.nan)),
+            'dir_cover_key': str(dir_info.get('dir_cover_key', 'none')),
+            'dir_frame_id': int(dir_info.get('dir_frame_id', -1)),
         })
         prev_end_pos = int(end_pos)
         source_episode_id += 1
