@@ -389,13 +389,19 @@ def _draw_cover_route_point(canvas, cover, color, label, x_range, y_range):
 
 
 def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range, y_range):
+    world_xyz = np.asarray((cover or {}).get("scene_route_conflict_world_xyz", []), dtype=np.float32)
     world_xy = np.asarray((cover or {}).get("scene_route_conflict_world_xy", []), dtype=np.float32)
-    if world_xy.shape != (2,) or ego_matrix is None:
+    if ego_matrix is None:
         return None
-    local_xy = _transform_points_world_xyz_to_local(
-        np.array([[world_xy[0], world_xy[1], 0.0]], dtype=np.float32),
-        ego_matrix,
-    )
+    if world_xyz.shape == (3,):
+        local_xy = _transform_points_world_xyz_to_local(world_xyz[None, :], ego_matrix)
+    elif world_xy.shape == (2,):
+        local_xy = _transform_points_world_xyz_to_local(
+            np.array([[world_xy[0], world_xy[1], 0.0]], dtype=np.float32),
+            ego_matrix,
+        )
+    else:
+        return None
     if local_xy.shape != (1, 2):
         return None
     px = _local_to_canvas(local_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)

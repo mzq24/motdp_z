@@ -1346,6 +1346,7 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
             "route_point_local_xy": [],
             "scene_route_conflict_s_m": np.nan,
             "scene_route_conflict_world_xy": [],
+            "scene_route_conflict_world_xyz": [],
         }
 
     if case == 1:
@@ -1375,6 +1376,7 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
             "route_point_local_xy": route_point_local[:2].astype(float).tolist() if route_point_local.size >= 2 else [],
             "scene_route_conflict_s_m": np.nan,
             "scene_route_conflict_world_xy": [],
+            "scene_route_conflict_world_xyz": [],
         }
 
     current_box = best.get("current_box") or {}
@@ -1408,6 +1410,7 @@ def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=No
         "route_point_local_xy": route_point_local[:2].astype(float).tolist() if route_point_local.size >= 2 else [],
         "scene_route_conflict_s_m": np.nan,
         "scene_route_conflict_world_xy": [],
+        "scene_route_conflict_world_xyz": [],
     }
 
 
@@ -1415,6 +1418,7 @@ def _augment_cover_with_scene_route_fields(cover, ego_matrix_current, scene_rout
     cover_out = dict(cover or {})
     cover_out.setdefault("scene_route_conflict_s_m", np.nan)
     cover_out.setdefault("scene_route_conflict_world_xy", [])
+    cover_out.setdefault("scene_route_conflict_world_xyz", [])
     if int(cover_out.get("exists", 0.0)) <= 0:
         return cover_out
     route_point_local = np.asarray(cover_out.get("route_point_local_xy", []), dtype=np.float32).reshape(-1)
@@ -1432,6 +1436,7 @@ def _augment_cover_with_scene_route_fields(cover, ego_matrix_current, scene_rout
         return cover_out
     proj_world, proj_s = _project_point_to_polyline(route_point_world[0, :2], scene_route_polyline_world[:, :2])
     cover_out["scene_route_conflict_world_xy"] = route_point_world[0, :2].astype(float).tolist()
+    cover_out["scene_route_conflict_world_xyz"] = route_point_world[0, :3].astype(float).tolist()
     cover_out["scene_route_conflict_s_m"] = float(proj_s) if proj_s is not None else np.nan
     if proj_world is not None and not cover_out["scene_route_conflict_world_xy"]:
         cover_out["scene_route_conflict_world_xy"] = np.asarray(proj_world, dtype=np.float32).astype(float).tolist()
