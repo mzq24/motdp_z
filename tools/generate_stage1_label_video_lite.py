@@ -452,8 +452,9 @@ def _draw_local_point_marker(canvas, local_xy, color, label, x_range, y_range):
     if pt_px.shape != (1, 2):
         return
     px = tuple(pt_px[0])
+    cv2.circle(canvas, px, 16, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(canvas, px, 15, color, 2, cv2.LINE_AA)
     cv2.circle(canvas, px, 8, color, -1, cv2.LINE_AA)
-    cv2.circle(canvas, px, 14, color, 2, cv2.LINE_AA)
     if label not in (None, ""):
         cv2.putText(
             canvas,
@@ -475,9 +476,10 @@ def _draw_cross_labeled_marker(canvas, local_xy, color, label, x_range, y_range)
     if pt_px.shape != (1, 2):
         return
     px = tuple(pt_px[0])
-    cv2.circle(canvas, px, 6, color, -1, cv2.LINE_AA)
-    cv2.circle(canvas, px, 11, color, 1, cv2.LINE_AA)
-    cv2.drawMarker(canvas, px, color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=12, thickness=2)
+    cv2.circle(canvas, px, 15, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(canvas, px, 15, color, 2, cv2.LINE_AA)
+    cv2.drawMarker(canvas, px, (255, 255, 255), markerType=cv2.MARKER_TILTED_CROSS, markerSize=20, thickness=4)
+    cv2.drawMarker(canvas, px, color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=16, thickness=2)
     if label not in (None, ""):
         cv2.putText(
             canvas,
@@ -497,6 +499,21 @@ def _draw_segment_end_markers(canvas, segment_local_xy, color, x_range, y_range)
         return
     _draw_local_point_marker(canvas, pts[0], color, None, x_range, y_range)
     _draw_cross_labeled_marker(canvas, pts[-1], color, None, x_range, y_range)
+
+
+def _draw_world_xyz_marker(canvas, world_xyz, ego_matrix, color, marker_kind, x_range, y_range):
+    if ego_matrix is None:
+        return
+    world_xyz = np.asarray(world_xyz, dtype=np.float32).reshape(-1)
+    if world_xyz.shape[0] < 3:
+        return
+    local_xy = _transform_points_world_xyz_to_local(world_xyz[None, :3], ego_matrix)
+    if local_xy.shape != (1, 2):
+        return
+    if marker_kind == "start":
+        _draw_local_point_marker(canvas, local_xy[0], color, None, x_range, y_range)
+    elif marker_kind == "end":
+        _draw_cross_labeled_marker(canvas, local_xy[0], color, None, x_range, y_range)
 
 
 def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_range, y_range):
@@ -677,6 +694,8 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
                 seg_px = _local_to_canvas(stored_area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
                 cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
                 _draw_segment_end_markers(canvas, stored_area_segment_local, (50, 205, 50), x_range, y_range)
+                _draw_world_xyz_marker(canvas, stored_area_start_world, ego_matrix, (50, 205, 50), "start", x_range, y_range)
+                _draw_world_xyz_marker(canvas, stored_area_end_world, ego_matrix, (50, 205, 50), "end", x_range, y_range)
                 borrow_area_drawn = True
             elif np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
                 seg_pts = []
@@ -693,7 +712,12 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
                     seg_px = _local_to_canvas(seg_pts, canvas.shape[1], canvas.shape[0], x_range, y_range)
                     cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
                     _draw_segment_end_markers(canvas, seg_pts, (50, 205, 50), x_range, y_range)
+                    _draw_world_xyz_marker(canvas, stored_area_start_world, ego_matrix, (50, 205, 50), "start", x_range, y_range)
+                    _draw_world_xyz_marker(canvas, stored_area_end_world, ego_matrix, (50, 205, 50), "end", x_range, y_range)
                     borrow_area_drawn = True
+            else:
+                _draw_world_xyz_marker(canvas, stored_area_start_world, ego_matrix, (50, 205, 50), "start", x_range, y_range)
+                _draw_world_xyz_marker(canvas, stored_area_end_world, ego_matrix, (50, 205, 50), "end", x_range, y_range)
 
     stored_area_segment_world = np.asarray(conflict_area.get("area_segment_world_xyz", []), dtype=np.float32)
     stored_area_start_world = np.asarray(conflict_area.get("area_start_world_xyz", []), dtype=np.float32).reshape(-1)
@@ -704,6 +728,11 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
             seg_px = _local_to_canvas(area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
             cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
             _draw_segment_end_markers(canvas, area_segment_local, (50, 205, 50), x_range, y_range)
+            _draw_world_xyz_marker(canvas, stored_area_start_world, ego_matrix, (50, 205, 50), "start", x_range, y_range)
+            _draw_world_xyz_marker(canvas, stored_area_end_world, ego_matrix, (50, 205, 50), "end", x_range, y_range)
+    elif ego_matrix is not None and not borrow_area_drawn:
+        _draw_world_xyz_marker(canvas, stored_area_start_world, ego_matrix, (50, 205, 50), "start", x_range, y_range)
+        _draw_world_xyz_marker(canvas, stored_area_end_world, ego_matrix, (50, 205, 50), "end", x_range, y_range)
 
     area_type = str(conflict_area.get("area_type", "none"))
     if area_type == "circle":
