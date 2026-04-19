@@ -3066,9 +3066,10 @@ def _junction_conflict_dir_info(records, start_pos, end_pos, area_start_s_m, are
     }
 
 
-def _build_route_conflict_records(samples, route_sample_indices):
+def _build_route_conflict_records(samples, route_sample_indices, scene_route_world=None):
     ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
     records = []
+    scene_route_world = np.asarray(scene_route_world, dtype=np.float32)
     for sample_idx in ordered_indices:
         sample = samples[int(sample_idx)]
         stage1_debug = sample.get('stage1_speed_debug') or {}
@@ -3081,6 +3082,7 @@ def _build_route_conflict_records(samples, route_sample_indices):
             'base_dir': str(base_dir or ''),
             'event_name': str(event_name),
             'route_local': np.asarray(route_local, dtype=np.float32),
+            'scene_route_world': scene_route_world.copy() if scene_route_world.ndim == 2 else np.zeros((0, 3), dtype=np.float32),
             'current_cover': stage1_debug.get('current_cover') or {},
             'future_cover': stage1_debug.get('future_cover') or {},
             'merge_motion': stage1_debug.get('merge_motion') or {},
@@ -3136,11 +3138,42 @@ def _record_s_interval_world_geometry(record, area_start_s_m, area_end_s_m, step
     }
 
 
+def _record_scene_s_interval_world_geometry(record, area_start_s_m, area_end_s_m, step_m=0.5):
+    scene_route_world = np.asarray((record or {}).get('scene_route_world', np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    if scene_route_world.ndim != 2 or scene_route_world.shape[0] < 2 or scene_route_world.shape[1] < 3:
+        return None
+    query_s = np.arange(
+        float(area_start_s_m),
+        float(area_end_s_m) + 1e-6,
+        float(max(step_m, 0.25)),
+        dtype=np.float32,
+    )
+    if query_s.size == 0 or float(query_s[-1]) < float(area_end_s_m) - 1e-4:
+        query_s = np.concatenate([query_s, np.array([float(area_end_s_m)], dtype=np.float32)], axis=0)
+    world_segment = _sample_polyline_xyz_at_arclengths(scene_route_world[:, :3], query_s)
+    if world_segment.ndim != 2 or world_segment.shape[0] == 0 or world_segment.shape[1] < 3:
+        return None
+    return {
+        'area_start_world_xyz': world_segment[0, :3].astype(float).tolist(),
+        'area_end_world_xyz': world_segment[-1, :3].astype(float).tolist(),
+        'area_segment_world_xyz': world_segment[:, :3].astype(float).tolist(),
+    }
+
+
 def _window_s_interval_world_geometry(records, start_pos, end_pos, area_start_s_m, area_end_s_m, step_m=0.5):
     if not records:
         return None
     start_pos = int(max(start_pos, 0))
     end_pos = int(min(end_pos, len(records) - 1))
+    for pos in range(start_pos, end_pos + 1):
+        world_geometry = _record_scene_s_interval_world_geometry(
+            records[pos],
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+            step_m=step_m,
+        )
+        if world_geometry is not None:
+            return world_geometry
     for pos in range(start_pos, end_pos + 1):
         world_geometry = _record_s_interval_world_geometry(
             records[pos],
@@ -3749,8 +3782,8 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
         pos += 1
 
 
-def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
-    records = _build_route_conflict_records(samples, route_sample_indices)
+def _annotate_route_stage1_conflict_areas(samples, route_sample_indices, scene_route_world=None):
+    records = _build_route_conflict_records(samples, route_sample_indices, scene_route_world=scene_route_world)
     if not records:
         return
 
@@ -4651,7 +4684,11 @@ def precompute(
                 stage1_speed_built += 1
                 _maybe_checkpoint(phase='stage1_speed')
 
-            _annotate_route_stage1_conflict_areas(samples, route_sample_indices)
+            _annotate_route_stage1_conflict_areas(
+                samples,
+                route_sample_indices,
+                scene_route_world=scene_route_polyline_world.get(base_dir),
+            )
             _annotate_route_stage1_conflict_phases(samples, route_sample_indices)
             for sample_idx in route_sample_indices:
                 samples[int(sample_idx)].pop('_stage1_route_input_local', None)
