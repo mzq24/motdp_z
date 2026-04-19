@@ -207,6 +207,24 @@ def _transform_single_world_point_to_local_xy(world_xyz, world_xy, ego_matrix):
     return None
 
 
+def _transform_box_to_current_frame(box, transform):
+    pos = box.get("position", None)
+    if pos is None or len(pos) < 2:
+        return None
+    pos_h = np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0, 1.0], dtype=np.float32)
+    pos_cur = np.asarray(transform, dtype=np.float32) @ pos_h
+
+    yaw_future = float(box.get("yaw", 0.0))
+    heading_future = np.array([np.cos(yaw_future), np.sin(yaw_future), 0.0, 0.0], dtype=np.float32)
+    heading_cur = np.asarray(transform, dtype=np.float32) @ heading_future
+    yaw_cur = float(np.arctan2(heading_cur[1], heading_cur[0]))
+
+    box_cur = dict(box)
+    box_cur["position"] = [float(pos_cur[0]), float(pos_cur[1]), float(pos_cur[2])]
+    box_cur["yaw"] = yaw_cur
+    return box_cur
+
+
 def _route_with_origin(route):
     route = np.asarray(route, dtype=np.float32)
     if route.ndim != 2 or route.shape[0] == 0 or route.shape[1] != 2:
@@ -268,48 +286,84 @@ def _oriented_box_corners(position_xy, extent_xy, yaw):
     return corners @ rot.T + np.array([x, y], dtype=np.float32)
 
 
+def _draw_dashed_polyline(
+    canvas,
+    points_xy,
+    color,
+    x_range,
+    y_range,
+    thickness=2,
+    dash_px=10.0,
+    gap_px=6.0,
+    closed=False,
+):
+    pts = np.asarray(points_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return
+    if closed:
+        pts = np.concatenate([pts, pts[:1]], axis=0)
+    pts_px = _local_to_canvas(pts, canvas.shape[1], canvas.shape[0], x_range, y_range).astype(np.float32)
+    if pts_px.shape[0] < 2:
+        return
+    dash_px = float(max(dash_px, 1.0))
+    gap_px = float(max(gap_px, 0.0))
+    for idx in range(pts_px.shape[0] - 1):
+        start = pts_px[idx]
+        end = pts_px[idx + 1]
+        seg = end - start
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len < 1e-6:
+            continue
+        direction = seg / seg_len
+        cursor = 0.0
+        while cursor < seg_len:
+            dash_end = min(cursor + dash_px, seg_len)
+            p0 = start + direction * cursor
+            p1 = start + direction * dash_end
+            cv2.line(
+                canvas,
+                tuple(np.round(p0).astype(np.int32)),
+                tuple(np.round(p1).astype(np.int32)),
+                color,
+                thickness,
+                lineType=cv2.LINE_AA,
+            )
+            cursor += dash_px + gap_px
+
+
 def _local_to_canvas(points_xy, canvas_w, canvas_h, x_range, y_range):
     pts = np.asarray(points_xy, dtype=np.float32)
     if pts.ndim != 2 or pts.shape[1] != 2:
         return np.zeros((0, 2), dtype=np.int32)
     x0, x1 = float(x_range[0]), float(x_range[1])
     y0, y1 = float(y_range[0]), float(y_range[1])
-    xs = (pts[:, 0] - x0) / max(x1 - x0, 1e-6) * float(canvas_w)
-    ys = (1.0 - (pts[:, 1] - y0) / max(y1 - y0, 1e-6)) * float(canvas_h)
+    # Match the old world-panel convention exactly:
+    # x_forward -> right in image, y_lateral -> down in image.
+    xs = (pts[:, 0] - x0) / max(x1 - x0, 1e-6) * float(max(canvas_w - 1, 1))
+    ys = (pts[:, 1] - y0) / max(y1 - y0, 1e-6) * float(max(canvas_h - 1, 1))
     return np.stack([xs, ys], axis=1).round().astype(np.int32)
 
 
-def _draw_box(canvas, box, color, x_range, y_range, thickness=2):
+def _draw_box(canvas, box, color, x_range, y_range, thickness=2, dashed=False):
     pos = box.get("position", None)
     extent = box.get("extent", None)
     if pos is None or extent is None or len(pos) < 2 or len(extent) < 2:
         return
     corners = _oriented_box_corners(pos[:2], extent[:2], float(box.get("yaw", 0.0)))
+    if dashed:
+        _draw_dashed_polyline(
+            canvas,
+            corners,
+            color=color,
+            x_range=x_range,
+            y_range=y_range,
+            thickness=thickness,
+            closed=True,
+        )
+        return
     corners_px = _local_to_canvas(corners, canvas.shape[1], canvas.shape[0], x_range, y_range)
     if corners_px.shape[0] == 4:
         cv2.polylines(canvas, [corners_px], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
-
-
-def _draw_box_center_label(canvas, box, label, color, x_range, y_range):
-    pos = box.get("position", None)
-    if pos is None or len(pos) < 2:
-        return
-    center = np.asarray([[float(pos[0]), float(pos[1])]], dtype=np.float32)
-    center_px = _local_to_canvas(center, canvas.shape[1], canvas.shape[0], x_range, y_range)
-    if center_px.shape != (1, 2):
-        return
-    px = tuple(center_px[0])
-    cv2.circle(canvas, px, 5, color, -1, cv2.LINE_AA)
-    cv2.putText(
-        canvas,
-        str(label),
-        (px[0] + 8, px[1] - 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.58,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
 
 
 def _draw_cover_route_point(canvas, cover, color, label, x_range, y_range):
@@ -321,16 +375,17 @@ def _draw_cover_route_point(canvas, cover, color, label, x_range, y_range):
         return
     px = tuple(route_px[0])
     cv2.drawMarker(canvas, px, color, markerType=cv2.MARKER_TILTED_CROSS, markerSize=16, thickness=2)
-    cv2.putText(
-        canvas,
-        str(label),
-        (px[0] + 8, px[1] + 18),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
+    if label:
+        cv2.putText(
+            canvas,
+            str(label),
+            (px[0] + 8, px[1] + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range, y_range):
@@ -349,16 +404,17 @@ def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range
     point_px = tuple(px[0])
     cv2.drawMarker(canvas, point_px, color, markerType=cv2.MARKER_STAR, markerSize=22, thickness=2)
     cv2.circle(canvas, point_px, 10, color, 1, cv2.LINE_AA)
-    cv2.putText(
-        canvas,
-        str(label),
-        (point_px[0] + 10, point_px[1] - 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
+    if label:
+        cv2.putText(
+            canvas,
+            str(label),
+            (point_px[0] + 10, point_px[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
     return local_xy[0]
 
 
@@ -451,6 +507,35 @@ def _find_box_by_id(boxes, actor_id):
     return None
 
 
+def _load_future_cover_box_current_frame(image_data_root, base_dir, current_frame_id, current_meas, future_cover):
+    if current_meas is None:
+        return None
+    if int((future_cover or {}).get("exists", 0.0)) <= 0:
+        return None
+    actor_id = future_cover.get("actor_id", None)
+    frame_index = int((future_cover or {}).get("frame_index", -1))
+    ego_matrix_current = current_meas.get("ego_matrix", None)
+    if actor_id is None or frame_index <= 0 or ego_matrix_current is None:
+        return None
+    future_frame_id = int(current_frame_id) + int(frame_index)
+    future_frame_str = f"{future_frame_id:04d}"
+    future_boxes = _load_json_gz_if_exists(
+        os.path.join(image_data_root, base_dir, "boxes", f"{future_frame_str}.json.gz")
+    ) or []
+    future_meas = _load_json_gz_if_exists(
+        os.path.join(image_data_root, base_dir, "measurements", f"{future_frame_str}.json.gz")
+    ) or {}
+    ego_matrix_future = future_meas.get("ego_matrix", None) if isinstance(future_meas, dict) else None
+    future_box = _find_box_by_id(future_boxes, actor_id)
+    if future_box is None or ego_matrix_future is None:
+        return None
+    try:
+        transform = np.linalg.inv(np.asarray(ego_matrix_current, dtype=np.float32)) @ np.asarray(ego_matrix_future, dtype=np.float32)
+    except np.linalg.LinAlgError:
+        return None
+    return _transform_box_to_current_frame(future_box, transform)
+
+
 def _cover_subtype(cover):
     return str((cover or {}).get("interaction", {}).get("subtype", "none"))
 
@@ -476,7 +561,7 @@ def _fmt_int(x):
         return "NA"
 
 
-def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
+def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, future_cover_current_box=None):
     canvas = np.full((760, 760, 3), 248, dtype=np.uint8)
     route = np.asarray(sample.get("route", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
     route_xy = _route_with_origin(route)
@@ -507,11 +592,12 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
         cv2.polylines(canvas, [route_px], isClosed=False, color=(30, 30, 30), thickness=3, lineType=cv2.LINE_AA)
 
     ego_poly = _local_to_canvas(np.array([[0.0, 0.0]], dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
-    cv2.drawMarker(canvas, tuple(ego_poly[0]), (255, 120, 0), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+    cv2.drawMarker(canvas, tuple(ego_poly[0]), (255, 0, 0), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
 
     for box in current_boxes or []:
         cls = str(box.get("class", "")).lower()
         if cls == "ego_car":
+            _draw_box(canvas, box, color=(255, 0, 0), x_range=x_range, y_range=y_range, thickness=3)
             continue
         color = (180, 180, 180) if cls in VEHICLE_CLASSES else (205, 205, 205)
         _draw_box(canvas, box, color=color, x_range=x_range, y_range=y_range, thickness=1)
@@ -527,44 +613,26 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range):
     future_box = _find_box_by_id(current_boxes, future_cover.get("actor_id"))
     if current_box is not None:
         _draw_box(canvas, current_box, color=(0, 0, 255), x_range=x_range, y_range=y_range, thickness=3)
-        _draw_box_center_label(
-            canvas,
-            current_box,
-            f"CUR {int(current_cover.get('actor_id', -1))}",
-            (0, 0, 255),
-            x_range,
-            y_range,
-        )
     if future_box is not None:
-        _draw_box(canvas, future_box, color=(0, 165, 255), x_range=x_range, y_range=y_range, thickness=3)
-        _draw_box_center_label(
+        _draw_box(canvas, future_box, color=(0, 215, 255), x_range=x_range, y_range=y_range, thickness=3)
+    if future_cover_current_box is not None:
+        _draw_box(
             canvas,
-            future_box,
-            f"FUT {int(future_cover.get('actor_id', -1))}",
-            (0, 165, 255),
-            x_range,
-            y_range,
+            future_cover_current_box,
+            color=(0, 215, 255),
+            x_range=x_range,
+            y_range=y_range,
+            thickness=3,
+            dashed=True,
         )
-    _draw_cover_route_point(canvas, current_cover, (0, 0, 255), "cur_pt", x_range, y_range)
-    _draw_cover_route_point(canvas, future_cover, (0, 165, 255), "fut_pt", x_range, y_range)
-    current_collision_local = _draw_cover_collision_point(
-        canvas, current_cover, ego_matrix, (180, 0, 255), "cur_cp", x_range, y_range
+    _draw_cover_route_point(canvas, current_cover, (0, 0, 255), None, x_range, y_range)
+    _draw_cover_route_point(canvas, future_cover, (0, 215, 255), None, x_range, y_range)
+    _draw_cover_collision_point(
+        canvas, current_cover, ego_matrix, (180, 0, 255), None, x_range, y_range
     )
-    future_collision_local = _draw_cover_collision_point(
-        canvas, future_cover, ego_matrix, (0, 140, 255), "fut_cp", x_range, y_range
+    _draw_cover_collision_point(
+        canvas, future_cover, ego_matrix, (0, 215, 255), None, x_range, y_range
     )
-    if current_box is not None and current_collision_local is not None:
-        box_center = np.asarray([[float(current_box["position"][0]), float(current_box["position"][1])]], dtype=np.float32)
-        box_px = _local_to_canvas(box_center, canvas.shape[1], canvas.shape[0], x_range, y_range)
-        cp_px = _local_to_canvas(current_collision_local[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
-        if box_px.shape == (1, 2) and cp_px.shape == (1, 2):
-            cv2.line(canvas, tuple(box_px[0]), tuple(cp_px[0]), (180, 0, 255), 2, cv2.LINE_AA)
-    if future_box is not None and future_collision_local is not None:
-        box_center = np.asarray([[float(future_box["position"][0]), float(future_box["position"][1])]], dtype=np.float32)
-        box_px = _local_to_canvas(box_center, canvas.shape[1], canvas.shape[0], x_range, y_range)
-        cp_px = _local_to_canvas(future_collision_local[None, :], canvas.shape[1], canvas.shape[0], x_range, y_range)
-        if box_px.shape == (1, 2) and cp_px.shape == (1, 2):
-            cv2.line(canvas, tuple(box_px[0]), tuple(cp_px[0]), (0, 140, 255), 2, cv2.LINE_AA)
 
     borrow_area_drawn = False
     if ego_matrix is not None:
@@ -688,6 +756,12 @@ def _build_text_panel(sample, current_meas):
     dir_code = int(sample.get("conflict_area_dir", 0))
     issue_count = int(conflict_area.get("issue_count", 0))
     issue_families = ",".join(str(x) for x in conflict_area.get("issue_families", [])) or "none"
+    if issue_count > 0:
+        issue_line = f"issue={conflict_area.get('missing_reason', 'none')}"
+        if issue_families != "none":
+            issue_line += f" [{issue_families}]"
+    else:
+        issue_line = "issue=none"
     _draw_panel_header(panel, f"{event_name} | frame {int(sample.get('frame_id', -1)):04d}", route_name)
     col_gap = 18
     col_x0 = 10
@@ -718,8 +792,7 @@ def _build_text_panel(sample, current_meas):
             f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
             f"borrow prog s={_fmt_float(conflict_area.get('borrow_conflict_start_progress_m', np.nan))} e={_fmt_float(conflict_area.get('borrow_conflict_end_progress_m', np.nan))}",
             f"src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')} reason={conflict_area.get('selection_reason', 'none')}",
-            f"issue_count={issue_count} issue_families={issue_families}",
-            f"missing_reason={conflict_area.get('missing_reason', 'none')}",
+            issue_line,
         ],
         (56, 122, 78),
     )
@@ -836,7 +909,22 @@ def _render_route_video(route_name, route_samples, image_data_root, fps, x_range
             os.path.join(image_data_root, base_dir, "measurements", f"{frame_str}.json.gz")
         ) or {}
         rgb = _load_scene_rgb(image_data_root, base_dir, frame_str)
-        bev_panel = _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range)
+        future_cover = ((sample.get("stage1_speed_debug") or {}).get("future_cover") or {})
+        future_cover_current_box = _load_future_cover_box_current_frame(
+            image_data_root=image_data_root,
+            base_dir=base_dir,
+            current_frame_id=int(sample.get("frame_id", -1)),
+            current_meas=current_meas,
+            future_cover=future_cover,
+        )
+        bev_panel = _build_bev_panel(
+            sample,
+            current_boxes,
+            current_meas,
+            x_range,
+            y_range,
+            future_cover_current_box=future_cover_current_box,
+        )
         text_panel = _build_text_panel(sample, current_meas)
         frame = _compose_frame(rgb, bev_panel, text_panel)
 
