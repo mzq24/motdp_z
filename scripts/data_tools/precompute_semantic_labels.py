@@ -1891,6 +1891,36 @@ def _sample_polyline_at_arclengths(polyline_xy, query_s):
     return np.asarray(sampled, dtype=np.float32)
 
 
+def _sample_polyline_xyz_at_arclengths(polyline_xyz, query_s):
+    pts = np.asarray(polyline_xyz, dtype=np.float32)
+    query_s = np.asarray(query_s, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 3:
+        return np.zeros((0, 3), dtype=np.float32)
+    if pts.shape[0] == 1:
+        keep = query_s >= 0.0
+        return np.repeat(pts[:1, :3], int(np.count_nonzero(keep)), axis=0).astype(np.float32)
+    arc = _polyline_arclengths(pts[:, :2])
+    total_len = float(arc[-1]) if arc.size > 0 else 0.0
+    query_s = query_s[(query_s >= 0.0) & (query_s <= total_len + 1e-6)]
+    if query_s.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    sampled = []
+    seg_idx = 0
+    for q in query_s:
+        while seg_idx + 1 < arc.shape[0] and float(arc[seg_idx + 1]) < float(q):
+            seg_idx += 1
+        if seg_idx + 1 >= arc.shape[0]:
+            sampled.append(pts[-1, :3])
+            continue
+        seg_len = float(arc[seg_idx + 1] - arc[seg_idx])
+        if seg_len < 1e-8:
+            sampled.append(pts[seg_idx, :3])
+            continue
+        t = float((q - arc[seg_idx]) / seg_len)
+        sampled.append(pts[seg_idx, :3] + t * (pts[seg_idx + 1, :3] - pts[seg_idx, :3]))
+    return np.asarray(sampled, dtype=np.float32)
+
+
 def _is_two_way_event_corridor_scene_context(event_name=None):
     return str(event_name or "") in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}
 
@@ -3762,6 +3792,9 @@ def _default_conflict_area_debug():
         'area_type': 'none',
         'area_start_s_m': np.nan,
         'area_end_s_m': np.nan,
+        'area_start_world_xyz': [],
+        'area_end_world_xyz': [],
+        'area_segment_world_xyz': [],
         'area_center_world_xy': [],
         'area_radius_m': np.nan,
         'borrow_start_world_xy': [],
@@ -4203,6 +4236,61 @@ def _record_scene_rear_s(record):
     return float(rear_s) if np.isfinite(rear_s) else np.nan
 
 
+def _record_ego_matrix(record):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    ego_matrix = np.asarray(merge_motion.get('ego_matrix', []), dtype=np.float32)
+    if ego_matrix.shape == (4, 4) and np.all(np.isfinite(ego_matrix)):
+        return ego_matrix
+    return None
+
+
+def _record_s_interval_world_geometry(record, area_start_s_m, area_end_s_m, step_m=0.5):
+    route_local = np.asarray((record or {}).get('route_local', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    route_poly = _route_with_origin(route_local)
+    ego_matrix = _record_ego_matrix(record)
+    front_s = _record_scene_front_s(record)
+    if route_poly.ndim != 2 or route_poly.shape[0] < 2 or ego_matrix is None or not np.isfinite(front_s):
+        return None
+    local_start_s = max(float(area_start_s_m) - float(front_s), 0.0)
+    local_end_s = max(float(area_end_s_m) - float(front_s), local_start_s)
+    query_s = np.arange(local_start_s, local_end_s + 1e-6, float(max(step_m, 0.25)), dtype=np.float32)
+    if query_s.size == 0 or float(query_s[-1]) < local_end_s - 1e-4:
+        query_s = np.concatenate([query_s, np.array([local_end_s], dtype=np.float32)], axis=0)
+    local_segment = _sample_polyline_at_arclengths(route_poly, query_s)
+    if local_segment.ndim != 2 or local_segment.shape[0] == 0 or local_segment.shape[1] < 2:
+        return None
+    world_segment = _transform_points_local_to_world_xyz(local_segment[:, :2], ego_matrix)
+    if world_segment.ndim != 2 or world_segment.shape[0] == 0 or world_segment.shape[1] < 3:
+        return None
+    return {
+        'area_start_world_xyz': world_segment[0, :3].astype(float).tolist(),
+        'area_end_world_xyz': world_segment[-1, :3].astype(float).tolist(),
+        'area_segment_world_xyz': world_segment[:, :3].astype(float).tolist(),
+    }
+
+
+def _borrow_conflict_world_geometry(scene_borrow_context, conflict_start_progress_m, conflict_end_progress_m, step_m=0.5):
+    corridor_world = np.asarray((scene_borrow_context or {}).get('borrow_segment_world_xyz', []), dtype=np.float32)
+    if corridor_world.ndim != 2 or corridor_world.shape[0] < 2 or corridor_world.shape[1] < 3:
+        return None
+    query_s = np.arange(
+        float(conflict_start_progress_m),
+        float(conflict_end_progress_m) + 1e-6,
+        float(max(step_m, 0.25)),
+        dtype=np.float32,
+    )
+    if query_s.size == 0 or float(query_s[-1]) < float(conflict_end_progress_m) - 1e-4:
+        query_s = np.concatenate([query_s, np.array([float(conflict_end_progress_m)], dtype=np.float32)], axis=0)
+    world_segment = _sample_polyline_xyz_at_arclengths(corridor_world[:, :3], query_s)
+    if world_segment.ndim != 2 or world_segment.shape[0] == 0 or world_segment.shape[1] < 3:
+        return None
+    return {
+        'area_start_world_xyz': world_segment[0, :3].astype(float).tolist(),
+        'area_end_world_xyz': world_segment[-1, :3].astype(float).tolist(),
+        'area_segment_world_xyz': world_segment[:, :3].astype(float).tolist(),
+    }
+
+
 def _borrow_record_conflict_progresses(record):
     scene_borrow_context = (record or {}).get('scene_borrow_context') or {}
     borrow_motion = (record or {}).get('borrow_motion') or {}
@@ -4311,6 +4399,11 @@ def _build_borrow_conflict_windows(records, samples):
         conflict_start_progress_m=conflict_start_progress_m,
         conflict_end_progress_m=conflict_end_progress_m,
     )
+    world_geometry = _borrow_conflict_world_geometry(
+        scene_borrow_context,
+        conflict_start_progress_m=conflict_start_progress_m,
+        conflict_end_progress_m=conflict_end_progress_m,
+    ) or {}
     windows.append({
         'family': 'borrow',
         'family_code': int(CONFLICT_FAMILY_TO_CODE['borrow']),
@@ -4329,6 +4422,9 @@ def _build_borrow_conflict_windows(records, samples):
         'borrow_distance_m': float(scene_borrow_context.get('borrow_distance_m', np.nan)),
         'borrow_conflict_start_progress_m': float(conflict_start_progress_m),
         'borrow_conflict_end_progress_m': float(conflict_end_progress_m),
+        'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
+        'area_end_world_xyz': list(world_geometry.get('area_end_world_xyz', [])),
+        'area_segment_world_xyz': list(world_geometry.get('area_segment_world_xyz', [])),
         'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
         'dir_angle_deg': float(dir_info.get('dir_angle_deg', np.nan)),
         'route_heading_deg': float(dir_info.get('route_heading_deg', np.nan)),
@@ -4426,6 +4522,11 @@ def _build_merge_conflict_windows(records, samples):
             merge_area_start_s_m=merge_area_start_s_m,
             merge_area_end_s_m=merge_area_end_s_m,
         )
+        world_geometry = _record_s_interval_world_geometry(
+            records[start_pos],
+            area_start_s_m=merge_area_start_s_m,
+            area_end_s_m=merge_area_end_s_m,
+        ) or {}
         windows.append({
             'family': 'merge',
             'family_code': int(CONFLICT_FAMILY_TO_CODE['merge']),
@@ -4441,6 +4542,9 @@ def _build_merge_conflict_windows(records, samples):
             'end_frame': int(records[end_pos]['frame_id']),
             'area_start_s_m': float(merge_area_start_s_m),
             'area_end_s_m': float(merge_area_end_s_m),
+            'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
+            'area_end_world_xyz': list(world_geometry.get('area_end_world_xyz', [])),
+            'area_segment_world_xyz': list(world_geometry.get('area_segment_world_xyz', [])),
             'merge_area_first_conflict_s_m': float(area_info['first_conflict_s_m']),
             'merge_area_last_conflict_s_m': float(area_info['last_conflict_s_m']),
             'merge_direction_heading_rad': float(np.radians(dir_info.get('route_heading_deg', np.nan))) if np.isfinite(float(dir_info.get('route_heading_deg', np.nan))) else np.nan,
@@ -4512,6 +4616,11 @@ def _build_junction_conflict_windows(records, samples):
             area_start_s_m=area_start_s_m,
             area_end_s_m=area_end_s_m,
         )
+        world_geometry = _record_s_interval_world_geometry(
+            records[start_pos],
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+        ) or {}
         windows.append({
             'family': 'junction',
             'family_code': int(CONFLICT_FAMILY_TO_CODE['junction']),
@@ -4527,6 +4636,9 @@ def _build_junction_conflict_windows(records, samples):
             'end_frame': int(records[end_pos]['frame_id']),
             'area_start_s_m': float(area_start_s_m),
             'area_end_s_m': float(area_end_s_m),
+            'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
+            'area_end_world_xyz': list(world_geometry.get('area_end_world_xyz', [])),
+            'area_segment_world_xyz': list(world_geometry.get('area_segment_world_xyz', [])),
             'area_center_world_xy': center_xy[:2].astype(float).tolist(),
             'area_radius_m': float(radius_m),
             'candidate_frame_count': int(len(cluster_positions)),
@@ -4721,6 +4833,7 @@ def _build_merge_motion_context(
     scene_route_front_s = np.nan
     scene_route_rear_s = np.nan
     ego_world_xy = np.asarray([np.nan, np.nan], dtype=np.float32)
+    ego_matrix_list = []
     scene_route_polyline_world = np.asarray(scene_route_polyline_world, dtype=np.float32)
     if (
         ego_matrix_current is not None and
@@ -4730,6 +4843,8 @@ def _build_merge_motion_context(
         ego_matrix_np = np.asarray(ego_matrix_current, dtype=np.float32)
         if ego_matrix_np.ndim == 2 and ego_matrix_np.shape[0] >= 3 and ego_matrix_np.shape[1] >= 4:
             ego_world_xy = ego_matrix_np[:2, 3].astype(np.float32)
+        if ego_matrix_np.shape == (4, 4) and np.all(np.isfinite(ego_matrix_np)):
+            ego_matrix_list = ego_matrix_np.astype(float).tolist()
         ego_probe_local = np.asarray(
             [
                 [0.0, 0.0],
@@ -4752,6 +4867,7 @@ def _build_merge_motion_context(
         'route_heading_local_rad': np.nan if route_heading_local is None else float(route_heading_local),
         'heading_error_deg': float(heading_error_deg) if np.isfinite(heading_error_deg) else np.nan,
         'ego_half_length_m': float(ego_half_length_m),
+        'ego_matrix': ego_matrix_list,
         'ego_world_xy': ego_world_xy.astype(float).tolist() if np.all(np.isfinite(ego_world_xy)) else [],
         'scene_route_center_s_m': float(scene_route_center_s) if np.isfinite(scene_route_center_s) else np.nan,
         'scene_route_front_s_m': float(scene_route_front_s) if np.isfinite(scene_route_front_s) else np.nan,

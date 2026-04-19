@@ -160,6 +160,71 @@ def _load_scene_rgb(image_root, base_dir, frame_str):
     return np.zeros((900, 1600, 3), dtype=np.uint8)
 
 
+def _load_measurements_for_sample(image_data_root, sample, meas_cache=None):
+    base_dir, frame_str = _resolve_feature_frame_info(sample)
+    if base_dir is None or frame_str is None:
+        return None
+    cache_key = (base_dir, frame_str)
+    if meas_cache is not None and cache_key in meas_cache:
+        return meas_cache[cache_key]
+    meas = _load_json_gz_if_exists(
+        os.path.join(image_data_root, base_dir, "measurements", f"{frame_str}.json.gz")
+    ) or {}
+    if meas_cache is not None:
+        meas_cache[cache_key] = meas
+    return meas
+
+
+def _resolve_fixed_s_interval_world_geometry(sample, route_samples_by_frame, image_data_root, meas_cache=None, geom_cache=None):
+    conflict_area = (sample.get("stage1_speed_debug") or {}).get("conflict_area") or {}
+    if str(conflict_area.get("area_type", "none")) != "s_interval":
+        return None
+    area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
+    area_end_s = float(conflict_area.get("area_end_s_m", np.nan))
+    start_frame = int(sample.get("conflict_area_start_frame", -1))
+    end_frame = int(sample.get("conflict_area_end_frame", -1))
+    if not np.isfinite(area_start_s) or not np.isfinite(area_end_s) or area_end_s < area_start_s or start_frame < 0:
+        return None
+    cache_key = (start_frame, end_frame, round(area_start_s, 3), round(area_end_s, 3))
+    if geom_cache is not None and cache_key in geom_cache:
+        return geom_cache[cache_key]
+
+    anchor_sample = route_samples_by_frame.get(start_frame)
+    if anchor_sample is None:
+        return None
+    anchor_meas = _load_measurements_for_sample(image_data_root, anchor_sample, meas_cache=meas_cache)
+    ego_matrix = None if not isinstance(anchor_meas, dict) else anchor_meas.get("ego_matrix", None)
+    if ego_matrix is None:
+        return None
+    route_xy = _route_with_origin(np.asarray(anchor_sample.get("route", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32))
+    if route_xy.shape[0] < 2:
+        return None
+    merge_motion = ((anchor_sample.get("stage1_speed_debug") or {}).get("merge_motion") or {})
+    front_s = float(merge_motion.get("scene_route_front_s_m", np.nan))
+    if not np.isfinite(front_s):
+        front_s = float(merge_motion.get("scene_route_center_s_m", np.nan))
+    if not np.isfinite(front_s):
+        return None
+
+    local_start_s = max(float(area_start_s) - float(front_s), 0.0)
+    local_end_s = max(float(area_end_s) - float(front_s), local_start_s)
+    local_segment = _sample_polyline_segment_at_s(route_xy, local_start_s, local_end_s, step_m=0.5)
+    if local_segment.shape[0] == 0:
+        return None
+    world_segment_xyz = _transform_points_local_to_world_xyz(local_segment, ego_matrix)
+    if world_segment_xyz.shape[0] == 0:
+        return None
+
+    result = {
+        "area_start_world_xyz": world_segment_xyz[0].astype(float).tolist(),
+        "area_end_world_xyz": world_segment_xyz[-1].astype(float).tolist(),
+        "area_segment_world_xyz": world_segment_xyz.astype(float).tolist(),
+    }
+    if geom_cache is not None:
+        geom_cache[cache_key] = result
+    return result
+
+
 def _transform_points_world_xyz_to_local(points_xyz, ego_matrix):
     pts = np.asarray(points_xyz, dtype=np.float32)
     if pts.ndim != 2 or pts.shape[1] < 3:
@@ -172,6 +237,19 @@ def _transform_points_world_xyz_to_local(points_xyz, ego_matrix):
     pts_h = np.concatenate([pts[:, :3], np.ones((pts.shape[0], 1), dtype=np.float32)], axis=1)
     local = (ego_inv @ pts_h.T).T
     return local[:, :2].astype(np.float32)
+
+
+def _transform_points_local_to_world_xyz(points_xy, ego_matrix):
+    pts = np.asarray(points_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return np.zeros((0, 3), dtype=np.float32)
+    ego_matrix = np.asarray(ego_matrix, dtype=np.float32)
+    pts_h = np.concatenate(
+        [pts[:, :2], np.zeros((pts.shape[0], 1), dtype=np.float32), np.ones((pts.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    )
+    world = (ego_matrix @ pts_h.T).T
+    return world[:, :3].astype(np.float32)
 
 
 def _transform_points_world_xy_to_local(points_xy, ego_matrix):
@@ -267,6 +345,24 @@ def _sample_polyline_point_at_s(poly_xy, progress_m):
     idx = int(np.searchsorted(dense_s, progress_m, side="left"))
     idx = int(np.clip(idx, 0, dense.shape[0] - 1))
     return dense[idx]
+
+
+def _sample_polyline_segment_at_s(poly_xy, start_s, end_s, step_m=0.5):
+    dense, dense_s = _interpolate_route_with_arclength(np.asarray(poly_xy, dtype=np.float32), step_m=step_m)
+    if dense.shape[0] == 0 or dense_s.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    start_s = float(max(start_s, 0.0))
+    end_s = float(max(end_s, start_s))
+    total_s = float(dense_s[-1])
+    if total_s <= 1e-6 or start_s > total_s:
+        return np.zeros((0, 2), dtype=np.float32)
+    end_s = float(min(end_s, total_s))
+    query = np.arange(start_s, end_s + float(step_m) * 0.5, float(step_m), dtype=np.float32)
+    if query.size == 0 or float(query[-1]) < end_s - 1e-4:
+        query = np.concatenate([query, np.array([end_s], dtype=np.float32)], axis=0)
+    x = np.interp(query, dense_s, dense[:, 0]).astype(np.float32)
+    y = np.interp(query, dense_s, dense[:, 1]).astype(np.float32)
+    return np.stack([x, y], axis=1)
 
 
 def _oriented_box_corners(position_xy, extent_xy, yaw):
@@ -567,7 +663,7 @@ def _fmt_int(x):
         return "NA"
 
 
-def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, future_cover_current_box=None):
+def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, future_cover_current_box=None, fixed_s_interval_geometry=None):
     canvas = np.full((760, 760, 3), 248, dtype=np.uint8)
     route = np.asarray(sample.get("route", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
     route_xy = _route_with_origin(route)
@@ -631,8 +727,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
             thickness=3,
             dashed=True,
         )
-    _draw_cover_route_point(canvas, current_cover, (0, 0, 255), None, x_range, y_range)
-    _draw_cover_route_point(canvas, future_cover, (0, 215, 255), None, x_range, y_range)
     _draw_cover_collision_point(
         canvas, current_cover, ego_matrix, (180, 0, 255), None, x_range, y_range
     )
@@ -668,7 +762,21 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
 
             conflict_start_progress_m = float(conflict_area.get("borrow_conflict_start_progress_m", np.nan))
             conflict_end_progress_m = float(conflict_area.get("borrow_conflict_end_progress_m", np.nan))
-            if np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
+            stored_area_segment_world = np.asarray(conflict_area.get("area_segment_world_xyz", []), dtype=np.float32)
+            stored_area_start_world = np.asarray(conflict_area.get("area_start_world_xyz", []), dtype=np.float32).reshape(-1)
+            stored_area_end_world = np.asarray(conflict_area.get("area_end_world_xyz", []), dtype=np.float32).reshape(-1)
+            stored_area_segment_local = _transform_world_points_to_local_xy(stored_area_segment_world, ego_matrix)
+            if stored_area_segment_local.shape[0] >= 2:
+                seg_px = _local_to_canvas(stored_area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
+                cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
+                area_start_local = _transform_single_world_point_to_local_xy(stored_area_start_world, [], ego_matrix)
+                area_end_local = _transform_single_world_point_to_local_xy(stored_area_end_world, [], ego_matrix)
+                if area_start_local is not None:
+                    _draw_local_point_marker(canvas, area_start_local, (0, 180, 0), "area_s", x_range, y_range)
+                if area_end_local is not None:
+                    _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
+                borrow_area_drawn = True
+            elif np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
                 area_start_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_start_progress_m)
                 area_end_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_end_progress_m)
                 if area_start_local is not None:
@@ -689,7 +797,35 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
                     cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
                     borrow_area_drawn = True
 
-    if route_xy.shape[0] >= 2 and not borrow_area_drawn:
+    stored_area_segment_world = np.asarray(conflict_area.get("area_segment_world_xyz", []), dtype=np.float32)
+    stored_area_start_world = np.asarray(conflict_area.get("area_start_world_xyz", []), dtype=np.float32).reshape(-1)
+    stored_area_end_world = np.asarray(conflict_area.get("area_end_world_xyz", []), dtype=np.float32).reshape(-1)
+    if ego_matrix is not None and not borrow_area_drawn and stored_area_segment_world.ndim == 2 and stored_area_segment_world.shape[0] >= 2:
+        area_segment_local = _transform_world_points_to_local_xy(stored_area_segment_world, ego_matrix)
+        if area_segment_local.shape[0] >= 2:
+            seg_px = _local_to_canvas(area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
+            cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
+        area_start_local = _transform_single_world_point_to_local_xy(stored_area_start_world, [], ego_matrix)
+        area_end_local = _transform_single_world_point_to_local_xy(stored_area_end_world, [], ego_matrix)
+        if area_start_local is not None:
+            _draw_local_point_marker(canvas, area_start_local, (0, 170, 0), "area_s", x_range, y_range)
+        if area_end_local is not None:
+            _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
+    elif ego_matrix is not None and not borrow_area_drawn and fixed_s_interval_geometry is not None:
+        area_segment_world = np.asarray(fixed_s_interval_geometry.get("area_segment_world_xyz", []), dtype=np.float32)
+        area_start_world = np.asarray(fixed_s_interval_geometry.get("area_start_world_xyz", []), dtype=np.float32).reshape(-1)
+        area_end_world = np.asarray(fixed_s_interval_geometry.get("area_end_world_xyz", []), dtype=np.float32).reshape(-1)
+        area_segment_local = _transform_world_points_to_local_xy(area_segment_world, ego_matrix)
+        if area_segment_local.shape[0] >= 2:
+            seg_px = _local_to_canvas(area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
+            cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
+        area_start_local = _transform_single_world_point_to_local_xy(area_start_world, [], ego_matrix)
+        area_end_local = _transform_single_world_point_to_local_xy(area_end_world, [], ego_matrix)
+        if area_start_local is not None:
+            _draw_local_point_marker(canvas, area_start_local, (0, 170, 0), "area_s", x_range, y_range)
+        if area_end_local is not None:
+            _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
+    elif route_xy.shape[0] >= 2 and not borrow_area_drawn:
         area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
         area_end_s = float(conflict_area.get("area_end_s_m", np.nan))
         if np.isfinite(area_start_s) and np.isfinite(area_end_s) and area_end_s >= area_start_s:
@@ -901,6 +1037,9 @@ def _resolve_output_path(scene_name, route_name, output=None, output_dir=None):
 
 def _render_route_video(route_name, route_samples, image_data_root, fps, x_range, y_range, output_path):
     writer = None
+    route_samples_by_frame = {int(s.get("frame_id", -1)): s for s in route_samples}
+    meas_cache = {}
+    fixed_geom_cache = {}
     for sample in route_samples:
         base_dir, frame_str = _resolve_feature_frame_info(sample)
         if base_dir is None or frame_str is None:
@@ -923,6 +1062,13 @@ def _render_route_video(route_name, route_samples, image_data_root, fps, x_range
             current_meas=current_meas,
             future_cover=future_cover,
         )
+        fixed_s_interval_geometry = _resolve_fixed_s_interval_world_geometry(
+            sample,
+            route_samples_by_frame=route_samples_by_frame,
+            image_data_root=image_data_root,
+            meas_cache=meas_cache,
+            geom_cache=fixed_geom_cache,
+        )
         bev_panel = _build_bev_panel(
             sample,
             current_boxes,
@@ -930,6 +1076,7 @@ def _render_route_video(route_name, route_samples, image_data_root, fps, x_range
             x_range,
             y_range,
             future_cover_current_box=future_cover_current_box,
+            fixed_s_interval_geometry=fixed_s_interval_geometry,
         )
         text_panel = _build_text_panel(sample, current_meas)
         frame = _compose_frame(rgb, bev_panel, text_panel)
