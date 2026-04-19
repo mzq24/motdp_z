@@ -107,6 +107,7 @@ STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
 STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
+STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
 
 STAGE1_SPEED_FIELDS = (
@@ -3653,6 +3654,18 @@ def _conflict_window_release_pos(records, family, start_pos, entry_pos, end_pos)
     return int(start_pos), 'window_start'
 
 
+def _conflict_window_go_pos(records, family, start_pos, release_pos, end_pos, release_reason):
+    if str(release_reason) != 'stopped':
+        return int(start_pos), 'window_start_direct_go'
+
+    for pos in range(int(release_pos), int(end_pos) + 1):
+        speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+        if np.isfinite(speed_mps) and speed_mps > float(STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS):
+            return int(pos), 'post_stop_speed_restart'
+
+    return None, 'stopped_no_restart'
+
+
 def _conflict_phase_frame_role(pos, start_pos, end_pos, entry_pos, go_pos, phase):
     tags = []
     if int(pos) == int(start_pos):
@@ -3718,8 +3731,15 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
                 entry_pos=entry_pos,
                 end_pos=end_pos,
             )
-            go_pos = int(release_pos)
-            go_frame = int(records[int(go_pos)]['frame_id'])
+            go_pos, go_reason = _conflict_window_go_pos(
+                records,
+                family=family,
+                start_pos=start_pos,
+                release_pos=release_pos,
+                end_pos=end_pos,
+                release_reason=release_reason,
+            )
+            go_frame = int(records[int(go_pos)]['frame_id']) if go_pos is not None else -1
 
         for window_pos in range(int(start_pos), int(end_pos) + 1):
             record = records[int(window_pos)]
@@ -3742,8 +3762,8 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
                     go_pos=go_pos,
                     phase=phase,
                 ),
-                'source': 'area_entry_backward_stop_or_local_min',
-                'release_reason': str(release_reason),
+                'source': 'area_entry_backward_stop_then_restart',
+                'release_reason': str(release_reason if entry_pos is None else go_reason),
                 'entry_found': float(entry_pos is not None),
                 'speed_mps': float(_record_conflict_speed_mps(record, family)),
                 'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
