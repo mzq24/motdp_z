@@ -1,39 +1,21 @@
 #!/usr/bin/env python3
 """
-Pre-compute training-time supervision/cache fields and inject them into samples_packed.pkl.
+Pre-compute lightweight debug/cache fields and inject them into samples_packed.pkl.
 
-This avoids expensive on-the-fly BEV semantic + boxes + measurements IO during training,
-and also moves cheap-but-frequent tensor assembly out of the dataloader.
+This keeps the packed samples aligned with the current stage1 debug workflow.
 Each sample gets these fast fields:
-  - behavior_labels: (num_modes,) int64
-  - allowed_flags:   (num_modes,) float32
-  - scene_buckets:   (NUM_BUCKET_CATEGORIES,) float32
-  - energy_targets:  (num_modes, 5) float32
-  - energy_active_mask: (num_modes,) bool
   - ego_status:      (obs_horizon, 14) float32
-  - front_route_distance: () float32, route-arc distance to first lead vehicle
-  - front_route_ttc:      () float32, TTC under current-cover / future-meeting rule
-  - front_route_risk:     () float32, continuous front risk from TTC/blocking
-  - front_route_block_risk: () float32, blocking risk from current route occupancy
-  - front_route_case:     () int64, 0=none, 1=current_cover, 2=future_cover
-  - front_route_has_lead: () float32, 1 if any vehicle covers the current route corridor
-  - front_route_actor_class: () int64, 0=none, 1=vehicle, 2=bicycle, 3=pedestrian
-  - front_route_actor_weight: () float32, class-dependent training weight
-  - front_route_block_bin: () int64, 0..4 blocking severity bin
-  - front_route_ttc_bin: () int64, 0..4 TTC severity bin
-  - front_route_hazard_bin: () int64, 0..4 overall hazard severity bin
+  - conflict_area_family / dir / active / start_frame / end_frame
 
 Usage:
   python scripts/data_tools/precompute_semantic_labels.py \
     --dataset_path /media/z/data/dataset/pdm_lite_mini/train \
-    --image_data_root /media/z/data/dataset/pdm_lite_mini \
-    --anchor_path dd_baseline/anchors/carla_kmeans_32.npy
+    --image_data_root /media/z/data/dataset/pdm_lite_mini
 
   # Also for val split:
   python scripts/data_tools/precompute_semantic_labels.py \
     --dataset_path /media/z/data/dataset/pdm_lite_mini/val \
-    --image_data_root /media/z/data/dataset/pdm_lite_mini \
-    --anchor_path dd_baseline/anchors/carla_kmeans_32.npy
+    --image_data_root /media/z/data/dataset/pdm_lite_mini
 """
 
 import os
@@ -47,73 +29,18 @@ import glob
 import time
 from collections import defaultdict
 from tqdm import tqdm
-from PIL import Image
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
 
-from tools.anchor_semantic_labeler import label_anchors_semantic, classify_scene_buckets, NUM_BUCKET_CATEGORIES
-
 
 FAST_FIELDS = (
-    'behavior_labels',
-    'allowed_flags',
-    'scene_buckets',
-    'energy_targets',
-    'energy_active_mask',
     'ego_status',
-    'front_route_distance',
-    'front_route_ttc',
-    'front_route_risk',
-    'front_route_block_risk',
-    'front_route_case',
-    'front_route_has_lead',
-    'front_route_actor_class',
-    'front_route_actor_weight',
-    'front_route_block_bin',
-    'front_route_ttc_bin',
-    'front_route_hazard_bin',
-    'speed_sample_values',
-    'speed_sample_valid_mask',
-    'speed_sample_exp_index',
-    'speed_risk_chase_values',
-    'speed_risk_meet_values',
-    'speed_risk_junction_cross_yld_values',
-    'speed_risk_junction_cross_go_values',
-    'speed_risk_merge_yld_values',
-    'speed_risk_merge_go_values',
-    'speed_risk_borrow_yld_values',
-    'speed_risk_borrow_go_values',
-    'speed_risk_ped_values',
-    'speed_cross_wait_time_s',
-    'speed_cross_wait_valid',
     'conflict_area_family',
     'conflict_area_dir',
     'conflict_area_active',
     'conflict_area_start_frame',
     'conflict_area_end_frame',
-    'junction_cross_episode_id',
-    'junction_cross_episode_active',
-    'junction_cross_episode_start_frame',
-    'junction_cross_episode_end_frame',
-    'borrow_cross_decision_phase',
-    'borrow_cross_episode_id',
-    'borrow_cross_episode_active',
-    'borrow_cross_active_time_s',
-    'borrow_cross_episode_start_frame',
-    'borrow_cross_episode_end_frame',
-    'borrow_cross_go_frame',
-    'borrow_cross_context_frame',
-    'merge_decision_phase',
-    'merge_episode_id',
-    'merge_episode_active',
-    'merge_episode_no_go',
-    'merge_episode_start_frame',
-    'merge_episode_end_frame',
-    'merge_go_frame',
-    'merge_resolution_actor_id',
-    'merge_end_state',
-    'merge_hold',
 )
 
 
@@ -167,15 +94,7 @@ TWOWAY_BORROW_ONEWAY_ROUTE_OVERRIDES = {
     "Town13_Rep0_1315_0_route0_11_09_00_34_48",
     "Town13_Rep0_1315_1_route0_11_09_06_09_23",
 }
-STAGE1_SPEED_OFFSETS_MPS = np.asarray([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=np.float32)
-STAGE1_MERGE_GRACE_FRAMES = 4
 STAGE1_MERGE_START_CONFIRM_FRAMES = 2
-STAGE1_MERGE_RED_LIGHT_WAIT_SPEED_THRESH = 0.5
-STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES = 6
-STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES = 6
-STAGE1_GO_END_STEER_ABS_THRESH = 0.08
-STAGE1_GO_END_HEADING_ALIGN_THRESH_DEG = 12.0
-STAGE1_GO_END_CONFIRM_FRAMES = 3
 STAGE1_MERGE_SPEED_CAP_MPS = 1000.0
 STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
 STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
@@ -184,78 +103,14 @@ STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
-STAGE1_PERSISTED_MEET_FRAMES = 3
-STAGE1_BORROW_ACTIVE_DT_S = 0.25
-STAGE1_CROSS_WAIT_DT_S = 0.25
-STAGE1_CROSS_GO_SPEED_THRESH = 1.0
-STAGE1_CROSS_WAIT_SPEED_THRESH = 0.5
-STAGE1_CROSS_START_DISTANCE_M = 10.0
-
-MERGE_DECISION_PHASE_TO_CODE = {
-    'none': 0,
-    'yld': 1,
-    'go': 2,
-}
-
-MERGE_END_STATE_TO_CODE = {
-    'none': 0,
-    'ended_with_chase': 1,
-    'ended_with_cross': 2,
-    'ended_with_other_current_actor': 3,
-    'ended_empty': 4,
-    'ended_route_end': 5,
-    'ended_merge_area': 6,
-}
 
 STAGE1_SPEED_FIELDS = (
-    'speed_sample_values',
-    'speed_sample_valid_mask',
-    'speed_sample_exp_index',
-    'speed_risk_chase_values',
-    'speed_risk_meet_values',
-    'speed_risk_junction_cross_yld_values',
-    'speed_risk_junction_cross_go_values',
-    'speed_risk_merge_yld_values',
-    'speed_risk_merge_go_values',
-    'speed_risk_borrow_yld_values',
-    'speed_risk_borrow_go_values',
-    'speed_risk_ped_values',
-    'speed_cross_wait_time_s',
-    'speed_cross_wait_valid',
     'conflict_area_family',
     'conflict_area_dir',
     'conflict_area_active',
     'conflict_area_start_frame',
     'conflict_area_end_frame',
-    'junction_cross_episode_id',
-    'junction_cross_episode_active',
-    'junction_cross_episode_start_frame',
-    'junction_cross_episode_end_frame',
-    'borrow_cross_decision_phase',
-    'borrow_cross_episode_id',
-    'borrow_cross_episode_active',
-    'borrow_cross_active_time_s',
-    'borrow_cross_episode_start_frame',
-    'borrow_cross_episode_end_frame',
-    'borrow_cross_go_frame',
-    'borrow_cross_context_frame',
-    'merge_decision_phase',
-    'merge_episode_id',
-    'merge_episode_active',
-    'merge_episode_no_go',
-    'merge_episode_start_frame',
-    'merge_episode_end_frame',
-    'merge_go_frame',
-    'merge_resolution_actor_id',
-    'merge_end_state',
-    'merge_hold',
 )
-
-CROSS_DECISION_PHASE_TO_CODE = {
-    'none': 0,
-    'yld': 1,
-    'go': 2,
-}
 
 CONFLICT_FAMILY_TO_CODE = {
     'none': 0,
@@ -291,26 +146,6 @@ def _infer_num_future_points(samples, default_num_points=6):
         if ego_waypoints.ndim == 2 and ego_waypoints.shape[0] >= 2:
             return max(int(ego_waypoints.shape[0] - 1), 1)
     return int(default_num_points)
-
-
-def _set_semantic_fallback(sample, num_modes):
-    sample['behavior_labels'] = np.zeros(num_modes, dtype=np.int64)
-    sample['allowed_flags'] = np.ones(num_modes, dtype=np.float32)
-    sample['scene_buckets'] = np.zeros(NUM_BUCKET_CATEGORIES, dtype=np.float32)
-
-
-def _build_energy_targets(behavior_labels, allowed_flags):
-    behavior_labels = np.asarray(behavior_labels, dtype=np.int64)
-    allowed_flags = np.asarray(allowed_flags, dtype=np.float32)
-    energy_targets = np.stack([
-        (behavior_labels == 1).astype(np.float32),
-        (behavior_labels == 2).astype(np.float32),
-        (behavior_labels == 3).astype(np.float32),
-        (behavior_labels == 4).astype(np.float32),
-        ((behavior_labels >= 5) & (behavior_labels <= 6)).astype(np.float32),
-    ], axis=-1)
-    energy_active_mask = (allowed_flags < 0.5).astype(np.bool_)
-    return energy_targets.astype(np.float32), energy_active_mask
 
 
 def _extract_target_points(sample):
@@ -731,20 +566,6 @@ def _risk_from_ttc(ttc_s, safe_ttc_s):
     if not np.isfinite(ttc_s):
         return 0.0
     return float(np.clip((safe_ttc_s - ttc_s) / max(safe_ttc_s, 1e-6), 0.0, 1.0))
-
-
-def _set_front_route_fallback(sample, max_distance_m, max_ttc_s):
-    sample['front_route_distance'] = np.float32(max_distance_m)
-    sample['front_route_ttc'] = np.float32(max_ttc_s)
-    sample['front_route_risk'] = np.float32(0.0)
-    sample['front_route_block_risk'] = np.float32(0.0)
-    sample['front_route_case'] = np.int64(0)  # 0=none, 1=current_cover, 2=future_cover
-    sample['front_route_has_lead'] = np.float32(0.0)
-    sample['front_route_actor_class'] = np.int64(ACTOR_CLASS_NONE)
-    sample['front_route_actor_weight'] = np.float32(_actor_weight(ACTOR_CLASS_NONE))
-    sample['front_route_block_bin'] = np.int64(0)
-    sample['front_route_ttc_bin'] = np.int64(0)
-    sample['front_route_hazard_bin'] = np.int64(0)
 
 
 def _ensure_packed_samples(dataset_path):
@@ -1567,11 +1388,6 @@ def _actor_has_ego_cover_before_future_cover(
     if len(trajectory_points) >= 2 and _polyline_has_ego_cover(np.stack(trajectory_points, axis=0), ego_box):
         return True
     return False
-
-
-def _speed_risk_samples_fixed(speed_mps, max_speed_mps=20.0):
-    speed_mps = float(max(speed_mps, 0.0))
-    return np.clip(speed_mps + STAGE1_SPEED_OFFSETS_MPS, 0.0, float(max_speed_mps)).astype(np.float32)
 
 
 def _pedestrian_corridor_margin_m(current_boxes, base_margin_m=0.5):
@@ -2760,910 +2576,6 @@ def _extend_local_route_with_scene_polyline(route_local, ego_matrix_current, sce
 
 
 
-def _build_speed_curve_debug(
-    current_cover,
-    future_cover,
-    current_meas,
-    current_boxes=None,
-    event_name=None,
-    release_info=None,
-    route_local=None,
-    safe_ttc_s=3.0,
-    merge_tau_s=0.25,
-    merge_clearance_m=6.0,
-    merge_follow_base_gap_m=4.0,
-    merge_follow_headway_s=0.6,
-    merge_band_smooth_mps=1.0,
-    chase_follow_base_gap_m=3.0,
-    chase_follow_headway_s=0.5,
-    rear_hard_ttc_s=1.0,
-    rear_safe_ttc_s=3.0,
-    ped_hard_ttc_s=1.0,
-    ped_safe_ttc_s=3.0,
-    junction_left_conflict_len_scale=1.5,
-    cross_safe_gap_s=1.0,
-    sample_speeds_override=None,
-):
-    speed = float((current_meas or {}).get("speed", 0.0))
-    if sample_speeds_override is None:
-        sample_speeds = _speed_risk_samples_fixed(speed)
-    else:
-        sample_speeds = np.asarray(sample_speeds_override, dtype=np.float32)
-        if sample_speeds.ndim != 1:
-            sample_speeds = sample_speeds.reshape(-1).astype(np.float32)
-    chase_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    meet_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    junction_cross_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    junction_cross_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    merge_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    merge_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    borrow_yld_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    borrow_go_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-    ego_length_m = _ego_length_m(current_boxes)
-    left_junction_conflict_len_m = _left_junction_conflict_len_m(
-        current_meas,
-        current_boxes,
-        scale=junction_left_conflict_len_scale,
-        event_name=event_name,
-    )
-    borrow_cross_conflict_len_m = np.nan
-    if _is_borrow_cross_scene_context(event_name=event_name):
-        borrow_distance_m = np.nan if release_info is None else float(release_info.get("borrow_distance_m", np.nan))
-        if np.isfinite(borrow_distance_m) and borrow_distance_m > 1e-3:
-            borrow_cross_conflict_len_m = float(max(borrow_distance_m, ego_length_m))
-        else:
-            borrow_cross_conflict_len_m = float(max(3.0 * ego_length_m, ego_length_m))
-    borrow_corridor = _borrow_corridor_metrics(
-        release_info,
-        current_meas=current_meas,
-        route_local=route_local,
-    )
-
-    chase_info = {
-        "valid": 0.0,
-        "gap_m": np.nan,
-        "lead_speed_mps": np.nan,
-        "safe_gap_cur_m": np.nan,
-    }
-    if int(current_cover.get("exists", 0.0)) > 0 and current_cover["interaction"]["name"] == "chase":
-        gap_m = float(current_cover.get("distance", np.nan))
-        lead_speed_mps = float(current_cover.get("other_speed", np.nan))
-        if np.isfinite(gap_m) and np.isfinite(lead_speed_mps):
-            chase_info = {
-                "valid": 1.0,
-                "gap_m": gap_m,
-                "lead_speed_mps": lead_speed_mps,
-                "safe_gap_cur_m": float(chase_follow_base_gap_m + chase_follow_headway_s * max(speed, 0.0)),
-            }
-            for idx, candidate_speed in enumerate(sample_speeds):
-                closing = float(candidate_speed) - lead_speed_mps
-                ttc = np.inf if closing <= 1e-6 else gap_m / max(closing, 1e-6)
-                safe_gap = float(chase_follow_base_gap_m + chase_follow_headway_s * max(float(candidate_speed), 0.0))
-                gap_risk = float(np.clip((safe_gap - gap_m) / max(safe_gap, 1e-6), 0.0, 1.0))
-                ttc_risk = _risk_from_time_gap(ttc, safe_ttc_s)
-                if closing > 1e-6:
-                    closing_speed_risk = float(np.clip(closing / max(float(candidate_speed), 1.0), 0.0, 1.0))
-                    distance_weight = float(safe_gap / max(gap_m + safe_gap, 1e-6))
-                    closing_trend_risk = float(np.clip(closing_speed_risk * distance_weight, 0.0, 1.0))
-                else:
-                    closing_trend_risk = 0.0
-                chase_risks[idx] = max(gap_risk, ttc_risk, closing_trend_risk)
-
-    meet_info = {
-        "valid": 0.0,
-        "d_ego_m": np.nan,
-        "d_bg_m": np.nan,
-        "conflict_len_m": np.nan,
-        "context_conflict_len_m": float(left_junction_conflict_len_m),
-        "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
-        "borrow_start_distance_m": np.nan,
-        "borrow_total_distance_m": np.nan,
-        "d_bg_to_end_m": np.nan,
-        "t_bg_to_end_s": np.nan,
-        "ego_clearance_m": np.nan,
-        "bg_clearance_m": np.nan,
-        "bg_speed_mps": np.nan,
-        "t_bg_s": np.nan,
-        "t_bg_exit_s": np.nan,
-        "t_current_bg_exit_s": np.nan,
-        "t_bg_clear_s": np.nan,
-        "t_ego_exit_s": np.nan,
-        "safe_gap_bg_m": np.nan,
-        "rear_gap_m": np.nan,
-        "v_equal_mps": np.nan,
-        "v_go_min_mps": np.nan,
-        "v_go_cap_mps": np.nan,
-        "v_behind_min_mps": np.nan,
-        "v_go_need_mps": np.nan,
-        "v_yield_max_mps": np.nan,
-    }
-
-    def _cross_wait_from_meet_debug(info):
-        subtype = str(info.get("subtype", "none"))
-        if "cross" not in subtype:
-            return 0.0, 0.0
-        t_exit = float(info.get("t_bg_exit_s", np.nan))
-        t_bg = float(info.get("t_bg_s", np.nan))
-        t_wait = t_exit if np.isfinite(t_exit) else t_bg
-        if not np.isfinite(t_wait):
-            return 0.0, 0.0
-        return float(max(t_wait, 0.0)), 1.0
-
-    ped_cover = None
-    if int(current_cover.get("exists", 0.0)) > 0 and str(current_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES:
-        ped_cover = {
-            "case": "current",
-            "distance_m": float(current_cover.get("distance", np.nan)),
-            "actor_id": int(current_cover.get("actor_id", -1)),
-        }
-    elif int(future_cover.get("exists", 0.0)) > 0 and str(future_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES:
-        d_ego = float(future_cover.get("d_ego", np.nan))
-        if not np.isfinite(d_ego):
-            d_ego = float(future_cover.get("distance", np.nan))
-        ped_cover = {
-            "case": "future",
-            "distance_m": float(d_ego),
-            "actor_id": int(future_cover.get("actor_id", -1)),
-        }
-    if ped_cover is not None and np.isfinite(float(ped_cover["distance_m"])):
-        ped_distance = max(float(ped_cover["distance_m"]), 0.0)
-        meet_info = {
-            "valid": 1.0,
-            "d_ego_m": float(ped_distance),
-            "d_bg_m": np.nan,
-            "conflict_len_m": np.nan,
-            "context_conflict_len_m": float(left_junction_conflict_len_m),
-            "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
-            "bg_speed_mps": np.nan,
-            "t_bg_s": np.nan,
-            "t_bg_exit_s": np.nan,
-            "t_bg_clear_s": np.nan,
-            "safe_gap_bg_m": np.nan,
-            "rear_gap_m": np.nan,
-            "v_equal_mps": np.nan,
-            "v_go_min_mps": np.nan,
-            "v_behind_min_mps": np.nan,
-            "v_go_need_mps": np.nan,
-            "v_yield_max_mps": np.nan,
-            "subtype": "ped_cross",
-            "ped_case": str(ped_cover["case"]),
-            "ped_actor_id": int(ped_cover["actor_id"]),
-        }
-        for idx, candidate_speed in enumerate(sample_speeds):
-            v = float(candidate_speed)
-            if v <= 1e-6:
-                meet_risks[idx] = 0.0
-                continue
-            t_cover = ped_distance / max(v, 1e-6)
-            risk = float(
-                np.clip(
-                    (float(ped_safe_ttc_s) - t_cover) /
-                    max(float(ped_safe_ttc_s) - float(ped_hard_ttc_s), 1e-6),
-                    0.0,
-                    1.0,
-                )
-            )
-            meet_risks[idx] = risk
-        total_risks = np.maximum(chase_risks, meet_risks)
-        cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
-        return {
-            "sample_speeds_mps": sample_speeds.astype(np.float32),
-            "chase_risks": chase_risks.astype(np.float32),
-            "meet_risks": meet_risks.astype(np.float32),
-            "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
-            "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
-            "merge_yld_risks": merge_yld_risks.astype(np.float32),
-            "merge_go_risks": merge_go_risks.astype(np.float32),
-            "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
-            "borrow_go_risks": borrow_go_risks.astype(np.float32),
-            "total_risks": total_risks.astype(np.float32),
-            "cross_wait_time_s": float(cross_wait_time_s),
-            "cross_wait_valid": float(cross_wait_valid),
-            "chase": chase_info,
-            "meet": meet_info,
-        }
-
-    if int(current_cover.get("exists", 0.0)) > 0 and current_cover["interaction"]["name"] == "meet":
-        d_ego = float(current_cover.get("distance", np.nan))
-        bg_speed = float(current_cover.get("other_speed", np.nan))
-        meet_subtype = str(current_cover.get("interaction", {}).get("subtype", "none"))
-        if np.isfinite(d_ego):
-            if meet_subtype == "borrow_cross_meet" and borrow_corridor is not None:
-                bg_length_m = float(current_cover.get("other_length_m", np.nan))
-                if not np.isfinite(bg_length_m):
-                    bg_length_m = float(ego_length_m)
-                bg_clearance_m = float(max(bg_length_m, 1.0))
-                start_distance_m = float(borrow_corridor["borrow_start_distance_m"])
-                borrow_distance_m = float(borrow_corridor["borrow_distance_m"])
-                distance_to_clear_start_m = float(max(float(d_ego) - start_distance_m, 0.0) + bg_clearance_m)
-                t_bg_exit = np.inf if not np.isfinite(bg_speed) or bg_speed <= 1e-6 else distance_to_clear_start_m / max(bg_speed, 1e-6)
-                v_yield_max = np.nan
-                if np.isfinite(t_bg_exit):
-                    denom = float(t_bg_exit) + float(cross_safe_gap_s)
-                    v_yield_max = np.inf if denom <= 1e-6 else float(start_distance_m) / max(denom, 1e-6)
-                v_go_min = np.inf
-                meet_info = {
-                    "valid": 1.0,
-                    "d_ego_m": float(d_ego),
-                    "d_bg_m": 0.0,
-                    "conflict_len_m": float(borrow_distance_m),
-                    "context_conflict_len_m": float(left_junction_conflict_len_m),
-                    "borrow_conflict_len_m": float(borrow_distance_m),
-                    "borrow_start_distance_m": float(start_distance_m),
-                    "borrow_total_distance_m": float(borrow_corridor["borrow_total_clear_distance_m"]),
-                    "d_bg_to_end_m": np.nan,
-                    "ego_clearance_m": float(ego_length_m),
-                    "bg_clearance_m": float(bg_clearance_m),
-                    "bg_speed_mps": float(bg_speed),
-                    "t_bg_s": 0.0,
-                    "t_bg_exit_s": float(t_bg_exit),
-                    "t_bg_to_end_s": np.nan,
-                    "t_bg_clear_s": np.nan,
-                    "safe_gap_bg_m": np.nan,
-                    "rear_gap_m": np.nan,
-                    "v_equal_mps": np.nan,
-                    "v_go_min_mps": float(v_go_min),
-                    "v_behind_min_mps": np.nan,
-                    "v_go_need_mps": np.nan,
-                    "v_yield_max_mps": float(v_yield_max),
-                    "subtype": meet_subtype,
-                    "cover_case": "current",
-                }
-                for idx, candidate_speed in enumerate(sample_speeds):
-                    v = float(candidate_speed)
-                    if v <= 1e-6:
-                        borrow_yld_risks[idx] = 0.0
-                        borrow_go_risks[idx] = 1.0
-                        meet_risks[idx] = 0.0
-                        continue
-                    if np.isfinite(v_yield_max):
-                        yld_risk = 0.0 if v <= float(v_yield_max) else 1.0
-                    elif not np.isfinite(t_bg_exit):
-                        yld_risk = 1.0
-                    else:
-                        t_ego_hit = float(d_ego) / max(v, 1e-6)
-                        yld_risk = _risk_from_time_gap(t_ego_hit - float(t_bg_exit), cross_safe_gap_s)
-                    borrow_yld_risks[idx] = float(np.clip(yld_risk, 0.0, 1.0))
-                    borrow_go_risks[idx] = 1.0
-                    meet_risks[idx] = float(np.clip(min(borrow_yld_risks[idx], borrow_go_risks[idx]), 0.0, 1.0))
-                total_risks = np.maximum(chase_risks, meet_risks)
-                cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
-                return {
-                    "sample_speeds_mps": sample_speeds.astype(np.float32),
-                    "chase_risks": chase_risks.astype(np.float32),
-                    "meet_risks": meet_risks.astype(np.float32),
-                    "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
-                    "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
-                    "merge_yld_risks": merge_yld_risks.astype(np.float32),
-                    "merge_go_risks": merge_go_risks.astype(np.float32),
-                    "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
-                    "borrow_go_risks": borrow_go_risks.astype(np.float32),
-                    "total_risks": total_risks.astype(np.float32),
-                    "cross_wait_time_s": float(cross_wait_time_s),
-                    "cross_wait_valid": float(cross_wait_valid),
-                    "chase": chase_info,
-                    "meet": meet_info,
-                }
-            conflict_len_m = np.nan
-            if meet_subtype == "junction_left_cross_meet":
-                conflict_len_m = float(left_junction_conflict_len_m)
-            elif "cross" in meet_subtype and meet_subtype != "borrow_cross_meet":
-                conflict_len_m = float(max(ego_length_m, 1.0))
-            bg_length_m = float(current_cover.get("other_length_m", np.nan))
-            if not np.isfinite(bg_length_m):
-                bg_length_m = float(ego_length_m)
-            bg_clearance_m = float(max(bg_length_m, 1.0))
-            d_ego_entry_m = np.nan
-            if not np.isfinite(d_ego_entry_m):
-                if np.isfinite(conflict_len_m):
-                    d_ego_entry_m = float(max(float(d_ego) - 0.5 * float(conflict_len_m), 0.0))
-                else:
-                    d_ego_entry_m = float(max(float(d_ego), 0.0))
-            t_bg = 0.0
-            current_bg_exit_s = np.nan
-            junction_go_cap_mps = np.nan
-            if meet_subtype == "junction_left_cross_meet" and np.isfinite(conflict_len_m):
-                current_bg_occ_len_m = float(max(0.5 * float(conflict_len_m), 0.0) + bg_clearance_m)
-                if np.isfinite(bg_speed) and bg_speed > 1e-3:
-                    current_bg_exit_s = float(current_bg_occ_len_m / max(bg_speed, 1e-6))
-                else:
-                    current_bg_exit_s = np.inf
-                denom = float(current_bg_exit_s) + float(cross_safe_gap_s)
-                if np.isfinite(denom):
-                    junction_go_cap_mps = np.inf if denom <= 1e-6 else float(d_ego_entry_m) / max(denom, 1e-6)
-                t_bg_exit = float(current_bg_exit_s)
-            elif np.isfinite(bg_speed) and bg_speed > 1e-3 and np.isfinite(conflict_len_m):
-                t_bg_exit = float(conflict_len_m / max(bg_speed, 1e-6))
-            elif np.isfinite(conflict_len_m):
-                t_bg_exit = np.inf
-            else:
-                t_bg_exit = np.nan
-            meet_info = {
-                "valid": 1.0,
-                "d_ego_m": float(d_ego_entry_m),
-                "d_bg_m": 0.0,
-                "conflict_len_m": float(conflict_len_m),
-                "context_conflict_len_m": float(left_junction_conflict_len_m),
-                "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
-                "ego_clearance_m": float(ego_length_m) if meet_subtype == "junction_left_cross_meet" else np.nan,
-                "bg_clearance_m": float(bg_clearance_m) if meet_subtype == "junction_left_cross_meet" else np.nan,
-                "bg_speed_mps": float(bg_speed),
-                "t_bg_s": float(t_bg),
-                "t_bg_exit_s": float(t_bg_exit),
-                "t_current_bg_exit_s": float(current_bg_exit_s),
-                "t_bg_clear_s": np.nan,
-                "safe_gap_bg_m": np.nan,
-                "rear_gap_m": np.nan,
-                "v_equal_mps": np.nan,
-                "v_go_min_mps": 0.0 if meet_subtype == "junction_left_cross_meet" else np.nan,
-                "v_go_cap_mps": float(junction_go_cap_mps),
-                "v_behind_min_mps": np.nan,
-                "v_go_need_mps": np.nan,
-                "v_yield_max_mps": float(junction_go_cap_mps) if meet_subtype == "junction_left_cross_meet" else np.nan,
-                "subtype": meet_subtype,
-                "cover_case": "current",
-            }
-            if np.isfinite(conflict_len_m):
-                current_cover_dist_horizon_m = float(max(15.0, 2.0 * float(conflict_len_m)))
-            else:
-                current_cover_dist_horizon_m = 15.0
-            occupancy_floor = float(
-                np.clip(
-                    (current_cover_dist_horizon_m - float(d_ego_entry_m)) /
-                    max(current_cover_dist_horizon_m, 1e-6),
-                    0.02,
-                    1.0,
-                )
-            )
-            current_cover_time_horizon_s = float(max(float(cross_safe_gap_s), 3.0))
-            for idx, candidate_speed in enumerate(sample_speeds):
-                v = float(candidate_speed)
-                if v <= 1e-6:
-                    meet_risks[idx] = 0.0
-                    if meet_subtype == "junction_left_cross_meet":
-                        junction_cross_yld_risks[idx] = 0.0
-                        junction_cross_go_risks[idx] = 1.0
-                    continue
-                t_ego_in = float(max(d_ego_entry_m, 0.0) / max(v, 1e-6))
-                if float(d_ego_entry_m) <= 1e-4:
-                    risk = 1.0
-                else:
-                    risk = float(
-                        np.clip(
-                            (current_cover_time_horizon_s - t_ego_in) / max(current_cover_time_horizon_s, 1e-6),
-                            0.0,
-                            1.0,
-                        )
-                    )
-                if meet_subtype == "junction_left_cross_meet":
-                    current_cap_risk = _risk_from_time_gap(t_ego_in - float(t_bg_exit), cross_safe_gap_s)
-                    junction_cross_yld_risks[idx] = float(
-                        np.clip(np.nan_to_num(current_cap_risk, nan=1.0, posinf=0.0, neginf=1.0), 0.0, 1.0)
-                    )
-                    junction_cross_go_risks[idx] = float(
-                        np.clip(np.nan_to_num(current_cap_risk, nan=1.0, posinf=0.0, neginf=1.0), 0.0, 1.0)
-                    )
-                    meet_risks[idx] = float(
-                        max(
-                            float(np.clip(np.nan_to_num(current_cap_risk, nan=1.0, posinf=0.0, neginf=1.0), 0.0, 1.0)),
-                            occupancy_floor,
-                        )
-                    )
-                else:
-                    meet_risks[idx] = float(max(risk, occupancy_floor))
-            total_risks = np.maximum(chase_risks, meet_risks)
-            cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_debug(meet_info)
-            return {
-                "sample_speeds_mps": sample_speeds.astype(np.float32),
-                "chase_risks": chase_risks.astype(np.float32),
-                "meet_risks": meet_risks.astype(np.float32),
-                "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
-                "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
-                "merge_yld_risks": merge_yld_risks.astype(np.float32),
-                "merge_go_risks": merge_go_risks.astype(np.float32),
-                "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
-                "borrow_go_risks": borrow_go_risks.astype(np.float32),
-                "total_risks": total_risks.astype(np.float32),
-                "cross_wait_time_s": float(cross_wait_time_s),
-                "cross_wait_valid": float(cross_wait_valid),
-                "chase": chase_info,
-                "meet": meet_info,
-            }
-
-    if int(future_cover.get("exists", 0.0)) > 0 and future_cover["interaction"]["name"] == "meet":
-        d_ego = float(future_cover.get("d_ego", np.nan))
-        d_bg = float(future_cover.get("d_bg", np.nan))
-        bg_speed = float(future_cover.get("other_speed", np.nan))
-        meet_subtype = str(future_cover.get("interaction", {}).get("subtype", "none"))
-        if np.isfinite(d_ego) and np.isfinite(d_bg) and np.isfinite(bg_speed) and d_bg > 1e-4 and bg_speed > 1e-4:
-            if meet_subtype == "borrow_cross_meet" and borrow_corridor is not None:
-                actor_id = int(future_cover.get("actor_id", -1))
-                bg_length_m = float(future_cover.get("other_length_m", np.nan))
-                if not np.isfinite(bg_length_m):
-                    bg_length_m = float(ego_length_m)
-                bg_clearance_m = float(max(bg_length_m, 1.0))
-                start_distance_m = float(borrow_corridor["borrow_start_distance_m"])
-                borrow_distance_m = float(borrow_corridor["borrow_distance_m"])
-                d_bg_to_end_m = _borrow_actor_distance_to_corridor_end_m(
-                    current_boxes=current_boxes,
-                    actor_id=actor_id,
-                    end_local_xy=borrow_corridor.get("end_local_xy"),
-                    fallback_distance_m=d_bg,
-                )
-                t_bg_to_end = float(d_bg_to_end_m / max(bg_speed, 1e-6))
-                t_bg_exit_to_start = float((d_bg_to_end_m + borrow_distance_m + bg_clearance_m) / max(bg_speed, 1e-6))
-                v_yield_max = np.nan
-                if np.isfinite(t_bg_exit_to_start):
-                    denom = float(t_bg_exit_to_start) + float(cross_safe_gap_s)
-                    v_yield_max = np.inf if denom <= 1e-6 else float(start_distance_m) / max(denom, 1e-6)
-                v_go_min = np.nan
-                if np.isfinite(t_bg_to_end):
-                    go_denom = float(t_bg_to_end) - float(cross_safe_gap_s)
-                    v_go_min = np.inf if go_denom <= 1e-6 else float(borrow_corridor["borrow_total_clear_distance_m"] + ego_length_m) / max(go_denom, 1e-6)
-                meet_info = {
-                    "valid": 1.0,
-                    "d_ego_m": float(d_ego),
-                    "d_bg_m": float(d_bg),
-                    "conflict_len_m": float(borrow_distance_m),
-                    "context_conflict_len_m": float(left_junction_conflict_len_m),
-                    "borrow_conflict_len_m": float(borrow_distance_m),
-                    "borrow_start_distance_m": float(start_distance_m),
-                    "borrow_total_distance_m": float(borrow_corridor["borrow_total_clear_distance_m"]),
-                    "d_bg_to_end_m": float(d_bg_to_end_m),
-                    "ego_clearance_m": float(ego_length_m),
-                    "bg_clearance_m": float(bg_clearance_m),
-                    "bg_speed_mps": float(bg_speed),
-                    "t_bg_s": float(d_bg / max(bg_speed, 1e-6)),
-                    "t_bg_exit_s": float(t_bg_exit_to_start),
-                    "t_bg_to_end_s": float(t_bg_to_end),
-                    "t_bg_clear_s": np.nan,
-                    "safe_gap_bg_m": np.nan,
-                    "rear_gap_m": np.nan,
-                    "v_equal_mps": np.nan,
-                    "v_go_min_mps": float(v_go_min),
-                    "v_behind_min_mps": np.nan,
-                    "v_go_need_mps": np.nan,
-                    "v_yield_max_mps": float(v_yield_max),
-                    "subtype": meet_subtype,
-                    "cover_case": "future",
-                }
-                for idx, candidate_speed in enumerate(sample_speeds):
-                    v = float(candidate_speed)
-                    if v <= 1e-6:
-                        borrow_yld_risks[idx] = 0.0
-                        borrow_go_risks[idx] = 1.0
-                        meet_risks[idx] = 0.0
-                        continue
-                    t_ego_enter = float(start_distance_m / max(v, 1e-6))
-                    t_ego_clear = float((borrow_corridor["borrow_total_clear_distance_m"] + ego_length_m) / max(v, 1e-6))
-                    if np.isfinite(v_yield_max):
-                        yld_risk = 0.0 if v <= float(v_yield_max) else 1.0
-                    else:
-                        yld_risk = _risk_from_time_gap(t_ego_enter - t_bg_exit_to_start, cross_safe_gap_s)
-                    go_risk = _risk_from_time_gap(t_bg_to_end - t_ego_clear, cross_safe_gap_s)
-                    borrow_yld_risks[idx] = float(np.clip(yld_risk, 0.0, 1.0))
-                    borrow_go_risks[idx] = float(np.clip(go_risk, 0.0, 1.0))
-                    meet_risks[idx] = float(np.clip(min(borrow_yld_risks[idx], borrow_go_risks[idx]), 0.0, 1.0))
-                total_risks = np.maximum(chase_risks, meet_risks)
-                return {
-                    "sample_speeds_mps": sample_speeds.astype(np.float32),
-                    "chase_risks": chase_risks.astype(np.float32),
-                    "meet_risks": meet_risks.astype(np.float32),
-                    "merge_yld_risks": merge_yld_risks.astype(np.float32),
-                    "merge_go_risks": merge_go_risks.astype(np.float32),
-                    "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
-                    "borrow_go_risks": borrow_go_risks.astype(np.float32),
-                    "total_risks": total_risks.astype(np.float32),
-                    "chase": chase_info,
-                    "meet": meet_info,
-                }
-            conflict_len_m = np.nan
-            risk_d_ego = float(d_ego)
-            risk_d_bg = float(d_bg)
-            ego_clearance_m = float(max(float(ego_length_m), 1.0))
-            bg_length_m = float(future_cover.get("other_length_m", np.nan))
-            if not np.isfinite(bg_length_m):
-                bg_length_m = float(ego_length_m)
-            bg_clearance_m = float(max(bg_length_m, 1.0))
-            if meet_subtype == "junction_left_cross_meet":
-                conflict_len_m = float(left_junction_conflict_len_m)
-                conflict_half_m = 0.5 * conflict_len_m
-                risk_d_ego = max(float(d_ego) - conflict_half_m, 0.0)
-                risk_d_bg = max(float(d_bg) - conflict_half_m, 0.0)
-            current_junction_bg_exit_s = np.nan
-            current_junction_go_cap_mps = np.nan
-            if (
-                meet_subtype == "junction_left_cross_meet" and
-                int(current_cover.get("exists", 0.0)) > 0 and
-                str(current_cover.get("interaction", {}).get("subtype", "none")) == "junction_left_cross_meet"
-            ):
-                current_bg_speed = float(current_cover.get("other_speed", np.nan))
-                current_bg_length_m = float(current_cover.get("other_length_m", np.nan))
-                if not np.isfinite(current_bg_length_m):
-                    current_bg_length_m = float(ego_length_m)
-                current_bg_clearance_m = float(max(current_bg_length_m, 1.0))
-                current_bg_occ_len_m = float(max(0.5 * float(conflict_len_m), 0.0) + current_bg_clearance_m)
-                if np.isfinite(current_bg_speed) and current_bg_speed > 1e-3:
-                    current_junction_bg_exit_s = float(current_bg_occ_len_m / max(current_bg_speed, 1e-6))
-                else:
-                    current_junction_bg_exit_s = np.inf
-                cap_denom = float(current_junction_bg_exit_s) + float(cross_safe_gap_s)
-                if np.isfinite(cap_denom):
-                    current_junction_go_cap_mps = (
-                        np.inf if cap_denom <= 1e-6 else (risk_d_ego / max(cap_denom, 1e-6))
-                    )
-            t_bg = risk_d_bg / max(bg_speed, 1e-6)
-            cross_conflict_len_m = max(float(conflict_len_m) if np.isfinite(conflict_len_m) else 0.0, 0.0)
-            bg_occ_len_m = float(
-                cross_conflict_len_m + (bg_clearance_m if meet_subtype == "junction_left_cross_meet" else 0.0)
-            )
-            ego_cross_occ_len_m = float(
-                cross_conflict_len_m + (ego_clearance_m if meet_subtype == "junction_left_cross_meet" else 0.0)
-            )
-            t_bg_exit = (risk_d_bg + bg_occ_len_m) / max(bg_speed, 1e-6)
-            safe_gap_bg = float(merge_follow_base_gap_m + merge_follow_headway_s * max(bg_speed, 0.0))
-            merge_clearance_effective_m = float(max(float(merge_clearance_m), float(ego_length_m)))
-            t_bg_clear = (risk_d_bg + merge_clearance_effective_m) / max(bg_speed, 1e-6)
-            rear_gap_m = float(future_cover.get("rear_gap_m", np.nan))
-            if meet_subtype == "merge_meet":
-                v_behind_min = _merge_speed_cap(max(float(bg_speed), 0.0), default=0.0)
-                v_equal = _merge_speed_cap(
-                    (d_ego + ego_clearance_m) / max(t_bg, 1e-3),
-                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-                )
-                v_go_min = _merge_speed_cap(
-                    (d_ego + ego_clearance_m) / max(t_bg - float(merge_tau_s), 1e-3),
-                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-                )
-                v_go_need = _merge_speed_cap(
-                    max(float(v_go_min), float(v_behind_min)),
-                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-                )
-                v_yield_max = _merge_speed_cap(
-                    d_ego / max(t_bg_clear + float(merge_tau_s), 1e-3),
-                    default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-                )
-                debug_v_equal = float(v_equal)
-                debug_v_go_min = float(v_go_min)
-            else:
-                safe_gap_bg = np.nan
-                t_bg_clear = np.nan
-                v_equal = np.nan
-                v_go_min = np.nan
-                v_behind_min = np.nan
-                v_go_need = np.nan
-                v_yield_max = np.nan
-                debug_v_equal = np.nan
-                debug_v_go_min = np.nan
-                if meet_subtype == "junction_left_cross_meet":
-                    go_denom = float(t_bg) - float(cross_safe_gap_s)
-                    v_go_min = np.inf if go_denom <= 1e-6 else (risk_d_ego + ego_cross_occ_len_m) / max(go_denom, 1e-6)
-                    v_yield_max = risk_d_ego / max(t_bg_exit + float(cross_safe_gap_s), 1e-6)
-            meet_info = {
-                "valid": 1.0,
-                "d_ego_m": risk_d_ego,
-                "d_bg_m": risk_d_bg,
-                "conflict_len_m": float(conflict_len_m),
-                "context_conflict_len_m": float(left_junction_conflict_len_m),
-                "borrow_conflict_len_m": float(borrow_cross_conflict_len_m),
-                "ego_clearance_m": float(ego_clearance_m) if meet_subtype in {"merge_meet", "junction_left_cross_meet"} else np.nan,
-                "bg_clearance_m": float(bg_clearance_m) if meet_subtype == "junction_left_cross_meet" else np.nan,
-                "bg_speed_mps": bg_speed,
-                "t_bg_s": float(t_bg),
-                "t_bg_exit_s": float(t_bg_exit),
-                "t_current_bg_exit_s": float(current_junction_bg_exit_s),
-                "t_bg_clear_s": float(t_bg_clear),
-                "t_ego_exit_s": np.nan,
-                "safe_gap_bg_m": float(safe_gap_bg),
-                "rear_gap_m": float(rear_gap_m),
-                "v_equal_mps": float(debug_v_equal),
-                "v_go_min_mps": float(debug_v_go_min),
-                "v_go_cap_mps": float(current_junction_go_cap_mps),
-                "v_behind_min_mps": float(v_behind_min),
-                "v_go_need_mps": float(v_go_need),
-                "v_yield_max_mps": float(v_yield_max),
-                "subtype": meet_subtype,
-            }
-            for idx, candidate_speed in enumerate(sample_speeds):
-                v = float(candidate_speed)
-                if v <= 1e-6:
-                    meet_risks[idx] = 0.0
-                    merge_yld_risks[idx] = 0.0
-                    merge_go_risks[idx] = 1.0 if (meet_subtype == "merge_meet" and np.isfinite(v_go_need)) else 0.0
-                    continue
-                if meet_subtype == "merge_meet":
-                    yld_risk = 0.0
-                    go_risk = 0.0
-                    if not np.isfinite(v_go_need):
-                        risk = 0.0
-                    elif not np.isfinite(v_yield_max):
-                        rear_gap = rear_gap_m
-                        if not np.isfinite(rear_gap):
-                            rear_gap = d_bg
-                        closing_rear = max(bg_speed - v, 0.0)
-                        if closing_rear <= 1e-6:
-                            risk = 0.0
-                        else:
-                            rear_ttc = rear_gap / max(closing_rear, 1e-6)
-                            risk = float(
-                                np.clip(
-                                    (float(rear_safe_ttc_s) - rear_ttc) /
-                                    max(float(rear_safe_ttc_s) - float(rear_hard_ttc_s), 1e-6),
-                                    0.0,
-                                    1.0,
-                                )
-                            )
-                        yld_risk = float(risk)
-                        go_risk = float(risk)
-                    elif not np.isfinite(v_equal):
-                        risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
-                        yld_risk = float(np.clip((v - v_yield_max) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
-                        go_risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
-                    else:
-                        if v_go_need <= v_yield_max:
-                            meet_risks[idx] = 0.0
-                            merge_yld_risks[idx] = 0.0
-                            merge_go_risks[idx] = 0.0
-                            continue
-                        peak_speed = max(float(v_equal), float(v_yield_max))
-                        if v <= float(v_yield_max):
-                            risk = 0.0
-                            yld_risk = 0.0
-                            go_risk = 1.0
-                        elif peak_speed <= float(v_yield_max) + 1e-6:
-                            risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
-                            yld_risk = float(np.clip((v - v_yield_max) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
-                            go_risk = float(np.clip((v_go_need - v) / max(v_go_need - v_yield_max, 1e-6), 0.0, 1.0))
-                        elif v <= peak_speed:
-                            risk = float(np.clip((v - v_yield_max) / max(peak_speed - v_yield_max, 1e-6), 0.0, 1.0))
-                            yld_risk = float(np.clip((v - v_yield_max) / max(peak_speed - v_yield_max, 1e-6), 0.0, 1.0))
-                            go_risk = 1.0
-                        elif v < v_go_need:
-                            risk = float(np.clip((v_go_need - v) / max(v_go_need - peak_speed, 1e-6), 0.0, 1.0))
-                            yld_risk = 1.0
-                            go_risk = float(np.clip((v_go_need - v) / max(v_go_need - peak_speed, 1e-6), 0.0, 1.0))
-                        else:
-                            risk = 0.0
-                            yld_risk = 1.0
-                            go_risk = 0.0
-                    if (
-                        np.isfinite(v_yield_max) and np.isfinite(v_behind_min) and
-                        float(v_behind_min) > float(v_yield_max) + 1e-6 and
-                        v > float(v_yield_max)
-                    ):
-                        rear_speed_risk = float(
-                            np.clip(
-                                (float(v_behind_min) - v) /
-                                max(float(v_behind_min) - float(v_yield_max), 1e-6),
-                                0.0,
-                                1.0,
-                            )
-                        )
-                        risk = max(float(risk), float(rear_speed_risk))
-                        yld_risk = max(float(yld_risk), float(rear_speed_risk))
-                        go_risk = max(float(go_risk), float(rear_speed_risk))
-                    merge_yld_risks[idx] = float(np.clip(np.nan_to_num(yld_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
-                    merge_go_risks[idx] = float(np.clip(np.nan_to_num(go_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
-                else:
-                    conflict_len = max(float(conflict_len_m) if np.isfinite(conflict_len_m) else 0.0, 0.0)
-                    t_ego_in = risk_d_ego / max(v, 1e-6)
-                    if conflict_len > 1e-6:
-                        t_ego_out = (risk_d_ego + ego_cross_occ_len_m) / max(v, 1e-6)
-                        if meet_subtype == "junction_left_cross_meet" and idx == int(len(sample_speeds) // 2):
-                            meet_info["t_ego_exit_s"] = float(t_ego_out)
-                        gap_before = t_bg - t_ego_out
-                        gap_after = t_ego_in - t_bg_exit
-                        if meet_subtype == "junction_left_cross_meet":
-                            yld_risk = float(
-                                np.clip(
-                                    (float(cross_safe_gap_s) - gap_after) / max(float(cross_safe_gap_s), 1e-6),
-                                    0.0,
-                                    1.0,
-                                )
-                            )
-                            go_risk = float(
-                                np.clip(
-                                    (float(cross_safe_gap_s) - gap_before) / max(float(cross_safe_gap_s), 1e-6),
-                                    0.0,
-                                    1.0,
-                                )
-                            )
-                            if np.isfinite(current_junction_bg_exit_s):
-                                current_gap_after = t_ego_in - float(current_junction_bg_exit_s)
-                                current_cap_risk = float(
-                                    np.clip(
-                                        (float(cross_safe_gap_s) - current_gap_after) /
-                                        max(float(cross_safe_gap_s), 1e-6),
-                                        0.0,
-                                        1.0,
-                                    )
-                                )
-                                go_risk = max(float(go_risk), float(current_cap_risk))
-                            junction_cross_yld_risks[idx] = float(np.clip(np.nan_to_num(yld_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
-                            junction_cross_go_risks[idx] = float(np.clip(np.nan_to_num(go_risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
-                            risk = float(min(junction_cross_yld_risks[idx], junction_cross_go_risks[idx]))
-                        else:
-                            time_clearance = max(gap_before, gap_after)
-                            risk = float(
-                                np.clip(
-                                    (float(cross_safe_gap_s) - time_clearance) / max(float(cross_safe_gap_s), 1e-6),
-                                    0.0,
-                                    1.0,
-                                )
-                            )
-                    else:
-                        delta_t = abs(t_ego_in - t_bg)
-                        risk = _risk_from_time_gap(delta_t, merge_tau_s)
-                meet_risks[idx] = float(np.clip(np.nan_to_num(risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0))
-
-    total_risks = np.maximum(chase_risks, meet_risks)
-    return {
-        "sample_speeds_mps": sample_speeds.astype(np.float32),
-        "chase_risks": chase_risks.astype(np.float32),
-        "meet_risks": meet_risks.astype(np.float32),
-        "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
-        "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
-        "merge_yld_risks": merge_yld_risks.astype(np.float32),
-        "merge_go_risks": merge_go_risks.astype(np.float32),
-        "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
-        "borrow_go_risks": borrow_go_risks.astype(np.float32),
-        "total_risks": total_risks.astype(np.float32),
-        "chase": chase_info,
-        "meet": meet_info,
-    }
-
-
-def _build_speed_curve_targets(
-    current_cover,
-    future_cover,
-    current_meas,
-    current_boxes=None,
-    route_local=None,
-    release_info=None,
-    event_name=None,
-    safe_ttc_s=3.0,
-    merge_tau_s=0.25,
-    merge_clearance_m=6.0,
-    merge_follow_base_gap_m=4.0,
-    merge_follow_headway_s=0.6,
-    chase_follow_base_gap_m=3.0,
-    chase_follow_headway_s=0.5,
-    rear_hard_ttc_s=1.0,
-    rear_safe_ttc_s=3.0,
-    ped_hard_ttc_s=1.0,
-    ped_safe_ttc_s=3.0,
-    junction_left_conflict_len_scale=1.5,
-    cross_safe_gap_s=1.0,
-    return_debug=False,
-):
-    speed = float((current_meas or {}).get("speed", 0.0))
-    sample_speeds = _speed_risk_samples_fixed(speed)
-    speed_curve = _build_speed_curve_debug(
-        current_cover=current_cover,
-        future_cover=future_cover,
-        current_meas=current_meas,
-        current_boxes=current_boxes,
-        event_name=event_name,
-        release_info=release_info,
-        route_local=route_local,
-        safe_ttc_s=safe_ttc_s,
-        merge_tau_s=merge_tau_s,
-        merge_clearance_m=merge_clearance_m,
-        merge_follow_base_gap_m=merge_follow_base_gap_m,
-        merge_follow_headway_s=merge_follow_headway_s,
-        chase_follow_base_gap_m=chase_follow_base_gap_m,
-        chase_follow_headway_s=chase_follow_headway_s,
-        rear_hard_ttc_s=rear_hard_ttc_s,
-        rear_safe_ttc_s=rear_safe_ttc_s,
-        ped_hard_ttc_s=ped_hard_ttc_s,
-        ped_safe_ttc_s=ped_safe_ttc_s,
-        junction_left_conflict_len_scale=junction_left_conflict_len_scale,
-        cross_safe_gap_s=cross_safe_gap_s,
-        sample_speeds_override=sample_speeds,
-    )
-
-    sample_speeds = np.asarray(speed_curve.get("sample_speeds_mps", sample_speeds), dtype=np.float32)
-    valid_mask = np.ones(sample_speeds.shape, dtype=np.float32)
-    exp_index = np.int64(int(np.argmin(np.abs(sample_speeds - speed)))) if sample_speeds.size > 0 else np.int64(-1)
-    zeros = np.zeros(sample_speeds.shape, dtype=np.float32)
-
-    chase_risks = np.asarray(speed_curve.get("chase_risks", zeros), dtype=np.float32)
-    meet_risks_raw = np.asarray(speed_curve.get("meet_risks", zeros), dtype=np.float32)
-    junction_cross_yld_risks = np.asarray(speed_curve.get("junction_cross_yld_risks", zeros), dtype=np.float32)
-    junction_cross_go_risks = np.asarray(speed_curve.get("junction_cross_go_risks", zeros), dtype=np.float32)
-    merge_yld_risks = np.asarray(speed_curve.get("merge_yld_risks", zeros), dtype=np.float32)
-    merge_go_risks = np.asarray(speed_curve.get("merge_go_risks", zeros), dtype=np.float32)
-    borrow_yld_risks = np.asarray(speed_curve.get("borrow_yld_risks", zeros), dtype=np.float32)
-    borrow_go_risks = np.asarray(speed_curve.get("borrow_go_risks", zeros), dtype=np.float32)
-
-    is_ped_context = (
-        int(current_cover.get("exists", 0.0)) > 0 and str(current_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES
-    ) or (
-        int(future_cover.get("exists", 0.0)) > 0 and str(future_cover.get("actor_class_name", "")) in PEDESTRIAN_CLASSES
-    )
-
-    if is_ped_context:
-        ped_risks = meet_risks_raw.copy()
-        meet_risks = zeros.copy()
-        chase_risks = zeros.copy()
-        junction_cross_yld_risks = zeros.copy()
-        junction_cross_go_risks = zeros.copy()
-        merge_yld_risks = zeros.copy()
-        merge_go_risks = zeros.copy()
-        borrow_yld_risks = zeros.copy()
-        borrow_go_risks = zeros.copy()
-    else:
-        ped_risks = zeros.copy()
-        meet_risks = meet_risks_raw
-
-    if not return_debug:
-        return (
-            sample_speeds,
-            valid_mask,
-            exp_index,
-            chase_risks,
-            meet_risks,
-            ped_risks,
-            junction_cross_yld_risks,
-            junction_cross_go_risks,
-            merge_yld_risks,
-            merge_go_risks,
-            borrow_yld_risks,
-            borrow_go_risks,
-        )
-
-    def _cross_wait_from_meet_info(info):
-        subtype = str((info or {}).get("subtype", "none"))
-        if "cross" not in subtype:
-            return 0.0, 0.0
-        t_exit = float((info or {}).get("t_bg_exit_s", np.nan))
-        t_bg = float((info or {}).get("t_bg_s", np.nan))
-        t_wait = t_exit if np.isfinite(t_exit) else t_bg
-        if not np.isfinite(t_wait):
-            return 0.0, 0.0
-        return float(max(t_wait, 0.0)), 1.0
-
-    meet_info = dict(speed_curve.get("meet", {}))
-    cross_wait_time_s = speed_curve.get("cross_wait_time_s", np.nan)
-    cross_wait_valid = speed_curve.get("cross_wait_valid", np.nan)
-    if not np.isfinite(float(cross_wait_time_s)) or not np.isfinite(float(cross_wait_valid)):
-        cross_wait_time_s, cross_wait_valid = _cross_wait_from_meet_info(meet_info)
-
-    total_risks = np.maximum(np.maximum(chase_risks, meet_risks), ped_risks)
-    debug_payload = {
-        "sample_speeds_mps": sample_speeds.astype(np.float32),
-        "total_risks": total_risks.astype(np.float32),
-        "chase_risks": chase_risks.astype(np.float32),
-        "meet_risks": meet_risks.astype(np.float32),
-        "junction_cross_yld_risks": junction_cross_yld_risks.astype(np.float32),
-        "junction_cross_go_risks": junction_cross_go_risks.astype(np.float32),
-        "merge_yld_risks": merge_yld_risks.astype(np.float32),
-        "merge_go_risks": merge_go_risks.astype(np.float32),
-        "borrow_yld_risks": borrow_yld_risks.astype(np.float32),
-        "borrow_go_risks": borrow_go_risks.astype(np.float32),
-        "ped_risks": ped_risks.astype(np.float32),
-        "cross_wait_time_s": float(cross_wait_time_s),
-        "cross_wait_valid": float(cross_wait_valid),
-        "chase_debug": dict(speed_curve.get("chase", {})),
-        "meet_debug": meet_info,
-    }
-    return (
-        sample_speeds,
-        valid_mask,
-        exp_index,
-        chase_risks,
-        meet_risks,
-        ped_risks,
-        junction_cross_yld_risks,
-        junction_cross_go_risks,
-        merge_yld_risks,
-        merge_go_risks,
-        borrow_yld_risks,
-        borrow_go_risks,
-        debug_payload,
-    )
-
-
 def _to_stage1_debug_python(value):
     if isinstance(value, dict):
         return {str(k): _to_stage1_debug_python(v) for k, v in value.items()}
@@ -3683,11 +2595,6 @@ def _to_stage1_debug_python(value):
 def _build_stage1_speed_debug_payload(
     current_cover,
     future_cover,
-    ped_current_cover,
-    ped_future_cover,
-    speed_curve_future_cover,
-    speed_curve_future_persisted,
-    speed_curve_debug,
     merge_motion=None,
     scene_borrow_context=None,
     borrow_motion=None,
@@ -3695,79 +2602,11 @@ def _build_stage1_speed_debug_payload(
     return _to_stage1_debug_python({
         "current_cover": dict(current_cover),
         "future_cover": dict(future_cover),
-        "ped_current_cover": dict(ped_current_cover),
-        "ped_future_cover": dict(ped_future_cover),
-        "speed_curve_future_cover": dict(speed_curve_future_cover),
-        "speed_curve_future_persisted": bool(speed_curve_future_persisted),
-        "speed_curve": dict(speed_curve_debug),
         "merge_motion": dict(merge_motion or {}),
         "scene_borrow_context": None if scene_borrow_context is None else dict(scene_borrow_context),
         "borrow_motion": dict(borrow_motion or {}),
+        "conflict_area": _default_conflict_area_debug(),
     })
-
-
-def _default_merge_episode_debug():
-    return {
-        'phase': 'none',
-        'phase_code': int(MERGE_DECISION_PHASE_TO_CODE['none']),
-        'episode_id': -1,
-        'active': 0.0,
-        'hold': 0.0,
-        'hold_reason': 'none',
-        'no_go': 0.0,
-        'start_frame': -1,
-        'end_frame': -1,
-        'go_frame': -1,
-        'go_reason': 'none',
-        'resolution_actor_id': -1,
-        'end_state': 'none',
-        'end_state_code': int(MERGE_END_STATE_TO_CODE['none']),
-        'actor_ids': [],
-        'actor_switch_frames': [],
-        'future_merge_count': 0,
-        'merge_area_start_s_m': np.nan,
-        'merge_area_end_s_m': np.nan,
-        'merge_area_first_conflict_s_m': np.nan,
-        'merge_area_last_conflict_s_m': np.nan,
-        'frame_role': 'none',
-        'future_grace_index': 0,
-        'red_light_hold_index': 0,
-        'post_go_grace_index': 0,
-        'red_light_hold': 0.0,
-        'grace_frames': int(STAGE1_MERGE_GRACE_FRAMES),
-        'actor_grace_frames': int(STAGE1_MERGE_ACTOR_CONTINUITY_GRACE_FRAMES),
-        'resolution_lookahead_frames': int(STAGE1_MERGE_RESOLUTION_LOOKAHEAD_FRAMES),
-    }
-
-
-def _default_borrow_cross_episode_debug():
-    return {
-        'phase': 'none',
-        'phase_code': int(CROSS_DECISION_PHASE_TO_CODE['none']),
-        'episode_id': -1,
-        'active': 0.0,
-        'active_time_s': 0.0,
-        'start_frame': -1,
-        'end_frame': -1,
-        'go_frame': -1,
-        'context_frame': -1,
-        'window_start_distance_m': np.nan,
-        'window_end_distance_m': np.nan,
-        'frame_role': 'none',
-    }
-
-
-def _default_junction_cross_episode_debug():
-    return {
-        'episode_id': -1,
-        'active': 0.0,
-        'start_frame': -1,
-        'end_frame': -1,
-        'frame_role': 'none',
-        'area_center_world_xy': [],
-        'area_radius_m': np.nan,
-        'candidate_frame_count': 0,
-    }
 
 
 def _default_conflict_area_debug():
@@ -3832,46 +2671,6 @@ def _set_stage1_conflict_area_annotation(sample, conflict_info):
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['conflict_area'] = _to_stage1_debug_python(dict(conflict_info))
-
-
-def _set_stage1_junction_cross_defaults(sample):
-    sample['junction_cross_episode_id'] = np.int64(-1)
-    sample['junction_cross_episode_active'] = np.float32(0.0)
-    sample['junction_cross_episode_start_frame'] = np.int64(-1)
-    sample['junction_cross_episode_end_frame'] = np.int64(-1)
-    stage1_debug = sample.get('stage1_speed_debug')
-    if isinstance(stage1_debug, dict):
-        stage1_debug['junction_cross_episode'] = _default_junction_cross_episode_debug()
-
-
-def _set_stage1_borrow_cross_defaults(sample):
-    sample['borrow_cross_decision_phase'] = np.int64(CROSS_DECISION_PHASE_TO_CODE['none'])
-    sample['borrow_cross_episode_id'] = np.int64(-1)
-    sample['borrow_cross_episode_active'] = np.float32(0.0)
-    sample['borrow_cross_active_time_s'] = np.float32(0.0)
-    sample['borrow_cross_episode_start_frame'] = np.int64(-1)
-    sample['borrow_cross_episode_end_frame'] = np.int64(-1)
-    sample['borrow_cross_go_frame'] = np.int64(-1)
-    sample['borrow_cross_context_frame'] = np.int64(-1)
-    stage1_debug = sample.get('stage1_speed_debug')
-    if isinstance(stage1_debug, dict):
-        stage1_debug['borrow_cross_episode'] = _default_borrow_cross_episode_debug()
-
-
-def _set_stage1_merge_defaults(sample):
-    sample['merge_decision_phase'] = np.int64(MERGE_DECISION_PHASE_TO_CODE['none'])
-    sample['merge_episode_id'] = np.int64(-1)
-    sample['merge_episode_active'] = np.float32(0.0)
-    sample['merge_episode_no_go'] = np.float32(0.0)
-    sample['merge_episode_start_frame'] = np.int64(-1)
-    sample['merge_episode_end_frame'] = np.int64(-1)
-    sample['merge_go_frame'] = np.int64(-1)
-    sample['merge_resolution_actor_id'] = np.int64(-1)
-    sample['merge_end_state'] = np.int64(MERGE_END_STATE_TO_CODE['none'])
-    sample['merge_hold'] = np.float32(0.0)
-    stage1_debug = sample.get('stage1_speed_debug')
-    if isinstance(stage1_debug, dict):
-        stage1_debug['merge_episode'] = _default_merge_episode_debug()
 
 
 def _conflict_area_issue(sample, family, reason, **extra):
@@ -4233,7 +3032,6 @@ def _build_route_conflict_records(samples, route_sample_indices):
             'route_local': np.asarray(route_local, dtype=np.float32),
             'current_cover': stage1_debug.get('current_cover') or {},
             'future_cover': stage1_debug.get('future_cover') or {},
-            'speed_curve_future_cover': stage1_debug.get('speed_curve_future_cover') or {},
             'merge_motion': stage1_debug.get('merge_motion') or {},
             'borrow_motion': stage1_debug.get('borrow_motion') or {},
             'scene_borrow_context': stage1_debug.get('scene_borrow_context') or {},
@@ -4761,58 +3559,14 @@ def _has_stage1_speed_fields(sample):
 
 
 def _set_stage1_speed_fallback(sample):
-    speed_hist = sample.get('speed_hist', sample.get('speed'))
-    if speed_hist is None:
-        speed_mps = 0.0
-    else:
-        speed_arr = np.asarray(speed_hist, dtype=np.float32)
-        speed_mps = float(speed_arr[-1]) if speed_arr.ndim > 0 else float(speed_arr)
-    sample_speeds = _speed_risk_samples_fixed(speed_mps)
-    sample['speed_sample_values'] = sample_speeds.astype(np.float32)
-    sample['speed_sample_valid_mask'] = np.ones(sample_speeds.shape, dtype=np.float32)
-    sample['speed_sample_exp_index'] = np.int64(3)
-    sample['speed_risk_chase_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_meet_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_junction_cross_yld_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_junction_cross_go_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_merge_yld_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_merge_go_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_borrow_yld_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_borrow_go_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_risk_ped_values'] = np.zeros(sample_speeds.shape, dtype=np.float32)
-    sample['speed_cross_wait_time_s'] = np.float32(0.0)
-    sample['speed_cross_wait_valid'] = np.float32(0.0)
     sample['stage1_speed_debug'] = _build_stage1_speed_debug_payload(
         current_cover=_cover_candidate_summary(0, None, {}),
         future_cover=_cover_candidate_summary(0, None, {}),
-        ped_current_cover=_cover_candidate_summary(0, None, {}),
-        ped_future_cover=_cover_candidate_summary(0, None, {}),
-        speed_curve_future_cover=_cover_candidate_summary(0, None, {}),
-        speed_curve_future_persisted=False,
-        speed_curve_debug={
-            'sample_speeds_mps': sample_speeds.astype(np.float32),
-            'total_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'chase_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'meet_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'junction_cross_yld_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'junction_cross_go_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'merge_yld_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'merge_go_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'borrow_yld_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'borrow_go_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'ped_risks': np.zeros(sample_speeds.shape, dtype=np.float32),
-            'cross_wait_time_s': 0.0,
-            'cross_wait_valid': 0.0,
-            'chase_debug': {'valid': 0.0},
-            'meet_debug': {'valid': 0.0},
-        },
+        merge_motion=None,
         scene_borrow_context=None,
         borrow_motion=None,
     )
     _set_stage1_conflict_area_defaults(sample)
-    _set_stage1_junction_cross_defaults(sample)
-    _set_stage1_borrow_cross_defaults(sample)
-    _set_stage1_merge_defaults(sample)
 
 
 def _cover_actor_id(cover):
@@ -5126,34 +3880,6 @@ def _merge_resolve_conflict_area(records, candidate_positions):
     }
 
 
-def _merge_episode_actor_summary(records, start_pos, end_pos):
-    actor_ids = []
-    actor_switch_frames = []
-    last_actor_id = None
-    for pos in range(int(start_pos), int(end_pos) + 1):
-        future_cover = records[pos]['future_cover']
-        if not _cover_is_merge_meet(future_cover):
-            continue
-        actor_id = _cover_actor_id(future_cover)
-        if actor_id < 0:
-            continue
-        actor_ids.append(int(actor_id))
-        if last_actor_id is None or int(actor_id) != int(last_actor_id):
-            actor_switch_frames.append(int(records[pos]['frame_id']))
-            last_actor_id = int(actor_id)
-    if not actor_ids:
-        return [], [], -1
-    unique_actor_ids = []
-    for actor_id in actor_ids:
-        if actor_id not in unique_actor_ids:
-            unique_actor_ids.append(int(actor_id))
-    counts = {}
-    for actor_id in actor_ids:
-        counts[int(actor_id)] = counts.get(int(actor_id), 0) + 1
-    dominant_actor_id = max(sorted(counts.keys()), key=lambda actor_id: (counts[actor_id], -unique_actor_ids.index(actor_id)))
-    return unique_actor_ids, actor_switch_frames, int(dominant_actor_id)
-
-
 def _junction_cover_conflict_world_xy(cover):
     if int((cover or {}).get('exists', 0.0)) <= 0:
         return None
@@ -5260,16 +3986,6 @@ def _junction_cluster_conflict_candidates(records):
     return valid_clusters
 
 
-def _set_stage1_junction_cross_annotation(sample, cross_info):
-    sample['junction_cross_episode_id'] = np.int64(int(cross_info.get('episode_id', -1)))
-    sample['junction_cross_episode_active'] = np.float32(float(cross_info.get('active', 0.0)))
-    sample['junction_cross_episode_start_frame'] = np.int64(int(cross_info.get('start_frame', -1)))
-    sample['junction_cross_episode_end_frame'] = np.int64(int(cross_info.get('end_frame', -1)))
-    stage1_debug = sample.get('stage1_speed_debug')
-    if isinstance(stage1_debug, dict):
-        stage1_debug['junction_cross_episode'] = _to_stage1_debug_python(dict(cross_info))
-
-
 def _build_borrow_motion_context(release_info, current_meas=None, route_local=None, frame_id=-1):
     speed_mps = np.nan if current_meas is None else float(current_meas.get('speed', np.nan))
     corridor = _borrow_corridor_metrics(
@@ -5296,533 +4012,6 @@ def _build_borrow_motion_context(release_info, current_meas=None, route_local=No
         'corridor_length_m': float(corridor.get('borrow_distance_m', np.nan)),
         'context_frame_id': int((release_info or {}).get('context_frame_id', -1)),
     }
-
-
-def _set_stage1_borrow_cross_annotation(sample, cross_info):
-    phase = str(cross_info.get('phase', 'none'))
-    sample['borrow_cross_decision_phase'] = np.int64(CROSS_DECISION_PHASE_TO_CODE.get(phase, 0))
-    sample['borrow_cross_episode_id'] = np.int64(int(cross_info.get('episode_id', -1)))
-    sample['borrow_cross_episode_active'] = np.float32(float(cross_info.get('active', 0.0)))
-    sample['borrow_cross_active_time_s'] = np.float32(float(cross_info.get('active_time_s', 0.0)))
-    sample['borrow_cross_episode_start_frame'] = np.int64(int(cross_info.get('start_frame', -1)))
-    sample['borrow_cross_episode_end_frame'] = np.int64(int(cross_info.get('end_frame', -1)))
-    sample['borrow_cross_go_frame'] = np.int64(int(cross_info.get('go_frame', -1)))
-    sample['borrow_cross_context_frame'] = np.int64(int(cross_info.get('context_frame', -1)))
-    stage1_debug = sample.get('stage1_speed_debug')
-    if isinstance(stage1_debug, dict):
-        stage1_debug['borrow_cross_episode'] = _to_stage1_debug_python(dict(cross_info))
-
-
-def _borrow_find_slowdown_start_pos(records, candidate_positions, search_stop_pos):
-    positions = [int(pos) for pos in candidate_positions if int(pos) <= int(search_stop_pos)]
-    for pos in positions:
-        if pos + 2 >= len(records):
-            continue
-        v0 = float((records[pos].get('borrow_motion') or {}).get('speed_mps', np.nan))
-        v1 = float((records[pos + 1].get('borrow_motion') or {}).get('speed_mps', np.nan))
-        v2 = float((records[pos + 2].get('borrow_motion') or {}).get('speed_mps', np.nan))
-        if not (np.isfinite(v0) and np.isfinite(v1) and np.isfinite(v2)):
-            continue
-        if v1 <= v0 - 0.15 and v2 <= v1 + 0.05:
-            return int(pos)
-    return None
-
-
-def _annotate_route_stage1_borrow_cross_decisions(samples, route_sample_indices):
-    ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
-    records = []
-    for sample_idx in ordered_indices:
-        sample = samples[sample_idx]
-        stage1_debug = sample.get('stage1_speed_debug') or {}
-        scene_borrow_context = stage1_debug.get('scene_borrow_context') or {}
-        current_cover = stage1_debug.get('current_cover') or {}
-        future_cover = stage1_debug.get('future_cover') or {}
-        speed_curve_future_cover = stage1_debug.get('speed_curve_future_cover') or {}
-        records.append({
-            'sample_idx': int(sample_idx),
-            'frame_id': int(sample.get('frame_id', -1)),
-            'scene_borrow_context': scene_borrow_context,
-            'borrow_motion': stage1_debug.get('borrow_motion') or {},
-            'current_cover': current_cover,
-            'future_cover': future_cover,
-            'speed_curve_future_cover': speed_curve_future_cover,
-        })
-
-    default_info = _default_borrow_cross_episode_debug()
-    for record in records:
-        _set_stage1_borrow_cross_annotation(samples[record['sample_idx']], default_info)
-
-    if not records:
-        return
-
-    scene_borrow_context = None
-    for record in records:
-        ctx = record.get('scene_borrow_context') or {}
-        if float(ctx.get('valid', 0.0)) > 0.5 and float(ctx.get('ready', 0.0)) > 0.5:
-            scene_borrow_context = ctx
-            break
-    if scene_borrow_context is None:
-        return
-
-    event_name = str(scene_borrow_context.get('event_name', ''))
-    if event_name not in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}:
-        return
-
-    context_frame_id = int(scene_borrow_context.get('context_frame_id', -1))
-    context_pos = None
-    if context_frame_id >= 0:
-        for pos, record in enumerate(records):
-            if int(record['frame_id']) == int(context_frame_id):
-                context_pos = int(pos)
-                break
-    if context_pos is None:
-        return
-
-    end_pos = None
-    for pos in range(int(context_pos), len(records)):
-        end_dist = float((records[pos].get('borrow_motion') or {}).get('borrow_end_distance_m', np.nan))
-        if np.isfinite(end_dist) and end_dist <= 0.5:
-            end_pos = int(pos)
-            break
-    if end_pos is None:
-        return
-
-    go_pos = None
-    context_speed = float((records[context_pos].get('borrow_motion') or {}).get('speed_mps', np.nan))
-    if np.isfinite(context_speed) and context_speed > 0.5:
-        go_pos = int(context_pos)
-    else:
-        for pos in range(int(context_pos), int(end_pos) + 1):
-            motion = records[pos].get('borrow_motion') or {}
-            speed_mps = float(motion.get('speed_mps', np.nan))
-            start_dist = float(motion.get('borrow_start_distance_m', np.nan))
-            if np.isfinite(speed_mps) and speed_mps > 0.5 and np.isfinite(start_dist) and start_dist <= 5.0:
-                go_pos = int(pos)
-                break
-
-    band_positions = []
-    for pos, record in enumerate(records):
-        if pos > int(end_pos):
-            break
-        start_dist = float((record.get('borrow_motion') or {}).get('borrow_start_distance_m', np.nan))
-        if np.isfinite(start_dist) and 0.0 <= start_dist <= 10.0:
-            band_positions.append(int(pos))
-    if not band_positions:
-        return
-
-    start_pos = _borrow_find_slowdown_start_pos(
-        records,
-        candidate_positions=band_positions,
-        search_stop_pos=(go_pos if go_pos is not None else end_pos),
-    )
-    if start_pos is None:
-        fallback_positions = [
-            int(pos) for pos in band_positions
-            if int(pos) <= int(go_pos if go_pos is not None else end_pos)
-        ]
-        if not fallback_positions:
-            return
-        start_pos = min(
-            fallback_positions,
-            key=lambda pos: abs(float((records[pos].get('borrow_motion') or {}).get('borrow_start_distance_m', np.nan)) - 5.0),
-        )
-
-    if int(start_pos) > int(end_pos):
-        return
-
-    episode_id = 0
-    start_frame = int(records[start_pos]['frame_id'])
-    end_frame = int(records[end_pos]['frame_id'])
-    go_frame = int(records[go_pos]['frame_id']) if go_pos is not None else -1
-    for pos in range(int(start_pos), int(end_pos) + 1):
-        phase = 'yld' if (go_pos is None or int(pos) < int(go_pos)) else 'go'
-        frame_role = 'active'
-        if int(pos) == int(start_pos):
-            frame_role = 'start'
-        if go_pos is not None and int(pos) == int(go_pos):
-            frame_role = 'go_start'
-        if int(pos) == int(end_pos):
-            frame_role = 'end'
-        cross_info = {
-            'phase': str(phase),
-            'phase_code': int(CROSS_DECISION_PHASE_TO_CODE.get(phase, 0)),
-            'episode_id': int(episode_id),
-            'active': 1.0,
-            'active_time_s': float((int(pos) - int(start_pos)) * float(STAGE1_BORROW_ACTIVE_DT_S)),
-            'start_frame': int(start_frame),
-            'end_frame': int(end_frame),
-            'go_frame': int(go_frame),
-            'context_frame': int(context_frame_id),
-            'window_start_distance_m': 10.0,
-            'window_end_distance_m': 0.0,
-            'frame_role': str(frame_role),
-        }
-        _set_stage1_borrow_cross_annotation(samples[records[pos]['sample_idx']], cross_info)
-
-
-def _annotate_route_stage1_junction_cross_decisions(samples, route_sample_indices):
-    ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
-    records = []
-    for sample_idx in ordered_indices:
-        sample = samples[sample_idx]
-        stage1_debug = sample.get('stage1_speed_debug') or {}
-        current_cover = stage1_debug.get('current_cover') or {}
-        future_cover = stage1_debug.get('future_cover') or {}
-        speed_curve = stage1_debug.get('speed_curve') or {}
-        records.append({
-            'sample_idx': int(sample_idx),
-            'frame_id': int(sample.get('frame_id', -1)),
-            'current_cover': current_cover,
-            'future_cover': future_cover,
-            'merge_motion': stage1_debug.get('merge_motion') or {},
-            'meet_debug': speed_curve.get('meet_debug') or {},
-        })
-
-    default_info = _default_junction_cross_episode_debug()
-    for record in records:
-        _set_stage1_junction_cross_annotation(samples[record['sample_idx']], default_info)
-
-    if not records:
-        return
-
-    episode_id = 0
-    prev_end_pos = -1
-    for cluster in _junction_cluster_conflict_candidates(records):
-        cluster_positions = sorted(
-            int(item['pos']) for item in cluster['items']
-            if int(item['pos']) > int(prev_end_pos)
-        )
-        cluster_positions = [
-            int(pos) for pos in cluster_positions
-            if not _current_follow_chase_start_gate(records[int(pos)])
-        ]
-        if not cluster_positions:
-            continue
-        start_pos = max(int(min(cluster_positions)), int(prev_end_pos) + 1)
-        if start_pos >= len(records):
-            continue
-        center_xy = np.asarray(cluster['center_xy'], dtype=np.float32)
-        radius_m = float(cluster['radius_m'])
-        if center_xy.shape != (2,) or not np.all(np.isfinite(center_xy)) or not np.isfinite(radius_m) or radius_m <= 0.0:
-            continue
-
-        if len(cluster_positions) < int(STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS):
-            continue
-
-        end_pos = None
-        has_entered_area = False
-        for pos in range(int(start_pos), len(records)):
-            ego_xy = _junction_record_ego_world_xy(records[pos])
-            if ego_xy is None:
-                continue
-            inside_area = float(np.linalg.norm(ego_xy - center_xy)) <= float(radius_m)
-            if inside_area:
-                has_entered_area = True
-                continue
-            if has_entered_area and not inside_area:
-                end_pos = int(pos)
-                break
-        if end_pos is None:
-            end_pos = int(max(cluster_positions) if not has_entered_area else len(records) - 1)
-
-        if int(start_pos) > int(end_pos):
-            continue
-
-        start_frame = int(records[start_pos]['frame_id'])
-        end_frame = int(records[end_pos]['frame_id'])
-        candidate_frame_count = int(len(cluster_positions))
-        for pos in range(int(start_pos), int(end_pos) + 1):
-            frame_role = 'active'
-            if int(pos) == int(start_pos):
-                frame_role = 'start'
-            if int(pos) == int(end_pos):
-                frame_role = 'end'
-            cross_info = {
-                'episode_id': int(episode_id),
-                'active': 1.0,
-                'start_frame': int(start_frame),
-                'end_frame': int(end_frame),
-                'frame_role': str(frame_role),
-                'area_center_world_xy': center_xy.astype(float).tolist(),
-                'area_radius_m': float(radius_m),
-                'candidate_frame_count': int(candidate_frame_count),
-            }
-            _set_stage1_junction_cross_annotation(samples[records[pos]['sample_idx']], cross_info)
-        prev_end_pos = int(end_pos)
-        episode_id += 1
-
-
-def _set_stage1_merge_annotation(sample, merge_info):
-    phase = str(merge_info.get('phase', 'none'))
-    end_state = str(merge_info.get('end_state', 'none'))
-    sample['merge_decision_phase'] = np.int64(MERGE_DECISION_PHASE_TO_CODE.get(phase, 0))
-    sample['merge_episode_id'] = np.int64(int(merge_info.get('episode_id', -1)))
-    sample['merge_episode_active'] = np.float32(float(merge_info.get('active', 0.0)))
-    sample['merge_episode_no_go'] = np.float32(float(merge_info.get('no_go', 0.0)))
-    sample['merge_episode_start_frame'] = np.int64(int(merge_info.get('start_frame', -1)))
-    sample['merge_episode_end_frame'] = np.int64(int(merge_info.get('end_frame', -1)))
-    sample['merge_go_frame'] = np.int64(int(merge_info.get('go_frame', -1)))
-    sample['merge_resolution_actor_id'] = np.int64(int(merge_info.get('resolution_actor_id', -1)))
-    sample['merge_end_state'] = np.int64(MERGE_END_STATE_TO_CODE.get(end_state, 0))
-    sample['merge_hold'] = np.float32(float(merge_info.get('hold', 0.0)))
-    stage1_debug = sample.get('stage1_speed_debug')
-    if isinstance(stage1_debug, dict):
-        stage1_debug['merge_episode'] = _to_stage1_debug_python(dict(merge_info))
-
-
-def _gate_route_stage1_merge_speed_risks(samples, route_sample_indices):
-    for sample_idx in route_sample_indices:
-        sample = samples[int(sample_idx)]
-        merge_active = float(sample.get('merge_episode_active', 0.0))
-        if merge_active > 0.5:
-            continue
-
-        merge_yld = np.asarray(sample.get('speed_risk_merge_yld_values', []), dtype=np.float32).reshape(-1)
-        merge_go = np.asarray(sample.get('speed_risk_merge_go_values', []), dtype=np.float32).reshape(-1)
-        if merge_yld.size > 0:
-            sample['speed_risk_merge_yld_values'] = np.zeros_like(merge_yld, dtype=np.float32)
-        if merge_go.size > 0:
-            sample['speed_risk_merge_go_values'] = np.zeros_like(merge_go, dtype=np.float32)
-
-        stage1_debug = sample.get('stage1_speed_debug')
-        if not isinstance(stage1_debug, dict):
-            continue
-        speed_curve = stage1_debug.get('speed_curve')
-        if not isinstance(speed_curve, dict):
-            continue
-        debug_merge_yld = np.asarray(speed_curve.get('merge_yld_risks', []), dtype=np.float32).reshape(-1)
-        debug_merge_go = np.asarray(speed_curve.get('merge_go_risks', []), dtype=np.float32).reshape(-1)
-        if debug_merge_yld.size > 0:
-            speed_curve['merge_yld_risks'] = np.zeros_like(debug_merge_yld, dtype=np.float32)
-        if debug_merge_go.size > 0:
-            speed_curve['merge_go_risks'] = np.zeros_like(debug_merge_go, dtype=np.float32)
-
-
-def _gate_route_stage1_borrow_speed_risks(samples, route_sample_indices):
-    for sample_idx in route_sample_indices:
-        sample = samples[int(sample_idx)]
-        borrow_active = float(sample.get('borrow_cross_episode_active', 0.0))
-        if borrow_active > 0.5:
-            continue
-
-        borrow_yld = np.asarray(sample.get('speed_risk_borrow_yld_values', []), dtype=np.float32).reshape(-1)
-        borrow_go = np.asarray(sample.get('speed_risk_borrow_go_values', []), dtype=np.float32).reshape(-1)
-        if borrow_yld.size > 0:
-            sample['speed_risk_borrow_yld_values'] = np.zeros_like(borrow_yld, dtype=np.float32)
-        if borrow_go.size > 0:
-            sample['speed_risk_borrow_go_values'] = np.zeros_like(borrow_go, dtype=np.float32)
-
-        stage1_debug = sample.get('stage1_speed_debug')
-        if not isinstance(stage1_debug, dict):
-            continue
-        speed_curve = stage1_debug.get('speed_curve')
-        if not isinstance(speed_curve, dict):
-            continue
-        debug_borrow_yld = np.asarray(speed_curve.get('borrow_yld_risks', []), dtype=np.float32).reshape(-1)
-        debug_borrow_go = np.asarray(speed_curve.get('borrow_go_risks', []), dtype=np.float32).reshape(-1)
-        if debug_borrow_yld.size > 0:
-            speed_curve['borrow_yld_risks'] = np.zeros_like(debug_borrow_yld, dtype=np.float32)
-        if debug_borrow_go.size > 0:
-            speed_curve['borrow_go_risks'] = np.zeros_like(debug_borrow_go, dtype=np.float32)
-
-
-def _gate_route_stage1_junction_speed_risks(samples, route_sample_indices):
-    for sample_idx in route_sample_indices:
-        sample = samples[int(sample_idx)]
-        junction_active = float(sample.get('junction_cross_episode_active', 0.0))
-        if junction_active > 0.5:
-            continue
-
-        junction_yld = np.asarray(sample.get('speed_risk_junction_cross_yld_values', []), dtype=np.float32).reshape(-1)
-        junction_go = np.asarray(sample.get('speed_risk_junction_cross_go_values', []), dtype=np.float32).reshape(-1)
-        if junction_yld.size > 0:
-            sample['speed_risk_junction_cross_yld_values'] = np.zeros_like(junction_yld, dtype=np.float32)
-        if junction_go.size > 0:
-            sample['speed_risk_junction_cross_go_values'] = np.zeros_like(junction_go, dtype=np.float32)
-
-        stage1_debug = sample.get('stage1_speed_debug')
-        if not isinstance(stage1_debug, dict):
-            continue
-        speed_curve = stage1_debug.get('speed_curve')
-        if not isinstance(speed_curve, dict):
-            continue
-        debug_junction_yld = np.asarray(speed_curve.get('junction_cross_yld_risks', []), dtype=np.float32).reshape(-1)
-        debug_junction_go = np.asarray(speed_curve.get('junction_cross_go_risks', []), dtype=np.float32).reshape(-1)
-        if debug_junction_yld.size > 0:
-            speed_curve['junction_cross_yld_risks'] = np.zeros_like(debug_junction_yld, dtype=np.float32)
-        if debug_junction_go.size > 0:
-            speed_curve['junction_cross_go_risks'] = np.zeros_like(debug_junction_go, dtype=np.float32)
-
-
-def _annotate_route_stage1_merge_decisions(samples, route_sample_indices, grace_frames=STAGE1_MERGE_GRACE_FRAMES):
-    ordered_indices = sorted(route_sample_indices, key=lambda i: int(samples[i].get('frame_id', -1)))
-    records = []
-    for sample_idx in ordered_indices:
-        sample = samples[sample_idx]
-        stage1_debug = sample.get('stage1_speed_debug') or {}
-        current_cover = stage1_debug.get('current_cover') or _cover_candidate_summary(0, None, {})
-        future_cover = stage1_debug.get('future_cover') or _cover_candidate_summary(0, None, {})
-        speed_curve = stage1_debug.get('speed_curve') or {}
-        records.append({
-            'sample_idx': int(sample_idx),
-            'frame_id': int(sample.get('frame_id', -1)),
-            'current_cover': current_cover,
-            'future_cover': future_cover,
-            'merge_motion': stage1_debug.get('merge_motion') or {},
-            'meet_debug': speed_curve.get('meet_debug') or {},
-        })
-
-    default_info = _default_merge_episode_debug()
-    for record in records:
-        _set_stage1_merge_annotation(samples[record['sample_idx']], default_info)
-
-    num_records = len(records)
-    pos = 0
-    episode_id = 0
-    while pos < num_records:
-        start_scan_pos = None
-        while pos < num_records:
-            if np.isfinite(_merge_record_conflict_s(records[pos])):
-                start_scan_pos = int(pos)
-                break
-            pos += 1
-        if start_scan_pos is None:
-            break
-
-        area_info = _merge_resolve_conflict_area(
-            records,
-            _merge_collect_conflict_candidate_positions(records, start_scan_pos),
-        )
-        if area_info is None:
-            pos = int(start_scan_pos) + 1
-            continue
-
-        future_merge_positions = [int(p) for p in area_info.get('inlier_positions', [])]
-        conflict_s_values = [
-            float(_merge_record_conflict_s(records[int(p)]))
-            for p in future_merge_positions
-            if np.isfinite(_merge_record_conflict_s(records[int(p)]))
-        ]
-        if not future_merge_positions or not conflict_s_values:
-            pos = int(start_scan_pos) + 1
-            continue
-        eligible_start_positions = [
-            int(p) for p in future_merge_positions
-            if not _current_follow_chase_start_gate(records[int(p)])
-        ]
-        if not eligible_start_positions:
-            pos = int(max(future_merge_positions)) + 1
-            continue
-        front_candidates = []
-        for p in eligible_start_positions:
-            front_s = _merge_record_scene_front_s(records[int(p)])
-            if np.isfinite(front_s):
-                front_candidates.append((float(front_s), int(p)))
-        if front_candidates:
-            _, start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))
-        else:
-            start_pos = min(eligible_start_positions)
-
-        go_pos = None
-        go_reason = 'none'
-        end_pos = None
-        end_state = 'ended_route_end'
-        scan_pos = int(start_pos)
-
-        merge_area_first_conflict_s_m = float(area_info['first_conflict_s_m'])
-        merge_area_last_conflict_s_m = float(area_info['last_conflict_s_m'])
-        merge_area_start_s_m = float(merge_area_first_conflict_s_m)
-        merge_area_end_s_m = float(merge_area_last_conflict_s_m + float(STAGE1_MERGE_AREA_POST_MARGIN_M))
-
-        while scan_pos < num_records:
-            if go_pos is None:
-                has_go_signal, current_go_reason = _merge_record_go_signal(
-                    records[scan_pos],
-                    merge_area_start_s_m=merge_area_start_s_m,
-                )
-                if has_go_signal:
-                    go_pos = int(scan_pos)
-                    go_reason = str(current_go_reason)
-
-            if _merge_record_passed_area(records[scan_pos], merge_area_end_s_m):
-                end_pos = int(scan_pos)
-                end_state = 'ended_merge_area'
-                break
-            scan_pos += 1
-
-        if end_pos is None:
-            end_pos = num_records - 1
-        start_frame = int(records[start_pos]['frame_id'])
-        end_frame = int(records[end_pos]['frame_id'])
-        no_go = go_pos is None
-        actor_ids, actor_switch_frames, dominant_actor_id = _merge_episode_actor_summary(records, start_pos, end_pos)
-
-        red_light_hold_indices = {}
-        red_light_hold_run = 0
-        for episode_pos in range(int(start_pos), int(end_pos) + 1):
-            if _merge_is_red_light_wait(records[episode_pos].get('merge_motion', {})):
-                red_light_hold_run += 1
-                red_light_hold_indices[int(episode_pos)] = int(red_light_hold_run)
-            else:
-                red_light_hold_run = 0
-
-        merge_area_first_conflict_s_m = float(min(conflict_s_values))
-        merge_area_last_conflict_s_m = float(max(conflict_s_values))
-        merge_area_start_s_m = float(merge_area_first_conflict_s_m)
-        merge_area_end_s_m = float(merge_area_last_conflict_s_m + float(STAGE1_MERGE_AREA_POST_MARGIN_M))
-
-        for episode_pos in range(int(start_pos), int(end_pos) + 1):
-            record = records[episode_pos]
-            red_light_hold = _merge_is_red_light_wait(record.get('merge_motion', {}))
-            hold_reason = 'red_light' if red_light_hold else 'none'
-            if no_go:
-                phase = 'yld'
-            else:
-                phase = 'yld' if int(episode_pos) < int(go_pos) else 'go'
-            frame_role = phase
-            if int(episode_pos) == int(start_pos):
-                frame_role = 'start'
-            if red_light_hold:
-                frame_role = 'hold'
-            if go_pos is not None and int(episode_pos) == int(go_pos):
-                frame_role = 'go_start'
-            if int(episode_pos) == int(end_pos):
-                frame_role = 'end'
-            merge_info = {
-                'phase': str(phase),
-                'phase_code': int(MERGE_DECISION_PHASE_TO_CODE[phase]),
-                'episode_id': int(episode_id),
-                'active': 1.0,
-                'hold': float(red_light_hold),
-                'hold_reason': str(hold_reason),
-                'no_go': float(no_go),
-                'start_frame': int(start_frame),
-                'end_frame': int(end_frame),
-                'go_frame': int(records[go_pos]['frame_id']) if go_pos is not None else -1,
-                'resolution_actor_id': int(dominant_actor_id),
-                'end_state': str(end_state),
-                'end_state_code': int(MERGE_END_STATE_TO_CODE.get(end_state, 0)),
-                'actor_ids': [int(actor_id) for actor_id in actor_ids],
-                'actor_switch_frames': [int(frame_id) for frame_id in actor_switch_frames],
-                'future_merge_count': int(len(future_merge_positions)),
-                'merge_area_start_s_m': float(merge_area_start_s_m),
-                'merge_area_end_s_m': float(merge_area_end_s_m),
-                'merge_area_first_conflict_s_m': float(merge_area_first_conflict_s_m),
-                'merge_area_last_conflict_s_m': float(merge_area_last_conflict_s_m),
-                'frame_role': str(frame_role),
-                'future_grace_index': 0,
-                'red_light_hold_index': int(red_light_hold_indices.get(int(episode_pos), 0)),
-                'post_go_grace_index': 0,
-                'red_light_hold': float(red_light_hold),
-                'grace_frames': 0,
-                'actor_grace_frames': 0,
-                'resolution_lookahead_frames': 0,
-                'go_reason': str(go_reason),
-            }
-            _set_stage1_merge_annotation(samples[record['sample_idx']], merge_info)
-
-        episode_id += 1
-        pos = int(end_pos) + 1
 
 
 def _build_future_frames_data(image_data_root, base_dir, frame_str, num_future):
@@ -5893,20 +4082,7 @@ def precompute(
     stage1_timing=False,
     stage1_timing_every=1,
 ):
-    anchor_centers_abs = None
-    num_modes = None
     num_points = None
-    if not stage1_only:
-        if anchor_path is None:
-            raise ValueError("anchor_path is required unless --stage1_only is used")
-        if anchor_path.endswith('.npy'):
-            anchor_centers_abs = np.load(anchor_path)
-        else:
-            with open(anchor_path, 'rb') as f:
-                anchor_centers_abs = pickle.load(f)['centers']
-        num_modes = anchor_centers_abs.shape[0]
-        num_points = anchor_centers_abs.shape[1]
-        print(f"Anchor: {anchor_centers_abs.shape} from {anchor_path}")
 
     # Load packed samples
     packed_path = _ensure_packed_samples(dataset_path)
@@ -5924,26 +4100,22 @@ def precompute(
             f"packed_size_gb={packed_size_gb:.2f}"
         )
 
-    already_semantic = sum(1 for s in samples if 'behavior_labels' in s and 'allowed_flags' in s and 'scene_buckets' in s)
-    already_energy = sum(1 for s in samples if 'energy_targets' in s and 'energy_active_mask' in s)
     already_ego_status = sum(1 for s in samples if 'ego_status' in s)
     already_stage1_speed = sum(1 for s in samples if _has_stage1_speed_fields(s))
+    num_points = _infer_num_future_points(samples)
     if stage1_only:
-        num_points = _infer_num_future_points(samples)
         print(
-            f"Existing fields (stage1-only): stage1_speed={already_stage1_speed}/{len(samples)}, "
+            f"Existing fields (stage1-only): conflict_area={already_stage1_speed}/{len(samples)}, "
             f"inferred_num_future={num_points}"
         )
         if already_stage1_speed == len(samples) and not force:
-            print(f"All {len(samples)} samples already have stage1 speed fields. Use --force to re-compute.")
+            print(f"All {len(samples)} samples already have stage1 conflict-area fields. Use --force to re-compute.")
             return
     else:
         complete_fast_fields = sum(1 for s in samples if _has_all_fast_fields(s))
         print(
-            f"Existing fields: semantic={already_semantic}/{len(samples)}, "
-            f"energy={already_energy}/{len(samples)}, "
-            f"ego_status={already_ego_status}/{len(samples)}, "
-            f"stage1_speed={already_stage1_speed}/{len(samples)}, "
+            f"Existing fields: ego_status={already_ego_status}/{len(samples)}, "
+            f"conflict_area={already_stage1_speed}/{len(samples)}, "
             f"complete={complete_fast_fields}/{len(samples)}"
         )
         if complete_fast_fields == len(samples) and not force:
@@ -5951,10 +4123,7 @@ def precompute(
             return
 
     image_data_root = os.path.realpath(image_data_root)
-    semantic_computed = 0
-    energy_built = 0
     ego_status_built = 0
-    front_route_built = 0
     stage1_speed_built = 0
     skipped = 0
     fallback = 0
@@ -5975,10 +4144,7 @@ def precompute(
             'dataset_path': os.path.realpath(dataset_path),
             'packed_path': packed_path,
             'num_samples': len(samples),
-            'semantic_computed': semantic_computed,
-            'energy_built': energy_built,
             'ego_status_built': ego_status_built,
-            'front_route_built': front_route_built,
             'stage1_speed_built': stage1_speed_built,
             'labeling_processed': labeling_processed,
             'stage1_processed': stage1_processed,
@@ -6011,208 +4177,16 @@ def precompute(
 
     try:
         if not stage1_only:
-            for sample in tqdm(samples, desc="Labeling"):
+            for sample in tqdm(samples, desc="Ego Status"):
                 labeling_processed += 1
-                needs_semantic = force or any(
-                    field not in sample for field in ('behavior_labels', 'allowed_flags', 'scene_buckets')
-                )
-                needs_energy = force or any(
-                    field not in sample for field in ('energy_targets', 'energy_active_mask')
-                )
                 needs_ego_status = force or ('ego_status' not in sample)
-                needs_front_route = force or any(
-                    field not in sample for field in (
-                        'front_route_distance',
-                        'front_route_ttc',
-                        'front_route_risk',
-                        'front_route_block_risk',
-                        'front_route_case',
-                        'front_route_has_lead',
-                        'front_route_actor_class',
-                        'front_route_actor_weight',
-                        'front_route_block_bin',
-                        'front_route_ttc_bin',
-                        'front_route_hazard_bin',
-                    )
-                )
 
-                if not (needs_semantic or needs_energy or needs_ego_status or needs_front_route):
+                if not needs_ego_status:
                     skipped += 1
                     _maybe_checkpoint(phase='labeling')
                     continue
 
                 dirty_since_checkpoint = True
-                base_dir = None
-                frame_str = None
-                current_boxes = None
-                current_measurements = None
-                ego_matrix_current = None
-                future_frames_data = None
-
-                if needs_semantic:
-                    base_dir, frame_str = _resolve_feature_frame_info(sample)
-                    if base_dir is None or frame_str is None:
-                        _set_semantic_fallback(sample, num_modes)
-                        fallback += 1
-                    else:
-                        bev_rel = os.path.join(base_dir, 'bev_semantics', f'{frame_str}.png')
-                        bev_path = os.path.join(image_data_root, bev_rel)
-
-                        if not os.path.exists(bev_path):
-                            _set_semantic_fallback(sample, num_modes)
-                            fallback += 1
-                        else:
-                            bev_semantic = np.array(Image.open(bev_path))
-
-                            boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
-                            boxes_path = os.path.join(image_data_root, boxes_rel)
-                            current_boxes = _load_json_gz_if_exists(boxes_path)
-
-                            meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
-                            meas_path = os.path.join(image_data_root, meas_rel)
-                            current_measurements = _load_json_gz_if_exists(meas_path)
-
-                            if current_measurements is not None:
-                                ego_matrix_current = current_measurements.get('ego_matrix', None)
-
-                            if ego_matrix_current is not None:
-                                frame_id = int(frame_str)
-                                future_frames_data = []
-                                for k in range(1, num_points + 1):
-                                    future_frame_str = f"{frame_id + k:04d}"
-                                    fut_boxes_path = os.path.join(
-                                        image_data_root, base_dir,
-                                        'boxes', f'{future_frame_str}.json.gz')
-                                    fut_meas_path = os.path.join(
-                                        image_data_root, base_dir,
-                                        'measurements', f'{future_frame_str}.json.gz')
-                                    if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
-                                        try:
-                                            fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
-                                            fut_meas = _load_json_gz_if_exists(fut_meas_path)
-                                            if fut_boxes is None or fut_meas is None:
-                                                future_frames_data.append(None)
-                                                continue
-                                            fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                                            if fut_ego_matrix is not None:
-                                                future_frames_data.append((fut_boxes, fut_ego_matrix))
-                                            else:
-                                                future_frames_data.append(None)
-                                        except Exception:
-                                            future_frames_data.append(None)
-                                    else:
-                                        future_frames_data.append(None)
-                            gt_traj = sample.get('ego_waypoints', None)
-                            if gt_traj is not None:
-                                if isinstance(gt_traj, np.ndarray):
-                                    gt_traj = gt_traj[1:]
-                                else:
-                                    gt_traj = np.array(gt_traj)[1:]
-
-                            behavior_labels, allowed_flags, _ = label_anchors_semantic(
-                                anchor_centers_abs, bev_semantic,
-                                ppm=bev_ppm, bev_size=bev_size,
-                                boxes=current_boxes,
-                                measurements=current_measurements,
-                                ego_matrix_current=ego_matrix_current,
-                                future_frames_data=future_frames_data,
-                                gt_trajectory=gt_traj,
-                            )
-
-                            bucket_flags = classify_scene_buckets(
-                                measurements=current_measurements,
-                                boxes=current_boxes,
-                                ego_waypoints=gt_traj,
-                            )
-
-                            sample['behavior_labels'] = behavior_labels
-                            sample['allowed_flags'] = allowed_flags.astype(np.float32)
-                            sample['scene_buckets'] = bucket_flags.astype(np.float32)
-                            semantic_computed += 1
-
-                if needs_front_route:
-                    if base_dir is None or frame_str is None:
-                        base_dir, frame_str = _resolve_feature_frame_info(sample)
-                    if base_dir is None or frame_str is None:
-                        _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
-                        fallback += 1
-                    else:
-                        if current_boxes is None:
-                            boxes_rel = os.path.join(base_dir, 'boxes', f'{frame_str}.json.gz')
-                            boxes_path = os.path.join(image_data_root, boxes_rel)
-                            current_boxes = _load_json_gz_if_exists(boxes_path)
-                        if current_measurements is None:
-                            meas_rel = os.path.join(base_dir, 'measurements', f'{frame_str}.json.gz')
-                            meas_path = os.path.join(image_data_root, meas_rel)
-                            current_measurements = _load_json_gz_if_exists(meas_path)
-                        if ego_matrix_current is None and current_measurements is not None:
-                            ego_matrix_current = current_measurements.get('ego_matrix', None)
-                        if future_frames_data is None and ego_matrix_current is not None:
-                            frame_id = int(frame_str)
-                            future_frames_data = []
-                            for k in range(1, num_points + 1):
-                                future_frame_str = f'{frame_id + k:04d}'
-                                fut_boxes_path = os.path.join(image_data_root, base_dir, 'boxes', f'{future_frame_str}.json.gz')
-                                fut_meas_path = os.path.join(image_data_root, base_dir, 'measurements', f'{future_frame_str}.json.gz')
-                                fut_boxes = _load_json_gz_if_exists(fut_boxes_path)
-                                fut_meas = _load_json_gz_if_exists(fut_meas_path)
-                                if fut_boxes is None or fut_meas is None:
-                                    future_frames_data.append(None)
-                                    continue
-                                fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                                if fut_ego_matrix is not None:
-                                    future_frames_data.append((fut_boxes, fut_ego_matrix))
-                                else:
-                                    future_frames_data.append(None)
-
-                        route = sample.get('route', None)
-                        ego_speed = 0.0
-                        if current_measurements is not None:
-                            ego_speed = float(current_measurements.get('speed', 0.0))
-                        elif sample.get('speed_hist', None) is not None:
-                            ego_speed = float(np.asarray(sample['speed_hist'], dtype=np.float32)[-1])
-
-                        if route is None or current_boxes is None:
-                            _set_front_route_fallback(sample, front_max_distance_m, front_max_ttc_s)
-                            fallback += 1
-                        else:
-                            front_label = _compute_front_route_label(
-                                route=route,
-                                current_boxes=current_boxes,
-                                ego_speed=ego_speed,
-                                ego_matrix_current=ego_matrix_current,
-                                future_frames_data=future_frames_data,
-                                corridor_margin_m=front_corridor_margin_m,
-                                route_step_m=front_route_step_m,
-                                max_distance_m=front_max_distance_m,
-                                safe_ttc_s=front_safe_ttc_s,
-                                max_ttc_s=front_max_ttc_s,
-                                block_safe_distance_m=front_block_safe_distance_m,
-                            )
-                            sample['front_route_distance'] = np.float32(front_label['distance'])
-                            sample['front_route_ttc'] = np.float32(front_label['ttc'])
-                            sample['front_route_risk'] = np.float32(front_label['risk'])
-                            sample['front_route_block_risk'] = np.float32(front_label['block_risk'])
-                            sample['front_route_case'] = np.int64(front_label['case'])
-                            sample['front_route_has_lead'] = np.float32(front_label['has_lead'])
-                            sample['front_route_actor_class'] = np.int64(front_label['actor_class'])
-                            sample['front_route_actor_weight'] = np.float32(front_label['actor_weight'])
-                            sample['front_route_block_bin'] = np.int64(front_label['block_bin'])
-                            sample['front_route_ttc_bin'] = np.int64(front_label['ttc_bin'])
-                            sample['front_route_hazard_bin'] = np.int64(front_label['hazard_bin'])
-                            front_route_built += 1
-
-                if needs_energy:
-                    if 'behavior_labels' not in sample or 'allowed_flags' not in sample:
-                        _set_semantic_fallback(sample, num_modes)
-                    energy_targets, energy_active_mask = _build_energy_targets(
-                        sample['behavior_labels'],
-                        sample['allowed_flags'],
-                    )
-                    sample['energy_targets'] = energy_targets
-                    sample['energy_active_mask'] = energy_active_mask
-                    energy_built += 1
-
                 if needs_ego_status:
                     sample['ego_status'] = _build_ego_status(sample)
                     ego_status_built += 1
@@ -6235,7 +4209,7 @@ def precompute(
         stage1_timing_every = max(int(stage1_timing_every), 1)
         stage1_timing_totals = defaultdict(float)
         for route_group_idx, (base_dir, route_sample_indices) in enumerate(
-            tqdm(route_groups.items(), desc="Stage1 speed", leave=False),
+            tqdm(route_groups.items(), desc="Stage1 conflict-area", leave=False),
             start=1,
         ):
             route_total_start = time.perf_counter()
@@ -6316,13 +4290,6 @@ def precompute(
                         route_step_m=max(0.25, float(front_route_step_m)),
                     )
 
-            persisted_meet = None
-            persisted_meet_frames_left = 0
-            persist_dt_s = 0.25
-            cross_wait_state = 0
-            cross_wait_frames = 0
-            cross_episode_active = False
-
             for sample_idx in route_sample_indices:
                 stage1_processed += 1
                 dirty_since_checkpoint = True
@@ -6402,46 +4369,6 @@ def precompute(
                 route_timing['front_route'] += float(time.perf_counter() - timing_start)
                 current_cover = _cover_candidate_summary(1, front_debug.get('best_current'), front_debug, current_meas=current_measurements, event_name=event_name)
                 future_cover = _cover_candidate_summary(2, front_debug.get('best_future'), front_debug, current_meas=current_measurements, event_name=event_name)
-                speed_curve_future_cover = dict(future_cover)
-                speed_curve_future_persisted = False
-
-                if int(future_cover.get('exists', 0.0)) > 0 and future_cover['interaction']['name'] == 'meet':
-                    persisted_meet = dict(future_cover)
-                    persisted_meet['actor_id'] = int(future_cover.get('actor_id', -1))
-                    persisted_meet_frames_left = STAGE1_PERSISTED_MEET_FRAMES
-                elif persisted_meet is not None and persisted_meet_frames_left > 0:
-                    actor_id = int(persisted_meet.get('actor_id', -1))
-                    actor_box = _find_box_by_id(current_boxes_dynamic, actor_id)
-                    ego_box = _find_ego_box(current_boxes_dynamic)
-                    ego_speed_now = float(current_measurements.get('speed', 0.0))
-                    bg_speed_now = float(persisted_meet.get('other_speed', np.nan))
-                    if actor_box is not None:
-                        bg_speed_now = float(abs(actor_box.get('speed', bg_speed_now)))
-                    pseudo = dict(persisted_meet)
-                    keep_persisted = False
-                    if actor_box is not None:
-                        pos = np.asarray(actor_box.get('position', [np.nan, np.nan])[:2], dtype=np.float32)
-                        if pos.shape == (2,) and np.all(np.isfinite(pos)):
-                            if float(pos[0]) < 1.0 and float(np.linalg.norm(pos)) < 12.0:
-                                pseudo['d_ego'] = 0.0
-                                pseudo['d_bg'] = float(max(np.linalg.norm(pos), 1e-3))
-                                pseudo['rear_gap_m'] = float(_approx_box_clearance_gap_m(actor_box, ego_box))
-                                keep_persisted = True
-                    if not keep_persisted:
-                        if np.isfinite(float(pseudo.get('d_ego', np.nan))):
-                            pseudo['d_ego'] = float(max(float(pseudo['d_ego']) - ego_speed_now * persist_dt_s, 0.0))
-                        if np.isfinite(float(pseudo.get('d_bg', np.nan))):
-                            pseudo['d_bg'] = float(max(float(pseudo['d_bg']) - bg_speed_now * persist_dt_s, 0.0))
-                        keep_persisted = bool(np.isfinite(float(pseudo.get('d_bg', np.nan))) and float(pseudo.get('d_bg', 0.0)) > 0.25)
-                    if keep_persisted:
-                        pseudo['other_speed'] = float(bg_speed_now)
-                        speed_curve_future_cover = pseudo
-                        speed_curve_future_persisted = True
-                        persisted_meet = dict(pseudo)
-                        persisted_meet_frames_left -= 1
-                    else:
-                        persisted_meet = None
-                        persisted_meet_frames_left = 0
 
                 scene_route_world = scene_route_polyline_world.get(base_dir_cur)
                 current_cover = _augment_cover_with_scene_route_fields(
@@ -6454,173 +4381,15 @@ def precompute(
                     ego_matrix_current=ego_matrix_current,
                     scene_route_polyline_world=scene_route_world,
                 )
-                speed_curve_future_cover = _augment_cover_with_scene_route_fields(
-                    speed_curve_future_cover,
-                    ego_matrix_current=ego_matrix_current,
-                    scene_route_polyline_world=scene_route_world,
-                )
-
-                raw_cross_active = _cover_is_cross_meet(current_cover) or _cover_is_cross_meet(speed_curve_future_cover)
-                if not cross_episode_active and raw_cross_active:
-                    cross_episode_active = True
-                borrow_corridor = _borrow_corridor_metrics(
-                    scene_borrow_context,
-                    current_meas=current_measurements,
-                    route_local=route_input,
-                )
                 borrow_motion = _build_borrow_motion_context(
                     scene_borrow_context,
                     current_meas=current_measurements,
                     route_local=route_input,
                     frame_id=int(sample.get('frame_id', -1)),
                 )
-
-                def _cross_start_distance_from_cover(cover):
-                    if not _cover_is_cross_meet(cover):
-                        return np.nan
-                    subtype = _cover_interaction_subtype(cover)
-                    if subtype == "borrow_cross_meet" and borrow_corridor is not None:
-                        return float(borrow_corridor.get("borrow_start_distance_m", np.nan))
-                    d_ego = cover.get("distance", cover.get("d_ego", np.nan))
-                    return float(d_ego) if np.isfinite(float(d_ego)) else np.nan
-
-                cross_start_distance = np.nan
-                dist_current = _cross_start_distance_from_cover(current_cover)
-                dist_future = _cross_start_distance_from_cover(speed_curve_future_cover)
-                if np.isfinite(dist_current) and np.isfinite(dist_future):
-                    cross_start_distance = float(min(dist_current, dist_future))
-                elif np.isfinite(dist_current):
-                    cross_start_distance = float(dist_current)
-                elif np.isfinite(dist_future):
-                    cross_start_distance = float(dist_future)
-
-                near_cross_start = (
-                    np.isfinite(cross_start_distance) and
-                    float(cross_start_distance) <= float(STAGE1_CROSS_START_DISTANCE_M)
-                )
-                go_now = False
-                if cross_episode_active:
-                    if cross_wait_state == 0:
-                        if near_cross_start and ego_speed <= float(STAGE1_CROSS_WAIT_SPEED_THRESH):
-                            cross_wait_state = 1
-                            cross_wait_frames = 0
-                    if cross_wait_state == 1:
-                        if ego_speed >= float(STAGE1_CROSS_GO_SPEED_THRESH):
-                            go_now = True
-                            cross_wait_state = 2
-                        else:
-                            cross_wait_frames += 1
-                cross_wait_time_s = float(cross_wait_frames) * float(STAGE1_CROSS_WAIT_DT_S)
-                cross_wait_valid = 1.0 if (cross_wait_state == 1 or go_now) else 0.0
-                if go_now:
-                    cross_episode_active = False
-                    cross_wait_state = 0
-                    cross_wait_frames = 0
-
-                ped_margin_m = _pedestrian_corridor_margin_m(current_boxes)
-                ped_current_boxes = _filter_current_boxes_pedestrian(current_boxes)
-                ped_future_frames = _filter_future_frames_pedestrian(future_frames_data)
-                _, ped_debug = _compute_front_route_label(
-                    route=route_input,
-                    current_boxes=ped_current_boxes,
-                    ego_speed=ego_speed,
-                    ego_matrix_current=ego_matrix_current,
-                    future_frames_data=ped_future_frames,
-                    corridor_margin_m=ped_margin_m,
-                    route_step_m=front_route_step_m,
-                    max_distance_m=front_max_distance_m,
-                    safe_ttc_s=front_safe_ttc_s,
-                    max_ttc_s=front_max_ttc_s,
-                    block_safe_distance_m=front_block_safe_distance_m,
-                    return_debug=True,
-                )
-                ped_current_cover = _cover_candidate_summary(1, ped_debug.get('best_current'), ped_debug, current_meas=current_measurements, event_name=event_name)
-                ped_future_cover = _cover_candidate_summary(2, ped_debug.get('best_future'), ped_debug, current_meas=current_measurements, event_name=event_name)
-
-                (
-                    sample_speeds,
-                    valid_mask,
-                    exp_index,
-                    chase_risks,
-                    meet_risks,
-                    _,
-                    junction_cross_yld_risks,
-                    junction_cross_go_risks,
-                    merge_yld_risks,
-                    merge_go_risks,
-                    borrow_yld_risks,
-                    borrow_go_risks,
-                    speed_curve_debug,
-                ) = _build_speed_curve_targets(
-                    current_cover=current_cover,
-                    future_cover=speed_curve_future_cover,
-                    current_meas=current_measurements,
-                    current_boxes=current_boxes_dynamic,
-                    route_local=route_input,
-                    release_info=scene_borrow_context,
-                    event_name=event_name,
-                    return_debug=True,
-                )
-                (
-                    ped_sample_speeds,
-                    _,
-                    _,
-                    _,
-                    _,
-                    ped_risks,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                ) = _build_speed_curve_targets(
-                    current_cover=ped_current_cover,
-                    future_cover=ped_future_cover,
-                    current_meas=current_measurements,
-                    current_boxes=current_boxes,
-                    route_local=route_input,
-                    release_info=scene_borrow_context,
-                    event_name=event_name,
-                )
-                if ped_sample_speeds.shape != sample_speeds.shape or not np.allclose(ped_sample_speeds, sample_speeds):
-                    ped_risks = np.zeros(sample_speeds.shape, dtype=np.float32)
-
-                sample['speed_sample_values'] = sample_speeds.astype(np.float32)
-                sample['speed_sample_valid_mask'] = valid_mask.astype(np.float32)
-                sample['speed_sample_exp_index'] = np.int64(exp_index)
-                sample['speed_risk_chase_values'] = chase_risks.astype(np.float32)
-                sample['speed_risk_meet_values'] = meet_risks.astype(np.float32)
-                sample['speed_risk_junction_cross_yld_values'] = junction_cross_yld_risks.astype(np.float32)
-                sample['speed_risk_junction_cross_go_values'] = junction_cross_go_risks.astype(np.float32)
-                sample['speed_risk_merge_yld_values'] = merge_yld_risks.astype(np.float32)
-                sample['speed_risk_merge_go_values'] = merge_go_risks.astype(np.float32)
-                sample['speed_risk_borrow_yld_values'] = borrow_yld_risks.astype(np.float32)
-                sample['speed_risk_borrow_go_values'] = borrow_go_risks.astype(np.float32)
-                sample['speed_risk_ped_values'] = ped_risks.astype(np.float32)
-                sample['speed_cross_wait_time_s'] = np.float32(cross_wait_time_s)
-                sample['speed_cross_wait_valid'] = np.float32(cross_wait_valid)
-                speed_curve_debug['junction_cross_yld_risks'] = np.asarray(junction_cross_yld_risks, dtype=np.float32)
-                speed_curve_debug['junction_cross_go_risks'] = np.asarray(junction_cross_go_risks, dtype=np.float32)
-                speed_curve_debug['merge_yld_risks'] = np.asarray(merge_yld_risks, dtype=np.float32)
-                speed_curve_debug['merge_go_risks'] = np.asarray(merge_go_risks, dtype=np.float32)
-                speed_curve_debug['borrow_yld_risks'] = np.asarray(borrow_yld_risks, dtype=np.float32)
-                speed_curve_debug['borrow_go_risks'] = np.asarray(borrow_go_risks, dtype=np.float32)
-                speed_curve_debug['ped_risks'] = np.asarray(ped_risks, dtype=np.float32)
-                speed_curve_debug['cross_wait_time_s'] = np.float32(cross_wait_time_s)
-                speed_curve_debug['cross_wait_valid'] = np.float32(cross_wait_valid)
-                speed_curve_debug['total_risks'] = np.maximum(
-                    np.maximum(np.asarray(chase_risks, dtype=np.float32), np.asarray(meet_risks, dtype=np.float32)),
-                    np.asarray(ped_risks, dtype=np.float32),
-                ).astype(np.float32)
                 sample['stage1_speed_debug'] = _build_stage1_speed_debug_payload(
                     current_cover=current_cover,
                     future_cover=future_cover,
-                    ped_current_cover=ped_current_cover,
-                    ped_future_cover=ped_future_cover,
-                    speed_curve_future_cover=speed_curve_future_cover,
-                    speed_curve_future_persisted=speed_curve_future_persisted,
-                    speed_curve_debug=speed_curve_debug,
                     merge_motion=_build_merge_motion_context(
                         current_meas=current_measurements,
                         route_dense=front_debug.get('route_dense'),
@@ -6634,12 +4403,6 @@ def precompute(
                 stage1_speed_built += 1
                 _maybe_checkpoint(phase='stage1_speed')
 
-            _annotate_route_stage1_borrow_cross_decisions(samples, route_sample_indices)
-            _annotate_route_stage1_junction_cross_decisions(samples, route_sample_indices)
-            _annotate_route_stage1_merge_decisions(samples, route_sample_indices)
-            _gate_route_stage1_junction_speed_risks(samples, route_sample_indices)
-            _gate_route_stage1_borrow_speed_risks(samples, route_sample_indices)
-            _gate_route_stage1_merge_speed_risks(samples, route_sample_indices)
             _annotate_route_stage1_conflict_areas(samples, route_sample_indices)
             for sample_idx in route_sample_indices:
                 samples[int(sample_idx)].pop('_stage1_route_input_local', None)
@@ -6674,9 +4437,8 @@ def precompute(
         raise
 
     print(
-        f"\nDone: semantic={semantic_computed}, energy={energy_built}, "
-        f"ego_status={ego_status_built}, front_route={front_route_built}, "
-        f"stage1_speed={stage1_speed_built}, "
+        f"\nDone: ego_status={ego_status_built}, "
+        f"conflict_area={stage1_speed_built}, "
         f"skipped={skipped}, fallback={fallback}"
     )
 
@@ -6684,15 +4446,17 @@ def precompute(
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Pre-compute fast training fields into samples_packed.pkl")
+    parser = argparse.ArgumentParser(description="Pre-compute lightweight debug fields into samples_packed.pkl")
     parser.add_argument('--dataset_path', type=str, required=True,
                         help='Path to dataset split (e.g. /media/z/data/dataset/pdm_lite_mini/train)')
     parser.add_argument('--image_data_root', type=str, required=True,
                         help='Root of image data (e.g. /media/z/data/dataset/pdm_lite_mini)')
     parser.add_argument('--anchor_path', type=str, default=None,
-                        help='Path to anchor file (.npy or .pkl). Required unless --stage1_only is used.')
-    parser.add_argument('--bev_ppm', type=float, default=2.0)
-    parser.add_argument('--bev_size', type=int, default=256)
+                        help='Compatibility no-op. Semantic anchor labeling is disabled in the current debug-focused script.')
+    parser.add_argument('--bev_ppm', type=float, default=2.0,
+                        help='Compatibility no-op. Kept to avoid breaking old commands.')
+    parser.add_argument('--bev_size', type=int, default=256,
+                        help='Compatibility no-op. Kept to avoid breaking old commands.')
     parser.add_argument('--front_corridor_margin_m', type=float, default=0.5)
     parser.add_argument('--front_route_step_m', type=float, default=0.25)
     parser.add_argument('--front_max_distance_m', type=float, default=40.0)
@@ -6702,16 +4466,13 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_every_minutes', type=float, default=20.0,
                         help='Periodically atomically save updated samples_packed.pkl to make long runs resumable. Set <=0 to disable.')
     parser.add_argument('--stage1_only', action='store_true',
-                        help='Skip old semantic/energy/ego/front_route labeling and only (re)compute stage1 speed-energy labels.')
+                        help='Skip ego_status refresh and only (re)compute stage1 conflict-area labels.')
     parser.add_argument('--stage1_timing', action='store_true',
                         help='Print lightweight stage1 timing summaries (load/front_route/route_total).')
     parser.add_argument('--stage1_timing_every', type=int, default=1,
                         help='When --stage1_timing is set, print every N route groups.')
     parser.add_argument('--force', action='store_true', help='Re-compute even if labels exist')
     args = parser.parse_args()
-
-    if not args.stage1_only and not args.anchor_path:
-        parser.error('--anchor_path is required unless --stage1_only is used')
 
     precompute(args.dataset_path, args.image_data_root, args.anchor_path,
                bev_ppm=args.bev_ppm,

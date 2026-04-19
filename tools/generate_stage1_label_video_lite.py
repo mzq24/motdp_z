@@ -832,9 +832,6 @@ def _build_text_panel(sample, current_meas):
     current_cover = stage1_debug.get("current_cover") or {}
     future_cover = stage1_debug.get("future_cover") or {}
     conflict_area = stage1_debug.get("conflict_area") or {}
-    borrow_episode = stage1_debug.get("borrow_cross_episode") or {}
-    merge_episode = stage1_debug.get("merge_episode") or {}
-    junction_episode = stage1_debug.get("junction_cross_episode") or {}
 
     base_dir, _ = _resolve_feature_frame_info(sample)
     event_name = _scene_name_from_base_dir(base_dir) or "unknown"
@@ -894,11 +891,11 @@ def _build_text_panel(sample, current_meas):
         col_x0,
         y_left,
         col_w,
-        "Legacy Episodes",
+        "Area Debug",
         [
-            f"borrow active={int(float(sample.get('borrow_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('borrow_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('borrow_cross_episode_end_frame', -1))} go={_fmt_int(sample.get('borrow_cross_go_frame', -1))}",
-            f"merge  active={int(float(sample.get('merge_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('merge_episode_start_frame', -1))} end={_fmt_int(sample.get('merge_episode_end_frame', -1))} go={_fmt_int(sample.get('merge_go_frame', -1))}",
-            f"junc   active={int(float(sample.get('junction_cross_episode_active', 0.0)) > 0.5)} start={_fmt_int(sample.get('junction_cross_episode_start_frame', -1))} end={_fmt_int(sample.get('junction_cross_episode_end_frame', -1))}",
+            f"issue_count={issue_count} issue_families={issue_families}",
+            f"dir src={conflict_area.get('dir_source', 'none')} cover={conflict_area.get('dir_cover_key', 'none')} frame={_fmt_int(conflict_area.get('dir_frame_id', -1))}",
+            f"angle={_fmt_float(conflict_area.get('dir_angle_deg', np.nan))} route={_fmt_float(conflict_area.get('route_heading_deg', np.nan))} actor={_fmt_float(conflict_area.get('actor_heading_deg', np.nan))}",
         ],
         (120, 90, 44),
     )
@@ -924,9 +921,9 @@ def _build_text_panel(sample, current_meas):
         col_w,
         "Debug",
         [
-            f"borrow dbg: phase={borrow_episode.get('phase', 'none')} ctx={_fmt_int(sample.get('borrow_cross_context_frame', -1))} t={_fmt_float(sample.get('borrow_cross_active_time_s', np.nan))}",
-            f"merge dbg : phase={merge_episode.get('phase', 'none')} no_go={_fmt_int(sample.get('merge_episode_no_go', 0))} hold={_fmt_float(sample.get('merge_hold', np.nan))}",
-            f"junc dbg  : episode={_fmt_int(junction_episode.get('episode_id', -1))} candidates={_fmt_int(junction_episode.get('candidate_frame_count', 0))}",
+            f"area xyz start={len(conflict_area.get('area_start_world_xyz', []))} end={len(conflict_area.get('area_end_world_xyz', []))} seg={len(conflict_area.get('area_segment_world_xyz', []))}",
+            f"borrow xyz s={len(conflict_area.get('borrow_start_world_xy', []))} e={len(conflict_area.get('borrow_end_world_xy', []))}",
+            f"collision xyz={len(conflict_area.get('collision_point_world_xyz', []))} radius={_fmt_float(conflict_area.get('area_radius_m', np.nan))}",
         ],
         (86, 86, 86),
     )
