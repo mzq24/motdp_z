@@ -179,7 +179,7 @@ STAGE1_GO_END_CONFIRM_FRAMES = 3
 STAGE1_MERGE_SPEED_CAP_MPS = 1000.0
 STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
 STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
-STAGE1_MERGE_AREA_POST_MARGIN_M = 3.0
+STAGE1_MERGE_AREA_POST_MARGIN_M = 7.0
 STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
@@ -3804,6 +3804,7 @@ def _default_conflict_area_debug():
         'dir_angle_deg': np.nan,
         'route_heading_deg': np.nan,
         'actor_heading_deg': np.nan,
+        'collision_point_world_xyz': [],
         'dir_cover_key': 'none',
         'dir_frame_id': -1,
     }
@@ -3917,6 +3918,16 @@ def _cover_actor_heading_rad(cover):
     if not np.isfinite(actor_heading_deg):
         return np.nan
     return float(np.radians(actor_heading_deg))
+
+
+def _cover_conflict_world_xyz(cover):
+    xyz = np.asarray((cover or {}).get('scene_route_conflict_world_xyz', []), dtype=np.float32).reshape(-1)
+    if xyz.size >= 3 and np.all(np.isfinite(xyz[:3])):
+        return xyz[:3].astype(float).tolist()
+    xy = np.asarray((cover or {}).get('scene_route_conflict_world_xy', []), dtype=np.float32).reshape(-1)
+    if xy.size >= 2 and np.all(np.isfinite(xy[:2])):
+        return [float(xy[0]), float(xy[1]), 0.0]
+    return []
 
 
 def _conflict_dir_from_headings(route_heading_rad, actor_heading_rad):
@@ -4096,13 +4107,14 @@ def _borrow_conflict_dir_info(records, start_pos, end_pos, conflict_start_progre
             'dir': 'opposite',
             'dir_code': int(CONFLICT_DIR_TO_CODE['opposite']),
             'dir_source': 'family_fallback',
-        'dir_angle_deg': np.nan,
-        'route_heading_deg': np.nan,
-        'actor_heading_deg': np.nan,
-        'dir_cover_key': 'none',
-        'dir_frame_id': -1,
-        'topology_override': 'none',
-    }
+            'dir_angle_deg': np.nan,
+            'route_heading_deg': np.nan,
+            'actor_heading_deg': np.nan,
+            'collision_point_world_xyz': [],
+            'dir_cover_key': 'none',
+            'dir_frame_id': -1,
+            'topology_override': 'none',
+        }
     record = records[int(selected['pos'])]
     route_heading_rad = _borrow_route_heading_rad_from_conflict_area(
         record,
@@ -4120,6 +4132,7 @@ def _borrow_conflict_dir_info(records, start_pos, end_pos, conflict_start_progre
         'dir_angle_deg': float(angle_deg) if np.isfinite(angle_deg) else np.nan,
         'route_heading_deg': _heading_to_deg(route_heading_rad) if np.isfinite(route_heading_rad) else np.nan,
         'actor_heading_deg': _heading_to_deg(actor_heading_rad) if np.isfinite(actor_heading_rad) else np.nan,
+        'collision_point_world_xyz': _cover_conflict_world_xyz(selected.get('cover') or {}),
         'dir_cover_key': str(selected.get('cover_key', 'none')),
         'dir_frame_id': int(records[int(selected['pos'])].get('frame_id', -1)),
     }
@@ -4142,6 +4155,7 @@ def _merge_conflict_dir_info(records, start_pos, end_pos, merge_area_start_s_m, 
             'dir_angle_deg': np.nan,
             'route_heading_deg': np.nan,
             'actor_heading_deg': np.nan,
+            'collision_point_world_xyz': [],
             'dir_cover_key': 'none',
             'dir_frame_id': -1,
         }
@@ -4158,6 +4172,7 @@ def _merge_conflict_dir_info(records, start_pos, end_pos, merge_area_start_s_m, 
         'dir_angle_deg': float(angle_deg) if np.isfinite(angle_deg) else np.nan,
         'route_heading_deg': _heading_to_deg(route_heading_rad) if np.isfinite(route_heading_rad) else np.nan,
         'actor_heading_deg': _heading_to_deg(actor_heading_rad) if np.isfinite(actor_heading_rad) else np.nan,
+        'collision_point_world_xyz': _cover_conflict_world_xyz(selected.get('cover') or {}),
         'dir_cover_key': str(selected.get('cover_key', 'none')),
         'dir_frame_id': int(records[int(selected['pos'])].get('frame_id', -1)),
     }
@@ -4180,6 +4195,7 @@ def _junction_conflict_dir_info(records, start_pos, end_pos, area_start_s_m, are
             'dir_angle_deg': np.nan,
             'route_heading_deg': np.nan,
             'actor_heading_deg': np.nan,
+            'collision_point_world_xyz': [],
             'dir_cover_key': 'none',
             'dir_frame_id': -1,
         }
@@ -4194,6 +4210,7 @@ def _junction_conflict_dir_info(records, start_pos, end_pos, area_start_s_m, are
         'dir_angle_deg': float(angle_deg) if np.isfinite(angle_deg) else np.nan,
         'route_heading_deg': _heading_to_deg(route_heading_rad) if np.isfinite(route_heading_rad) else np.nan,
         'actor_heading_deg': _heading_to_deg(actor_heading_rad) if np.isfinite(actor_heading_rad) else np.nan,
+        'collision_point_world_xyz': _cover_conflict_world_xyz(selected.get('cover') or {}),
         'dir_cover_key': str(selected.get('cover_key', 'none')),
         'dir_frame_id': int(records[int(selected['pos'])].get('frame_id', -1)),
     }
@@ -4425,6 +4442,7 @@ def _build_borrow_conflict_windows(records, samples):
         'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
         'area_end_world_xyz': list(world_geometry.get('area_end_world_xyz', [])),
         'area_segment_world_xyz': list(world_geometry.get('area_segment_world_xyz', [])),
+        'collision_point_world_xyz': list(dir_info.get('collision_point_world_xyz', [])),
         'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
         'dir_angle_deg': float(dir_info.get('dir_angle_deg', np.nan)),
         'route_heading_deg': float(dir_info.get('route_heading_deg', np.nan)),
@@ -4545,6 +4563,7 @@ def _build_merge_conflict_windows(records, samples):
             'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
             'area_end_world_xyz': list(world_geometry.get('area_end_world_xyz', [])),
             'area_segment_world_xyz': list(world_geometry.get('area_segment_world_xyz', [])),
+            'collision_point_world_xyz': list(dir_info.get('collision_point_world_xyz', [])),
             'merge_area_first_conflict_s_m': float(area_info['first_conflict_s_m']),
             'merge_area_last_conflict_s_m': float(area_info['last_conflict_s_m']),
             'merge_direction_heading_rad': float(np.radians(dir_info.get('route_heading_deg', np.nan))) if np.isfinite(float(dir_info.get('route_heading_deg', np.nan))) else np.nan,
@@ -4639,6 +4658,7 @@ def _build_junction_conflict_windows(records, samples):
             'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
             'area_end_world_xyz': list(world_geometry.get('area_end_world_xyz', [])),
             'area_segment_world_xyz': list(world_geometry.get('area_segment_world_xyz', [])),
+            'collision_point_world_xyz': list(dir_info.get('collision_point_world_xyz', [])),
             'area_center_world_xy': center_xy[:2].astype(float).tolist(),
             'area_radius_m': float(radius_m),
             'candidate_frame_count': int(len(cluster_positions)),

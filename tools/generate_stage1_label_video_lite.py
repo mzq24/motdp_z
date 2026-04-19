@@ -484,18 +484,26 @@ def _draw_cover_route_point(canvas, cover, color, label, x_range, y_range):
         )
 
 
+def _resolve_collision_point_world_xyz(payload):
+    payload = payload or {}
+    world_xyz = np.asarray(payload.get("collision_point_world_xyz", []), dtype=np.float32).reshape(-1)
+    if world_xyz.size >= 3 and np.all(np.isfinite(world_xyz[:3])):
+        return world_xyz[:3]
+    world_xyz = np.asarray(payload.get("scene_route_conflict_world_xyz", []), dtype=np.float32).reshape(-1)
+    if world_xyz.size >= 3 and np.all(np.isfinite(world_xyz[:3])):
+        return world_xyz[:3]
+    world_xy = np.asarray(payload.get("scene_route_conflict_world_xy", []), dtype=np.float32).reshape(-1)
+    if world_xy.size >= 2 and np.all(np.isfinite(world_xy[:2])):
+        return np.array([world_xy[0], world_xy[1], 0.0], dtype=np.float32)
+    return np.zeros((0,), dtype=np.float32)
+
+
 def _draw_cover_collision_point(canvas, cover, ego_matrix, color, label, x_range, y_range):
-    world_xyz = np.asarray((cover or {}).get("scene_route_conflict_world_xyz", []), dtype=np.float32)
-    world_xy = np.asarray((cover or {}).get("scene_route_conflict_world_xy", []), dtype=np.float32)
+    world_xyz = _resolve_collision_point_world_xyz(cover)
     if ego_matrix is None:
         return None
     if world_xyz.shape == (3,):
         local_xy = _transform_points_world_xyz_to_local(world_xyz[None, :], ego_matrix)
-    elif world_xy.shape == (2,):
-        local_xy = _transform_points_world_xyz_to_local(
-            np.array([[world_xy[0], world_xy[1], 0.0]], dtype=np.float32),
-            ego_matrix,
-        )
     else:
         return None
     if local_xy.shape != (1, 2):
