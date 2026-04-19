@@ -903,6 +903,7 @@ def _compute_front_route_label(
         return (result, debug) if return_debug else result
 
     best_future = None
+    future_ego_cover_cache = {}
     for frame_idx, frame_data in enumerate(future_frames_data):
         if frame_data is None:
             continue
@@ -927,6 +928,23 @@ def _compute_front_route_label(
             if actor_id is not None and actor_id in current_cover_actor_ids:
                 continue
             current_box = current_boxes_by_id.get(actor_id, None)
+            actor_cache_key = None if actor_id is None else (int(actor_id), int(frame_idx))
+            if actor_cache_key is not None:
+                blocked_by_ego_cover = future_ego_cover_cache.get(actor_cache_key, None)
+                if blocked_by_ego_cover is None:
+                    blocked_by_ego_cover = _actor_has_ego_cover_before_future_cover(
+                        actor_id=int(actor_id),
+                        current_box=current_box,
+                        future_frames_data=future_frames_data,
+                        ego_inv=ego_inv,
+                        ego_box=ego_box,
+                        stop_frame_idx=int(frame_idx),
+                    )
+                    future_ego_cover_cache[actor_cache_key] = bool(blocked_by_ego_cover)
+                if blocked_by_ego_cover:
+                    continue
+            elif _boxes_have_cover(current_box, ego_box):
+                continue
             if current_box is not None and len(current_box.get('position', [])) >= 2:
                 bg_pos = np.asarray(current_box['position'][:2], dtype=np.float32)
                 bg_speed = float(abs(current_box.get('speed', box_future.get('speed', 0.0))))
@@ -1455,6 +1473,59 @@ def _approx_box_clearance_gap_m(box_a, box_b):
     radius_a = float(np.linalg.norm(np.asarray(ext_a[:2], dtype=np.float32)))
     radius_b = float(np.linalg.norm(np.asarray(ext_b[:2], dtype=np.float32)))
     return float(max(center_dist - radius_a - radius_b, 0.0))
+
+
+def _boxes_have_cover(box_a, box_b, clearance_thresh_m=0.25):
+    if box_a is None or box_b is None:
+        return False
+    pos_a = box_a.get("position", None)
+    pos_b = box_b.get("position", None)
+    ext_a = box_a.get("extent", None)
+    ext_b = box_b.get("extent", None)
+    if (
+        pos_a is None or pos_b is None or ext_a is None or ext_b is None or
+        len(pos_a) < 2 or len(pos_b) < 2 or len(ext_a) < 2 or len(ext_b) < 2
+    ):
+        return False
+    if _oriented_boxes_intersect(
+        center_a=np.asarray(pos_a[:2], dtype=np.float32),
+        extent_a=np.asarray(ext_a[:2], dtype=np.float32),
+        yaw_a=float(box_a.get("yaw", 0.0)),
+        center_b=np.asarray(pos_b[:2], dtype=np.float32),
+        extent_b=np.asarray(ext_b[:2], dtype=np.float32),
+        yaw_b=float(box_b.get("yaw", 0.0)),
+    ):
+        return True
+    gap_m = _approx_box_clearance_gap_m(box_a, box_b)
+    return bool(np.isfinite(gap_m) and float(gap_m) <= float(clearance_thresh_m))
+
+
+def _actor_has_ego_cover_before_future_cover(
+    actor_id,
+    current_box,
+    future_frames_data,
+    ego_inv,
+    ego_box,
+    stop_frame_idx,
+    clearance_thresh_m=0.25,
+):
+    if _boxes_have_cover(current_box, ego_box, clearance_thresh_m=clearance_thresh_m):
+        return True
+    if actor_id is None or int(stop_frame_idx) <= 0:
+        return False
+    for prior_frame_idx in range(int(stop_frame_idx)):
+        frame_data = future_frames_data[prior_frame_idx]
+        if frame_data is None:
+            continue
+        boxes_future, ego_matrix_future = frame_data
+        actor_box_future = _find_box_by_id(boxes_future, actor_id)
+        if actor_box_future is None:
+            continue
+        transform = np.asarray(ego_inv, dtype=np.float32) @ np.asarray(ego_matrix_future, dtype=np.float32)
+        actor_box_cur = _transform_box_to_current_frame(actor_box_future, transform)
+        if _boxes_have_cover(actor_box_cur, ego_box, clearance_thresh_m=clearance_thresh_m):
+            return True
+    return False
 
 
 def _speed_risk_samples_fixed(speed_mps, max_speed_mps=20.0):
