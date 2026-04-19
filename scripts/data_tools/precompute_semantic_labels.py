@@ -1475,29 +1475,60 @@ def _approx_box_clearance_gap_m(box_a, box_b):
     return float(max(center_dist - radius_a - radius_b, 0.0))
 
 
-def _boxes_have_cover(box_a, box_b, clearance_thresh_m=0.25):
-    if box_a is None or box_b is None:
-        return False
-    pos_a = box_a.get("position", None)
-    pos_b = box_b.get("position", None)
-    ext_a = box_a.get("extent", None)
-    ext_b = box_b.get("extent", None)
+def _segment_intersects_oriented_box(point_a, point_b, box, margin_m=0.0):
+    point_a = np.asarray(point_a, dtype=np.float32).reshape(-1)
+    point_b = np.asarray(point_b, dtype=np.float32).reshape(-1)
+    pos = None if box is None else box.get("position", None)
+    extent = None if box is None else box.get("extent", None)
     if (
-        pos_a is None or pos_b is None or ext_a is None or ext_b is None or
-        len(pos_a) < 2 or len(pos_b) < 2 or len(ext_a) < 2 or len(ext_b) < 2
+        point_a.size < 2 or point_b.size < 2 or pos is None or extent is None or
+        len(pos) < 2 or len(extent) < 2
     ):
         return False
-    if _oriented_boxes_intersect(
-        center_a=np.asarray(pos_a[:2], dtype=np.float32),
-        extent_a=np.asarray(ext_a[:2], dtype=np.float32),
-        yaw_a=float(box_a.get("yaw", 0.0)),
-        center_b=np.asarray(pos_b[:2], dtype=np.float32),
-        extent_b=np.asarray(ext_b[:2], dtype=np.float32),
-        yaw_b=float(box_b.get("yaw", 0.0)),
+    segment = np.stack([point_a[:2], point_b[:2]], axis=0).astype(np.float32)
+    if np.any(
+        _points_inside_oriented_box(
+            segment,
+            center=np.asarray(pos[:2], dtype=np.float32),
+            extent=np.asarray(extent[:2], dtype=np.float32),
+            yaw=float(box.get("yaw", 0.0)),
+            margin_m=margin_m,
+        )
     ):
         return True
-    gap_m = _approx_box_clearance_gap_m(box_a, box_b)
-    return bool(np.isfinite(gap_m) and float(gap_m) <= float(clearance_thresh_m))
+    corners = _oriented_box_corners(
+        center=np.asarray(pos[:2], dtype=np.float32),
+        extent=np.asarray(extent[:2], dtype=np.float32) + float(margin_m),
+        yaw=float(box.get("yaw", 0.0)),
+    )
+    if corners.shape != (4, 2):
+        return False
+    for idx in range(4):
+        edge_p0 = corners[idx]
+        edge_p1 = corners[(idx + 1) % 4]
+        inter_pt, _ = _line_segment_intersection_2d(point_a[:2], point_b[:2], edge_p0, edge_p1)
+        if inter_pt is not None:
+            return True
+    return False
+
+
+def _polyline_has_ego_cover(polyline_points_xy, ego_box):
+    pts = np.asarray(polyline_points_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
+        return False
+    if np.any(
+        _points_inside_oriented_box(
+            pts[:, :2],
+            center=np.asarray(ego_box.get("position", [0.0, 0.0])[:2], dtype=np.float32),
+            extent=np.asarray(ego_box.get("extent", DEFAULT_EGO_EXTENT_2D)[:2], dtype=np.float32),
+            yaw=float(ego_box.get("yaw", 0.0)),
+        )
+    ):
+        return True
+    for idx in range(pts.shape[0] - 1):
+        if _segment_intersects_oriented_box(pts[idx], pts[idx + 1], ego_box):
+            return True
+    return False
 
 
 def _actor_has_ego_cover_before_future_cover(
@@ -1507,13 +1538,15 @@ def _actor_has_ego_cover_before_future_cover(
     ego_inv,
     ego_box,
     stop_frame_idx,
-    clearance_thresh_m=0.25,
 ):
-    if _boxes_have_cover(current_box, ego_box, clearance_thresh_m=clearance_thresh_m):
-        return True
-    if actor_id is None or int(stop_frame_idx) <= 0:
+    if actor_id is None:
         return False
-    for prior_frame_idx in range(int(stop_frame_idx)):
+    trajectory_points = []
+    if current_box is not None:
+        pos = current_box.get("position", None)
+        if pos is not None and len(pos) >= 2:
+            trajectory_points.append(np.asarray(pos[:2], dtype=np.float32))
+    for prior_frame_idx in range(int(stop_frame_idx) + 1):
         frame_data = future_frames_data[prior_frame_idx]
         if frame_data is None:
             continue
@@ -1523,8 +1556,11 @@ def _actor_has_ego_cover_before_future_cover(
             continue
         transform = np.asarray(ego_inv, dtype=np.float32) @ np.asarray(ego_matrix_future, dtype=np.float32)
         actor_box_cur = _transform_box_to_current_frame(actor_box_future, transform)
-        if _boxes_have_cover(actor_box_cur, ego_box, clearance_thresh_m=clearance_thresh_m):
-            return True
+        pos = None if actor_box_cur is None else actor_box_cur.get("position", None)
+        if pos is not None and len(pos) >= 2:
+            trajectory_points.append(np.asarray(pos[:2], dtype=np.float32))
+    if len(trajectory_points) >= 2 and _polyline_has_ego_cover(np.stack(trajectory_points, axis=0), ego_box):
+        return True
     return False
 
 
