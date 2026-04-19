@@ -693,9 +693,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
         route_px = _local_to_canvas(route_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
         cv2.polylines(canvas, [route_px], isClosed=False, color=(30, 30, 30), thickness=3, lineType=cv2.LINE_AA)
 
-    ego_poly = _local_to_canvas(np.array([[0.0, 0.0]], dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
-    cv2.drawMarker(canvas, tuple(ego_poly[0]), (255, 0, 0), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-
     for box in current_boxes or []:
         cls = str(box.get("class", "")).lower()
         if cls == "ego_car":
@@ -727,13 +724,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
             thickness=3,
             dashed=True,
         )
-    _draw_cover_collision_point(
-        canvas, current_cover, ego_matrix, (180, 0, 255), None, x_range, y_range
-    )
-    _draw_cover_collision_point(
-        canvas, future_cover, ego_matrix, (0, 215, 255), None, x_range, y_range
-    )
-
     borrow_area_drawn = False
     if ego_matrix is not None:
         corridor_world = np.asarray(scene_borrow_context.get("borrow_segment_world_xyz", []), dtype=np.float32)
@@ -744,22 +734,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
             corridor_px = _local_to_canvas(corridor_local_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
             cv2.polylines(canvas, [corridor_px], isClosed=False, color=(0, 135, 180), thickness=3, lineType=cv2.LINE_AA)
 
-            start_local_xy = _transform_single_world_point_to_local_xy(
-                scene_borrow_context.get("borrow_start_world_xyz", []),
-                scene_borrow_context.get("borrow_start_world_xy", []),
-                ego_matrix,
-            )
-            if start_local_xy is not None:
-                _draw_cross_labeled_marker(canvas, start_local_xy, (0, 120, 210), "start", x_range, y_range)
-
-            end_local_xy = _transform_single_world_point_to_local_xy(
-                scene_borrow_context.get("borrow_end_world_xyz", []),
-                scene_borrow_context.get("borrow_end_world_xy", []),
-                ego_matrix,
-            )
-            if end_local_xy is not None:
-                _draw_cross_labeled_marker(canvas, end_local_xy, (255, 200, 0), "end", x_range, y_range)
-
             conflict_start_progress_m = float(conflict_area.get("borrow_conflict_start_progress_m", np.nan))
             conflict_end_progress_m = float(conflict_area.get("borrow_conflict_end_progress_m", np.nan))
             stored_area_segment_world = np.asarray(conflict_area.get("area_segment_world_xyz", []), dtype=np.float32)
@@ -769,20 +743,8 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
             if stored_area_segment_local.shape[0] >= 2:
                 seg_px = _local_to_canvas(stored_area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
                 cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
-                area_start_local = _transform_single_world_point_to_local_xy(stored_area_start_world, [], ego_matrix)
-                area_end_local = _transform_single_world_point_to_local_xy(stored_area_end_world, [], ego_matrix)
-                if area_start_local is not None:
-                    _draw_local_point_marker(canvas, area_start_local, (0, 180, 0), "area_s", x_range, y_range)
-                if area_end_local is not None:
-                    _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
                 borrow_area_drawn = True
             elif np.isfinite(conflict_start_progress_m) and np.isfinite(conflict_end_progress_m):
-                area_start_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_start_progress_m)
-                area_end_local = _sample_polyline_point_at_s(corridor_local_xy, conflict_end_progress_m)
-                if area_start_local is not None:
-                    _draw_local_point_marker(canvas, area_start_local, (0, 180, 0), "area_s", x_range, y_range)
-                if area_end_local is not None:
-                    _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
                 seg_pts = []
                 for s in np.linspace(
                     conflict_start_progress_m,
@@ -805,26 +767,12 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
         if area_segment_local.shape[0] >= 2:
             seg_px = _local_to_canvas(area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
             cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
-        area_start_local = _transform_single_world_point_to_local_xy(stored_area_start_world, [], ego_matrix)
-        area_end_local = _transform_single_world_point_to_local_xy(stored_area_end_world, [], ego_matrix)
-        if area_start_local is not None:
-            _draw_local_point_marker(canvas, area_start_local, (0, 170, 0), "area_s", x_range, y_range)
-        if area_end_local is not None:
-            _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
     elif ego_matrix is not None and not borrow_area_drawn and fixed_s_interval_geometry is not None:
         area_segment_world = np.asarray(fixed_s_interval_geometry.get("area_segment_world_xyz", []), dtype=np.float32)
-        area_start_world = np.asarray(fixed_s_interval_geometry.get("area_start_world_xyz", []), dtype=np.float32).reshape(-1)
-        area_end_world = np.asarray(fixed_s_interval_geometry.get("area_end_world_xyz", []), dtype=np.float32).reshape(-1)
         area_segment_local = _transform_world_points_to_local_xy(area_segment_world, ego_matrix)
         if area_segment_local.shape[0] >= 2:
             seg_px = _local_to_canvas(area_segment_local, canvas.shape[1], canvas.shape[0], x_range, y_range)
             cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
-        area_start_local = _transform_single_world_point_to_local_xy(area_start_world, [], ego_matrix)
-        area_end_local = _transform_single_world_point_to_local_xy(area_end_world, [], ego_matrix)
-        if area_start_local is not None:
-            _draw_local_point_marker(canvas, area_start_local, (0, 170, 0), "area_s", x_range, y_range)
-        if area_end_local is not None:
-            _draw_local_point_marker(canvas, area_end_local, (30, 120, 30), "area_e", x_range, y_range)
     elif route_xy.shape[0] >= 2 and not borrow_area_drawn:
         area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
         area_end_s = float(conflict_area.get("area_end_s_m", np.nan))
@@ -837,24 +785,6 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
             if len(seg_pts) >= 2:
                 seg_px = _local_to_canvas(np.asarray(seg_pts, dtype=np.float32), canvas.shape[1], canvas.shape[0], x_range, y_range)
                 cv2.polylines(canvas, [seg_px], isClosed=False, color=(50, 205, 50), thickness=5, lineType=cv2.LINE_AA)
-            _draw_route_progress_marker(
-                canvas,
-                route_xy,
-                area_start_s,
-                (0, 170, 0),
-                "area_s",
-                x_range,
-                y_range,
-            )
-            _draw_route_progress_marker(
-                canvas,
-                route_xy,
-                area_end_s,
-                (30, 120, 30),
-                "area_e",
-                x_range,
-                y_range,
-            )
 
     area_type = str(conflict_area.get("area_type", "none"))
     if area_type == "circle":
