@@ -730,6 +730,7 @@ def _build_text_panel(sample, current_meas):
     current_cover = stage1_debug.get("current_cover") or {}
     future_cover = stage1_debug.get("future_cover") or {}
     conflict_area = stage1_debug.get("conflict_area") or {}
+    conflict_phase = stage1_debug.get("conflict_phase") or {}
 
     base_dir, _ = _resolve_feature_frame_info(sample)
     event_name = _scene_name_from_base_dir(base_dir) or "unknown"
@@ -783,6 +784,20 @@ def _build_text_panel(sample, current_meas):
             issue_line,
         ],
         (56, 122, 78),
+    )
+    y_left = _draw_text_section(
+        panel,
+        col_x0,
+        y_left,
+        col_w,
+        "Phase",
+        [
+            f"phase={conflict_phase.get('phase', 'none')} active={int(float(conflict_phase.get('active', 0.0)) > 0.5)} family={conflict_phase.get('family', 'none')}",
+            f"go_frame={_fmt_int(sample.get('conflict_go_frame', -1))} entry={_fmt_int(conflict_phase.get('entry_frame', -1))} release={_fmt_int(conflict_phase.get('release_frame', -1))}",
+            f"role={conflict_phase.get('frame_role', 'none')} src={conflict_phase.get('source', 'none')} reason={conflict_phase.get('release_reason', 'none')}",
+            f"speed={_fmt_float(conflict_phase.get('speed_mps', np.nan))} stop_th={_fmt_float(conflict_phase.get('stop_speed_thresh_mps', np.nan))}",
+        ],
+        (146, 98, 42),
     )
     _draw_text_section(
         panel,

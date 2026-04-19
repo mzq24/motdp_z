@@ -6,6 +6,7 @@ This keeps the packed samples aligned with the current stage1 debug workflow.
 Each sample gets these fast fields:
   - ego_status:      (obs_horizon, 14) float32
   - conflict_area_family / dir / active / start_frame / end_frame
+  - conflict_decision_phase / conflict_go_frame
 
 Usage:
   python scripts/data_tools/precompute_semantic_labels.py \
@@ -41,6 +42,8 @@ FAST_FIELDS = (
     'conflict_area_active',
     'conflict_area_start_frame',
     'conflict_area_end_frame',
+    'conflict_decision_phase',
+    'conflict_go_frame',
 )
 
 
@@ -103,6 +106,8 @@ STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
+STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
+STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
 
 STAGE1_SPEED_FIELDS = (
     'conflict_area_family',
@@ -110,6 +115,8 @@ STAGE1_SPEED_FIELDS = (
     'conflict_area_active',
     'conflict_area_start_frame',
     'conflict_area_end_frame',
+    'conflict_decision_phase',
+    'conflict_go_frame',
 )
 
 CONFLICT_FAMILY_TO_CODE = {
@@ -130,6 +137,12 @@ CONFLICT_FAMILY_PRIORITY = {
     'borrow': 0,
     'merge': 1,
     'junction': 2,
+}
+
+CONFLICT_DECISION_PHASE_TO_CODE = {
+    'none': 0,
+    'yld': 1,
+    'go': 2,
 }
 
 
@@ -2606,6 +2619,7 @@ def _build_stage1_speed_debug_payload(
         "scene_borrow_context": None if scene_borrow_context is None else dict(scene_borrow_context),
         "borrow_motion": dict(borrow_motion or {}),
         "conflict_area": _default_conflict_area_debug(),
+        "conflict_phase": _default_conflict_phase_debug(),
     })
 
 
@@ -2649,6 +2663,26 @@ def _default_conflict_area_debug():
     }
 
 
+def _default_conflict_phase_debug():
+    return {
+        'phase': 'none',
+        'phase_code': int(CONFLICT_DECISION_PHASE_TO_CODE['none']),
+        'active': 0.0,
+        'family': 'none',
+        'start_frame': -1,
+        'end_frame': -1,
+        'entry_frame': -1,
+        'go_frame': -1,
+        'release_frame': -1,
+        'frame_role': 'none',
+        'source': 'none',
+        'release_reason': 'none',
+        'entry_found': 0.0,
+        'speed_mps': np.nan,
+        'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
+    }
+
+
 def _set_stage1_conflict_area_defaults(sample):
     sample['conflict_area_family'] = np.int64(CONFLICT_FAMILY_TO_CODE['none'])
     sample['conflict_area_dir'] = np.int64(CONFLICT_DIR_TO_CODE['none'])
@@ -2671,6 +2705,23 @@ def _set_stage1_conflict_area_annotation(sample, conflict_info):
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['conflict_area'] = _to_stage1_debug_python(dict(conflict_info))
+
+
+def _set_stage1_conflict_phase_defaults(sample):
+    sample['conflict_decision_phase'] = np.int64(CONFLICT_DECISION_PHASE_TO_CODE['none'])
+    sample['conflict_go_frame'] = np.int64(-1)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['conflict_phase'] = _default_conflict_phase_debug()
+
+
+def _set_stage1_conflict_phase_annotation(sample, phase_info):
+    phase = str(phase_info.get('phase', 'none'))
+    sample['conflict_decision_phase'] = np.int64(CONFLICT_DECISION_PHASE_TO_CODE.get(phase, 0))
+    sample['conflict_go_frame'] = np.int64(int(phase_info.get('go_frame', -1)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['conflict_phase'] = _to_stage1_debug_python(dict(phase_info))
 
 
 def _conflict_area_issue(sample, family, reason, **extra):
@@ -3502,6 +3553,202 @@ def _conflict_window_frame_role(window, pos):
     return 'active'
 
 
+def _active_conflict_window_identity(sample):
+    if float(sample.get('conflict_area_active', 0.0)) <= 0.5:
+        return None
+    stage1_debug = sample.get('stage1_speed_debug')
+    if not isinstance(stage1_debug, dict):
+        return None
+    conflict_info = stage1_debug.get('conflict_area') or {}
+    family = str(conflict_info.get('family', 'none'))
+    if family == 'none':
+        return None
+    return (
+        str(family),
+        int(conflict_info.get('start_frame', -1)),
+        int(conflict_info.get('end_frame', -1)),
+        str(conflict_info.get('source', 'none')),
+        int(conflict_info.get('source_episode_id', -1)),
+    )
+
+
+def _record_conflict_speed_mps(record, family):
+    if str(family) == 'borrow':
+        borrow_motion = (record or {}).get('borrow_motion') or {}
+        speed_mps = float(borrow_motion.get('speed_mps', np.nan))
+        if np.isfinite(speed_mps):
+            return float(speed_mps)
+    merge_motion = (record or {}).get('merge_motion') or {}
+    speed_mps = float(merge_motion.get('speed_mps', np.nan))
+    return float(speed_mps) if np.isfinite(speed_mps) else np.nan
+
+
+def _window_neighbor_speed(records, family, pos, start_pos, end_pos, step):
+    scan_pos = int(pos) + int(step)
+    while int(start_pos) <= int(scan_pos) <= int(end_pos):
+        speed_mps = _record_conflict_speed_mps(records[int(scan_pos)], family)
+        if np.isfinite(speed_mps):
+            return float(speed_mps), int(scan_pos)
+        scan_pos += int(step)
+    return np.nan, -1
+
+
+def _conflict_speed_is_local_min(records, family, pos, start_pos, end_pos):
+    cur_speed = _record_conflict_speed_mps(records[int(pos)], family)
+    if not np.isfinite(cur_speed):
+        return False
+    prev_speed, _ = _window_neighbor_speed(records, family, pos, start_pos, end_pos, step=-1)
+    next_speed, _ = _window_neighbor_speed(records, family, pos, start_pos, end_pos, step=1)
+    if not np.isfinite(prev_speed) or not np.isfinite(next_speed):
+        return False
+    return bool(
+        prev_speed >= cur_speed and
+        next_speed >= cur_speed and
+        (prev_speed > cur_speed + 1e-3 or next_speed > cur_speed + 1e-3)
+    )
+
+
+def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_pos):
+    family = str(family or 'none')
+    if family == 'borrow':
+        conflict_start_progress_m = float(conflict_info.get('borrow_conflict_start_progress_m', np.nan))
+        if not np.isfinite(conflict_start_progress_m):
+            return None
+        for pos in range(int(start_pos), int(end_pos) + 1):
+            borrow_motion = (records[int(pos)].get('borrow_motion') or {})
+            borrow_start_distance_m = float(borrow_motion.get('borrow_start_distance_m', np.nan))
+            if not np.isfinite(borrow_start_distance_m):
+                continue
+            dist_to_area_start_m = float(borrow_start_distance_m - conflict_start_progress_m)
+            if dist_to_area_start_m <= float(STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+                return int(pos)
+        return None
+
+    area_start_s_m = float(conflict_info.get('area_start_s_m', np.nan))
+    if not np.isfinite(area_start_s_m):
+        return None
+    for pos in range(int(start_pos), int(end_pos) + 1):
+        front_s_m = _record_scene_front_s(records[int(pos)])
+        if not np.isfinite(front_s_m):
+            continue
+        if front_s_m >= float(area_start_s_m) - float(STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+            return int(pos)
+    return None
+
+
+def _conflict_window_release_pos(records, family, start_pos, entry_pos, end_pos):
+    for pos in range(int(entry_pos), int(start_pos) - 1, -1):
+        speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+        if np.isfinite(speed_mps) and speed_mps <= float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS):
+            return int(pos), 'stopped'
+
+    for pos in range(int(entry_pos), int(start_pos) - 1, -1):
+        if _conflict_speed_is_local_min(records, family, pos, start_pos, end_pos):
+            return int(pos), 'local_min'
+
+    return int(start_pos), 'window_start'
+
+
+def _conflict_phase_frame_role(pos, start_pos, end_pos, entry_pos, go_pos, phase):
+    tags = []
+    if int(pos) == int(start_pos):
+        tags.append('start')
+    if entry_pos is not None and int(pos) == int(entry_pos):
+        tags.append('entry')
+    if go_pos is not None and int(pos) == int(go_pos):
+        tags.append('go_start')
+    if int(pos) == int(end_pos):
+        tags.append('end')
+    if tags:
+        return '_'.join(tags)
+    return str(phase)
+
+
+def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
+    records = _build_route_conflict_records(samples, route_sample_indices)
+    if not records:
+        return
+
+    for record in records:
+        sample = samples[int(record['sample_idx'])]
+        _set_stage1_conflict_phase_defaults(sample)
+
+    pos = 0
+    while pos < len(records):
+        sample = samples[int(records[int(pos)]['sample_idx'])]
+        window_key = _active_conflict_window_identity(sample)
+        if window_key is None:
+            pos += 1
+            continue
+
+        start_pos = int(pos)
+        stage1_debug = sample.get('stage1_speed_debug') or {}
+        conflict_info = dict(stage1_debug.get('conflict_area') or {})
+        while pos + 1 < len(records):
+            next_sample = samples[int(records[int(pos) + 1]['sample_idx'])]
+            if _active_conflict_window_identity(next_sample) != window_key:
+                break
+            pos += 1
+        end_pos = int(pos)
+
+        family = str(conflict_info.get('family', 'none'))
+        start_frame = int(conflict_info.get('start_frame', -1))
+        end_frame = int(conflict_info.get('end_frame', -1))
+        entry_pos = _conflict_window_entry_pos(
+            records,
+            family=family,
+            conflict_info=conflict_info,
+            start_pos=start_pos,
+            end_pos=end_pos,
+        )
+        if entry_pos is None:
+            go_pos = None
+            go_frame = -1
+            release_pos = None
+            release_reason = 'entry_missing'
+        else:
+            release_pos, release_reason = _conflict_window_release_pos(
+                records,
+                family=family,
+                start_pos=start_pos,
+                entry_pos=entry_pos,
+                end_pos=end_pos,
+            )
+            go_pos = int(release_pos)
+            go_frame = int(records[int(go_pos)]['frame_id'])
+
+        for window_pos in range(int(start_pos), int(end_pos) + 1):
+            record = records[int(window_pos)]
+            phase = 'yld' if go_pos is None or int(window_pos) < int(go_pos) else 'go'
+            phase_info = {
+                'phase': str(phase),
+                'phase_code': int(CONFLICT_DECISION_PHASE_TO_CODE.get(phase, 0)),
+                'active': 1.0,
+                'family': str(family),
+                'start_frame': int(start_frame),
+                'end_frame': int(end_frame),
+                'entry_frame': int(records[int(entry_pos)]['frame_id']) if entry_pos is not None else -1,
+                'go_frame': int(go_frame),
+                'release_frame': int(records[int(release_pos)]['frame_id']) if release_pos is not None else -1,
+                'frame_role': _conflict_phase_frame_role(
+                    window_pos,
+                    start_pos=start_pos,
+                    end_pos=end_pos,
+                    entry_pos=entry_pos,
+                    go_pos=go_pos,
+                    phase=phase,
+                ),
+                'source': 'area_entry_backward_stop_or_local_min',
+                'release_reason': str(release_reason),
+                'entry_found': float(entry_pos is not None),
+                'speed_mps': float(_record_conflict_speed_mps(record, family)),
+                'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
+            }
+            _set_stage1_conflict_phase_annotation(samples[int(record['sample_idx'])], phase_info)
+
+        pos += 1
+
+
 def _annotate_route_stage1_conflict_areas(samples, route_sample_indices):
     records = _build_route_conflict_records(samples, route_sample_indices)
     if not records:
@@ -3567,6 +3814,7 @@ def _set_stage1_speed_fallback(sample):
         borrow_motion=None,
     )
     _set_stage1_conflict_area_defaults(sample)
+    _set_stage1_conflict_phase_defaults(sample)
 
 
 def _cover_actor_id(cover):
@@ -4404,6 +4652,7 @@ def precompute(
                 _maybe_checkpoint(phase='stage1_speed')
 
             _annotate_route_stage1_conflict_areas(samples, route_sample_indices)
+            _annotate_route_stage1_conflict_phases(samples, route_sample_indices)
             for sample_idx in route_sample_indices:
                 samples[int(sample_idx)].pop('_stage1_route_input_local', None)
             dirty_since_checkpoint = True
