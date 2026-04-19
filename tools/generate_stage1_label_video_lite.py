@@ -175,21 +175,7 @@ def _load_measurements_for_sample(image_data_root, sample, meas_cache=None):
     return meas
 
 
-def _resolve_fixed_s_interval_world_geometry(sample, route_samples_by_frame, image_data_root, meas_cache=None, geom_cache=None):
-    conflict_area = (sample.get("stage1_speed_debug") or {}).get("conflict_area") or {}
-    if str(conflict_area.get("area_type", "none")) != "s_interval":
-        return None
-    area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
-    area_end_s = float(conflict_area.get("area_end_s_m", np.nan))
-    start_frame = int(sample.get("conflict_area_start_frame", -1))
-    end_frame = int(sample.get("conflict_area_end_frame", -1))
-    if not np.isfinite(area_start_s) or not np.isfinite(area_end_s) or area_end_s < area_start_s or start_frame < 0:
-        return None
-    cache_key = (start_frame, end_frame, round(area_start_s, 3), round(area_end_s, 3))
-    if geom_cache is not None and cache_key in geom_cache:
-        return geom_cache[cache_key]
-
-    anchor_sample = route_samples_by_frame.get(start_frame)
+def _resolve_fixed_s_interval_world_geometry_from_anchor(anchor_sample, area_start_s, area_end_s, image_data_root, meas_cache=None):
     if anchor_sample is None:
         return None
     anchor_meas = _load_measurements_for_sample(image_data_root, anchor_sample, meas_cache=meas_cache)
@@ -215,14 +201,41 @@ def _resolve_fixed_s_interval_world_geometry(sample, route_samples_by_frame, ima
     if world_segment_xyz.shape[0] == 0:
         return None
 
-    result = {
+    return {
         "area_start_world_xyz": world_segment_xyz[0].astype(float).tolist(),
         "area_end_world_xyz": world_segment_xyz[-1].astype(float).tolist(),
         "area_segment_world_xyz": world_segment_xyz.astype(float).tolist(),
     }
-    if geom_cache is not None:
-        geom_cache[cache_key] = result
-    return result
+
+
+def _resolve_fixed_s_interval_world_geometry(sample, route_samples_by_frame, image_data_root, meas_cache=None, geom_cache=None):
+    conflict_area = (sample.get("stage1_speed_debug") or {}).get("conflict_area") or {}
+    if str(conflict_area.get("area_type", "none")) != "s_interval":
+        return None
+    area_start_s = float(conflict_area.get("area_start_s_m", np.nan))
+    area_end_s = float(conflict_area.get("area_end_s_m", np.nan))
+    start_frame = int(sample.get("conflict_area_start_frame", -1))
+    end_frame = int(sample.get("conflict_area_end_frame", -1))
+    if not np.isfinite(area_start_s) or not np.isfinite(area_end_s) or area_end_s < area_start_s or start_frame < 0:
+        return None
+    cache_key = (start_frame, end_frame, round(area_start_s, 3), round(area_end_s, 3))
+    if geom_cache is not None and cache_key in geom_cache:
+        return geom_cache[cache_key]
+
+    for frame_id in range(int(start_frame), int(max(end_frame, start_frame)) + 1):
+        anchor_sample = route_samples_by_frame.get(frame_id)
+        result = _resolve_fixed_s_interval_world_geometry_from_anchor(
+            anchor_sample,
+            area_start_s=area_start_s,
+            area_end_s=area_end_s,
+            image_data_root=image_data_root,
+            meas_cache=meas_cache,
+        )
+        if result is not None:
+            if geom_cache is not None:
+                geom_cache[cache_key] = result
+            return result
+    return None
 
 
 def _transform_points_world_xyz_to_local(points_xyz, ego_matrix):

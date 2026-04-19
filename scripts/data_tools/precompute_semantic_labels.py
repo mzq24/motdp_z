@@ -4224,12 +4224,13 @@ def _build_route_conflict_records(samples, route_sample_indices):
         stage1_debug = sample.get('stage1_speed_debug') or {}
         base_dir, _ = _resolve_feature_frame_info(sample)
         event_name = str(base_dir).split('/', 1)[0] if isinstance(base_dir, str) and base_dir else ''
+        route_local = sample.get('_stage1_route_input_local', sample.get('route', np.zeros((0, 2), dtype=np.float32)))
         records.append({
             'sample_idx': int(sample_idx),
             'frame_id': int(sample.get('frame_id', -1)),
             'base_dir': str(base_dir or ''),
             'event_name': str(event_name),
-            'route_local': np.asarray(sample.get('route', np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+            'route_local': np.asarray(route_local, dtype=np.float32),
             'current_cover': stage1_debug.get('current_cover') or {},
             'future_cover': stage1_debug.get('future_cover') or {},
             'speed_curve_future_cover': stage1_debug.get('speed_curve_future_cover') or {},
@@ -4284,6 +4285,23 @@ def _record_s_interval_world_geometry(record, area_start_s_m, area_end_s_m, step
         'area_end_world_xyz': world_segment[-1, :3].astype(float).tolist(),
         'area_segment_world_xyz': world_segment[:, :3].astype(float).tolist(),
     }
+
+
+def _window_s_interval_world_geometry(records, start_pos, end_pos, area_start_s_m, area_end_s_m, step_m=0.5):
+    if not records:
+        return None
+    start_pos = int(max(start_pos, 0))
+    end_pos = int(min(end_pos, len(records) - 1))
+    for pos in range(start_pos, end_pos + 1):
+        world_geometry = _record_s_interval_world_geometry(
+            records[pos],
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+            step_m=step_m,
+        )
+        if world_geometry is not None:
+            return world_geometry
+    return None
 
 
 def _borrow_conflict_world_geometry(scene_borrow_context, conflict_start_progress_m, conflict_end_progress_m, step_m=0.5):
@@ -4540,8 +4558,10 @@ def _build_merge_conflict_windows(records, samples):
             merge_area_start_s_m=merge_area_start_s_m,
             merge_area_end_s_m=merge_area_end_s_m,
         )
-        world_geometry = _record_s_interval_world_geometry(
-            records[start_pos],
+        world_geometry = _window_s_interval_world_geometry(
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
             area_start_s_m=merge_area_start_s_m,
             area_end_s_m=merge_area_end_s_m,
         ) or {}
@@ -4635,8 +4655,10 @@ def _build_junction_conflict_windows(records, samples):
             area_start_s_m=area_start_s_m,
             area_end_s_m=area_end_s_m,
         )
-        world_geometry = _record_s_interval_world_geometry(
-            records[start_pos],
+        world_geometry = _window_s_interval_world_geometry(
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
             area_start_s_m=area_start_s_m,
             area_end_s_m=area_end_s_m,
         ) or {}
@@ -6355,6 +6377,7 @@ def precompute(
                     )
                 else:
                     route_input = route_local.astype(np.float32)
+                sample['_stage1_route_input_local'] = np.asarray(route_input, dtype=np.float32)
 
                 ego_speed = float(current_measurements.get('speed', 0.0))
                 future_frames_data = _build_future_frames_data(image_data_root, base_dir_cur, frame_str, num_points)
@@ -6618,6 +6641,8 @@ def precompute(
             _gate_route_stage1_borrow_speed_risks(samples, route_sample_indices)
             _gate_route_stage1_merge_speed_risks(samples, route_sample_indices)
             _annotate_route_stage1_conflict_areas(samples, route_sample_indices)
+            for sample_idx in route_sample_indices:
+                samples[int(sample_idx)].pop('_stage1_route_input_local', None)
             dirty_since_checkpoint = True
             _maybe_checkpoint(phase='stage1_speed')
             route_total_s = float(time.perf_counter() - route_total_start)
