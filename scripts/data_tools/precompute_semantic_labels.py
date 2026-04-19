@@ -3616,31 +3616,6 @@ def _record_conflict_speed_mps(record, family):
     return float(speed_mps) if np.isfinite(speed_mps) else np.nan
 
 
-def _window_neighbor_speed(records, family, pos, start_pos, end_pos, step):
-    scan_pos = int(pos) + int(step)
-    while int(start_pos) <= int(scan_pos) <= int(end_pos):
-        speed_mps = _record_conflict_speed_mps(records[int(scan_pos)], family)
-        if np.isfinite(speed_mps):
-            return float(speed_mps), int(scan_pos)
-        scan_pos += int(step)
-    return np.nan, -1
-
-
-def _conflict_speed_is_local_min(records, family, pos, start_pos, end_pos):
-    cur_speed = _record_conflict_speed_mps(records[int(pos)], family)
-    if not np.isfinite(cur_speed):
-        return False
-    prev_speed, _ = _window_neighbor_speed(records, family, pos, start_pos, end_pos, step=-1)
-    next_speed, _ = _window_neighbor_speed(records, family, pos, start_pos, end_pos, step=1)
-    if not np.isfinite(prev_speed) or not np.isfinite(next_speed):
-        return False
-    return bool(
-        prev_speed >= cur_speed and
-        next_speed >= cur_speed and
-        (prev_speed > cur_speed + 1e-3 or next_speed > cur_speed + 1e-3)
-    )
-
-
 def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_pos):
     family = str(family or 'none')
     if family == 'borrow':
@@ -3674,10 +3649,6 @@ def _conflict_window_release_pos(records, family, start_pos, entry_pos, end_pos)
         speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
         if np.isfinite(speed_mps) and speed_mps <= float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS):
             return int(pos), 'stopped'
-
-    for pos in range(int(entry_pos), int(start_pos) - 1, -1):
-        if _conflict_speed_is_local_min(records, family, pos, start_pos, end_pos):
-            return int(pos), 'local_min'
 
     return int(start_pos), 'window_start'
 
