@@ -898,7 +898,12 @@ def _is_left_turn_scene_context(current_meas, event_name=None):
 
 
 def _is_borrow_cross_scene_context(event_name=None):
-    return str(event_name or "") in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}
+    return str(event_name or "") in {
+        "ConstructionObstacleTwoWays",
+        "AccidentTwoWays",
+        "ParkedObstacleTwoWays",
+        "VehicleOpensDoorTwoWays",
+    }
 
 
 EVENT_NAME_RECORD_EXCLUDED_SCENES = {
@@ -974,6 +979,132 @@ def _route_heading_at_idx(route_dense, route_idx):
     return float(np.arctan2(vec[1], vec[0]))
 
 
+def _mean_angle_rad(angles_rad):
+    angles = np.asarray(angles_rad, dtype=np.float32)
+    if angles.ndim != 1 or angles.size == 0:
+        return None
+    angles = angles[np.isfinite(angles)]
+    if angles.size == 0:
+        return None
+    mean_sin = float(np.mean(np.sin(angles)))
+    mean_cos = float(np.mean(np.cos(angles)))
+    if abs(mean_sin) < 1e-8 and abs(mean_cos) < 1e-8:
+        return None
+    return float(np.arctan2(mean_sin, mean_cos))
+
+
+def _route_heading_mean_at_idx(route_dense, route_idx, radius=2):
+    route_dense = np.asarray(route_dense, dtype=np.float32)
+    if route_dense.ndim != 2 or route_dense.shape[0] < 2 or route_dense.shape[1] != 2:
+        return None
+    idx = int(np.clip(route_idx, 0, route_dense.shape[0] - 1))
+    radius = int(max(radius, 0))
+    headings = []
+    for heading_idx in range(max(idx - radius, 0), min(idx + radius, route_dense.shape[0] - 1) + 1):
+        heading = _route_heading_at_idx(route_dense, heading_idx)
+        if heading is not None and np.isfinite(float(heading)):
+            headings.append(float(heading))
+    mean_heading = _mean_angle_rad(headings)
+    if mean_heading is not None and np.isfinite(float(mean_heading)):
+        return float(mean_heading)
+    return _route_heading_at_idx(route_dense, idx)
+
+
+def _route_heading_shape_near_idx(route_dense, route_idx, span=2, min_delta_deg=8.0):
+    center_idx = int(route_idx)
+    heading_prev = _route_heading_mean_at_idx(route_dense, center_idx - int(span), radius=1)
+    heading_center = _route_heading_mean_at_idx(route_dense, center_idx, radius=1)
+    heading_next = _route_heading_mean_at_idx(route_dense, center_idx + int(span), radius=1)
+    if heading_prev is None or heading_center is None or heading_next is None:
+        return {
+            "valid": False,
+            "prev_delta_deg": np.nan,
+            "next_delta_deg": np.nan,
+            "junction_like": False,
+            "borrow_like": False,
+        }
+    prev_delta_deg = float(_heading_to_deg(float(heading_center) - float(heading_prev)))
+    next_delta_deg = float(_heading_to_deg(float(heading_next) - float(heading_center)))
+    junction_like = bool(
+        abs(prev_delta_deg) >= float(min_delta_deg) and
+        abs(next_delta_deg) >= float(min_delta_deg) and
+        prev_delta_deg * next_delta_deg > 0.0
+    )
+    borrow_like = bool(
+        abs(prev_delta_deg) >= float(min_delta_deg) and
+        abs(next_delta_deg) >= float(min_delta_deg) and
+        prev_delta_deg * next_delta_deg < 0.0
+    )
+    return {
+        "valid": True,
+        "prev_delta_deg": float(prev_delta_deg),
+        "next_delta_deg": float(next_delta_deg),
+        "junction_like": bool(junction_like),
+        "borrow_like": bool(borrow_like),
+    }
+
+
+def _interaction_route_shape_debug(case, current_meas, event_name, route_shape):
+    mismatch_reason = 'none'
+    if bool(route_shape.get('valid', False)):
+        if (
+            _is_left_turn_scene_context(current_meas, event_name=event_name) and
+            bool(route_shape.get('borrow_like', False)) and
+            not bool(route_shape.get('junction_like', False))
+        ):
+            mismatch_reason = 'junction_shape_recovery'
+        elif (
+            _is_borrow_cross_scene_context(event_name=event_name) and
+            bool(route_shape.get('junction_like', False)) and
+            not bool(route_shape.get('borrow_like', False))
+        ):
+            mismatch_reason = 'borrow_shape_monotonic'
+    shape_label = 'none'
+    if bool(route_shape.get('junction_like', False)) and not bool(route_shape.get('borrow_like', False)):
+        shape_label = 'junction_like'
+    elif bool(route_shape.get('borrow_like', False)) and not bool(route_shape.get('junction_like', False)):
+        shape_label = 'borrow_like'
+    return {
+        "route_shape_valid": bool(route_shape.get("valid", False)),
+        "route_shape_prev_delta_deg": float(route_shape.get("prev_delta_deg", np.nan)),
+        "route_shape_next_delta_deg": float(route_shape.get("next_delta_deg", np.nan)),
+        "route_shape_label": str(shape_label),
+        "route_shape_mismatch_reason": str(mismatch_reason),
+        "route_shape_case": int(case),
+    }
+
+
+def _cover_route_shape_mismatch_reason(cover):
+    interaction = ((cover or {}).get('interaction') or {})
+    reason = str(interaction.get('route_shape_mismatch_reason', 'none'))
+    return reason if reason and reason != 'none' else 'none'
+
+
+def _record_window_cover_shape_issue(samples, records, family, positions):
+    seen = set()
+    for pos in positions or []:
+        record = records[int(pos)]
+        for cover_key in ('current_cover', 'future_cover'):
+            cover = (record or {}).get(cover_key) or {}
+            reason = _cover_route_shape_mismatch_reason(cover)
+            if reason == 'none':
+                continue
+            key = (str(reason), int(pos), str(cover_key))
+            if key in seen:
+                continue
+            seen.add(key)
+            return _conflict_area_issue(
+                samples[record['sample_idx']],
+                family,
+                f'{family}_cover_shape_mismatch',
+                pos=int(pos),
+                mismatch_reason=str(reason),
+                cover_key=str(cover_key),
+                cover_subtype=str(_cover_interaction_subtype(cover)),
+            )
+    return None
+
+
 def _heading_from_motion(start_xy, end_xy, min_motion_m=0.5):
     start_xy = np.asarray(start_xy, dtype=np.float32)
     end_xy = np.asarray(end_xy, dtype=np.float32)
@@ -1023,7 +1154,10 @@ def _interaction_signal_from_candidate(
             "motion_m": 0.0,
         }, event_name=event_name)
 
-    route_heading = _route_heading_at_idx(debug.get("route_dense"), cover.get("route_idx", 0))
+    if case == 2:
+        route_heading = _route_heading_mean_at_idx(debug.get("route_dense"), cover.get("route_idx", 0), radius=2)
+    else:
+        route_heading = _route_heading_at_idx(debug.get("route_dense"), cover.get("route_idx", 0))
     if route_heading is None:
         return _attach_event_name_record({
             "mode": 0,
@@ -1041,18 +1175,16 @@ def _interaction_signal_from_candidate(
     source = "yaw_vs_route"
     if case == 2:
         current_box = best.get("current_box")
-        future_box = best.get("box_current_frame")
+        future_box = best.get("box_future")
         if current_box is not None and future_box is not None:
-            actor_heading, motion_m = _heading_from_motion(
+            _, motion_m = _heading_from_motion(
                 np.asarray(current_box.get("position", [0.0, 0.0])[:2], dtype=np.float32),
-                np.asarray(future_box.get("position", [0.0, 0.0])[:2], dtype=np.float32),
+                np.asarray((best.get("box_current_frame") or {}).get("position", [0.0, 0.0])[:2], dtype=np.float32),
                 min_motion_m=min_motion_m,
             )
-            if actor_heading is not None:
-                source = "motion_vs_route"
-        if actor_heading is None and future_box is not None:
+        if future_box is not None:
             actor_heading = float(future_box.get("yaw", 0.0))
-            source = "future_yaw_vs_route"
+            source = "future_yaw_vs_route_avg"
     else:
         box = best.get("box")
         if box is not None:
@@ -1081,6 +1213,7 @@ def _interaction_signal_from_candidate(
             "motion_m": motion_m,
         }, event_name=event_name)
 
+    route_shape = _route_heading_shape_near_idx(debug.get("route_dense"), cover.get("route_idx", 0), span=2)
     angle_deg = abs(_heading_to_deg(actor_heading - route_heading))
     same_direction = angle_deg <= float(angle_thresh_deg)
     cross_direction = angle_deg >= float(INTERACTION_CROSS_MIN_ANGLE_THRESH_DEG)
@@ -1141,7 +1274,7 @@ def _interaction_signal_from_candidate(
     else:
         subtype = "cross_meet"
         source = f"{source}+cross_dir"
-    return _attach_event_name_record({
+    interaction = {
         "mode": 2,
         "name": "meet",
         "subtype": subtype,
@@ -1150,7 +1283,9 @@ def _interaction_signal_from_candidate(
         "route_heading_deg": _heading_to_deg(route_heading),
         "actor_heading_deg": _heading_to_deg(actor_heading),
         "motion_m": float(motion_m),
-    }, event_name=event_name)
+    }
+    interaction.update(_interaction_route_shape_debug(case, current_meas, event_name, route_shape))
+    return _attach_event_name_record(interaction, event_name=event_name)
 
 
 def _cover_candidate_summary(case, best, debug, current_meas=None, event_name=None):
@@ -3312,6 +3447,15 @@ def _build_borrow_conflict_windows(records, samples):
         issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'borrow', 'missing_borrow_conflict_end', pos=int(start_pos)))
         return windows, issues
 
+    shape_issue = _record_window_cover_shape_issue(
+        samples,
+        records,
+        family='borrow',
+        positions=range(int(start_pos), int(end_pos) + 1),
+    )
+    if shape_issue is not None:
+        issues.append(shape_issue)
+
     dir_info = _borrow_conflict_dir_info(
         records,
         start_pos=start_pos,
@@ -3526,6 +3670,15 @@ def _build_junction_conflict_windows(records, samples):
         if end_pos is None:
             issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_end', pos=int(start_pos)))
             continue
+
+        shape_issue = _record_window_cover_shape_issue(
+            samples,
+            records,
+            family='junction',
+            positions=range(int(start_pos), int(end_pos) + 1),
+        )
+        if shape_issue is not None:
+            issues.append(shape_issue)
 
         center_xyz = np.asarray(cluster.get('center_xyz', []), dtype=np.float32).reshape(-1)
         radius_m = float(cluster.get('radius_m', np.nan))
@@ -4156,6 +4309,8 @@ def _merge_resolve_conflict_area(records, candidate_positions):
 
 def _junction_cover_conflict_world_xyz(cover):
     if int((cover or {}).get('exists', 0.0)) <= 0:
+        return None
+    if str(((cover or {}).get('interaction') or {}).get('subtype', 'none')) != 'junction_left_cross_meet':
         return None
     pt = np.asarray((cover or {}).get('scene_route_conflict_world_xyz', []), dtype=np.float32).reshape(-1)
     if pt.size >= 3 and np.all(np.isfinite(pt[:3])):
