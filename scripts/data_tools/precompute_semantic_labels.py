@@ -106,6 +106,8 @@ STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
+STAGE1_JUNCTION_AREA_PRE_MARGIN_M = 10.0
+STAGE1_JUNCTION_AREA_POST_MARGIN_M = 10.0
 STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
 STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
@@ -3648,18 +3650,29 @@ def _build_junction_conflict_windows(records, samples):
             issues.append(_conflict_area_issue(samples[records[issue_pos]['sample_idx']], 'junction', 'junction_start_blocked_by_current_follow_chase', pos=issue_pos))
             continue
 
-        front_candidates = []
-        for pos in cluster_positions:
-            front_s = _record_scene_front_s(records[pos])
-            if np.isfinite(front_s):
-                front_candidates.append((float(front_s), int(pos)))
-        if not front_candidates:
-            issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_route_progress', pos=int(cluster_positions[0])))
+        cluster_conflict_s_m = float(cluster.get('conflict_s_m', np.nan))
+        if not np.isfinite(cluster_conflict_s_m):
+            issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_conflict_s', pos=int(cluster_positions[0])))
             continue
 
-        area_start_s_m = float(min(item[0] for item in front_candidates))
-        area_end_s_m = float(max(item[0] for item in front_candidates))
-        start_pos = min(front_candidates, key=lambda item: (float(item[0]), int(item[1])))[1]
+        area_start_s_m = float(max(cluster_conflict_s_m - float(STAGE1_JUNCTION_AREA_PRE_MARGIN_M), 0.0))
+        area_end_s_m = float(max(cluster_conflict_s_m + float(STAGE1_JUNCTION_AREA_POST_MARGIN_M), area_start_s_m))
+
+        start_pos = None
+        for pos in range(int(max(int(prev_end_pos) + 1, 0)), len(records)):
+            front_s = _record_scene_front_s(records[pos])
+            if np.isfinite(front_s) and float(front_s) >= float(area_start_s_m):
+                start_pos = int(pos)
+                break
+        if start_pos is None:
+            issues.append(_conflict_area_issue(
+                samples[records[cluster_positions[0]]['sample_idx']],
+                'junction',
+                'missing_junction_start',
+                pos=int(cluster_positions[0]),
+                cluster_conflict_s_m=float(cluster_conflict_s_m),
+            ))
+            continue
 
         end_pos = None
         for pos in range(int(start_pos), len(records)):
@@ -3668,7 +3681,13 @@ def _build_junction_conflict_windows(records, samples):
                 end_pos = int(pos)
                 break
         if end_pos is None:
-            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'junction', 'missing_junction_end', pos=int(start_pos)))
+            issues.append(_conflict_area_issue(
+                samples[records[start_pos]['sample_idx']],
+                'junction',
+                'missing_junction_end',
+                pos=int(start_pos),
+                cluster_conflict_s_m=float(cluster_conflict_s_m),
+            ))
             continue
 
         shape_issue = _record_window_cover_shape_issue(
@@ -3721,6 +3740,7 @@ def _build_junction_conflict_windows(records, samples):
             'collision_point_world_xyz': list(dir_info.get('collision_point_world_xyz', [])),
             'area_center_world_xyz': center_xyz[:3].astype(float).tolist(),
             'area_radius_m': float(radius_m),
+            'cluster_conflict_s_m': float(cluster_conflict_s_m),
             'candidate_frame_count': int(len(cluster_positions)),
             'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
             'dir_angle_deg': float(dir_info.get('dir_angle_deg', np.nan)),
@@ -4327,6 +4347,25 @@ def _junction_record_conflict_world_xyz(record):
     return _junction_cover_conflict_world_xyz(current_cover)
 
 
+def _junction_cover_conflict_s(cover):
+    if int((cover or {}).get('exists', 0.0)) <= 0:
+        return np.nan
+    if str(((cover or {}).get('interaction') or {}).get('subtype', 'none')) != 'junction_left_cross_meet':
+        return np.nan
+    conflict_s = float((cover or {}).get('scene_route_conflict_s_m', np.nan))
+    return float(conflict_s) if np.isfinite(conflict_s) else np.nan
+
+
+def _junction_record_conflict_s(record):
+    future_cover = (record or {}).get('future_cover') or {}
+    conflict_s = _junction_cover_conflict_s(future_cover)
+    if np.isfinite(conflict_s):
+        return float(conflict_s)
+    current_cover = (record or {}).get('current_cover') or {}
+    conflict_s = _junction_cover_conflict_s(current_cover)
+    return float(conflict_s) if np.isfinite(conflict_s) else np.nan
+
+
 def _junction_record_conflict_radius_m(record):
     meet_debug = (record or {}).get('meet_debug') or {}
     radius_m = float(meet_debug.get('context_conflict_len_m', np.nan))
@@ -4362,6 +4401,7 @@ def _junction_cluster_conflict_candidates(records):
             'pos': int(pos),
             'frame_id': int(record.get('frame_id', -1)),
             'point_xyz': pt_xyz.astype(np.float32),
+            'conflict_s': float(_junction_record_conflict_s(record)),
             'radius_m': float(_junction_record_conflict_radius_m(record)),
             'front_s': float(_junction_record_scene_front_s(record)),
         })
@@ -4403,11 +4443,17 @@ def _junction_cluster_conflict_candidates(records):
             _, start_pos = min(front_candidates, key=lambda entry: (float(entry[0]), int(entry[1])))
         else:
             start_pos = min(int(entry['pos']) for entry in items)
+        conflict_s_values = [
+            float(entry['conflict_s'])
+            for entry in items
+            if np.isfinite(float(entry.get('conflict_s', np.nan)))
+        ]
         valid_clusters.append({
             'center_xyz': np.asarray(cluster['center_xyz'], dtype=np.float32),
             'radius_m': float(cluster['radius_m']),
             'items': items,
             'start_pos': int(start_pos),
+            'conflict_s_m': float(np.median(conflict_s_values)) if conflict_s_values else np.nan,
         })
     valid_clusters.sort(key=lambda cluster: int(cluster['start_pos']))
     return valid_clusters
