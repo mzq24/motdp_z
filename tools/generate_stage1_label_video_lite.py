@@ -736,12 +736,12 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
 
     area_type = str(conflict_area.get("area_type", "none"))
     if area_type == "circle":
-        center_world_xy = np.asarray(conflict_area.get("area_center_world_xy", []), dtype=np.float32)
+        center_world_xyz = np.asarray(conflict_area.get("area_center_world_xyz", []), dtype=np.float32)
         radius_m = float(conflict_area.get("area_radius_m", np.nan))
         ego_matrix = None if current_meas is None else current_meas.get("ego_matrix", None)
-        if center_world_xy.shape == (2,) and ego_matrix is not None and np.isfinite(radius_m):
+        if center_world_xyz.shape == (3,) and ego_matrix is not None and np.isfinite(radius_m):
             center_local = _transform_points_world_xyz_to_local(
-                np.array([[center_world_xy[0], center_world_xy[1], 0.0]], dtype=np.float32),
+                center_world_xyz[None, :3].astype(np.float32),
                 ego_matrix,
             )
             if center_local.shape == (1, 2):
@@ -864,7 +864,7 @@ def _build_text_panel(sample, current_meas):
         "Debug",
         [
             f"area xyz start={len(conflict_area.get('area_start_world_xyz', []))} end={len(conflict_area.get('area_end_world_xyz', []))} seg={len(conflict_area.get('area_segment_world_xyz', []))}",
-            f"borrow xyz s={len(conflict_area.get('borrow_start_world_xy', []))} e={len(conflict_area.get('borrow_end_world_xy', []))}",
+            f"borrow xyz s={len(conflict_area.get('borrow_start_world_xyz', []))} e={len(conflict_area.get('borrow_end_world_xyz', []))}",
             f"collision xyz={len(conflict_area.get('collision_point_world_xyz', []))} radius={_fmt_float(conflict_area.get('area_radius_m', np.nan))}",
         ],
         (86, 86, 86),
