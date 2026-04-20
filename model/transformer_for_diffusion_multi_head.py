@@ -1851,50 +1851,62 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.energy_route_head      = _make_energy_head()  # route deviation (continuous, computed in policy)
             self.front_route_risk_head  = _make_energy_head()  # route-conditioned front risk (GT/pred_x0 path)
 
-            self.speed_energy_route_proj = nn.Sequential(
+            self.shared_stage1_route_geom_proj = nn.Sequential(
                 nn.Linear(self.num_waypoints * self.output_dim, n_emb),
                 nn.SiLU(),
                 nn.Linear(n_emb, n_emb),
             )
-            self.speed_energy_speed_query_proj = nn.Sequential(
-                nn.Linear(1, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.speed_energy_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
-            self.speed_energy_query_attn = nn.MultiheadAttention(
+            # Shared main-path semantic neck (shared path v1)
+            self.shared_stage1_pool_attn = nn.MultiheadAttention(
                 embed_dim=n_emb,
                 num_heads=n_head,
                 batch_first=True,
             )
-            self.speed_energy_query_norm = nn.LayerNorm(n_emb)
+            self.shared_stage1_pool_norm = nn.LayerNorm(n_emb)
+            self.shared_stage1_traj_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.shared_stage1_route_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.shared_stage1_neck = nn.Sequential(
+                nn.Linear(5 * n_emb, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+                nn.LayerNorm(n_emb),
+            )
+            self.shared_stage1_speed_query_proj = nn.Sequential(
+                nn.Linear(1, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.shared_stage1_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.shared_stage1_query_attn = nn.MultiheadAttention(
+                embed_dim=n_emb,
+                num_heads=n_head,
+                batch_first=True,
+            )
+            self.shared_stage1_query_norm = nn.LayerNorm(n_emb)
 
-            def _make_speed_energy_head():
+            def _make_shared_stage1_scalar_head(out_dim: int = 1):
                 return nn.Sequential(
                     nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
-                    nn.Linear(n_emb // 2, 1),
+                    nn.Linear(n_emb // 2, out_dim),
                 )
 
-            def _make_speed_energy_active_head():
-                return nn.Sequential(
-                    nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
-                    nn.Linear(n_emb // 2, 1),
-                )
-
-            self.speed_energy_chase_head = _make_speed_energy_head()
-            self.speed_energy_merge_yld_head = _make_speed_energy_head()
-            self.speed_energy_merge_go_head = _make_speed_energy_head()
-            self.speed_energy_junction_yld_head = _make_speed_energy_head()
-            self.speed_energy_junction_go_head = _make_speed_energy_head()
-            self.speed_energy_borrow_yld_head = _make_speed_energy_head()
-            self.speed_energy_borrow_go_head = _make_speed_energy_head()
-            self.speed_energy_pedestrian_head = _make_speed_energy_head()
-            self.speed_energy_merge_active_head = _make_speed_energy_active_head()
-            self.speed_energy_junction_active_head = _make_speed_energy_active_head()
-            self.speed_energy_borrow_active_head = _make_speed_energy_active_head()
-            self.speed_energy_lane_dir_relation_head = nn.Sequential(
+            self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.shared_stage1_conflict_state_head = _make_shared_stage1_scalar_head(out_dim=3)
+            self.shared_stage1_merge_active_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_active_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_active_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_chase_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_merge_yld_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_merge_go_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_yld_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_go_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_yld_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_go_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_pedestrian_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_conflict_area_head = nn.Sequential(
                 nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 2),
+                nn.Linear(n_emb // 2, 1),
             )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
@@ -2101,49 +2113,138 @@ class TransformerForDiffusion(ModuleAttrMixin):
             energy_scores['route'] = self.energy_route_head(energy_input).squeeze(-1)
         return energy_scores
 
-    def _compute_speed_energy_scores(
+    def _attn_pool_stage1_tokens(
         self,
-        mode_out: torch.Tensor,
+        tokens: torch.Tensor,
+        summary_query: torch.Tensor,
+    ) -> torch.Tensor:
+        B = tokens.shape[0]
+        query = summary_query.expand(B, -1, -1)
+        attn_out, _ = self.shared_stage1_pool_attn(
+            query=query,
+            key=tokens,
+            value=tokens,
+            need_weights=False,
+        )
+        return self.shared_stage1_pool_norm(query + attn_out).squeeze(1)
+
+    def _build_shared_stage1_context(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
         route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+    ) -> dict:
+        if speed_out is None:
+            raise RuntimeError("shared stage1 context expects a speed token output")
+        if route_points.dim() != 3:
+            raise ValueError(f"shared stage1 expects route_points as (B, T_route, 2), got {route_points.shape}")
+
+        route_geom = self.shared_stage1_route_geom_proj(route_points.reshape(route_points.shape[0], -1))
+        traj_summary = self._attn_pool_stage1_tokens(
+            traj_out, self.shared_stage1_traj_summary_query
+        )
+        route_summary = self._attn_pool_stage1_tokens(
+            route_out, self.shared_stage1_route_summary_query
+        )
+        speed_summary = speed_out.squeeze(1)
+        semantic_feature = self.shared_stage1_neck(
+            torch.cat(
+                [traj_summary, route_summary, speed_summary, route_geom, conditioning],
+                dim=-1,
+            )
+        )
+        curve_memory = torch.stack(
+            [traj_summary, route_summary, speed_summary, route_geom],
+            dim=1,
+        )
+        route_geom_tokens = route_geom.unsqueeze(1).expand(-1, route_out.shape[1], -1)
+        return {
+            'traj_summary': traj_summary,
+            'route_summary': route_summary,
+            'speed_summary': speed_summary,
+            'route_geom': route_geom,
+            'semantic_feature': semantic_feature,
+            'curve_memory': curve_memory,
+            'route_geom_tokens': route_geom_tokens,
+        }
+
+    def _compute_shared_stage1_scores(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
         speed_samples: torch.Tensor,
     ) -> dict:
         if speed_samples.dim() != 2:
-            raise ValueError(f"speed_samples must be (B, K), got {speed_samples.shape}")
-        if mode_out.shape[1] != 1:
-            raise ValueError(
-                f"stage1 speed-energy expects a single trajectory mode, got mode_out shape {mode_out.shape}"
-            )
-        if route_points.dim() != 3:
-            raise ValueError(f"route_points must be (B, T_route, 2), got {route_points.shape}")
+            raise ValueError(f"shared stage1 speed_samples must be (B, K), got {speed_samples.shape}")
 
-        B, K = speed_samples.shape
-        route_geom = self.speed_energy_route_proj(route_points.reshape(B, -1)).unsqueeze(1)
-        scene_memory = torch.cat([mode_out[:, :1, :], route_geom], dim=1)
-        active_input = torch.cat([mode_out[:, 0, :], route_geom[:, 0, :]], dim=-1)
+        context = self._build_shared_stage1_context(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+        )
+        semantic_feature = context['semantic_feature']
+
         speed_norm = (speed_samples / 20.0).unsqueeze(-1)
-        speed_queries = self.speed_energy_speed_query_proj(speed_norm)
-        speed_queries = speed_queries + self.speed_energy_query_token.expand(B, K, -1)
-        attn_out, _ = self.speed_energy_query_attn(
+        speed_queries = self.shared_stage1_speed_query_proj(speed_norm)
+        speed_queries = speed_queries + self.shared_stage1_query_token.expand(
+            speed_samples.shape[0], speed_samples.shape[1], -1
+        )
+        attn_out, _ = self.shared_stage1_query_attn(
             query=speed_queries,
-            key=scene_memory,
-            value=scene_memory,
+            key=context['curve_memory'],
+            value=context['curve_memory'],
             need_weights=False,
         )
-        head_input = self.speed_energy_query_norm(speed_queries + attn_out)
+        head_input = self.shared_stage1_query_norm(speed_queries + attn_out)
+        conflict_area_input = torch.cat([route_out, context['route_geom_tokens']], dim=-1)
+
+        # 2-class alias kept for backward compatibility with agent-side smoothing/debug.
+        conflict_state_logits = self.shared_stage1_conflict_state_head(semantic_feature)
+        lane_dir_relation_logits = conflict_state_logits[:, 1:]
+
         return {
-            'chase': self.speed_energy_chase_head(head_input).squeeze(-1),
-            'merge_yld': self.speed_energy_merge_yld_head(head_input).squeeze(-1),
-            'merge_go': self.speed_energy_merge_go_head(head_input).squeeze(-1),
-            'junction_yld': self.speed_energy_junction_yld_head(head_input).squeeze(-1),
-            'junction_go': self.speed_energy_junction_go_head(head_input).squeeze(-1),
-            'borrow_yld': self.speed_energy_borrow_yld_head(head_input).squeeze(-1),
-            'borrow_go': self.speed_energy_borrow_go_head(head_input).squeeze(-1),
-            'pedestrian': self.speed_energy_pedestrian_head(head_input).squeeze(-1),
-            'merge_active_logits': self.speed_energy_merge_active_head(active_input).squeeze(-1),
-            'junction_active_logits': self.speed_energy_junction_active_head(active_input).squeeze(-1),
-            'borrow_active_logits': self.speed_energy_borrow_active_head(active_input).squeeze(-1),
-            'lane_dir_relation_logits': self.speed_energy_lane_dir_relation_head(active_input),
+            'window_logits': self.shared_stage1_window_head(semantic_feature),
+            'phase_logits': self.shared_stage1_phase_head(semantic_feature),
+            'conflict_state_logits': conflict_state_logits,
+            'lane_dir_relation_logits': lane_dir_relation_logits,
+            'merge_active_logits': self.shared_stage1_merge_active_head(semantic_feature).squeeze(-1),
+            'junction_active_logits': self.shared_stage1_junction_active_head(semantic_feature).squeeze(-1),
+            'borrow_active_logits': self.shared_stage1_borrow_active_head(semantic_feature).squeeze(-1),
+            'chase': self.shared_stage1_chase_head(head_input).squeeze(-1),
+            'merge_yld': self.shared_stage1_merge_yld_head(head_input).squeeze(-1),
+            'merge_go': self.shared_stage1_merge_go_head(head_input).squeeze(-1),
+            'junction_yld': self.shared_stage1_junction_yld_head(head_input).squeeze(-1),
+            'junction_go': self.shared_stage1_junction_go_head(head_input).squeeze(-1),
+            'borrow_yld': self.shared_stage1_borrow_yld_head(head_input).squeeze(-1),
+            'borrow_go': self.shared_stage1_borrow_go_head(head_input).squeeze(-1),
+            'pedestrian': self.shared_stage1_pedestrian_head(head_input).squeeze(-1),
+            'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
         }
+
+    def compute_shared_stage1_from_ego_outputs(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        speed_samples: torch.Tensor,
+    ) -> dict:
+        return self._compute_shared_stage1_scores(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+            speed_samples=speed_samples,
+        )
 
     def _forward_traj_energy_context(
         self,
@@ -2247,7 +2348,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         branch_condition: Optional[torch.Tensor] = None,
         branch_condition_scale: float = 1.0,
         branch_condition_schedule: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_intermediates: bool = False,
+        stage1_speed_samples: Optional[torch.Tensor] = None,
+    ):
         """
         Ego denoising path with joint trajectory+route waypoint diffusion.
 
@@ -2379,6 +2482,30 @@ class TransformerForDiffusion(ModuleAttrMixin):
             conditioning,
         ], dim=-1)
         speed_profile_pred = self.speed_profile_head(speed_profile_input)
+        if return_intermediates:
+            result = {
+                'poses_reg': poses_reg,
+                'route_pred': route_pred,
+                'traj_out': traj_out,
+                'route_out': route_out,
+                'speed_out': speed_out,
+                'route_points': route_points,
+                'conditioning': conditioning,
+                'speed_pred': speed_pred,
+                'speed_profile_pred': speed_profile_pred,
+            }
+            if stage1_speed_samples is not None:
+                stage1_speed_samples = stage1_speed_samples.to(device=device, dtype=model_dtype)
+                result['stage1_raw_scores'] = self._compute_shared_stage1_scores(
+                    traj_out=traj_out,
+                    route_out=route_out,
+                    speed_out=speed_out,
+                    route_points=route_points,
+                    conditioning=conditioning,
+                    speed_samples=stage1_speed_samples,
+                )
+            return result
+
         return poses_reg, route_pred, traj_out, conditioning, speed_pred, speed_profile_pred
 
     def forward_energy(
@@ -2443,65 +2570,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             transfuser_lidar_bev=transfuser_lidar_bev,
         )
         return self.front_route_risk_head(energy_input).squeeze(-1), mode_out
-
-    def forward_speed_energy(
-        self,
-        x_t: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        speed_samples: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[dict, torch.Tensor]:
-        if route_points is None:
-            raise ValueError("forward_speed_energy requires route_points")
-        _, mode_out, _ = self._forward_traj_energy_context(
-            x_t=x_t,
-            x_t_abs=x_t_abs,
-            timestep=timestep,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=traj_for_energy,
-            bev_proj_cached=bev_proj_cached,
-            route_points=route_points,
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
-        return self._compute_speed_energy_scores(mode_out, route_points, speed_samples), mode_out
-
-    def forward_speed_energy_eval(
-        self,
-        x_t: torch.Tensor,
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        speed_samples: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[dict, torch.Tensor]:
-        B = x_t.shape[0]
-        timestep = torch.zeros(B, dtype=torch.long, device=x_t.device)
-        return self.forward_speed_energy(
-            x_t=x_t,
-            x_t_abs=x_t_abs,
-            timestep=timestep,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            speed_samples=speed_samples,
-            traj_for_energy=traj_for_energy,
-            bev_proj_cached=bev_proj_cached,
-            route_points=route_points,
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
 
     def forward_energy_eval(
         self,

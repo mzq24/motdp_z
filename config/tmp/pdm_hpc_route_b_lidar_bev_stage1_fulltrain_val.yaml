@@ -113,7 +113,7 @@ route_b:
   lidar_history_frames: 4
   train_energy: true
   use_stage1_speed_energy: true
-  use_front_route_risk_energy: false
+  shared_stage1_training_source: clean
   use_speed_profile_head: true
   guidance_scale: 0.0
   energy_loss_weight: 1.0
@@ -123,6 +123,8 @@ route_b:
   energy_chase_weight: 1.0
   energy_meet_weight: 1.0
   energy_ped_weight: 1.0
+  energy_window_weight: 0.25
+  energy_phase_weight: 0.25
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0
   num_gt_augmentations: 0

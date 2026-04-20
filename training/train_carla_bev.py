@@ -236,6 +236,8 @@ def validate_model(
                     'energy_junction_active_loss',
                     'energy_borrow_active_loss',
                     'energy_cross_active_loss',
+                    'energy_window_loss',
+                    'energy_phase_loss',
                 ):
                     if key in loss_dict:
                         val_metrics[key].append(loss_dict[key].item())
@@ -1425,7 +1427,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                            'energy_cross_yld_loss', 'energy_cross_go_loss',
                            'energy_merge_active_loss',
                            'energy_junction_active_loss', 'energy_borrow_active_loss',
-                           'energy_cross_active_loss'):
+                           'energy_cross_active_loss',
+                           'energy_window_loss', 'energy_phase_loss'):
                     if lk in loss_dict:
                         val = loss_dict[lk]
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
