@@ -535,13 +535,13 @@ def _draw_panel_header(panel, title, subtitle=None, bg_color=(28, 38, 54), fg_co
 def _draw_text_section(panel, x, y, width, title, lines, color):
     cv2.rectangle(panel, (x, y), (x + width, y + 26), color, -1, cv2.LINE_AA)
     cv2.putText(panel, str(title), (x + 10, y + 18), cv2.FONT_HERSHEY_DUPLEX, 0.50, (248, 248, 248), 1, cv2.LINE_AA)
-    y += 38
+    y += 34
     for line in lines:
         cv2.putText(panel, str(line), (x + 10, y), cv2.FONT_HERSHEY_DUPLEX, 0.50, (28, 28, 28), 1, cv2.LINE_AA)
         y += 24
         if y >= panel.shape[0] - 24:
             break
-    return y + 8
+    return y + 2
 
 
 def _find_box_by_id(boxes, actor_id):
@@ -597,13 +597,19 @@ def _cover_name(cover):
     return str((cover or {}).get("interaction", {}).get("name", "none"))
 
 
-def _fmt_float(x, fmt="{:.2f}"):
+def _fmt_float(x, fmt="{:.2f}", clip_abs=100.0):
     try:
         x = float(x)
     except Exception:
         return "NA"
-    if not np.isfinite(x):
+    if np.isnan(x):
         return "NA"
+    if np.isposinf(x):
+        x = float(clip_abs)
+    elif np.isneginf(x):
+        x = -float(clip_abs)
+    elif clip_abs is not None and abs(x) > float(clip_abs):
+        x = float(np.sign(x) * float(clip_abs))
     return fmt.format(x)
 
 
@@ -823,7 +829,8 @@ def _build_text_panel(sample, current_meas):
             f"frame start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
             f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
             f"borrow prog s={_fmt_float(conflict_area.get('borrow_conflict_start_progress_m', np.nan))} e={_fmt_float(conflict_area.get('borrow_conflict_end_progress_m', np.nan))}",
-            f"src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')} reason={conflict_area.get('selection_reason', 'none')}",
+            f"src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')}",
+            f"reason={conflict_area.get('selection_reason', 'none')}",
             issue_line,
         ],
         (56, 122, 78),
@@ -837,7 +844,8 @@ def _build_text_panel(sample, current_meas):
         [
             f"phase={conflict_phase.get('phase', 'none')} active={int(float(conflict_phase.get('active', 0.0)) > 0.5)} family={conflict_phase.get('family', 'none')}",
             f"go_frame={_fmt_int(sample.get('conflict_go_frame', -1))} entry={_fmt_int(conflict_phase.get('entry_frame', -1))} release={_fmt_int(conflict_phase.get('release_frame', -1))}",
-            f"role={conflict_phase.get('frame_role', 'none')} src={conflict_phase.get('source', 'none')} reason={conflict_phase.get('release_reason', 'none')} issue={conflict_phase.get('issue_reason', 'none')}",
+            f"role={conflict_phase.get('frame_role', 'none')} src={conflict_phase.get('source', 'none')} issue={conflict_phase.get('issue_reason', 'none')}",
+            f"reason={conflict_phase.get('release_reason', 'none')}",
             f"speed={_fmt_float(conflict_phase.get('speed_mps', np.nan))} stop_th={_fmt_float(conflict_phase.get('stop_speed_thresh_mps', np.nan))}",
         ],
         (146, 98, 42),
