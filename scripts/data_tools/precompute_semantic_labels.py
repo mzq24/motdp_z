@@ -115,6 +115,7 @@ STAGE1_JUNCTION_AREA_PRE_MARGIN_M = 10.0
 STAGE1_JUNCTION_AREA_POST_MARGIN_M = 10.0
 STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
 STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
+STAGE1_CONFLICT_AREA_ENTRY_POST_MARGIN_M = 4.0
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
 STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS = 2.0
 MERGE_THRESHOLD_NEGATIVE_TAIL_FRAMES = 12
@@ -2228,6 +2229,73 @@ def _two_way_blocker_box_allowed(box, event_name=None, stop_speed_thresh_mps=0.2
     return False
 
 
+def _two_way_route_progress_cache(record, route_step_m=0.25):
+    cache = record.get("_two_way_route_progress_cache", None)
+    step_m = float(max(route_step_m, 0.25))
+    if isinstance(cache, dict) and abs(float(cache.get("step_m", step_m)) - step_m) <= 1e-6:
+        return (
+            np.asarray(cache.get("route_poly", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+            np.asarray(cache.get("route_dense", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+            np.asarray(cache.get("route_s", np.zeros((0,), dtype=np.float32)), dtype=np.float32),
+        )
+
+    route_local = np.asarray(record.get("route_input_local", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    route_poly = _route_with_origin(route_local)
+    route_dense, route_s = _interpolate_route_with_arclength(route_poly, step_m=step_m)
+    record["_two_way_route_progress_cache"] = {
+        "step_m": float(step_m),
+        "route_poly": np.asarray(route_poly, dtype=np.float32),
+        "route_dense": np.asarray(route_dense, dtype=np.float32),
+        "route_s": np.asarray(route_s, dtype=np.float32),
+    }
+    return route_poly, route_dense, route_s
+
+
+def _two_way_box_route_progress_m(
+    record,
+    box,
+    route_step_m=0.25,
+    margin_m=0.0,
+    center_project_thresh_m=3.5,
+):
+    route_poly, route_dense, route_s = _two_way_route_progress_cache(record, route_step_m=route_step_m)
+    if route_dense.ndim != 2 or route_dense.shape[0] == 0 or route_dense.shape[1] != 2:
+        return np.nan
+
+    progress_m = _route_progress_inside_box(route_dense, route_s, box, margin_m=float(margin_m))
+    if np.isfinite(progress_m) and float(progress_m) > 1e-3:
+        return float(progress_m)
+
+    pos = box.get("position", None)
+    if pos is not None and len(pos) >= 2 and route_poly.ndim == 2 and route_poly.shape[0] >= 2:
+        center_xy = np.asarray(pos[:2], dtype=np.float32)
+        proj_xy, proj_s = _project_point_to_polyline(center_xy, route_poly)
+        if proj_xy is not None and proj_s is not None:
+            center_dist_m = float(np.linalg.norm(center_xy - np.asarray(proj_xy, dtype=np.float32)))
+            if center_dist_m <= float(center_project_thresh_m):
+                return float(proj_s)
+
+    if np.isfinite(progress_m) and float(progress_m) >= 0.0:
+        return float(progress_m)
+    return np.nan
+
+
+def _two_way_ego_route_progress_m(record, route_step_m=0.25):
+    ego_box = _find_ego_box((record or {}).get("current_boxes") or [])
+    if ego_box is None:
+        return 0.0
+    progress_m = _two_way_box_route_progress_m(
+        record,
+        ego_box,
+        route_step_m=route_step_m,
+        margin_m=0.0,
+        center_project_thresh_m=2.5,
+    )
+    if np.isfinite(progress_m):
+        return float(progress_m)
+    return 0.0
+
+
 def _empty_two_way_borrow_context(
     event_name=None,
     failure_reason="unknown",
@@ -2374,15 +2442,18 @@ def _find_best_two_way_cluster_candidate(
     frame_records,
     cluster_actor_ids,
     lateral_thresh_m=5.0,
+    route_progress_ahead_margin_m=0.5,
 ):
     cluster_actor_ids = {int(actor_id) for actor_id in (cluster_actor_ids or [])}
     if not cluster_actor_ids:
         return None
 
-    best_candidate = None
-    for route_candidate in route_candidates:
+    ordered_candidates = sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"])))
+    for route_candidate in ordered_candidates:
         record = frame_records[int(route_candidate["record_idx"])]
         ego_matrix_current = None if record.get("current_meas") is None else record["current_meas"].get("ego_matrix", None)
+        ego_route_progress_m = _two_way_ego_route_progress_m(record)
+        frame_candidates = []
         for box in record.get("current_boxes") or []:
             actor_id = box.get("id", None)
             if actor_id is None or int(actor_id) not in cluster_actor_ids:
@@ -2394,22 +2465,35 @@ def _find_best_two_way_cluster_candidate(
             local_y = float(pos[1])
             if local_x <= 0.0 or float(abs(local_y)) > float(lateral_thresh_m):
                 continue
+            actor_route_progress_m = _two_way_box_route_progress_m(record, box)
+            if not np.isfinite(actor_route_progress_m):
+                continue
+            if float(actor_route_progress_m) <= float(ego_route_progress_m) + float(route_progress_ahead_margin_m):
+                continue
             world_xyz = _box_world_xyz(box, ego_matrix_current=ego_matrix_current)
-            candidate = {
-                "score": (float(local_x), float(abs(local_y)), -int(route_candidate["frame_id"])),
+            frame_candidates.append({
+                "score": (
+                    float(actor_route_progress_m),
+                    float(abs(local_y)),
+                    float(local_x),
+                    int(actor_id),
+                ),
                 "record_idx": int(route_candidate["record_idx"]),
                 "frame_id": int(route_candidate["frame_id"]),
                 "actor_id": int(actor_id),
                 "actor_class": str(_box_class_name(box)),
                 "local_x": float(local_x),
                 "local_y": float(local_y),
+                "route_progress_m": float(actor_route_progress_m),
+                "ego_route_progress_m": float(ego_route_progress_m),
                 "world_xyz": [] if world_xyz is None else np.asarray(world_xyz, dtype=np.float32).astype(float).tolist(),
                 "geom": dict(route_candidate["geom"]),
                 "priority": int(route_candidate["priority"]),
-            }
-            if best_candidate is None or candidate["score"] < best_candidate["score"]:
-                best_candidate = candidate
-    return best_candidate
+            })
+        if frame_candidates:
+            frame_candidates.sort(key=lambda item: item["score"])
+            return dict(frame_candidates[0])
+    return None
 
 
 def _build_event_two_way_borrow_context(
@@ -2509,6 +2593,8 @@ def _build_event_two_way_borrow_context(
             "actor_class": str(primary_cluster_candidate["actor_class"]),
             "seed_frame_id": int(primary_cluster_candidate["frame_id"]),
             "seed_priority": int(primary_cluster_candidate.get("priority", -1)),
+            "seed_route_progress_m": float(primary_cluster_candidate.get("route_progress_m", np.nan)),
+            "seed_ego_route_progress_m": float(primary_cluster_candidate.get("ego_route_progress_m", np.nan)),
             "seed_world_xyz": list(primary_cluster_candidate.get("world_xyz", [])),
             "seed_source": "scene_global_cluster",
             "cluster_actor_ids": list(scene_global_cluster.get("actor_ids", [])),
@@ -2516,6 +2602,7 @@ def _build_event_two_way_borrow_context(
     else:
         for route_candidate in sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"]))):
             record = frame_records[int(route_candidate["record_idx"])]
+            ego_route_progress_m = _two_way_ego_route_progress_m(record)
             eligible_boxes = []
             for box in record.get("current_boxes") or []:
                 actor_id = box.get("id", None)
@@ -2528,17 +2615,30 @@ def _build_event_two_way_borrow_context(
                 local_y = float(pos[1])
                 if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
                     continue
-                eligible_boxes.append((float(local_x), float(abs(local_y)), int(actor_id), box))
+                actor_route_progress_m = _two_way_box_route_progress_m(record, box)
+                if not np.isfinite(actor_route_progress_m):
+                    continue
+                if float(actor_route_progress_m) <= float(ego_route_progress_m) + 0.5:
+                    continue
+                eligible_boxes.append((
+                    float(actor_route_progress_m),
+                    float(abs(local_y)),
+                    float(local_x),
+                    int(actor_id),
+                    box,
+                ))
             if not eligible_boxes:
                 continue
-            eligible_boxes.sort(key=lambda item: (item[0], item[1], item[2]))
-            _, _, actor_id, seed_box = eligible_boxes[0]
+            eligible_boxes.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            actor_route_progress_m, _, _, actor_id, seed_box = eligible_boxes[0]
             seed_world_xyz = _box_world_xyz(seed_box, ego_matrix_current=record.get("current_meas", {}).get("ego_matrix", None))
             seed_actor = {
                 "actor_id": int(actor_id),
                 "actor_class": str(_box_class_name(seed_box)),
                 "seed_frame_id": int(route_candidate["frame_id"]),
                 "seed_priority": int(route_candidate["priority"]),
+                "seed_route_progress_m": float(actor_route_progress_m),
+                "seed_ego_route_progress_m": float(ego_route_progress_m),
                 "seed_world_xyz": [] if seed_world_xyz is None else np.asarray(seed_world_xyz, dtype=np.float32).astype(float).tolist(),
                 "seed_source": "route_candidate",
             }
@@ -2556,6 +2656,7 @@ def _build_event_two_way_borrow_context(
     for route_candidate in route_candidates:
         record = frame_records[int(route_candidate["record_idx"])]
         ego_matrix_current = None if record.get("current_meas") is None else record["current_meas"].get("ego_matrix", None)
+        ego_route_progress_m = _two_way_ego_route_progress_m(record)
         for box in record.get("current_boxes") or []:
             actor_id = box.get("id", None)
             if actor_id is None or int(actor_id) != int(seed_actor["actor_id"]):
@@ -2567,15 +2668,27 @@ def _build_event_two_way_borrow_context(
             local_y = float(pos[1])
             if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
                 continue
+            actor_route_progress_m = _two_way_box_route_progress_m(record, box)
+            if not np.isfinite(actor_route_progress_m):
+                continue
+            if float(actor_route_progress_m) <= float(ego_route_progress_m) + 0.5:
+                continue
             world_xyz = _box_world_xyz(box, ego_matrix_current=ego_matrix_current)
             candidate = {
-                "score": (float(local_x), float(abs(local_y)), -int(route_candidate["frame_id"])),
+                "score": (
+                    float(local_x),
+                    float(abs(local_y)),
+                    float(actor_route_progress_m),
+                    -int(route_candidate["frame_id"]),
+                ),
                 "record_idx": int(route_candidate["record_idx"]),
                 "frame_id": int(route_candidate["frame_id"]),
                 "actor_id": int(seed_actor["actor_id"]),
                 "actor_class": str(seed_actor["actor_class"]),
                 "local_x": float(local_x),
                 "local_y": float(local_y),
+                "route_progress_m": float(actor_route_progress_m),
+                "ego_route_progress_m": float(ego_route_progress_m),
                 "world_xyz": [] if world_xyz is None else np.asarray(world_xyz, dtype=np.float32).astype(float).tolist(),
                 "geom": dict(route_candidate["geom"]),
             }
@@ -4020,9 +4133,46 @@ def _record_conflict_speed_mps(record, family):
     return float(speed_mps) if np.isfinite(speed_mps) else np.nan
 
 
+def _scene_route_progress_from_world_xyz(records, world_xyz, start_pos=0, end_pos=None):
+    world_xyz = np.asarray(world_xyz, dtype=np.float32).reshape(-1)
+    if world_xyz.size < 3 or not np.all(np.isfinite(world_xyz[:2])):
+        return np.nan
+    if end_pos is None:
+        end_pos = len(records) - 1
+    start_pos = int(max(int(start_pos), 0))
+    end_pos = int(min(int(end_pos), len(records) - 1))
+    for pos in range(start_pos, end_pos + 1):
+        scene_route_world = np.asarray(
+            (records[int(pos)] or {}).get('scene_route_world', np.zeros((0, 3), dtype=np.float32)),
+            dtype=np.float32,
+        )
+        if scene_route_world.ndim != 2 or scene_route_world.shape[0] < 2 or scene_route_world.shape[1] < 2:
+            continue
+        _, route_s = _project_point_to_polyline(world_xyz[:2], scene_route_world[:, :2])
+        if route_s is not None and np.isfinite(float(route_s)):
+            return float(route_s)
+    return np.nan
+
+
 def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_pos):
     family = str(family or 'none')
+    entry_post_margin_m = float(STAGE1_CONFLICT_AREA_ENTRY_POST_MARGIN_M)
     if family == 'borrow':
+        area_start_world_xyz = np.asarray(conflict_info.get('area_start_world_xyz', []), dtype=np.float32).reshape(-1)
+        area_start_s_m = _scene_route_progress_from_world_xyz(
+            records,
+            area_start_world_xyz,
+            start_pos=start_pos,
+            end_pos=end_pos,
+        )
+        if np.isfinite(area_start_s_m):
+            target_front_s_m = float(area_start_s_m + entry_post_margin_m)
+            for pos in range(int(start_pos), int(end_pos) + 1):
+                front_s_m = _record_scene_front_s(records[int(pos)])
+                if np.isfinite(front_s_m) and front_s_m >= target_front_s_m:
+                    return int(pos)
+            return None
+
         conflict_start_progress_m = float(conflict_info.get('borrow_conflict_start_progress_m', np.nan))
         if not np.isfinite(conflict_start_progress_m):
             return None
@@ -4032,7 +4182,7 @@ def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_po
             if not np.isfinite(borrow_start_distance_m):
                 continue
             dist_to_area_start_m = float(borrow_start_distance_m - conflict_start_progress_m)
-            if dist_to_area_start_m <= float(STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+            if dist_to_area_start_m <= -float(entry_post_margin_m):
                 return int(pos)
         return None
 
@@ -4040,22 +4190,24 @@ def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_po
         first_conflict_s_m = float(conflict_info.get('junction_first_conflict_s_m', np.nan))
         if not np.isfinite(first_conflict_s_m):
             return None
+        target_front_s_m = float(first_conflict_s_m + entry_post_margin_m)
         for pos in range(int(start_pos), int(end_pos) + 1):
             front_s_m = _record_scene_front_s(records[int(pos)])
             if not np.isfinite(front_s_m):
                 continue
-            if front_s_m >= float(first_conflict_s_m) - float(STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+            if front_s_m >= target_front_s_m:
                 return int(pos)
         return None
 
     area_start_s_m = float(conflict_info.get('area_start_s_m', np.nan))
     if not np.isfinite(area_start_s_m):
         return None
+    target_front_s_m = float(area_start_s_m + entry_post_margin_m)
     for pos in range(int(start_pos), int(end_pos) + 1):
         front_s_m = _record_scene_front_s(records[int(pos)])
         if not np.isfinite(front_s_m):
             continue
-        if front_s_m >= float(area_start_s_m) - float(STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+        if front_s_m >= target_front_s_m:
             return int(pos)
     return None
 
