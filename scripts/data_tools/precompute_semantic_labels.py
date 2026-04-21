@@ -2450,6 +2450,7 @@ def _find_best_two_way_cluster_candidate(
 
     ordered_candidates = sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"])))
     del route_progress_ahead_margin_m
+    del lateral_thresh_m
     actor_candidates = []
     for route_candidate in ordered_candidates:
         record = frame_records[int(route_candidate["record_idx"])]
@@ -2459,25 +2460,19 @@ def _find_best_two_way_cluster_candidate(
             actor_id = box.get("id", None)
             if actor_id is None or int(actor_id) not in cluster_actor_ids:
                 continue
-            pos = box.get("position", None)
-            if pos is None or len(pos) < 2:
-                continue
-            local_x = float(pos[0])
-            local_y = float(pos[1])
-            if local_x <= 0.0 or float(abs(local_y)) > float(lateral_thresh_m):
-                continue
             actor_route_progress_m = _two_way_box_route_progress_m(record, box)
             if not np.isfinite(actor_route_progress_m):
                 continue
+            pos = box.get("position", None)
+            local_x = float(pos[0]) if pos is not None and len(pos) >= 2 else np.nan
+            local_y = float(pos[1]) if pos is not None and len(pos) >= 2 else np.nan
             world_xyz = _box_world_xyz(box, ego_matrix_current=ego_matrix_current)
             actor_candidates.append({
                 "score": (
                     float(actor_route_progress_m),
-                    float(abs(local_y)),
-                    float(local_x),
-                    int(actor_id),
                     int(route_candidate["priority"]),
                     int(route_candidate["frame_id"]),
+                    int(actor_id),
                 ),
                 "record_idx": int(route_candidate["record_idx"]),
                 "frame_id": int(route_candidate["frame_id"]),
@@ -2601,47 +2596,46 @@ def _build_event_two_way_borrow_context(
             "cluster_actor_ids": list(scene_global_cluster.get("actor_ids", [])),
         }
     else:
+        fallback_actor_candidates = []
         for route_candidate in sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"]))):
             record = frame_records[int(route_candidate["record_idx"])]
             ego_route_progress_m = _two_way_ego_route_progress_m(record)
-            eligible_boxes = []
             for box in record.get("current_boxes") or []:
                 actor_id = box.get("id", None)
                 if actor_id is None or not _two_way_blocker_box_allowed(box, event_name=event_name):
                     continue
-                pos = box.get("position", None)
-                if pos is None or len(pos) < 2:
-                    continue
-                local_x = float(pos[0])
-                local_y = float(pos[1])
-                if local_x <= 0.0 or float(abs(local_y)) > float(blocker_pre_shift_lateral_thresh):
-                    continue
                 actor_route_progress_m = _two_way_box_route_progress_m(record, box)
                 if not np.isfinite(actor_route_progress_m):
                     continue
-                eligible_boxes.append((
-                    float(actor_route_progress_m),
-                    float(abs(local_y)),
-                    float(local_x),
-                    int(actor_id),
-                    box,
-                ))
-            if not eligible_boxes:
-                continue
-            eligible_boxes.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-            actor_route_progress_m, _, _, actor_id, seed_box = eligible_boxes[0]
-            seed_world_xyz = _box_world_xyz(seed_box, ego_matrix_current=record.get("current_meas", {}).get("ego_matrix", None))
+                seed_world_xyz = _box_world_xyz(box, ego_matrix_current=record.get("current_meas", {}).get("ego_matrix", None))
+                fallback_actor_candidates.append({
+                    "score": (
+                        float(actor_route_progress_m),
+                        int(route_candidate["priority"]),
+                        int(route_candidate["frame_id"]),
+                        int(actor_id),
+                    ),
+                    "actor_id": int(actor_id),
+                    "actor_class": str(_box_class_name(box)),
+                    "seed_frame_id": int(route_candidate["frame_id"]),
+                    "seed_priority": int(route_candidate["priority"]),
+                    "seed_route_progress_m": float(actor_route_progress_m),
+                    "seed_ego_route_progress_m": float(ego_route_progress_m),
+                    "seed_world_xyz": [] if seed_world_xyz is None else np.asarray(seed_world_xyz, dtype=np.float32).astype(float).tolist(),
+                })
+        if fallback_actor_candidates:
+            fallback_actor_candidates.sort(key=lambda item: item["score"])
+            selected = fallback_actor_candidates[0]
             seed_actor = {
-                "actor_id": int(actor_id),
-                "actor_class": str(_box_class_name(seed_box)),
-                "seed_frame_id": int(route_candidate["frame_id"]),
-                "seed_priority": int(route_candidate["priority"]),
-                "seed_route_progress_m": float(actor_route_progress_m),
-                "seed_ego_route_progress_m": float(ego_route_progress_m),
-                "seed_world_xyz": [] if seed_world_xyz is None else np.asarray(seed_world_xyz, dtype=np.float32).astype(float).tolist(),
+                "actor_id": int(selected["actor_id"]),
+                "actor_class": str(selected["actor_class"]),
+                "seed_frame_id": int(selected["seed_frame_id"]),
+                "seed_priority": int(selected["seed_priority"]),
+                "seed_route_progress_m": float(selected["seed_route_progress_m"]),
+                "seed_ego_route_progress_m": float(selected["seed_ego_route_progress_m"]),
+                "seed_world_xyz": list(selected["seed_world_xyz"]),
                 "seed_source": "route_candidate",
             }
-            break
     if seed_actor is None:
         return _empty_two_way_borrow_context(
             event_name=event_name,
