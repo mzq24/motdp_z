@@ -760,6 +760,7 @@ def _build_text_panel(sample, current_meas):
     future_cover = stage1_debug.get("future_cover") or {}
     conflict_area = stage1_debug.get("conflict_area") or {}
     conflict_phase = stage1_debug.get("conflict_phase") or {}
+    merge_threshold_debug = stage1_debug.get("merge_thresholds") or {}
 
     base_dir, _ = _resolve_feature_frame_info(sample)
     event_name = _scene_name_from_base_dir(base_dir) or "unknown"
@@ -863,12 +864,13 @@ def _build_text_panel(sample, current_meas):
         col_w,
         "Debug",
         [
-            f"area xyz start={len(conflict_area.get('area_start_world_xyz', []))} end={len(conflict_area.get('area_end_world_xyz', []))} seg={len(conflict_area.get('area_segment_world_xyz', []))}",
-            f"borrow xyz s={len(conflict_area.get('borrow_start_world_xyz', []))} e={len(conflict_area.get('borrow_end_world_xyz', []))}",
+            f"xyz area={len(conflict_area.get('area_start_world_xyz', []))}/{len(conflict_area.get('area_end_world_xyz', []))}/{len(conflict_area.get('area_segment_world_xyz', []))} borrow={len(conflict_area.get('borrow_start_world_xyz', []))}/{len(conflict_area.get('borrow_end_world_xyz', []))}",
             f"collision xyz={len(conflict_area.get('collision_point_world_xyz', []))} radius={_fmt_float(conflict_area.get('area_radius_m', np.nan))}",
             f"yld f={_fmt_int(conflict_phase.get('yld_frame_count', 0))} low={_fmt_int(conflict_phase.get('yld_low_speed_frame_count', 0))} stop={_fmt_int(conflict_phase.get('yld_stop_frame_count', 0))}",
             f"v0={_fmt_float(conflict_phase.get('yld_start_speed_mps', np.nan))} vmin={_fmt_float(conflict_phase.get('window_min_speed_mps', np.nan))}@{_fmt_int(conflict_phase.get('window_min_speed_frame', -1))}/{conflict_phase.get('window_min_speed_phase', 'none')} vgo={_fmt_float(conflict_phase.get('yld_go_speed_mps', np.nan))}",
             f"drop={_fmt_float(conflict_phase.get('yld_speed_drop_from_start_mps', np.nan))} ratio={_fmt_float(conflict_phase.get('yld_speed_drop_ratio', np.nan))} prog={_fmt_float(conflict_phase.get('yld_progress_span_m', np.nan))}",
+            f"merge th yld={_fmt_float(sample.get('merge_yld_max_speed', np.nan))} valid={int(float(sample.get('merge_yld_max_speed_valid', 0.0)) > 0.5)} issue={merge_threshold_debug.get('issue_reason', 'none')}",
+            f"merge th go={_fmt_float(sample.get('merge_go_min_speed', np.nan))} valid={int(float(sample.get('merge_go_min_speed_valid', 0.0)) > 0.5)} tail={int(float(sample.get('merge_threshold_train_only_negative_tail', 0.0)) > 0.5)}",
         ],
         (86, 86, 86),
     )
