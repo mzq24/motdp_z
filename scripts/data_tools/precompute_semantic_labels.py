@@ -111,6 +111,7 @@ STAGE1_JUNCTION_AREA_POST_MARGIN_M = 10.0
 STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
 STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
+STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS = 2.0
 
 STAGE1_SPEED_FIELDS = (
     'conflict_area_family',
@@ -2823,6 +2824,25 @@ def _default_conflict_phase_debug():
         'entry_found': 0.0,
         'speed_mps': np.nan,
         'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
+        'low_speed_thresh_mps': float(STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS),
+        'yld_frame_count': 0,
+        'yld_valid_speed_count': 0,
+        'yld_low_speed_frame_count': 0,
+        'yld_stop_frame_count': 0,
+        'yld_start_speed_mps': np.nan,
+        'yld_entry_speed_mps': np.nan,
+        'yld_release_speed_mps': np.nan,
+        'yld_go_speed_mps': np.nan,
+        'yld_min_speed_mps': np.nan,
+        'yld_min_speed_frame': -1,
+        'yld_median_speed_mps': np.nan,
+        'yld_speed_drop_from_start_mps': np.nan,
+        'yld_speed_drop_from_median_mps': np.nan,
+        'yld_speed_drop_ratio': np.nan,
+        'yld_most_negative_speed_delta_mps': np.nan,
+        'yld_negative_speed_delta_sum_mps': np.nan,
+        'yld_progress_span_m': np.nan,
+        'yld_low_speed_progress_span_m': np.nan,
     }
 
 
@@ -3650,6 +3670,8 @@ def _build_junction_conflict_windows(records, samples):
             issues.append(_conflict_area_issue(samples[records[issue_pos]['sample_idx']], 'junction', 'junction_start_blocked_by_current_follow_chase', pos=issue_pos))
             continue
 
+        first_conflict_s_m = float(cluster.get('first_conflict_s_m', np.nan))
+        last_conflict_s_m = float(cluster.get('last_conflict_s_m', np.nan))
         cluster_conflict_s_m = float(cluster.get('conflict_s_m', np.nan))
         if not np.isfinite(cluster_conflict_s_m):
             issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_conflict_s', pos=int(cluster_positions[0])))
@@ -3740,6 +3762,8 @@ def _build_junction_conflict_windows(records, samples):
             'collision_point_world_xyz': list(dir_info.get('collision_point_world_xyz', [])),
             'area_center_world_xyz': center_xyz[:3].astype(float).tolist(),
             'area_radius_m': float(radius_m),
+            'junction_first_conflict_s_m': float(first_conflict_s_m),
+            'junction_last_conflict_s_m': float(last_conflict_s_m),
             'cluster_conflict_s_m': float(cluster_conflict_s_m),
             'candidate_frame_count': int(len(cluster_positions)),
             'dir_source': str(dir_info.get('dir_source', 'family_fallback')),
@@ -3808,6 +3832,18 @@ def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_po
                 return int(pos)
         return None
 
+    if family == 'junction':
+        first_conflict_s_m = float(conflict_info.get('junction_first_conflict_s_m', np.nan))
+        if not np.isfinite(first_conflict_s_m):
+            return None
+        for pos in range(int(start_pos), int(end_pos) + 1):
+            front_s_m = _record_scene_front_s(records[int(pos)])
+            if not np.isfinite(front_s_m):
+                continue
+            if front_s_m >= float(first_conflict_s_m) - float(STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+                return int(pos)
+        return None
+
     area_start_s_m = float(conflict_info.get('area_start_s_m', np.nan))
     if not np.isfinite(area_start_s_m):
         return None
@@ -3839,6 +3875,105 @@ def _conflict_window_go_pos(records, family, start_pos, release_pos, end_pos, re
             return int(pos), 'post_stop_speed_restart'
 
     return None, 'stopped_no_restart'
+
+
+def _conflict_window_phase_debug_stats(records, family, start_pos, entry_pos, release_pos, go_pos, end_pos):
+    if go_pos is None:
+        yld_end_pos = int(end_pos)
+    else:
+        yld_end_pos = int(go_pos) - 1
+    if yld_end_pos < int(start_pos):
+        yld_positions = []
+    else:
+        yld_positions = list(range(int(start_pos), int(yld_end_pos) + 1))
+
+    stats = {
+        'low_speed_thresh_mps': float(STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS),
+        'yld_frame_count': int(len(yld_positions)),
+        'yld_valid_speed_count': 0,
+        'yld_low_speed_frame_count': 0,
+        'yld_stop_frame_count': 0,
+        'yld_start_speed_mps': np.nan,
+        'yld_entry_speed_mps': np.nan,
+        'yld_release_speed_mps': np.nan,
+        'yld_go_speed_mps': np.nan,
+        'yld_min_speed_mps': np.nan,
+        'yld_min_speed_frame': -1,
+        'yld_median_speed_mps': np.nan,
+        'yld_speed_drop_from_start_mps': np.nan,
+        'yld_speed_drop_from_median_mps': np.nan,
+        'yld_speed_drop_ratio': np.nan,
+        'yld_most_negative_speed_delta_mps': np.nan,
+        'yld_negative_speed_delta_sum_mps': np.nan,
+        'yld_progress_span_m': np.nan,
+        'yld_low_speed_progress_span_m': np.nan,
+    }
+
+    def _speed_at(pos):
+        if pos is None:
+            return np.nan
+        return float(_record_conflict_speed_mps(records[int(pos)], family))
+
+    stats['yld_start_speed_mps'] = _speed_at(start_pos)
+    stats['yld_entry_speed_mps'] = _speed_at(entry_pos)
+    stats['yld_release_speed_mps'] = _speed_at(release_pos)
+    stats['yld_go_speed_mps'] = _speed_at(go_pos)
+
+    speed_items = []
+    low_speed_front_s = []
+    prev_speed = None
+    for pos in yld_positions:
+        speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+        if not np.isfinite(speed_mps):
+            prev_speed = None
+            continue
+        speed_mps = float(speed_mps)
+        speed_items.append((int(pos), speed_mps))
+        if speed_mps <= float(STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS):
+            stats['yld_low_speed_frame_count'] += 1
+            front_s = _record_scene_front_s(records[int(pos)])
+            if np.isfinite(front_s):
+                low_speed_front_s.append(float(front_s))
+        if speed_mps <= float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS):
+            stats['yld_stop_frame_count'] += 1
+        if prev_speed is not None:
+            delta = float(speed_mps - prev_speed)
+            if not np.isfinite(stats['yld_most_negative_speed_delta_mps']) or delta < float(stats['yld_most_negative_speed_delta_mps']):
+                stats['yld_most_negative_speed_delta_mps'] = float(delta)
+            if delta < 0.0:
+                current_sum = float(stats['yld_negative_speed_delta_sum_mps']) if np.isfinite(stats['yld_negative_speed_delta_sum_mps']) else 0.0
+                stats['yld_negative_speed_delta_sum_mps'] = float(current_sum + (-delta))
+        prev_speed = speed_mps
+
+    stats['yld_valid_speed_count'] = int(len(speed_items))
+    if speed_items:
+        speeds = np.asarray([item[1] for item in speed_items], dtype=np.float32)
+        min_idx = int(np.argmin(speeds))
+        min_pos = int(speed_items[min_idx][0])
+        min_speed = float(speeds[min_idx])
+        stats['yld_min_speed_mps'] = float(min_speed)
+        stats['yld_min_speed_frame'] = int(records[min_pos].get('frame_id', -1))
+        stats['yld_median_speed_mps'] = float(np.median(speeds))
+        start_speed = float(stats['yld_start_speed_mps']) if np.isfinite(stats['yld_start_speed_mps']) else np.nan
+        median_speed = float(stats['yld_median_speed_mps']) if np.isfinite(stats['yld_median_speed_mps']) else np.nan
+        if np.isfinite(start_speed):
+            stats['yld_speed_drop_from_start_mps'] = float(start_speed - min_speed)
+        if np.isfinite(median_speed):
+            stats['yld_speed_drop_from_median_mps'] = float(median_speed - min_speed)
+            if abs(median_speed) > 1e-6:
+                stats['yld_speed_drop_ratio'] = float(min_speed / median_speed)
+
+    front_s_values = [
+        float(_record_scene_front_s(records[int(pos)]))
+        for pos in yld_positions
+        if np.isfinite(_record_scene_front_s(records[int(pos)]))
+    ]
+    if len(front_s_values) >= 2:
+        stats['yld_progress_span_m'] = float(max(front_s_values) - min(front_s_values))
+    if len(low_speed_front_s) >= 2:
+        stats['yld_low_speed_progress_span_m'] = float(max(low_speed_front_s) - min(low_speed_front_s))
+
+    return stats
 
 
 def _conflict_phase_frame_role(pos, start_pos, end_pos, entry_pos, go_pos, phase):
@@ -3915,6 +4050,15 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
                 release_reason=release_reason,
             )
             go_frame = int(records[int(go_pos)]['frame_id']) if go_pos is not None else -1
+        phase_stats = _conflict_window_phase_debug_stats(
+            records,
+            family=family,
+            start_pos=start_pos,
+            entry_pos=entry_pos,
+            release_pos=release_pos,
+            go_pos=go_pos,
+            end_pos=end_pos,
+        )
 
         for window_pos in range(int(start_pos), int(end_pos) + 1):
             record = records[int(window_pos)]
@@ -3943,6 +4087,7 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
                 'speed_mps': float(_record_conflict_speed_mps(record, family)),
                 'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
             }
+            phase_info.update(phase_stats)
             _set_stage1_conflict_phase_annotation(samples[int(record['sample_idx'])], phase_info)
 
         pos += 1
@@ -4453,6 +4598,8 @@ def _junction_cluster_conflict_candidates(records):
             'radius_m': float(cluster['radius_m']),
             'items': items,
             'start_pos': int(start_pos),
+            'first_conflict_s_m': float(min(conflict_s_values)) if conflict_s_values else np.nan,
+            'last_conflict_s_m': float(max(conflict_s_values)) if conflict_s_values else np.nan,
             'conflict_s_m': float(np.median(conflict_s_values)) if conflict_s_values else np.nan,
         })
     valid_clusters.sort(key=lambda cluster: int(cluster['start_pos']))

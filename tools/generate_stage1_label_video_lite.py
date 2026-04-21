@@ -825,6 +825,9 @@ def _build_text_panel(sample, current_meas):
             f"go_frame={_fmt_int(sample.get('conflict_go_frame', -1))} entry={_fmt_int(conflict_phase.get('entry_frame', -1))} release={_fmt_int(conflict_phase.get('release_frame', -1))}",
             f"role={conflict_phase.get('frame_role', 'none')} src={conflict_phase.get('source', 'none')} reason={conflict_phase.get('release_reason', 'none')}",
             f"speed={_fmt_float(conflict_phase.get('speed_mps', np.nan))} stop_th={_fmt_float(conflict_phase.get('stop_speed_thresh_mps', np.nan))}",
+            f"yld f={_fmt_int(conflict_phase.get('yld_frame_count', 0))} low={_fmt_int(conflict_phase.get('yld_low_speed_frame_count', 0))} stop={_fmt_int(conflict_phase.get('yld_stop_frame_count', 0))}",
+            f"v0={_fmt_float(conflict_phase.get('yld_start_speed_mps', np.nan))} vmin={_fmt_float(conflict_phase.get('yld_min_speed_mps', np.nan))}@{_fmt_int(conflict_phase.get('yld_min_speed_frame', -1))} vgo={_fmt_float(conflict_phase.get('yld_go_speed_mps', np.nan))}",
+            f"drop={_fmt_float(conflict_phase.get('yld_speed_drop_from_start_mps', np.nan))} ratio={_fmt_float(conflict_phase.get('yld_speed_drop_ratio', np.nan))} prog={_fmt_float(conflict_phase.get('yld_progress_span_m', np.nan))}",
         ],
         (146, 98, 42),
     )
