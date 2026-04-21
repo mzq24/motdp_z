@@ -2670,8 +2670,6 @@ def _build_event_two_way_borrow_context(
             actor_route_progress_m = _two_way_box_route_progress_m(record, box)
             if not np.isfinite(actor_route_progress_m):
                 continue
-            if float(actor_route_progress_m) <= float(ego_route_progress_m) + 0.5:
-                continue
             world_xyz = _box_world_xyz(box, ego_matrix_current=ego_matrix_current)
             candidate = {
                 "score": (
@@ -3047,6 +3045,11 @@ def _default_conflict_area_debug():
         'borrow_start_world_xyz': [],
         'borrow_end_world_xyz': [],
         'borrow_distance_m': np.nan,
+        'blocking_actor_id': -1,
+        'blocking_actor_class': 'none',
+        'context_frame_id': -1,
+        'seed_frame_id': -1,
+        'seed_source': 'none',
         'dir_source': 'none',
         'dir_angle_deg': np.nan,
         'route_heading_deg': np.nan,
@@ -3808,6 +3811,11 @@ def _build_borrow_conflict_windows(records, samples):
         'borrow_start_world_xyz': list(scene_borrow_context.get('borrow_start_world_xyz', [])),
         'borrow_end_world_xyz': list(scene_borrow_context.get('borrow_end_world_xyz', [])),
         'borrow_distance_m': float(scene_borrow_context.get('borrow_distance_m', np.nan)),
+        'blocking_actor_id': int(scene_borrow_context.get('blocking_actor_id', -1)),
+        'blocking_actor_class': str(scene_borrow_context.get('blocking_actor_class', 'none')),
+        'context_frame_id': int(scene_borrow_context.get('context_frame_id', -1)),
+        'seed_frame_id': int(scene_borrow_context.get('seed_frame_id', -1)),
+        'seed_source': str(scene_borrow_context.get('seed_source', 'none')),
         'borrow_conflict_start_progress_m': float(conflict_start_progress_m),
         'borrow_conflict_end_progress_m': float(conflict_end_progress_m),
         'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
