@@ -2449,11 +2449,12 @@ def _find_best_two_way_cluster_candidate(
         return None
 
     ordered_candidates = sorted(route_candidates, key=lambda item: (int(item["priority"]), int(item["frame_id"])))
+    del route_progress_ahead_margin_m
+    actor_candidates = []
     for route_candidate in ordered_candidates:
         record = frame_records[int(route_candidate["record_idx"])]
         ego_matrix_current = None if record.get("current_meas") is None else record["current_meas"].get("ego_matrix", None)
         ego_route_progress_m = _two_way_ego_route_progress_m(record)
-        frame_candidates = []
         for box in record.get("current_boxes") or []:
             actor_id = box.get("id", None)
             if actor_id is None or int(actor_id) not in cluster_actor_ids:
@@ -2468,15 +2469,15 @@ def _find_best_two_way_cluster_candidate(
             actor_route_progress_m = _two_way_box_route_progress_m(record, box)
             if not np.isfinite(actor_route_progress_m):
                 continue
-            if float(actor_route_progress_m) <= float(ego_route_progress_m) + float(route_progress_ahead_margin_m):
-                continue
             world_xyz = _box_world_xyz(box, ego_matrix_current=ego_matrix_current)
-            frame_candidates.append({
+            actor_candidates.append({
                 "score": (
                     float(actor_route_progress_m),
                     float(abs(local_y)),
                     float(local_x),
                     int(actor_id),
+                    int(route_candidate["priority"]),
+                    int(route_candidate["frame_id"]),
                 ),
                 "record_idx": int(route_candidate["record_idx"]),
                 "frame_id": int(route_candidate["frame_id"]),
@@ -2490,10 +2491,10 @@ def _find_best_two_way_cluster_candidate(
                 "geom": dict(route_candidate["geom"]),
                 "priority": int(route_candidate["priority"]),
             })
-        if frame_candidates:
-            frame_candidates.sort(key=lambda item: item["score"])
-            return dict(frame_candidates[0])
-    return None
+    if not actor_candidates:
+        return None
+    actor_candidates.sort(key=lambda item: item["score"])
+    return dict(actor_candidates[0])
 
 
 def _build_event_two_way_borrow_context(
@@ -2618,8 +2619,6 @@ def _build_event_two_way_borrow_context(
                 actor_route_progress_m = _two_way_box_route_progress_m(record, box)
                 if not np.isfinite(actor_route_progress_m):
                     continue
-                if float(actor_route_progress_m) <= float(ego_route_progress_m) + 0.5:
-                    continue
                 eligible_boxes.append((
                     float(actor_route_progress_m),
                     float(abs(local_y)),
@@ -2699,7 +2698,7 @@ def _build_event_two_way_borrow_context(
                 if best_fallback is None or candidate["score"] < best_fallback["score"]:
                     best_fallback = candidate
 
-    best_candidate = primary_cluster_candidate if primary_cluster_candidate is not None else (best_strict if best_strict is not None else best_fallback)
+    best_candidate = best_strict if best_strict is not None else best_fallback
     if best_candidate is None:
         return _empty_two_way_borrow_context(
             event_name=event_name,
