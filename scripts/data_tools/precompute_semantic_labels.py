@@ -95,7 +95,9 @@ MERGE_DEBUG_MIN_GO_DENOM_S = 0.10
 NO_ROUTE_EXTENSION_SCENES = {'HazardAtSideLane'}
 TWOWAY_START_LATERAL_THRESH_M = 0.5
 TWOWAY_RETURN_TAIL_POINTS = 12
-TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX = 10
+TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX = 9
+TWOWAY_RETURN_TURN_HEADING_THRESH_DEG = 2.5
+TWOWAY_RETURN_SETTLE_HEADING_ABS_THRESH_DEG = 2.0
 TWOWAY_BORROW_ONEWAY_ROUTE_OVERRIDES = {
     "Town13_Rep0_1313_0_route0_11_09_06_18_06",
     "Town13_Rep0_1313_1_route0_11_08_23_22_02",
@@ -2217,6 +2219,77 @@ def _estimate_borrow_points_from_signed_route_heading(
     return geom
 
 
+def _resolve_borrow_return_from_context_route(
+    route_local_context,
+    shift_sign,
+    route_head_idx=0,
+    enter_idx=None,
+    return_turn_heading_thresh_deg=TWOWAY_RETURN_TURN_HEADING_THRESH_DEG,
+    settle_heading_abs_thresh_deg=TWOWAY_RETURN_SETTLE_HEADING_ABS_THRESH_DEG,
+):
+    summary = _summarize_signed_route_heading(
+        route_local=route_local_context,
+        shift_sign=shift_sign,
+    )
+    if summary is None:
+        return None
+
+    arc = np.asarray(summary.get("arc", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+    heading_deg = np.asarray(summary.get("heading_deg", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+    rel_heading_deg = np.asarray(summary.get("rel_heading_deg", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+    signed_rel_heading_deg = np.asarray(summary.get("signed_rel_heading_deg", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+    if arc.ndim != 1 or heading_deg.ndim != 1 or rel_heading_deg.ndim != 1 or signed_rel_heading_deg.ndim != 1:
+        return None
+    if not (arc.shape[0] == heading_deg.shape[0] == rel_heading_deg.shape[0] == signed_rel_heading_deg.shape[0]):
+        return None
+    if arc.shape[0] == 0:
+        return None
+
+    search_start_idx = int(max(int(route_head_idx), 0))
+    if enter_idx is not None:
+        search_start_idx = int(max(search_start_idx, int(enter_idx) + 1))
+    if search_start_idx >= arc.shape[0]:
+        return None
+
+    return_turn_idx = None
+    for idx in range(search_start_idx, arc.shape[0]):
+        signed_heading = float(signed_rel_heading_deg[idx])
+        if np.isfinite(signed_heading) and signed_heading <= -float(return_turn_heading_thresh_deg):
+            return_turn_idx = int(idx)
+            break
+    if return_turn_idx is None:
+        return {
+            "summary": summary,
+            "return_turn_idx": None,
+            "return_settle_idx": None,
+            "return_turn_s_m": np.nan,
+            "return_settle_s_m": np.nan,
+            "return_turn_heading_deg": np.nan,
+            "return_settle_heading_deg": np.nan,
+            "return_turn_rel_heading_deg": np.nan,
+            "return_settle_rel_heading_deg": np.nan,
+        }
+
+    return_settle_idx = None
+    for idx in range(int(return_turn_idx) + 1, arc.shape[0]):
+        rel_heading = float(rel_heading_deg[idx])
+        if np.isfinite(rel_heading) and abs(rel_heading) <= float(settle_heading_abs_thresh_deg):
+            return_settle_idx = int(idx)
+            break
+
+    return {
+        "summary": summary,
+        "return_turn_idx": int(return_turn_idx),
+        "return_settle_idx": int(return_settle_idx) if return_settle_idx is not None else None,
+        "return_turn_s_m": float(arc[int(return_turn_idx)]),
+        "return_settle_s_m": float(arc[int(return_settle_idx)]) if return_settle_idx is not None else np.nan,
+        "return_turn_heading_deg": float(heading_deg[int(return_turn_idx)]) if np.isfinite(float(heading_deg[int(return_turn_idx)])) else np.nan,
+        "return_settle_heading_deg": float(heading_deg[int(return_settle_idx)]) if return_settle_idx is not None and np.isfinite(float(heading_deg[int(return_settle_idx)])) else np.nan,
+        "return_turn_rel_heading_deg": float(rel_heading_deg[int(return_turn_idx)]) if np.isfinite(float(rel_heading_deg[int(return_turn_idx)])) else np.nan,
+        "return_settle_rel_heading_deg": float(rel_heading_deg[int(return_settle_idx)]) if return_settle_idx is not None and np.isfinite(float(rel_heading_deg[int(return_settle_idx)])) else np.nan,
+    }
+
+
 def _two_way_blocker_box_allowed(box, event_name=None, stop_speed_thresh_mps=0.25):
     cls = _box_class_name(box)
     if cls == "ego_car":
@@ -2762,7 +2835,13 @@ def _build_event_two_way_borrow_context(
         # Route head means the first actual route point, not the prepended origin.
         route_start_s = float(arc_context[min(route_head_idx, arc_context.shape[0] - 1)])
 
-    route_return_s = float(borrow_geom.get("return_s_m", np.nan))
+    return_info = _resolve_borrow_return_from_context_route(
+        route_local_context=route_local_context,
+        shift_sign=float(borrow_geom.get("shift_sign", -1.0)),
+        route_head_idx=route_head_idx,
+        enter_idx=borrow_geom.get("enter_idx", None),
+    ) or {}
+    route_return_s = float(return_info.get("return_settle_s_m", np.nan))
     if not np.isfinite(route_return_s) or route_return_s <= route_start_s + 1e-3:
         route_front_count = int(record.get("route_front_count", 0))
         fallback_local_idx = route_front_count + int(TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX) - 1
@@ -2812,6 +2891,12 @@ def _build_event_two_way_borrow_context(
     borrow_geom["enter_s_m"] = float(route_start_s)
     borrow_geom["return_s_m"] = float(route_return_s)
     borrow_geom["borrow_distance_m"] = float(max(route_return_s - route_start_s, 0.0))
+    borrow_geom["return_turn_s_m"] = float(return_info.get("return_turn_s_m", np.nan))
+    borrow_geom["return_settle_s_m"] = float(return_info.get("return_settle_s_m", np.nan))
+    borrow_geom["return_turn_heading_deg"] = float(return_info.get("return_turn_heading_deg", np.nan))
+    borrow_geom["return_settle_heading_deg"] = float(return_info.get("return_settle_heading_deg", np.nan))
+    borrow_geom["return_turn_rel_heading_deg"] = float(return_info.get("return_turn_rel_heading_deg", np.nan))
+    borrow_geom["return_settle_rel_heading_deg"] = float(return_info.get("return_settle_rel_heading_deg", np.nan))
     borrow_geom["start_from_route_head"] = False
     borrow_segment_world = _transform_points_local_to_world_xyz(
         np.asarray(borrow_geom.get("segment_local_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
@@ -2853,6 +2938,12 @@ def _build_event_two_way_borrow_context(
         "return_rel_heading_deg": float(borrow_geom.get("return_rel_heading_deg", np.nan)),
         "peak_signed_heading_deg": float(borrow_geom.get("peak_signed_heading_deg", np.nan)),
         "return_signed_heading_deg": float(borrow_geom.get("return_signed_heading_deg", np.nan)),
+        "return_turn_s_m": float(borrow_geom.get("return_turn_s_m", np.nan)),
+        "return_settle_s_m": float(borrow_geom.get("return_settle_s_m", np.nan)),
+        "return_turn_heading_deg": float(borrow_geom.get("return_turn_heading_deg", np.nan)),
+        "return_settle_heading_deg": float(borrow_geom.get("return_settle_heading_deg", np.nan)),
+        "return_turn_rel_heading_deg": float(borrow_geom.get("return_turn_rel_heading_deg", np.nan)),
+        "return_settle_rel_heading_deg": float(borrow_geom.get("return_settle_rel_heading_deg", np.nan)),
         "shift_sign": float(borrow_geom.get("shift_sign", np.nan)),
         "context_frame_id": int(best_candidate["frame_id"]),
         "anchor_actor_id": int(best_candidate["actor_id"]),
