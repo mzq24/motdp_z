@@ -2042,7 +2042,21 @@ def _is_two_way_event_corridor_scene_context(event_name=None):
     return str(event_name or "") in {"ConstructionObstacleTwoWays", "AccidentTwoWays"}
 
 
-def _summarize_signed_route_shift(route_local, shift_sign=-1.0, baseline_points=6):
+def _wrap_angle_deg(angle_deg):
+    angle_deg = np.asarray(angle_deg, dtype=np.float32)
+    return ((angle_deg + 180.0) % 360.0 - 180.0).astype(np.float32)
+
+
+def _circular_mean_deg(values_deg):
+    vals = np.asarray(values_deg, dtype=np.float32).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    angles = np.deg2rad(vals.astype(np.float64))
+    return float(np.rad2deg(np.angle(np.mean(np.exp(1j * angles)))))
+
+
+def _summarize_signed_route_heading(route_local, shift_sign=-1.0, baseline_points=6, heading_span_m=2.0):
     route_poly = _prepend_route_origin(route_local)
     if route_poly.shape[0] < 3:
         return None
@@ -2051,29 +2065,69 @@ def _summarize_signed_route_shift(route_local, shift_sign=-1.0, baseline_points=
     if arc.shape[0] != route_poly.shape[0]:
         return None
 
-    baseline_count = min(max(int(baseline_points), 2), route_poly.shape[0])
-    baseline_y = float(np.median(route_poly[:baseline_count, 1]))
-    rel_y = route_poly[:, 1] - baseline_y
+    heading_deg = _polyline_heading_deg(route_poly, span_m=heading_span_m)
+    baseline_count = min(max(int(baseline_points), 2), heading_deg.shape[0])
+    baseline_heading_deg = _circular_mean_deg(heading_deg[:baseline_count])
+    if not np.isfinite(baseline_heading_deg):
+        return None
+    rel_heading_deg = _wrap_angle_deg(heading_deg - float(baseline_heading_deg))
     signed_factor = float(np.sign(float(shift_sign)) or -1.0)
-    signed_rel_y = signed_factor * rel_y
-    peak_idx = int(np.argmax(signed_rel_y))
+    signed_rel_heading_deg = (signed_factor * rel_heading_deg).astype(np.float32)
+    finite_mask = np.isfinite(signed_rel_heading_deg)
+    if not np.any(finite_mask):
+        return None
+    peak_idx = int(np.nanargmax(signed_rel_heading_deg))
     return {
         "route_poly": route_poly.astype(np.float32),
         "arc": arc.astype(np.float32),
-        "baseline_y": float(baseline_y),
-        "rel_y": rel_y.astype(np.float32),
-        "signed_rel_y": signed_rel_y.astype(np.float32),
+        "baseline_heading_deg": float(baseline_heading_deg),
+        "heading_deg": heading_deg.astype(np.float32),
+        "rel_heading_deg": rel_heading_deg.astype(np.float32),
+        "signed_rel_heading_deg": signed_rel_heading_deg.astype(np.float32),
         "peak_idx": int(peak_idx),
-        "peak_signed_lateral_m": float(signed_rel_y[peak_idx]),
+        "peak_signed_heading_deg": float(signed_rel_heading_deg[peak_idx]),
         "shift_sign": float(signed_factor),
     }
 
 
-def _build_borrow_geom_from_shift_summary(summary, enter_idx, return_idx, segment_step_m=0.5, mode="strict"):
+def _polyline_heading_deg(polyline_xy, span_m=2.0):
+    pts = np.asarray(polyline_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
+        return np.zeros((0,), dtype=np.float32)
+    if pts.shape[0] == 1:
+        return np.zeros((1,), dtype=np.float32)
+
+    arc = _polyline_arclengths(pts)
+    total_len = float(arc[-1]) if arc.size > 0 else 0.0
+    span_m = float(max(span_m, 0.5))
+    headings = np.full((pts.shape[0],), np.nan, dtype=np.float32)
+    for idx in range(pts.shape[0]):
+        s_cur = float(arc[idx])
+        s0 = max(s_cur - span_m, 0.0)
+        s1 = min(s_cur + span_m, total_len)
+        delta = None
+        if s1 > s0 + 1e-4:
+            sample = _sample_polyline_at_arclengths(pts, np.asarray([s0, s1], dtype=np.float32))
+            if sample.shape[0] >= 2:
+                delta = np.asarray(sample[-1, :2] - sample[0, :2], dtype=np.float32)
+        if delta is None or float(np.linalg.norm(delta)) <= 1e-4:
+            lo = max(int(idx) - 1, 0)
+            hi = min(int(idx) + 1, pts.shape[0] - 1)
+            if hi <= lo:
+                continue
+            delta = np.asarray(pts[hi, :2] - pts[lo, :2], dtype=np.float32)
+            if float(np.linalg.norm(delta)) <= 1e-4:
+                continue
+        headings[idx] = float(np.degrees(np.arctan2(float(delta[1]), float(delta[0]))))
+    return headings
+
+
+def _build_borrow_geom_from_heading_summary(summary, enter_idx, return_idx, segment_step_m=0.5, mode="strict"):
     route_poly = np.asarray(summary["route_poly"], dtype=np.float32)
     arc = np.asarray(summary["arc"], dtype=np.float32)
-    rel_y = np.asarray(summary["rel_y"], dtype=np.float32)
-    signed_rel_y = np.asarray(summary["signed_rel_y"], dtype=np.float32)
+    heading_deg = np.asarray(summary["heading_deg"], dtype=np.float32)
+    rel_heading_deg = np.asarray(summary["rel_heading_deg"], dtype=np.float32)
+    signed_rel_heading_deg = np.asarray(summary["signed_rel_heading_deg"], dtype=np.float32)
     enter_idx = int(enter_idx)
     return_idx = int(return_idx)
     if not (0 <= enter_idx < return_idx < route_poly.shape[0]):
@@ -2094,29 +2148,32 @@ def _build_borrow_geom_from_shift_summary(summary, enter_idx, return_idx, segmen
         "enter_s_m": float(arc[enter_idx]),
         "return_s_m": float(arc[return_idx]),
         "borrow_distance_m": float(max(arc[return_idx] - arc[enter_idx], 0.0)),
-        "peak_lateral_m": float(np.max(np.abs(rel_y[enter_idx:return_idx + 1]))),
-        "peak_signed_lateral_m": float(np.max(signed_rel_y[enter_idx:return_idx + 1])),
-        "baseline_y_m": float(summary["baseline_y"]),
+        "baseline_heading_deg": float(summary["baseline_heading_deg"]),
         "shift_sign": float(summary["shift_sign"]),
         "enter_local_xy": route_poly[enter_idx, :2].astype(np.float32),
         "return_local_xy": route_poly[return_idx, :2].astype(np.float32),
         "segment_local_xy": segment_local.astype(np.float32),
         "mode": str(mode),
-        "return_abs_m": float(abs(signed_rel_y[return_idx])),
+        "enter_heading_deg": float(heading_deg[enter_idx]) if np.isfinite(float(heading_deg[enter_idx])) else np.nan,
+        "return_heading_deg": float(heading_deg[return_idx]) if np.isfinite(float(heading_deg[return_idx])) else np.nan,
+        "enter_rel_heading_deg": float(rel_heading_deg[enter_idx]) if np.isfinite(float(rel_heading_deg[enter_idx])) else np.nan,
+        "return_rel_heading_deg": float(rel_heading_deg[return_idx]) if np.isfinite(float(rel_heading_deg[return_idx])) else np.nan,
+        "peak_signed_heading_deg": float(np.nanmax(signed_rel_heading_deg[enter_idx:return_idx + 1])),
+        "return_signed_heading_deg": float(signed_rel_heading_deg[return_idx]) if np.isfinite(float(signed_rel_heading_deg[return_idx])) else np.nan,
     }
 
 
-def _estimate_borrow_points_from_signed_route_shift(
+def _estimate_borrow_points_from_signed_route_heading(
     route_local,
     shift_sign=-1.0,
-    borrow_enter_lateral_thresh=1.25,
-    return_lateral_thresh=0.8,
     min_enter_progress_m=4.0,
     min_return_progress_m=6.0,
     baseline_points=6,
     segment_step_m=0.5,
+    borrow_enter_heading_thresh_deg=4.0,
+    return_heading_thresh_deg=2.5,
 ):
-    summary = _summarize_signed_route_shift(
+    summary = _summarize_signed_route_heading(
         route_local=route_local,
         shift_sign=shift_sign,
         baseline_points=baseline_points,
@@ -2126,13 +2183,13 @@ def _estimate_borrow_points_from_signed_route_shift(
 
     route_poly = np.asarray(summary["route_poly"], dtype=np.float32)
     arc = np.asarray(summary["arc"], dtype=np.float32)
-    signed_rel_y = np.asarray(summary["signed_rel_y"], dtype=np.float32)
+    signed_rel_heading_deg = np.asarray(summary["signed_rel_heading_deg"], dtype=np.float32)
 
     enter_idx = None
     for idx in range(1, route_poly.shape[0]):
         if float(arc[idx]) < float(min_enter_progress_m):
             continue
-        if float(signed_rel_y[idx]) >= float(borrow_enter_lateral_thresh):
+        if np.isfinite(float(signed_rel_heading_deg[idx])) and float(signed_rel_heading_deg[idx]) >= float(borrow_enter_heading_thresh_deg):
             enter_idx = idx
             break
     if enter_idx is None:
@@ -2142,77 +2199,22 @@ def _estimate_borrow_points_from_signed_route_shift(
     for idx in range(enter_idx + 1, route_poly.shape[0]):
         if float(arc[idx] - arc[enter_idx]) < float(min_return_progress_m):
             continue
-        if float(signed_rel_y[idx]) <= float(return_lateral_thresh):
+        if np.isfinite(float(signed_rel_heading_deg[idx])) and float(signed_rel_heading_deg[idx]) <= -float(return_heading_thresh_deg):
             return_idx = idx
             break
     if return_idx is None:
         return None
 
-    return _build_borrow_geom_from_shift_summary(
+    geom = _build_borrow_geom_from_heading_summary(
         summary,
         enter_idx=enter_idx,
         return_idx=return_idx,
         segment_step_m=segment_step_m,
         mode="strict",
     )
-
-
-def _estimate_borrow_points_from_signed_route_shift_relaxed(
-    route_local,
-    shift_sign=-1.0,
-    borrow_enter_lateral_thresh=1.25,
-    return_lateral_thresh=0.8,
-    min_enter_progress_m=4.0,
-    min_return_progress_m=6.0,
-    baseline_points=6,
-    segment_step_m=0.5,
-    fallback_peak_lateral_thresh=2.5,
-    fallback_return_abs_thresh=1.5,
-    fallback_min_recovery_m=1.0,
-):
-    summary = _summarize_signed_route_shift(
-        route_local=route_local,
-        shift_sign=shift_sign,
-        baseline_points=baseline_points,
-    )
-    if summary is None:
-        return None
-
-    route_poly = np.asarray(summary["route_poly"], dtype=np.float32)
-    arc = np.asarray(summary["arc"], dtype=np.float32)
-    signed_rel_y = np.asarray(summary["signed_rel_y"], dtype=np.float32)
-
-    enter_idx = None
-    for idx in range(1, route_poly.shape[0]):
-        if float(arc[idx]) < float(min_enter_progress_m):
-            continue
-        if float(signed_rel_y[idx]) >= float(borrow_enter_lateral_thresh):
-            enter_idx = idx
-            break
-    if enter_idx is None:
-        return None
-
-    peak_slice = signed_rel_y[enter_idx:]
-    if peak_slice.size == 0:
-        return None
-    peak_idx = int(enter_idx + int(np.argmax(peak_slice)))
-    peak_signed = float(signed_rel_y[peak_idx])
-    if peak_signed < float(fallback_peak_lateral_thresh):
-        return None
-
-    for idx in range(peak_idx + 1, route_poly.shape[0]):
-        if float(arc[idx] - arc[enter_idx]) < float(min_return_progress_m):
-            continue
-        if float(signed_rel_y[idx]) <= float(return_lateral_thresh):
-            return _build_borrow_geom_from_shift_summary(
-                summary,
-                enter_idx=enter_idx,
-                return_idx=idx,
-                segment_step_m=segment_step_m,
-                mode="strict",
-            )
-
-    return None
+    if geom is not None:
+        geom["heading_route_candidate"] = 1.0
+    return geom
 
 
 def _two_way_blocker_box_allowed(box, event_name=None, stop_speed_thresh_mps=0.25):
@@ -2324,8 +2326,13 @@ def _empty_two_way_borrow_context(
         "borrow_end_world_xyz": [],
         "borrow_segment_world_xyz": [],
         "borrow_distance_m": np.nan,
-        "peak_lateral_m": np.nan,
-        "peak_signed_lateral_m": np.nan,
+        "baseline_heading_deg": np.nan,
+        "enter_heading_deg": np.nan,
+        "return_heading_deg": np.nan,
+        "enter_rel_heading_deg": np.nan,
+        "return_rel_heading_deg": np.nan,
+        "peak_signed_heading_deg": np.nan,
+        "return_signed_heading_deg": np.nan,
         "shift_sign": np.nan,
         "context_frame_id": int(best_candidate.get("frame_id", -1)),
         "anchor_actor_id": int(seed_actor.get("actor_id", best_candidate.get("actor_id", -1))),
@@ -2337,7 +2344,6 @@ def _empty_two_way_borrow_context(
         "blocking_actor_local_y_m": float(best_candidate.get("local_y", np.nan)),
         "seed_frame_id": int(seed_actor.get("seed_frame_id", -1)),
         "seed_priority": int(seed_actor.get("seed_priority", -1)),
-        "route_return_abs_m": np.nan,
         "blocked_frame_id": -1,
     }
 
@@ -2497,14 +2503,11 @@ def _build_event_two_way_borrow_context(
     event_name=None,
     route_step_m=0.5,
     borrow_start_mode="route_head",
-    borrow_enter_lateral_thresh=1.25,
-    return_lateral_thresh=0.8,
     min_enter_progress_m=4.0,
     min_return_progress_m=6.0,
     blocker_pre_shift_lateral_thresh=1.75,
-    fallback_peak_lateral_thresh=2.5,
-    fallback_return_abs_thresh=1.5,
-    fallback_min_recovery_m=1.0,
+    borrow_enter_heading_thresh_deg=4.0,
+    return_heading_thresh_deg=2.5,
 ):
     if not _is_two_way_event_corridor_scene_context(event_name=event_name):
         return None
@@ -2521,14 +2524,14 @@ def _build_event_two_way_borrow_context(
         best_score = None
         best_priority = None
         for shift_sign in (-1.0, 1.0):
-            strict_geom = _estimate_borrow_points_from_signed_route_shift(
+            strict_geom = _estimate_borrow_points_from_signed_route_heading(
                 route_local=route_local,
                 shift_sign=shift_sign,
-                borrow_enter_lateral_thresh=float(borrow_enter_lateral_thresh),
-                return_lateral_thresh=float(return_lateral_thresh),
                 min_enter_progress_m=float(min_enter_progress_m),
                 min_return_progress_m=float(min_return_progress_m),
                 segment_step_m=float(max(route_step_m, 0.25)),
+                borrow_enter_heading_thresh_deg=float(borrow_enter_heading_thresh_deg),
+                return_heading_thresh_deg=float(return_heading_thresh_deg),
             )
             geom = strict_geom
             priority = 0
@@ -2536,8 +2539,9 @@ def _build_event_two_way_borrow_context(
                 continue
             score = (
                 int(priority),
-                -float(geom.get("peak_signed_lateral_m", 0.0)),
-                float(geom.get("return_abs_m", np.inf)),
+                -float(geom.get("peak_signed_heading_deg", 0.0)),
+                float(geom.get("return_signed_heading_deg", np.inf)),
+                float(geom.get("return_s_m", np.inf)),
             )
             if best_score is None or score < best_score:
                 best_geom = dict(geom)
@@ -2644,11 +2648,16 @@ def _build_event_two_way_borrow_context(
             route_candidate_count=len(route_candidates),
         )
 
-    best_strict = None
-    best_fallback = None
-    for route_candidate in route_candidates:
-        record = frame_records[int(route_candidate["record_idx"])]
-        ego_matrix_current = None if record.get("current_meas") is None else record["current_meas"].get("ego_matrix", None)
+    best_candidate = None
+    for record_idx, record in enumerate(frame_records or []):
+        current_meas = record.get("current_meas")
+        ego_matrix_current = None if current_meas is None else current_meas.get("ego_matrix", None)
+        if ego_matrix_current is None:
+            continue
+        route_local_context = np.asarray(record.get("route_input_local", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+        borrow_geom, priority = _best_borrow_geom_for_route(route_local_context)
+        if borrow_geom is None:
+            continue
         ego_route_progress_m = _two_way_ego_route_progress_m(record)
         for box in record.get("current_boxes") or []:
             actor_id = box.get("id", None)
@@ -2668,12 +2677,10 @@ def _build_event_two_way_borrow_context(
             candidate = {
                 "score": (
                     float(local_x),
-                    float(abs(local_y)),
-                    float(actor_route_progress_m),
-                    -int(route_candidate["frame_id"]),
+                    -int(record.get("frame_id", -1)),
                 ),
-                "record_idx": int(route_candidate["record_idx"]),
-                "frame_id": int(route_candidate["frame_id"]),
+                "record_idx": int(record_idx),
+                "frame_id": int(record.get("frame_id", -1)),
                 "actor_id": int(seed_actor["actor_id"]),
                 "actor_class": str(seed_actor["actor_class"]),
                 "local_x": float(local_x),
@@ -2681,16 +2688,12 @@ def _build_event_two_way_borrow_context(
                 "route_progress_m": float(actor_route_progress_m),
                 "ego_route_progress_m": float(ego_route_progress_m),
                 "world_xyz": [] if world_xyz is None else np.asarray(world_xyz, dtype=np.float32).astype(float).tolist(),
-                "geom": dict(route_candidate["geom"]),
+                "geom": dict(borrow_geom),
+                "priority": int(priority),
             }
-            if int(route_candidate["priority"]) == 0:
-                if best_strict is None or candidate["score"] < best_strict["score"]:
-                    best_strict = candidate
-            else:
-                if best_fallback is None or candidate["score"] < best_fallback["score"]:
-                    best_fallback = candidate
+            if best_candidate is None or candidate["score"] < best_candidate["score"]:
+                best_candidate = candidate
 
-    best_candidate = best_strict if best_strict is not None else best_fallback
     if best_candidate is None:
         return _empty_two_way_borrow_context(
             event_name=event_name,
@@ -2759,21 +2762,7 @@ def _build_event_two_way_borrow_context(
         # Route head means the first actual route point, not the prepended origin.
         route_start_s = float(arc_context[min(route_head_idx, arc_context.shape[0] - 1)])
 
-    shift_summary = _summarize_signed_route_shift(
-        route_local=route_local_context,
-        shift_sign=float(borrow_geom.get("shift_sign", -1.0)),
-    )
-    route_return_s = np.nan
-    if shift_summary is not None:
-        rel_y = np.asarray(shift_summary.get("rel_y", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
-        peak_idx = int(shift_summary.get("peak_idx", route_head_idx))
-        search_start_idx = int(np.clip(max(route_head_idx, peak_idx), 0, max(rel_y.shape[0] - 1, 0)))
-        if rel_y.ndim == 1 and rel_y.shape[0] == route_poly_context.shape[0] and search_start_idx < rel_y.shape[0]:
-            if float(borrow_geom.get("shift_sign", -1.0)) < 0.0:
-                return_idx = int(search_start_idx + np.argmax(rel_y[search_start_idx:]))
-            else:
-                return_idx = int(search_start_idx + np.argmin(rel_y[search_start_idx:]))
-            route_return_s = float(arc_context[min(return_idx, arc_context.shape[0] - 1)])
+    route_return_s = float(borrow_geom.get("return_s_m", np.nan))
     if not np.isfinite(route_return_s) or route_return_s <= route_start_s + 1e-3:
         route_front_count = int(record.get("route_front_count", 0))
         fallback_local_idx = route_front_count + int(TWOWAY_RETURN_FALLBACK_EXTRA_POINT_INDEX) - 1
@@ -2857,8 +2846,13 @@ def _build_event_two_way_borrow_context(
         "borrow_end_world_xyz": borrow_world_xyz[1, :3].astype(float).tolist(),
         "borrow_segment_world_xyz": borrow_segment_world[:, :3].astype(float).tolist(),
         "borrow_distance_m": float(borrow_geom["borrow_distance_m"]),
-        "peak_lateral_m": float(borrow_geom["peak_lateral_m"]),
-        "peak_signed_lateral_m": float(borrow_geom.get("peak_signed_lateral_m", np.nan)),
+        "baseline_heading_deg": float(borrow_geom.get("baseline_heading_deg", np.nan)),
+        "enter_heading_deg": float(borrow_geom.get("enter_heading_deg", np.nan)),
+        "return_heading_deg": float(borrow_geom.get("return_heading_deg", np.nan)),
+        "enter_rel_heading_deg": float(borrow_geom.get("enter_rel_heading_deg", np.nan)),
+        "return_rel_heading_deg": float(borrow_geom.get("return_rel_heading_deg", np.nan)),
+        "peak_signed_heading_deg": float(borrow_geom.get("peak_signed_heading_deg", np.nan)),
+        "return_signed_heading_deg": float(borrow_geom.get("return_signed_heading_deg", np.nan)),
         "shift_sign": float(borrow_geom.get("shift_sign", np.nan)),
         "context_frame_id": int(best_candidate["frame_id"]),
         "anchor_actor_id": int(best_candidate["actor_id"]),
@@ -2874,7 +2868,6 @@ def _build_event_two_way_borrow_context(
         "scene_global_cluster_actor_ids": list(scene_global_cluster.get("actor_ids", [])) if scene_global_cluster is not None else [],
         "scene_global_cluster_actor_count": int(scene_global_cluster.get("actor_count", 0)) if scene_global_cluster is not None else 0,
         "scene_global_cluster_total_obs": int(scene_global_cluster.get("total_obs", 0)) if scene_global_cluster is not None else 0,
-        "route_return_abs_m": float(borrow_geom.get("return_abs_m", np.nan)),
         "blocked_frame_id": -1,
     }
 
@@ -4374,8 +4367,8 @@ def _conflict_phase_frame_role(pos, start_pos, end_pos, entry_pos, go_pos, phase
     return str(phase)
 
 
-def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
-    records = _build_route_conflict_records(samples, route_sample_indices)
+def _annotate_route_stage1_conflict_phases(samples, route_sample_indices, scene_route_world=None):
+    records = _build_route_conflict_records(samples, route_sample_indices, scene_route_world=scene_route_world)
     if not records:
         return
 
@@ -5760,7 +5753,11 @@ def precompute(
                 route_sample_indices,
                 scene_route_world=scene_route_polyline_world.get(base_dir),
             )
-            _annotate_route_stage1_conflict_phases(samples, route_sample_indices)
+            _annotate_route_stage1_conflict_phases(
+                samples,
+                route_sample_indices,
+                scene_route_world=scene_route_polyline_world.get(base_dir),
+            )
             _annotate_route_stage1_merge_thresholds(
                 samples,
                 route_sample_indices,

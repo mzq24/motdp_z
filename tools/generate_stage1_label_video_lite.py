@@ -661,7 +661,9 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
 
     current_box = _find_box_by_id(current_boxes, current_cover.get("actor_id"))
     future_box = _find_box_by_id(current_boxes, future_cover.get("actor_id"))
-    selected_borrow_actor_id = conflict_area.get("blocking_actor_id", scene_borrow_context.get("blocking_actor_id", -1))
+    selected_borrow_actor_id = conflict_area.get("blocking_actor_id", None)
+    if selected_borrow_actor_id in (None, -1):
+        selected_borrow_actor_id = scene_borrow_context.get("blocking_actor_id", -1)
     selected_borrow_box = _find_box_by_id(current_boxes, selected_borrow_actor_id)
     if current_box is not None:
         _draw_box(canvas, current_box, color=(0, 0, 255), x_range=x_range, y_range=y_range, thickness=3)
