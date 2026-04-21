@@ -44,6 +44,11 @@ FAST_FIELDS = (
     'conflict_area_end_frame',
     'conflict_decision_phase',
     'conflict_go_frame',
+    'merge_yld_max_speed',
+    'merge_go_min_speed',
+    'merge_yld_max_speed_valid',
+    'merge_go_min_speed_valid',
+    'merge_threshold_train_only_negative_tail',
 )
 
 
@@ -112,6 +117,13 @@ STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
 STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
 STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS = 2.0
+MERGE_THRESHOLD_NEGATIVE_TAIL_FRAMES = 12
+
+MERGE_COLLISION_INFRACTION_KEYS = {
+    'collisions_vehicle',
+    'collisions_pedestrian',
+    'collisions_layout',
+}
 
 STAGE1_SPEED_FIELDS = (
     'conflict_area_family',
@@ -121,6 +133,11 @@ STAGE1_SPEED_FIELDS = (
     'conflict_area_end_frame',
     'conflict_decision_phase',
     'conflict_go_frame',
+    'merge_yld_max_speed',
+    'merge_go_min_speed',
+    'merge_yld_max_speed_valid',
+    'merge_go_min_speed_valid',
+    'merge_threshold_train_only_negative_tail',
 )
 
 CONFLICT_FAMILY_TO_CODE = {
@@ -215,6 +232,68 @@ def _load_json_gz_if_exists(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _has_nonempty_infraction(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        try:
+            return float(value) > 0.0
+        except Exception:
+            return False
+    if isinstance(value, str):
+        return len(value.strip()) > 0
+    if isinstance(value, dict):
+        return any(_has_nonempty_infraction(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_nonempty_infraction(v) for v in value)
+    return True
+
+
+def _load_route_results_info(image_data_root, base_dir, cache=None):
+    base_dir = str(base_dir or '')
+    if cache is not None and base_dir in cache:
+        return dict(cache[base_dir])
+
+    info = {
+        'loaded': 0.0,
+        'results_path': os.path.join(image_data_root, base_dir, 'results.json.gz') if base_dir else '',
+        'collision_route': 0.0,
+        'collision_infractions': [],
+        'issue_reason': 'none',
+    }
+    if not base_dir:
+        info['issue_reason'] = 'missing_base_dir'
+        if cache is not None:
+            cache[base_dir] = dict(info)
+        return info
+
+    payload = _load_json_gz_if_exists(info['results_path'])
+    if not isinstance(payload, dict):
+        info['issue_reason'] = 'missing_route_results'
+        if cache is not None:
+            cache[base_dir] = dict(info)
+        return info
+
+    infractions = payload.get('infractions', {})
+    collision_infractions = []
+    for key in sorted(MERGE_COLLISION_INFRACTION_KEYS):
+        value = infractions.get(key) if isinstance(infractions, dict) else None
+        if _has_nonempty_infraction(value):
+            collision_infractions.append(str(key))
+
+    info.update({
+        'loaded': 1.0,
+        'collision_route': float(bool(collision_infractions)),
+        'collision_infractions': collision_infractions,
+        'issue_reason': 'none',
+    })
+    if cache is not None:
+        cache[base_dir] = dict(info)
+    return info
 
 
 def _prepend_route_origin(route):
@@ -1417,6 +1496,63 @@ def _merge_speed_cap(value, default=np.nan):
     if not np.isfinite(value):
         return float(default)
     return float(np.clip(value, 0.0, float(STAGE1_MERGE_SPEED_CAP_MPS)))
+
+
+def _build_merge_threshold_source_debug(future_cover, current_boxes=None, source_frame=-1, merge_tau_s=0.25, merge_clearance_m=6.0):
+    debug = _default_merge_threshold_debug()
+    future_cover = future_cover or {}
+    if int(future_cover.get('exists', 0.0)) <= 0:
+        return debug
+    if _cover_interaction_subtype(future_cover) != 'merge_meet':
+        return debug
+
+    debug.update({
+        'active': 1.0,
+        'subtype': 'merge_meet',
+        'source': 'future_merge_meet',
+        'source_frame': int(source_frame),
+    })
+
+    d_ego = float(future_cover.get('d_ego', np.nan))
+    d_bg = float(future_cover.get('d_bg', np.nan))
+    bg_speed = float(future_cover.get('other_speed', np.nan))
+    if not (np.isfinite(d_ego) and np.isfinite(d_bg) and np.isfinite(bg_speed) and d_bg > 1e-4 and bg_speed > 1e-4):
+        return debug
+
+    ego_length_m = float(_ego_length_m(current_boxes))
+    ego_clearance_m = float(max(ego_length_m, 1.0))
+    bg_length_m = float(future_cover.get('other_length_m', np.nan))
+    if not np.isfinite(bg_length_m):
+        bg_length_m = float(ego_length_m)
+    bg_clearance_m = float(max(bg_length_m, 1.0))
+
+    t_bg = float(d_bg / max(bg_speed, 1e-6))
+    merge_clearance_effective_m = float(max(float(merge_clearance_m), float(ego_length_m)))
+    t_bg_clear = float((d_bg + merge_clearance_effective_m) / max(bg_speed, 1e-6))
+    v_behind_min = _merge_speed_cap(max(float(bg_speed), 0.0), default=0.0)
+    v_go_min = _merge_speed_cap(
+        (d_ego + ego_clearance_m) / max(t_bg - float(merge_tau_s), 1e-3),
+        default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+    )
+    v_go_need = _merge_speed_cap(
+        max(float(v_go_min), float(v_behind_min)),
+        default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+    )
+    v_yield_max = _merge_speed_cap(
+        d_ego / max(t_bg_clear + float(merge_tau_s), 1e-3),
+        default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+    )
+
+    debug.update({
+        'v_yield_max_mps': float(v_yield_max),
+        'v_go_min_mps': float(v_go_min),
+        'v_go_need_mps': float(v_go_need),
+        'yld_max_speed_mps': float(v_yield_max),
+        'go_min_speed_mps': float(v_go_need) if np.isfinite(v_go_need) else float(v_go_min),
+        'yld_valid': float(np.isfinite(v_yield_max)),
+        'go_valid': float(np.isfinite(v_go_need) or np.isfinite(v_go_min)),
+    })
+    return debug
 
 
 def _find_box_by_id(boxes, actor_id):
@@ -2755,6 +2891,7 @@ def _build_stage1_speed_debug_payload(
     merge_motion=None,
     scene_borrow_context=None,
     borrow_motion=None,
+    merge_thresholds=None,
 ):
     return _to_stage1_debug_python({
         "current_cover": dict(current_cover),
@@ -2762,6 +2899,7 @@ def _build_stage1_speed_debug_payload(
         "merge_motion": dict(merge_motion or {}),
         "scene_borrow_context": None if scene_borrow_context is None else dict(scene_borrow_context),
         "borrow_motion": dict(borrow_motion or {}),
+        "merge_thresholds": _default_merge_threshold_debug() if merge_thresholds is None else dict(merge_thresholds),
         "conflict_area": _default_conflict_area_debug(),
         "conflict_phase": _default_conflict_phase_debug(),
     })
@@ -2807,6 +2945,29 @@ def _default_conflict_area_debug():
     }
 
 
+def _default_merge_threshold_debug():
+    return {
+        'active': 0.0,
+        'subtype': 'none',
+        'v_yield_max_mps': np.nan,
+        'v_go_min_mps': np.nan,
+        'v_go_need_mps': np.nan,
+        'yld_max_speed_mps': np.nan,
+        'go_min_speed_mps': np.nan,
+        'yld_valid': 0.0,
+        'go_valid': 0.0,
+        'source': 'none',
+        'source_frame': -1,
+        'collision_route': 0.0,
+        'collision_infractions': [],
+        'tail_anchor_frame': -1,
+        'tail_source_frame': -1,
+        'train_only_negative_tail': 0.0,
+        'issue': 0,
+        'issue_reason': 'none',
+    }
+
+
 def _default_conflict_phase_debug():
     return {
         'phase': 'none',
@@ -2825,6 +2986,12 @@ def _default_conflict_phase_debug():
         'speed_mps': np.nan,
         'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
         'low_speed_thresh_mps': float(STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS),
+        'issue': 0,
+        'issue_reason': 'none',
+        'window_valid_speed_count': 0,
+        'window_min_speed_mps': np.nan,
+        'window_min_speed_frame': -1,
+        'window_min_speed_phase': 'none',
         'yld_frame_count': 0,
         'yld_valid_speed_count': 0,
         'yld_low_speed_frame_count': 0,
@@ -2885,6 +3052,28 @@ def _set_stage1_conflict_phase_annotation(sample, phase_info):
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['conflict_phase'] = _to_stage1_debug_python(dict(phase_info))
+
+
+def _set_stage1_merge_threshold_defaults(sample):
+    sample['merge_yld_max_speed'] = np.float32(np.nan)
+    sample['merge_go_min_speed'] = np.float32(np.nan)
+    sample['merge_yld_max_speed_valid'] = np.float32(0.0)
+    sample['merge_go_min_speed_valid'] = np.float32(0.0)
+    sample['merge_threshold_train_only_negative_tail'] = np.float32(0.0)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['merge_thresholds'] = _default_merge_threshold_debug()
+
+
+def _set_stage1_merge_threshold_annotation(sample, threshold_info):
+    sample['merge_yld_max_speed'] = np.float32(float(threshold_info.get('yld_max_speed_mps', np.nan)))
+    sample['merge_go_min_speed'] = np.float32(float(threshold_info.get('go_min_speed_mps', np.nan)))
+    sample['merge_yld_max_speed_valid'] = np.float32(float(threshold_info.get('yld_valid', 0.0)))
+    sample['merge_go_min_speed_valid'] = np.float32(float(threshold_info.get('go_valid', 0.0)))
+    sample['merge_threshold_train_only_negative_tail'] = np.float32(float(threshold_info.get('train_only_negative_tail', 0.0)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['merge_thresholds'] = _to_stage1_debug_python(dict(threshold_info))
 
 
 def _conflict_area_issue(sample, family, reason, **extra):
@@ -3248,6 +3437,7 @@ def _build_route_conflict_records(samples, route_sample_indices, scene_route_wor
             'merge_motion': stage1_debug.get('merge_motion') or {},
             'borrow_motion': stage1_debug.get('borrow_motion') or {},
             'scene_borrow_context': stage1_debug.get('scene_borrow_context') or {},
+            'merge_thresholds': stage1_debug.get('merge_thresholds') or {},
             'stage1_speed_debug': stage1_debug if isinstance(stage1_debug, dict) else {},
         })
     return records
@@ -3598,7 +3788,21 @@ def _build_merge_conflict_windows(records, samples):
                 end_pos = int(scan_pos)
                 break
         if end_pos is None:
-            issues.append(_conflict_area_issue(samples[records[start_pos]['sample_idx']], 'merge', 'missing_merge_end', pos=int(start_pos)))
+            tail_anchor_pos = int(max(future_merge_positions))
+            issues.append(_conflict_area_issue(
+                samples[records[start_pos]['sample_idx']],
+                'merge',
+                'missing_merge_end',
+                pos=int(start_pos),
+                start_pos=int(start_pos),
+                tail_anchor_pos=int(tail_anchor_pos),
+                start_frame=int(records[start_pos]['frame_id']),
+                tail_anchor_frame=int(records[tail_anchor_pos]['frame_id']),
+                area_start_s_m=float(merge_area_start_s_m),
+                area_end_s_m=float(merge_area_end_s_m),
+                merge_area_first_conflict_s_m=float(area_info['first_conflict_s_m']),
+                merge_area_last_conflict_s_m=float(area_info['last_conflict_s_m']),
+            ))
             pos = int(max(future_merge_positions)) + 1
             continue
 
@@ -3878,6 +4082,7 @@ def _conflict_window_go_pos(records, family, start_pos, release_pos, end_pos, re
 
 
 def _conflict_window_phase_debug_stats(records, family, start_pos, entry_pos, release_pos, go_pos, end_pos):
+    window_positions = list(range(int(start_pos), int(end_pos) + 1))
     if go_pos is None:
         yld_end_pos = int(end_pos)
     else:
@@ -3889,6 +4094,12 @@ def _conflict_window_phase_debug_stats(records, family, start_pos, entry_pos, re
 
     stats = {
         'low_speed_thresh_mps': float(STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS),
+        'issue': 0,
+        'issue_reason': 'none',
+        'window_valid_speed_count': 0,
+        'window_min_speed_mps': np.nan,
+        'window_min_speed_frame': -1,
+        'window_min_speed_phase': 'none',
         'yld_frame_count': int(len(yld_positions)),
         'yld_valid_speed_count': 0,
         'yld_low_speed_frame_count': 0,
@@ -3918,6 +4129,25 @@ def _conflict_window_phase_debug_stats(records, family, start_pos, entry_pos, re
     stats['yld_entry_speed_mps'] = _speed_at(entry_pos)
     stats['yld_release_speed_mps'] = _speed_at(release_pos)
     stats['yld_go_speed_mps'] = _speed_at(go_pos)
+
+    window_speed_items = []
+    for pos in window_positions:
+        speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+        if not np.isfinite(speed_mps):
+            continue
+        window_speed_items.append((int(pos), float(speed_mps)))
+    stats['window_valid_speed_count'] = int(len(window_speed_items))
+    if window_speed_items:
+        window_speeds = np.asarray([item[1] for item in window_speed_items], dtype=np.float32)
+        window_min_idx = int(np.argmin(window_speeds))
+        window_min_pos = int(window_speed_items[window_min_idx][0])
+        stats['window_min_speed_mps'] = float(window_speeds[window_min_idx])
+        stats['window_min_speed_frame'] = int(records[window_min_pos].get('frame_id', -1))
+        window_min_phase = 'yld' if go_pos is None or int(window_min_pos) < int(go_pos) else 'go'
+        stats['window_min_speed_phase'] = str(window_min_phase)
+        if window_min_phase != 'yld':
+            stats['issue'] = 1
+            stats['issue_reason'] = 'window_min_speed_outside_yld'
 
     speed_items = []
     low_speed_front_s = []
@@ -4093,6 +4323,347 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices):
         pos += 1
 
 
+def _merge_threshold_info_from_record(record):
+    threshold_debug = (record or {}).get('merge_thresholds') or {}
+    if str(threshold_debug.get('subtype', 'none')) != 'merge_meet':
+        return None
+    v_yield_max = _merge_speed_cap(threshold_debug.get('v_yield_max_mps', np.nan))
+    v_go_min = _merge_speed_cap(threshold_debug.get('v_go_min_mps', np.nan))
+    v_go_need = _merge_speed_cap(threshold_debug.get('v_go_need_mps', np.nan))
+    go_threshold = float(v_go_need) if np.isfinite(v_go_need) else float(v_go_min)
+    info = _default_merge_threshold_debug()
+    info.update({
+        'active': 1.0,
+        'subtype': 'merge_meet',
+        'v_yield_max_mps': float(v_yield_max),
+        'v_go_min_mps': float(v_go_min),
+        'v_go_need_mps': float(v_go_need),
+        'yld_max_speed_mps': float(v_yield_max),
+        'go_min_speed_mps': float(go_threshold),
+        'yld_valid': float(np.isfinite(v_yield_max)),
+        'go_valid': float(np.isfinite(go_threshold)),
+        'source': str(threshold_debug.get('source', 'future_merge_meet')),
+        'source_frame': int(threshold_debug.get('source_frame', record.get('frame_id', -1))),
+    })
+    return info
+
+
+def _select_merge_threshold_source(records, start_pos, end_pos, reverse=False):
+    if not records:
+        return None
+    start_pos = int(max(start_pos, 0))
+    end_pos = int(min(end_pos, len(records) - 1))
+    if end_pos < start_pos:
+        return None
+    positions = range(end_pos, start_pos - 1, -1) if reverse else range(start_pos, end_pos + 1)
+    for pos in positions:
+        info = _merge_threshold_info_from_record(records[int(pos)])
+        if info is None:
+            continue
+        if float(info.get('yld_valid', 0.0)) <= 0.5 and float(info.get('go_valid', 0.0)) <= 0.5:
+            continue
+        return int(pos), info
+    return None
+
+
+def _annotate_merge_threshold_issue(sample, reason, **extra):
+    info = _default_merge_threshold_debug()
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        current = stage1_debug.get('merge_thresholds') or {}
+        if isinstance(current, dict):
+            info.update(dict(current))
+    info.update({
+        'issue': 1,
+        'issue_reason': str(reason),
+    })
+    info.update(extra)
+    _set_stage1_merge_threshold_annotation(sample, info)
+
+
+def _apply_merge_threshold_range(
+    samples,
+    records,
+    start_pos,
+    end_pos,
+    base_info,
+    collision_route=0.0,
+    collision_infractions=None,
+    train_only_negative_tail=0.0,
+    tail_anchor_frame=-1,
+    tail_source_frame=-1,
+):
+    collision_infractions = list(collision_infractions or [])
+    for pos in range(int(start_pos), int(end_pos) + 1):
+        sample = samples[int(records[int(pos)]['sample_idx'])]
+        info = dict(base_info or {})
+        info.update({
+            'active': 1.0,
+            'collision_route': float(collision_route),
+            'collision_infractions': collision_infractions,
+            'tail_anchor_frame': int(tail_anchor_frame),
+            'tail_source_frame': int(tail_source_frame),
+            'train_only_negative_tail': float(train_only_negative_tail),
+            'issue': 0,
+            'issue_reason': 'none',
+        })
+        _set_stage1_merge_threshold_annotation(sample, info)
+
+
+def _missing_merge_end_tail_anchor_pos(issue, records):
+    if not records:
+        return None
+    default_pos = int(issue.get('pos', -1))
+    tail_anchor_pos = int(issue.get('tail_anchor_pos', default_pos))
+    tail_anchor_pos = int(np.clip(tail_anchor_pos, 0, len(records) - 1))
+    return tail_anchor_pos
+
+
+def _audit_collision_merge_threshold_boundary(
+    samples,
+    records,
+    start_pos,
+    end_pos,
+    threshold_info,
+    issue_pos,
+    area_start_s_m,
+    area_end_s_m,
+):
+    if end_pos < start_pos:
+        _annotate_merge_threshold_issue(
+            samples[int(records[int(issue_pos)]['sample_idx'])],
+            'collision_boundary_audit_empty_pre_window',
+        )
+        return
+
+    if float(threshold_info.get('yld_valid', 0.0)) <= 0.5 and float(threshold_info.get('go_valid', 0.0)) <= 0.5:
+        _annotate_merge_threshold_issue(
+            samples[int(records[int(issue_pos)]['sample_idx'])],
+            'collision_boundary_audit_missing_thresholds',
+        )
+        return
+
+    conflict_info = {
+        'family': 'merge',
+        'area_start_s_m': float(area_start_s_m),
+        'area_end_s_m': float(area_end_s_m),
+    }
+    entry_pos = _conflict_window_entry_pos(
+        records,
+        family='merge',
+        conflict_info=conflict_info,
+        start_pos=start_pos,
+        end_pos=end_pos,
+    )
+    if entry_pos is None:
+        _annotate_merge_threshold_issue(
+            samples[int(records[int(issue_pos)]['sample_idx'])],
+            'collision_boundary_audit_entry_missing',
+        )
+        return
+
+    release_pos, release_reason = _conflict_window_release_pos(
+        records,
+        family='merge',
+        start_pos=start_pos,
+        entry_pos=entry_pos,
+        end_pos=end_pos,
+    )
+    go_pos, go_reason = _conflict_window_go_pos(
+        records,
+        family='merge',
+        start_pos=start_pos,
+        release_pos=release_pos,
+        end_pos=end_pos,
+        release_reason=release_reason,
+    )
+
+    yld_max_speed = float(threshold_info.get('yld_max_speed_mps', np.nan))
+    go_min_speed = float(threshold_info.get('go_min_speed_mps', np.nan))
+    violation_found = False
+    for pos in range(int(start_pos), int(end_pos) + 1):
+        speed_mps = _record_conflict_speed_mps(records[int(pos)], 'merge')
+        if not np.isfinite(speed_mps):
+            continue
+        phase = 'yld' if go_pos is None or int(pos) < int(go_pos) else 'go'
+        if phase == 'yld' and float(threshold_info.get('yld_valid', 0.0)) > 0.5 and np.isfinite(yld_max_speed):
+            if float(speed_mps) > float(yld_max_speed):
+                violation_found = True
+                break
+        if phase == 'go' and float(threshold_info.get('go_valid', 0.0)) > 0.5 and np.isfinite(go_min_speed):
+            if float(speed_mps) < float(go_min_speed):
+                violation_found = True
+                break
+
+    if violation_found:
+        return
+
+    _annotate_merge_threshold_issue(
+        samples[int(records[int(issue_pos)]['sample_idx'])],
+        'collision_boundary_audit_no_out_of_bound',
+        audit_start_frame=int(records[int(start_pos)].get('frame_id', -1)),
+        audit_end_frame=int(records[int(end_pos)].get('frame_id', -1)),
+        audit_entry_frame=int(records[int(entry_pos)].get('frame_id', -1)),
+        audit_go_frame=int(records[int(go_pos)].get('frame_id', -1)) if go_pos is not None else -1,
+        audit_release_reason=str(go_reason if entry_pos is not None else release_reason),
+    )
+
+
+def _annotate_route_stage1_merge_thresholds(samples, route_sample_indices, image_data_root, route_results_cache=None):
+    records = _build_route_conflict_records(samples, route_sample_indices)
+    if not records:
+        return
+
+    for record in records:
+        _set_stage1_merge_threshold_defaults(samples[int(record['sample_idx'])])
+
+    merge_windows, merge_issues = _build_merge_conflict_windows(records, samples)
+    for window in merge_windows:
+        start_pos = int(window.get('start_pos', -1))
+        end_pos = int(window.get('end_pos', -1))
+        source = _select_merge_threshold_source(records, start_pos, end_pos, reverse=False)
+        if source is None:
+            _annotate_merge_threshold_issue(
+                samples[int(records[start_pos]['sample_idx'])],
+                'missing_merge_threshold_source',
+            )
+            continue
+        source_pos, threshold_info = source
+        threshold_info = dict(threshold_info)
+        threshold_info.update({
+            'source': 'closed_window_first_valid_merge_meet',
+            'source_frame': int(records[int(source_pos)].get('frame_id', -1)),
+        })
+        _apply_merge_threshold_range(
+            samples,
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            base_info=threshold_info,
+        )
+
+    route_results = _load_route_results_info(
+        image_data_root,
+        records[0].get('base_dir', ''),
+        cache=route_results_cache,
+    )
+
+    for issue in merge_issues:
+        reason = str(issue.get('reason', 'none'))
+        issue_pos = int(np.clip(int(issue.get('pos', 0)), 0, len(records) - 1))
+        issue_sample = samples[int(records[issue_pos]['sample_idx'])]
+
+        if reason == 'missing_merge_conflict_cluster':
+            _annotate_merge_threshold_issue(
+                issue_sample,
+                'missing_merge_conflict_cluster',
+            )
+            continue
+
+        if reason != 'missing_merge_end':
+            continue
+
+        if float(route_results.get('loaded', 0.0)) <= 0.5:
+            _annotate_merge_threshold_issue(
+                issue_sample,
+                'missing_route_results_for_missing_merge_end',
+                results_path=str(route_results.get('results_path', '')),
+            )
+            continue
+
+        collision_route = float(route_results.get('collision_route', 0.0)) > 0.5
+        collision_infractions = list(route_results.get('collision_infractions', []))
+        if not collision_route:
+            _annotate_merge_threshold_issue(
+                issue_sample,
+                'missing_merge_end_non_collision',
+                collision_route=0.0,
+                collision_infractions=collision_infractions,
+            )
+            continue
+
+        start_pos = int(issue.get('start_pos', issue_pos))
+        tail_anchor_pos = _missing_merge_end_tail_anchor_pos(issue, records)
+        if tail_anchor_pos is None:
+            _annotate_merge_threshold_issue(
+                issue_sample,
+                'collision_missing_merge_end_tail_anchor_missing',
+                collision_route=1.0,
+                collision_infractions=collision_infractions,
+            )
+            continue
+
+        source = _select_merge_threshold_source(records, start_pos, tail_anchor_pos - 1, reverse=True)
+        if source is None:
+            _annotate_merge_threshold_issue(
+                samples[int(records[int(tail_anchor_pos)]['sample_idx'])],
+                'collision_missing_merge_end_no_pre_threshold_source',
+                collision_route=1.0,
+                collision_infractions=collision_infractions,
+                tail_anchor_frame=int(records[int(tail_anchor_pos)].get('frame_id', -1)),
+            )
+            continue
+
+        source_pos, threshold_info = source
+        threshold_info = dict(threshold_info)
+        threshold_info.update({
+            'source': 'collision_tail_last_valid_pre_anchor_merge_meet',
+            'source_frame': int(records[int(source_pos)].get('frame_id', -1)),
+        })
+        tail_anchor_frame = int(records[int(tail_anchor_pos)].get('frame_id', -1))
+        tail_source_frame = int(records[int(source_pos)].get('frame_id', -1))
+        empty_pre_window = False
+        if int(start_pos) <= int(tail_anchor_pos) - 1:
+            _apply_merge_threshold_range(
+                samples,
+                records,
+                start_pos=start_pos,
+                end_pos=int(tail_anchor_pos) - 1,
+                base_info=threshold_info,
+                collision_route=1.0,
+                collision_infractions=collision_infractions,
+                tail_anchor_frame=tail_anchor_frame,
+                tail_source_frame=tail_source_frame,
+            )
+        else:
+            empty_pre_window = True
+
+        tail_end_pos = min(
+            int(tail_anchor_pos) + int(MERGE_THRESHOLD_NEGATIVE_TAIL_FRAMES) - 1,
+            len(records) - 1,
+        )
+        _apply_merge_threshold_range(
+            samples,
+            records,
+            start_pos=int(tail_anchor_pos),
+            end_pos=int(tail_end_pos),
+            base_info=threshold_info,
+            collision_route=1.0,
+            collision_infractions=collision_infractions,
+            train_only_negative_tail=1.0,
+            tail_anchor_frame=tail_anchor_frame,
+            tail_source_frame=tail_source_frame,
+        )
+        if int(start_pos) <= int(tail_anchor_pos) - 1:
+            _audit_collision_merge_threshold_boundary(
+                samples,
+                records,
+                start_pos=start_pos,
+                end_pos=int(tail_anchor_pos) - 1,
+                threshold_info=threshold_info,
+                issue_pos=int(tail_anchor_pos),
+                area_start_s_m=float(issue.get('area_start_s_m', np.nan)),
+                area_end_s_m=float(issue.get('area_end_s_m', np.nan)),
+            )
+        elif empty_pre_window:
+            _annotate_merge_threshold_issue(
+                samples[int(records[int(tail_anchor_pos)]['sample_idx'])],
+                'collision_boundary_audit_empty_pre_window',
+                collision_route=1.0,
+                collision_infractions=collision_infractions,
+            )
+
+
 def _annotate_route_stage1_conflict_areas(samples, route_sample_indices, scene_route_world=None):
     records = _build_route_conflict_records(samples, route_sample_indices, scene_route_world=scene_route_world)
     if not records:
@@ -4156,9 +4727,11 @@ def _set_stage1_speed_fallback(sample):
         merge_motion=None,
         scene_borrow_context=None,
         borrow_motion=None,
+        merge_thresholds=None,
     )
     _set_stage1_conflict_area_defaults(sample)
     _set_stage1_conflict_phase_defaults(sample)
+    _set_stage1_merge_threshold_defaults(sample)
 
 
 def _cover_actor_id(cover):
@@ -4362,12 +4935,12 @@ def _merge_record_conflict_s(record):
 
 
 def _merge_record_thresholds(record):
-    meet_debug = (record or {}).get('meet_debug') or {}
-    if str(meet_debug.get('subtype', 'none')) != 'merge_meet':
+    threshold_debug = (record or {}).get('merge_thresholds') or {}
+    if str(threshold_debug.get('subtype', 'none')) != 'merge_meet':
         return np.nan, np.nan, np.nan
-    v_yield_max = _merge_speed_cap(meet_debug.get('v_yield_max_mps', np.nan))
-    v_go_min = _merge_speed_cap(meet_debug.get('v_go_min_mps', np.nan))
-    v_go_need = _merge_speed_cap(meet_debug.get('v_go_need_mps', np.nan))
+    v_yield_max = _merge_speed_cap(threshold_debug.get('v_yield_max_mps', np.nan))
+    v_go_min = _merge_speed_cap(threshold_debug.get('v_go_min_mps', np.nan))
+    v_go_need = _merge_speed_cap(threshold_debug.get('v_go_need_mps', np.nan))
     go_threshold = float(v_go_need) if np.isfinite(v_go_need) else float(v_go_min)
     return float(v_yield_max), float(v_go_min), float(go_threshold)
 
@@ -4755,6 +5328,7 @@ def precompute(
     checkpoint_progress_path = packed_path + '.progress.json'
     last_checkpoint_time = time.time()
     dirty_since_checkpoint = False
+    route_results_cache = {}
 
     def _checkpoint_payload(phase, reason):
         return {
@@ -5019,6 +5593,11 @@ def precompute(
                     ),
                     scene_borrow_context=scene_borrow_context,
                     borrow_motion=borrow_motion,
+                    merge_thresholds=_build_merge_threshold_source_debug(
+                        future_cover,
+                        current_boxes=current_boxes_dynamic,
+                        source_frame=int(sample.get('frame_id', -1)),
+                    ),
                 )
                 stage1_speed_built += 1
                 _maybe_checkpoint(phase='stage1_speed')
@@ -5029,6 +5608,12 @@ def precompute(
                 scene_route_world=scene_route_polyline_world.get(base_dir),
             )
             _annotate_route_stage1_conflict_phases(samples, route_sample_indices)
+            _annotate_route_stage1_merge_thresholds(
+                samples,
+                route_sample_indices,
+                image_data_root=image_data_root,
+                route_results_cache=route_results_cache,
+            )
             for sample_idx in route_sample_indices:
                 samples[int(sample_idx)].pop('_stage1_route_input_local', None)
             dirty_since_checkpoint = True
