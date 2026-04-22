@@ -43,6 +43,7 @@ FAST_FIELDS = (
     'conflict_area_start_frame',
     'conflict_area_end_frame',
     'conflict_decision_phase',
+    'conflict_control_phase',
     'conflict_go_frame',
     'merge_yld_max_speed',
     'merge_go_min_speed',
@@ -53,6 +54,10 @@ FAST_FIELDS = (
     'borrow_go_min_speed',
     'borrow_yld_max_speed_valid',
     'borrow_go_min_speed_valid',
+    'junction_yld_max_speed',
+    'junction_go_min_speed',
+    'junction_yld_max_speed_valid',
+    'junction_go_min_speed_valid',
 )
 
 
@@ -109,7 +114,9 @@ TWOWAY_BORROW_ONEWAY_ROUTE_OVERRIDES = {
     "Town13_Rep0_1315_1_route0_11_09_06_09_23",
 }
 STAGE1_MERGE_START_CONFIRM_FRAMES = 2
-STAGE1_MERGE_SPEED_CAP_MPS = 1000.0
+# Keep threshold labels in the dataset speed scale. Larger physical values mean
+# "not realistically go-able now", but should not inject OOD regression targets.
+STAGE1_MERGE_SPEED_CAP_MPS = 30.0
 STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
 STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
 STAGE1_MERGE_AREA_POST_MARGIN_M = 10.0
@@ -119,10 +126,14 @@ STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
 STAGE1_JUNCTION_AREA_PRE_MARGIN_M = 10.0
-STAGE1_JUNCTION_AREA_POST_MARGIN_M = 10.0
+STAGE1_JUNCTION_AREA_POST_MARGIN_M = 7.0
 STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
 STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
-STAGE1_CONFLICT_AREA_ENTRY_POST_MARGIN_M = 4.0
+STAGE1_CONFLICT_DEEP_SLOWDOWN_DROP_RATIO = 0.33
+STAGE1_CONFLICT_DEEP_SLOWDOWN_DROP_MPS = 2.0
+STAGE1_CONFLICT_DEEP_SLOWDOWN_MIN_REF_SPEED_MPS = 3.0
+STAGE1_CONFLICT_DEEP_SLOWDOWN_RESTART_DELTA_MPS = 0.5
+STAGE1_CONFLICT_AREA_ENTRY_POST_MARGIN_M = 3.0
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
 STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS = 2.0
 MERGE_THRESHOLD_NEGATIVE_TAIL_FRAMES = 12
@@ -140,6 +151,7 @@ STAGE1_SPEED_FIELDS = (
     'conflict_area_start_frame',
     'conflict_area_end_frame',
     'conflict_decision_phase',
+    'conflict_control_phase',
     'conflict_go_frame',
     'merge_yld_max_speed',
     'merge_go_min_speed',
@@ -150,6 +162,10 @@ STAGE1_SPEED_FIELDS = (
     'borrow_go_min_speed',
     'borrow_yld_max_speed_valid',
     'borrow_go_min_speed_valid',
+    'junction_yld_max_speed',
+    'junction_go_min_speed',
+    'junction_yld_max_speed_valid',
+    'junction_go_min_speed_valid',
 )
 
 CONFLICT_FAMILY_TO_CODE = {
@@ -176,6 +192,14 @@ CONFLICT_DECISION_PHASE_TO_CODE = {
     'none': 0,
     'yld': 1,
     'go': 2,
+}
+
+CONFLICT_CONTROL_PHASE_TO_CODE = {
+    'none': 0,
+    'coast_yld': 1,
+    'slow_yld': 2,
+    'stop_yld': 3,
+    'go': 4,
 }
 
 
@@ -1524,59 +1548,123 @@ def _threshold_speed_value_and_valid(value):
     return float(np.clip(value, 0.0, float(STAGE1_MERGE_SPEED_CAP_MPS))), 1.0
 
 
-def _build_merge_threshold_source_debug(future_cover, current_boxes=None, source_frame=-1, merge_tau_s=0.25, merge_clearance_m=6.0):
+def _build_merge_threshold_source_debug(
+    future_cover,
+    current_cover=None,
+    current_boxes=None,
+    source_frame=-1,
+    merge_tau_s=0.25,
+    merge_clearance_m=6.0,
+):
     debug = _default_merge_threshold_debug()
     future_cover = future_cover or {}
-    if int(future_cover.get('exists', 0.0)) <= 0:
+    future_valid = int(future_cover.get('exists', 0.0)) > 0 and _cover_interaction_subtype(future_cover) == 'merge_meet'
+
+    if future_valid:
+        debug.update({
+            'active': 1.0,
+            'subtype': 'merge_meet',
+            'source': 'future_merge_meet',
+            'source_frame': int(source_frame),
+            'cover_case': 'future',
+        })
+
+        d_ego = float(future_cover.get('d_ego', np.nan))
+        d_bg = float(future_cover.get('d_bg', np.nan))
+        bg_speed = float(future_cover.get('other_speed', np.nan))
+        debug.update({
+            'd_ego_m': float(d_ego),
+            'd_bg_m': float(d_bg),
+            'bg_speed_mps': float(bg_speed),
+        })
+        if not (np.isfinite(d_ego) and np.isfinite(d_bg) and np.isfinite(bg_speed) and d_bg > 1e-4 and bg_speed > 1e-4):
+            return debug
+
+        ego_length_m = float(_ego_length_m(current_boxes))
+        ego_clearance_m = float(max(ego_length_m, 1.0))
+        bg_length_m = float(future_cover.get('other_length_m', np.nan))
+        if not np.isfinite(bg_length_m):
+            bg_length_m = float(ego_length_m)
+        bg_clearance_m = float(max(bg_length_m, 1.0))
+
+        t_bg = float(d_bg / max(bg_speed, 1e-6))
+        merge_clearance_effective_m = float(max(float(merge_clearance_m), float(ego_length_m)))
+        t_bg_clear = float((d_bg + merge_clearance_effective_m) / max(bg_speed, 1e-6))
+        v_behind_min = _merge_speed_cap(max(float(bg_speed), 0.0), default=0.0)
+        v_go_min = _merge_speed_cap(
+            (d_ego + ego_clearance_m) / max(t_bg - float(merge_tau_s), 1e-3),
+            default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+        )
+        v_go_need = _merge_speed_cap(
+            max(float(v_go_min), float(v_behind_min)),
+            default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+        )
+        v_yield_max = _merge_speed_cap(
+            d_ego / max(t_bg_clear + float(merge_tau_s), 1e-3),
+            default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+        )
+
+        debug.update({
+            'v_yield_max_mps': float(v_yield_max),
+            'v_go_min_mps': float(v_go_min),
+            'v_go_need_mps': float(v_go_need),
+            'yld_max_speed_mps': float(v_yield_max),
+            'go_min_speed_mps': float(v_go_need) if np.isfinite(v_go_need) else float(v_go_min),
+            'yld_valid': float(np.isfinite(v_yield_max)),
+            'go_valid': float(np.isfinite(v_go_need) or np.isfinite(v_go_min)),
+            'bg_clearance_m': float(bg_clearance_m),
+            't_bg_s': float(t_bg),
+            't_bg_clear_s': float(t_bg_clear),
+        })
         return debug
-    if _cover_interaction_subtype(future_cover) != 'merge_meet':
+
+    current_cover = current_cover or {}
+    current_valid = int(current_cover.get('exists', 0.0)) > 0 and _cover_interaction_subtype(current_cover) == 'merge_meet'
+    if not current_valid:
         return debug
+
+    d_ego = float(current_cover.get('distance', np.nan))
+    bg_speed = float(current_cover.get('other_speed', np.nan))
+    ego_length_m = float(_ego_length_m(current_boxes))
+    bg_length_m = float(current_cover.get('other_length_m', np.nan))
+    if not np.isfinite(bg_length_m):
+        bg_length_m = float(ego_length_m)
+    bg_clearance_m = float(max(float(bg_length_m), float(ego_length_m), 1.0))
+    if np.isfinite(bg_speed) and bg_speed > 1e-3:
+        t_bg_exit = float(bg_clearance_m / max(bg_speed, 1e-6))
+    else:
+        t_bg_exit = np.inf
+
+    v_yield_max = np.nan
+    yld_valid = 0.0
+    if np.isfinite(d_ego):
+        if np.isfinite(t_bg_exit):
+            v_yield_max = _merge_speed_cap(
+                max(float(d_ego), 0.0) / max(float(t_bg_exit) + float(merge_tau_s), 1e-3),
+                default=float(STAGE1_MERGE_SPEED_CAP_MPS),
+            )
+        else:
+            v_yield_max = 0.0
+        yld_valid = 1.0
 
     debug.update({
         'active': 1.0,
         'subtype': 'merge_meet',
-        'source': 'future_merge_meet',
+        'source': 'current_merge_meet_transition',
         'source_frame': int(source_frame),
-    })
-
-    d_ego = float(future_cover.get('d_ego', np.nan))
-    d_bg = float(future_cover.get('d_bg', np.nan))
-    bg_speed = float(future_cover.get('other_speed', np.nan))
-    if not (np.isfinite(d_ego) and np.isfinite(d_bg) and np.isfinite(bg_speed) and d_bg > 1e-4 and bg_speed > 1e-4):
-        return debug
-
-    ego_length_m = float(_ego_length_m(current_boxes))
-    ego_clearance_m = float(max(ego_length_m, 1.0))
-    bg_length_m = float(future_cover.get('other_length_m', np.nan))
-    if not np.isfinite(bg_length_m):
-        bg_length_m = float(ego_length_m)
-    bg_clearance_m = float(max(bg_length_m, 1.0))
-
-    t_bg = float(d_bg / max(bg_speed, 1e-6))
-    merge_clearance_effective_m = float(max(float(merge_clearance_m), float(ego_length_m)))
-    t_bg_clear = float((d_bg + merge_clearance_effective_m) / max(bg_speed, 1e-6))
-    v_behind_min = _merge_speed_cap(max(float(bg_speed), 0.0), default=0.0)
-    v_go_min = _merge_speed_cap(
-        (d_ego + ego_clearance_m) / max(t_bg - float(merge_tau_s), 1e-3),
-        default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-    )
-    v_go_need = _merge_speed_cap(
-        max(float(v_go_min), float(v_behind_min)),
-        default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-    )
-    v_yield_max = _merge_speed_cap(
-        d_ego / max(t_bg_clear + float(merge_tau_s), 1e-3),
-        default=float(STAGE1_MERGE_SPEED_CAP_MPS),
-    )
-
-    debug.update({
+        'cover_case': 'current',
+        'd_ego_m': float(d_ego),
+        'd_bg_m': 0.0,
+        'bg_speed_mps': float(bg_speed),
+        'bg_clearance_m': float(bg_clearance_m),
+        't_bg_exit_s': float(t_bg_exit),
         'v_yield_max_mps': float(v_yield_max),
-        'v_go_min_mps': float(v_go_min),
-        'v_go_need_mps': float(v_go_need),
+        'v_go_min_mps': np.nan,
+        'v_go_need_mps': np.nan,
         'yld_max_speed_mps': float(v_yield_max),
-        'go_min_speed_mps': float(v_go_need) if np.isfinite(v_go_need) else float(v_go_min),
-        'yld_valid': float(np.isfinite(v_yield_max)),
-        'go_valid': float(np.isfinite(v_go_need) or np.isfinite(v_go_min)),
+        'go_min_speed_mps': np.nan,
+        'yld_valid': float(yld_valid),
+        'go_valid': 0.0,
     })
     return debug
 
@@ -1683,7 +1771,7 @@ def _build_borrow_threshold_source_debug(
         payload.update({
             'active': 1.0,
             'subtype': 'borrow_cross_meet',
-            'source': 'current_borrow_cross_meet',
+            'source': 'current_borrow_cross_transition',
             'source_frame': int(source_frame),
             'cover_case': 'current',
             'd_ego_m': float(d_ego),
@@ -1701,7 +1789,17 @@ def _build_borrow_threshold_source_debug(
                 denom = float(t_bg_exit) + float(cross_safe_gap_s)
                 v_yield_raw = np.inf if denom <= 1e-6 else float(borrow_start_distance_m) / max(denom, 1e-6)
             payload.update({'t_bg_exit_s': float(t_bg_exit)})
-            return _finish(payload, v_yield_raw, np.inf)
+            yld_value, yld_valid = _threshold_speed_value_and_valid(v_yield_raw)
+            payload.update({
+                'v_yield_max_mps': float(yld_value),
+                'v_go_min_mps': np.nan,
+                'v_go_need_mps': np.nan,
+                'yld_max_speed_mps': float(yld_value),
+                'go_min_speed_mps': np.nan,
+                'yld_valid': float(yld_valid),
+                'go_valid': 0.0,
+            })
+            return payload
         return payload
 
     return debug
@@ -3230,6 +3328,7 @@ def _build_stage1_speed_debug_payload(
     borrow_motion=None,
     merge_thresholds=None,
     borrow_thresholds=None,
+    junction_thresholds=None,
 ):
     return _to_stage1_debug_python({
         "current_cover": dict(current_cover),
@@ -3239,6 +3338,7 @@ def _build_stage1_speed_debug_payload(
         "borrow_motion": dict(borrow_motion or {}),
         "merge_thresholds": _default_merge_threshold_debug() if merge_thresholds is None else dict(merge_thresholds),
         "borrow_thresholds": _default_borrow_threshold_debug() if borrow_thresholds is None else dict(borrow_thresholds),
+        "junction_thresholds": _default_junction_threshold_debug() if junction_thresholds is None else dict(junction_thresholds),
         "conflict_area": _default_conflict_area_debug(),
         "conflict_phase": _default_conflict_phase_debug(),
     })
@@ -3302,6 +3402,15 @@ def _default_merge_threshold_debug():
         'go_valid': 0.0,
         'source': 'none',
         'source_frame': -1,
+        'cover_case': 'none',
+        'd_ego_m': np.nan,
+        'd_ego_end_m': np.nan,
+        'd_bg_m': np.nan,
+        'bg_speed_mps': np.nan,
+        'bg_clearance_m': np.nan,
+        't_bg_s': np.nan,
+        't_bg_clear_s': np.nan,
+        't_bg_exit_s': np.nan,
         'collision_route': 0.0,
         'collision_infractions': [],
         'tail_anchor_frame': -1,
@@ -3340,10 +3449,43 @@ def _default_borrow_threshold_debug():
     }
 
 
+def _default_junction_threshold_debug():
+    return {
+        'active': 0.0,
+        'subtype': 'none',
+        'v_yield_max_mps': np.nan,
+        'v_go_min_mps': np.nan,
+        'v_go_need_mps': np.nan,
+        'yld_max_speed_mps': np.nan,
+        'go_min_speed_mps': np.nan,
+        'yld_valid': 0.0,
+        'go_valid': 0.0,
+        'source': 'none',
+        'source_frame': -1,
+        'cover_case': 'none',
+        'd_ego_m': np.nan,
+        'd_ego_end_m': np.nan,
+        'd_bg_m': np.nan,
+        'bg_speed_mps': np.nan,
+        'bg_clearance_m': np.nan,
+        'area_start_s_m': np.nan,
+        'area_end_s_m': np.nan,
+        'area_length_m': np.nan,
+        'ego_front_s_m': np.nan,
+        't_bg_s': np.nan,
+        't_bg_clear_s': np.nan,
+        't_bg_exit_s': np.nan,
+        'issue': 0,
+        'issue_reason': 'none',
+    }
+
+
 def _default_conflict_phase_debug():
     return {
         'phase': 'none',
         'phase_code': int(CONFLICT_DECISION_PHASE_TO_CODE['none']),
+        'control_phase': 'none',
+        'control_phase_code': int(CONFLICT_CONTROL_PHASE_TO_CODE['none']),
         'active': 0.0,
         'family': 'none',
         'start_frame': -1,
@@ -3354,6 +3496,8 @@ def _default_conflict_phase_debug():
         'frame_role': 'none',
         'source': 'none',
         'release_reason': 'none',
+        'yld_release_reason': 'none',
+        'go_reason': 'none',
         'entry_found': 0.0,
         'speed_mps': np.nan,
         'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
@@ -3411,6 +3555,7 @@ def _set_stage1_conflict_area_annotation(sample, conflict_info):
 
 def _set_stage1_conflict_phase_defaults(sample):
     sample['conflict_decision_phase'] = np.int64(CONFLICT_DECISION_PHASE_TO_CODE['none'])
+    sample['conflict_control_phase'] = np.int64(CONFLICT_CONTROL_PHASE_TO_CODE['none'])
     sample['conflict_go_frame'] = np.int64(-1)
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
@@ -3419,7 +3564,9 @@ def _set_stage1_conflict_phase_defaults(sample):
 
 def _set_stage1_conflict_phase_annotation(sample, phase_info):
     phase = str(phase_info.get('phase', 'none'))
+    control_phase = str(phase_info.get('control_phase', 'none'))
     sample['conflict_decision_phase'] = np.int64(CONFLICT_DECISION_PHASE_TO_CODE.get(phase, 0))
+    sample['conflict_control_phase'] = np.int64(CONFLICT_CONTROL_PHASE_TO_CODE.get(control_phase, 0))
     sample['conflict_go_frame'] = np.int64(int(phase_info.get('go_frame', -1)))
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
@@ -3466,6 +3613,26 @@ def _set_stage1_borrow_threshold_annotation(sample, threshold_info):
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['borrow_thresholds'] = _to_stage1_debug_python(dict(threshold_info))
+
+
+def _set_stage1_junction_threshold_defaults(sample):
+    sample['junction_yld_max_speed'] = np.float32(np.nan)
+    sample['junction_go_min_speed'] = np.float32(np.nan)
+    sample['junction_yld_max_speed_valid'] = np.float32(0.0)
+    sample['junction_go_min_speed_valid'] = np.float32(0.0)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['junction_thresholds'] = _default_junction_threshold_debug()
+
+
+def _set_stage1_junction_threshold_annotation(sample, threshold_info):
+    sample['junction_yld_max_speed'] = np.float32(float(threshold_info.get('yld_max_speed_mps', np.nan)))
+    sample['junction_go_min_speed'] = np.float32(float(threshold_info.get('go_min_speed_mps', np.nan)))
+    sample['junction_yld_max_speed_valid'] = np.float32(float(threshold_info.get('yld_valid', 0.0)))
+    sample['junction_go_min_speed_valid'] = np.float32(float(threshold_info.get('go_valid', 0.0)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['junction_thresholds'] = _to_stage1_debug_python(dict(threshold_info))
 
 
 def _conflict_area_issue(sample, family, reason, **extra):
@@ -3831,6 +3998,7 @@ def _build_route_conflict_records(samples, route_sample_indices, scene_route_wor
             'scene_borrow_context': stage1_debug.get('scene_borrow_context') or {},
             'merge_thresholds': stage1_debug.get('merge_thresholds') or {},
             'borrow_thresholds': stage1_debug.get('borrow_thresholds') or {},
+            'junction_thresholds': stage1_debug.get('junction_thresholds') or {},
             'stage1_speed_debug': stage1_debug if isinstance(stage1_debug, dict) else {},
         })
     return records
@@ -4503,10 +4671,42 @@ def _conflict_window_release_pos(records, family, start_pos, entry_pos, end_pos)
         if np.isfinite(speed_mps) and speed_mps <= float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS):
             return int(pos), 'stopped'
 
+    speed_items = []
+    for pos in range(int(start_pos), int(entry_pos) + 1):
+        speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+        if np.isfinite(speed_mps):
+            speed_items.append((int(pos), float(speed_mps)))
+    if len(speed_items) >= 3:
+        speeds = np.asarray([item[1] for item in speed_items], dtype=np.float32)
+        min_idx = int(np.argmin(speeds))
+        min_pos = int(speed_items[min_idx][0])
+        min_speed = float(speeds[min_idx])
+        if min_pos > int(start_pos):
+            ref_speed = float(np.max(speeds[: min_idx + 1]))
+            drop_mps = float(ref_speed - min_speed)
+            drop_ratio = drop_mps / max(float(ref_speed), 1e-6)
+            if (
+                ref_speed >= float(STAGE1_CONFLICT_DEEP_SLOWDOWN_MIN_REF_SPEED_MPS) and
+                drop_mps >= float(STAGE1_CONFLICT_DEEP_SLOWDOWN_DROP_MPS) and
+                drop_ratio >= float(STAGE1_CONFLICT_DEEP_SLOWDOWN_DROP_RATIO)
+            ):
+                return int(min_pos), 'deep_slowdown'
+
     return int(start_pos), 'window_start'
 
 
 def _conflict_window_go_pos(records, family, start_pos, release_pos, end_pos, release_reason):
+    if str(release_reason) == 'deep_slowdown':
+        release_speed = _record_conflict_speed_mps(records[int(release_pos)], family)
+        if not np.isfinite(release_speed):
+            return None, 'deep_slowdown_missing_release_speed'
+        restart_thresh = float(release_speed) + float(STAGE1_CONFLICT_DEEP_SLOWDOWN_RESTART_DELTA_MPS)
+        for pos in range(int(release_pos) + 1, int(end_pos) + 1):
+            speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+            if np.isfinite(speed_mps) and speed_mps >= restart_thresh:
+                return int(pos), 'post_deep_slowdown_restart'
+        return None, 'deep_slowdown_no_restart'
+
     if str(release_reason) != 'stopped':
         return int(start_pos), 'window_start_direct_go'
 
@@ -4516,6 +4716,35 @@ def _conflict_window_go_pos(records, family, start_pos, release_pos, end_pos, re
             return int(pos), 'post_stop_speed_restart'
 
     return None, 'stopped_no_restart'
+
+
+def _conflict_window_phase_go_pos(records, family, start_pos, release_pos, entry_pos, end_pos, release_reason):
+    if entry_pos is None:
+        return None, 'entry_missing'
+
+    entry_pos = int(entry_pos)
+    start_pos = int(start_pos)
+    release_reason = str(release_reason or 'none')
+
+    if release_reason == 'deep_slowdown':
+        release_speed = _record_conflict_speed_mps(records[int(release_pos)], family)
+        if not np.isfinite(release_speed):
+            return int(entry_pos), 'entry_forced_go_missing_release_speed'
+        restart_thresh = float(release_speed) + float(STAGE1_CONFLICT_DEEP_SLOWDOWN_RESTART_DELTA_MPS)
+        for pos in range(int(release_pos) + 1, int(entry_pos) + 1):
+            speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+            if np.isfinite(speed_mps) and speed_mps >= restart_thresh:
+                return int(pos), 'post_deep_slowdown_restart_before_entry'
+        return int(entry_pos), 'entry_forced_go_after_deep_slowdown'
+
+    if release_reason == 'stopped':
+        for pos in range(int(release_pos) + 1, int(entry_pos) + 1):
+            speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+            if np.isfinite(speed_mps) and speed_mps > float(STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS):
+                return int(pos), 'post_stop_restart_before_entry'
+        return int(entry_pos), 'entry_forced_go_after_stop'
+
+    return int(start_pos), 'window_start_direct_go'
 
 
 def _conflict_window_phase_debug_stats(records, family, start_pos, entry_pos, release_pos, go_pos, end_pos):
@@ -4658,6 +4887,26 @@ def _conflict_phase_frame_role(pos, start_pos, end_pos, entry_pos, go_pos, phase
     return str(phase)
 
 
+def _conflict_control_phase_for_frame(records, family, pos, phase, release_reason):
+    phase = str(phase or 'none')
+    if phase == 'go':
+        return 'go'
+    if phase != 'yld':
+        return 'none'
+
+    release_reason = str(release_reason or 'none')
+    if release_reason == 'entry_missing':
+        return 'none'
+    speed_mps = _record_conflict_speed_mps(records[int(pos)], family)
+    if np.isfinite(speed_mps) and speed_mps <= float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS):
+        return 'stop_yld'
+    if release_reason == 'stopped':
+        return 'slow_yld'
+    if release_reason == 'deep_slowdown':
+        return 'slow_yld'
+    return 'coast_yld'
+
+
 def _annotate_route_stage1_conflict_phases(samples, route_sample_indices, scene_route_world=None):
     records = _build_route_conflict_records(samples, route_sample_indices, scene_route_world=scene_route_world)
     if not records:
@@ -4697,6 +4946,7 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices, scene_
         )
         if entry_pos is None:
             go_pos = None
+            go_reason = 'entry_missing'
             go_frame = -1
             release_pos = None
             release_reason = 'entry_missing'
@@ -4708,11 +4958,12 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices, scene_
                 entry_pos=entry_pos,
                 end_pos=end_pos,
             )
-            go_pos, go_reason = _conflict_window_go_pos(
+            go_pos, go_reason = _conflict_window_phase_go_pos(
                 records,
                 family=family,
                 start_pos=start_pos,
                 release_pos=release_pos,
+                entry_pos=entry_pos,
                 end_pos=end_pos,
                 release_reason=release_reason,
             )
@@ -4730,9 +4981,18 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices, scene_
         for window_pos in range(int(start_pos), int(end_pos) + 1):
             record = records[int(window_pos)]
             phase = 'yld' if go_pos is None or int(window_pos) < int(go_pos) else 'go'
+            control_phase = _conflict_control_phase_for_frame(
+                records,
+                family=family,
+                pos=window_pos,
+                phase=phase,
+                release_reason=release_reason,
+            )
             phase_info = {
                 'phase': str(phase),
                 'phase_code': int(CONFLICT_DECISION_PHASE_TO_CODE.get(phase, 0)),
+                'control_phase': str(control_phase),
+                'control_phase_code': int(CONFLICT_CONTROL_PHASE_TO_CODE.get(control_phase, 0)),
                 'active': 1.0,
                 'family': str(family),
                 'start_frame': int(start_frame),
@@ -4748,8 +5008,10 @@ def _annotate_route_stage1_conflict_phases(samples, route_sample_indices, scene_
                     go_pos=go_pos,
                     phase=phase,
                 ),
-                'source': 'area_entry_backward_stop_then_restart',
-                'release_reason': str(release_reason if entry_pos is None else go_reason),
+                'source': 'area_entry_rewind_go',
+                'release_reason': str(release_reason),
+                'yld_release_reason': str(release_reason),
+                'go_reason': str(go_reason) if entry_pos is not None else 'none',
                 'entry_found': float(entry_pos is not None),
                 'speed_mps': float(_record_conflict_speed_mps(record, family)),
                 'stop_speed_thresh_mps': float(STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS),
@@ -4814,6 +5076,59 @@ def _annotate_borrow_threshold_issue(sample, reason, **extra):
     _set_stage1_borrow_threshold_annotation(sample, info)
 
 
+def _threshold_info_has_any_valid(threshold_info):
+    if not isinstance(threshold_info, dict):
+        return False
+    return (
+        float(threshold_info.get('yld_valid', 0.0)) > 0.5 or
+        float(threshold_info.get('go_valid', 0.0)) > 0.5
+    )
+
+
+def _fill_unconstrained_threshold_bounds(
+    threshold_info,
+    debug_factory,
+    yld_default_mps=30.0,
+    go_default_mps=0.0,
+):
+    info = debug_factory()
+    if isinstance(threshold_info, dict):
+        info.update(dict(threshold_info))
+
+    filled_any = False
+    yld_value = float(info.get('yld_max_speed_mps', np.nan))
+    if float(info.get('yld_valid', 0.0)) <= 0.5 or not np.isfinite(yld_value):
+        info.update({
+            'v_yield_max_mps': float(yld_default_mps),
+            'yld_max_speed_mps': float(yld_default_mps),
+            'yld_valid': 1.0,
+        })
+        filled_any = True
+
+    go_value = float(info.get('go_min_speed_mps', np.nan))
+    if float(info.get('go_valid', 0.0)) <= 0.5 or not np.isfinite(go_value):
+        info.update({
+            'v_go_min_mps': float(go_default_mps),
+            'v_go_need_mps': float(go_default_mps),
+            'go_min_speed_mps': float(go_default_mps),
+            'go_valid': 1.0,
+        })
+        filled_any = True
+
+    return info, filled_any
+
+
+def _collect_window_threshold_infos(records, start_pos, end_pos, info_fn):
+    frame_infos = []
+    has_explicit_source = False
+    for pos in range(int(start_pos), int(end_pos) + 1):
+        threshold_info = info_fn(records[int(pos)])
+        frame_infos.append((int(pos), threshold_info))
+        if _threshold_info_has_any_valid(threshold_info):
+            has_explicit_source = True
+    return frame_infos, bool(has_explicit_source)
+
+
 def _apply_borrow_threshold_frame(samples, records, pos, threshold_info, source='active_window_frame_borrow_cross_meet'):
     sample = samples[int(records[int(pos)]['sample_idx'])]
     info = dict(threshold_info or {})
@@ -4827,17 +5142,41 @@ def _apply_borrow_threshold_frame(samples, records, pos, threshold_info, source=
     _set_stage1_borrow_threshold_annotation(sample, info)
 
 
-def _apply_borrow_threshold_per_frame_range(samples, records, start_pos, end_pos):
+def _apply_borrow_threshold_per_frame_range(
+    samples,
+    records,
+    start_pos,
+    end_pos,
+):
     valid_count = 0
-    for pos in range(int(start_pos), int(end_pos) + 1):
-        threshold_info = _borrow_threshold_info_from_record(records[int(pos)])
-        if threshold_info is None:
+    frame_infos, has_explicit_source = _collect_window_threshold_infos(
+        records,
+        start_pos,
+        end_pos,
+        _borrow_threshold_info_from_record,
+    )
+    for pos, threshold_info in frame_infos:
+        if threshold_info is None and not has_explicit_source:
             _annotate_borrow_threshold_issue(
                 samples[int(records[int(pos)]['sample_idx'])],
                 'missing_borrow_threshold_source_frame',
             )
             continue
-        _apply_borrow_threshold_frame(samples, records, pos, threshold_info)
+        source = 'active_window_frame_borrow_cross_meet'
+        if threshold_info is None:
+            threshold_info, _ = _fill_unconstrained_threshold_bounds(
+                None,
+                _default_borrow_threshold_debug,
+            )
+            source = 'active_window_unconstrained_borrow_cross_meet'
+        else:
+            threshold_info, filled_any = _fill_unconstrained_threshold_bounds(
+                threshold_info,
+                _default_borrow_threshold_debug,
+            )
+            if filled_any:
+                source = 'active_window_partial_unconstrained_borrow_cross_meet'
+        _apply_borrow_threshold_frame(samples, records, pos, threshold_info, source=source)
         valid_count += 1
     return int(valid_count)
 
@@ -4854,7 +5193,12 @@ def _annotate_route_stage1_borrow_thresholds(samples, route_sample_indices, scen
     for window in borrow_windows:
         start_pos = int(window.get('start_pos', -1))
         end_pos = int(window.get('end_pos', -1))
-        valid_count = _apply_borrow_threshold_per_frame_range(samples, records, start_pos, end_pos)
+        valid_count = _apply_borrow_threshold_per_frame_range(
+            samples,
+            records,
+            start_pos,
+            end_pos,
+        )
         if valid_count <= 0:
             _annotate_borrow_threshold_issue(
                 samples[int(records[start_pos]['sample_idx'])],
@@ -4867,6 +5211,253 @@ def _annotate_route_stage1_borrow_thresholds(samples, route_sample_indices, scen
             continue
         issue_pos = int(np.clip(int(issue.get('pos', 0)), 0, len(records) - 1))
         _annotate_borrow_threshold_issue(
+            samples[int(records[issue_pos]['sample_idx'])],
+            reason,
+        )
+
+
+def _record_ego_length_m(record, default_length_m=4.5):
+    merge_motion = (record or {}).get('merge_motion') or {}
+    half_length_m = float(merge_motion.get('ego_half_length_m', np.nan))
+    if np.isfinite(half_length_m):
+        return float(max(2.0 * float(half_length_m), 1.0))
+    return float(default_length_m)
+
+
+def _cover_is_junction_cross_meet(cover):
+    if int((cover or {}).get('exists', 0.0)) <= 0:
+        return False
+    return _cover_interaction_subtype(cover) == 'junction_left_cross_meet'
+
+
+def _junction_threshold_info_from_record(
+    record,
+    area_start_s_m,
+    area_end_s_m,
+    junction_tau_s=0.25,
+):
+    front_s = _record_scene_front_s(record)
+    area_start_s_m = float(area_start_s_m)
+    area_end_s_m = float(area_end_s_m)
+    if not (np.isfinite(front_s) and np.isfinite(area_start_s_m) and np.isfinite(area_end_s_m)):
+        return None
+
+    area_length_m = float(max(area_end_s_m - area_start_s_m, 0.0))
+    d_ego_start_m = float(max(area_start_s_m - float(front_s), 0.0))
+    d_ego_end_m = float(max(area_end_s_m - float(front_s), d_ego_start_m))
+    ego_length_m = float(_record_ego_length_m(record))
+
+    def _finish(payload, v_yield_raw, v_go_raw):
+        yld_value, yld_valid = _threshold_speed_value_and_valid(v_yield_raw)
+        go_value, go_valid = _threshold_speed_value_and_valid(v_go_raw)
+        payload.update({
+            'v_yield_max_mps': float(yld_value),
+            'v_go_min_mps': float(go_value),
+            'v_go_need_mps': np.nan,
+            'yld_max_speed_mps': float(yld_value),
+            'go_min_speed_mps': float(go_value),
+            'yld_valid': float(yld_valid),
+            'go_valid': float(go_valid),
+        })
+        if float(yld_valid) <= 0.5 and float(go_valid) <= 0.5:
+            return None
+        return payload
+
+    def _base_payload(cover, source, cover_case):
+        return {
+            **_default_junction_threshold_debug(),
+            'active': 1.0,
+            'subtype': 'junction_left_cross_meet',
+            'source': str(source),
+            'source_frame': int(record.get('frame_id', -1)),
+            'cover_case': str(cover_case),
+            'd_ego_m': float(d_ego_start_m),
+            'd_ego_end_m': float(d_ego_end_m),
+            'd_bg_m': float((cover or {}).get('d_bg', np.nan)),
+            'bg_speed_mps': float((cover or {}).get('other_speed', np.nan)),
+            'area_start_s_m': float(area_start_s_m),
+            'area_end_s_m': float(area_end_s_m),
+            'area_length_m': float(area_length_m),
+            'ego_front_s_m': float(front_s),
+        }
+
+    current_cover = (record or {}).get('current_cover') or {}
+    if _cover_is_junction_cross_meet(current_cover):
+        payload = _base_payload(
+            current_cover,
+            source='current_junction_cross_transition',
+            cover_case='current',
+        )
+        bg_speed = float(abs(float(current_cover.get('other_speed', np.nan))))
+        bg_length_m = float(current_cover.get('other_length_m', np.nan))
+        if not np.isfinite(bg_length_m):
+            bg_length_m = float(ego_length_m)
+        bg_clearance_m = float(max(bg_length_m, area_length_m, 1.0))
+        if np.isfinite(bg_speed) and bg_speed > 1e-3:
+            t_bg_exit_s = float(bg_clearance_m / max(bg_speed, 1e-6))
+        else:
+            t_bg_exit_s = np.inf
+        v_yield_raw = 0.0
+        if np.isfinite(t_bg_exit_s):
+            v_yield_raw = float(d_ego_start_m) / max(float(t_bg_exit_s) + float(junction_tau_s), 1e-3)
+        payload.update({
+            'bg_speed_mps': float(bg_speed),
+            'bg_clearance_m': float(bg_clearance_m),
+            't_bg_exit_s': float(t_bg_exit_s),
+        })
+        yld_value, yld_valid = _threshold_speed_value_and_valid(v_yield_raw)
+        payload.update({
+            'v_yield_max_mps': float(yld_value),
+            'v_go_min_mps': np.nan,
+            'v_go_need_mps': np.nan,
+            'yld_max_speed_mps': float(yld_value),
+            'go_min_speed_mps': np.nan,
+            'yld_valid': float(yld_valid),
+            'go_valid': 0.0,
+        })
+        return payload
+
+    future_cover = (record or {}).get('future_cover') or {}
+    if not _cover_is_junction_cross_meet(future_cover):
+        return None
+
+    payload = _base_payload(
+        future_cover,
+        source='future_junction_cross_meet',
+        cover_case='future',
+    )
+    d_bg_m = float(future_cover.get('d_bg', np.nan))
+    bg_speed = float(abs(float(future_cover.get('other_speed', np.nan))))
+    if not (np.isfinite(d_bg_m) and np.isfinite(bg_speed) and d_bg_m > 1e-4 and bg_speed > 1e-4):
+        return None
+
+    bg_length_m = float(future_cover.get('other_length_m', np.nan))
+    if not np.isfinite(bg_length_m):
+        bg_length_m = float(ego_length_m)
+    bg_clearance_m = float(max(bg_length_m, 1.0))
+    area_clearance_m = float(max(area_length_m, bg_clearance_m, ego_length_m, 1.0))
+    t_bg_s = float(d_bg_m / max(bg_speed, 1e-6))
+    t_bg_clear_s = float((d_bg_m + area_clearance_m) / max(bg_speed, 1e-6))
+    v_yield_raw = float(d_ego_start_m) / max(float(t_bg_clear_s) + float(junction_tau_s), 1e-3)
+    go_denom_s = float(t_bg_s) - float(junction_tau_s)
+    v_go_raw = np.inf if go_denom_s <= 1e-6 else float(d_ego_end_m + ego_length_m) / max(go_denom_s, 1e-6)
+    payload.update({
+        'd_bg_m': float(d_bg_m),
+        'bg_speed_mps': float(bg_speed),
+        'bg_clearance_m': float(bg_clearance_m),
+        't_bg_s': float(t_bg_s),
+        't_bg_clear_s': float(t_bg_clear_s),
+    })
+    return _finish(payload, v_yield_raw, v_go_raw)
+
+
+def _annotate_junction_threshold_issue(sample, reason, **extra):
+    info = _default_junction_threshold_debug()
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        current = stage1_debug.get('junction_thresholds') or {}
+        if isinstance(current, dict):
+            info.update(dict(current))
+    info.update({
+        'issue': 1,
+        'issue_reason': str(reason),
+    })
+    info.update(extra)
+    _set_stage1_junction_threshold_annotation(sample, info)
+
+
+def _apply_junction_threshold_frame(samples, records, pos, threshold_info, source='active_window_frame_junction_cross_meet'):
+    sample = samples[int(records[int(pos)]['sample_idx'])]
+    info = dict(threshold_info or {})
+    info.update({
+        'active': 1.0,
+        'source': str(source),
+        'source_frame': int(records[int(pos)].get('frame_id', -1)),
+        'issue': 0,
+        'issue_reason': 'none',
+    })
+    _set_stage1_junction_threshold_annotation(sample, info)
+
+
+def _apply_junction_threshold_per_frame_range(samples, records, start_pos, end_pos, area_start_s_m, area_end_s_m):
+    valid_count = 0
+    def _info_fn(record):
+        return _junction_threshold_info_from_record(
+            record,
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+        )
+
+    frame_infos, has_explicit_source = _collect_window_threshold_infos(
+        records,
+        start_pos,
+        end_pos,
+        _info_fn,
+    )
+    for pos, threshold_info in frame_infos:
+        if threshold_info is None and not has_explicit_source:
+            _annotate_junction_threshold_issue(
+                samples[int(records[int(pos)]['sample_idx'])],
+                'missing_junction_threshold_source_frame',
+                area_start_s_m=float(area_start_s_m),
+                area_end_s_m=float(area_end_s_m),
+            )
+            continue
+        source = 'active_window_frame_junction_cross_meet'
+        if threshold_info is None:
+            threshold_info, _ = _fill_unconstrained_threshold_bounds(
+                None,
+                _default_junction_threshold_debug,
+            )
+            source = 'active_window_unconstrained_junction_cross_meet'
+        else:
+            threshold_info, filled_any = _fill_unconstrained_threshold_bounds(
+                threshold_info,
+                _default_junction_threshold_debug,
+            )
+            if filled_any:
+                source = 'active_window_partial_unconstrained_junction_cross_meet'
+        _apply_junction_threshold_frame(samples, records, pos, threshold_info, source=source)
+        valid_count += 1
+    return int(valid_count)
+
+
+def _annotate_route_stage1_junction_thresholds(samples, route_sample_indices, scene_route_world=None):
+    records = _build_route_conflict_records(samples, route_sample_indices, scene_route_world=scene_route_world)
+    if not records:
+        return
+
+    for record in records:
+        _set_stage1_junction_threshold_defaults(samples[int(record['sample_idx'])])
+
+    junction_windows, junction_issues = _build_junction_conflict_windows(records, samples)
+    for window in junction_windows:
+        start_pos = int(window.get('start_pos', -1))
+        end_pos = int(window.get('end_pos', -1))
+        area_start_s_m = float(window.get('area_start_s_m', np.nan))
+        area_end_s_m = float(window.get('area_end_s_m', np.nan))
+        valid_count = _apply_junction_threshold_per_frame_range(
+            samples,
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            area_start_s_m=area_start_s_m,
+            area_end_s_m=area_end_s_m,
+        )
+        if valid_count <= 0:
+            _annotate_junction_threshold_issue(
+                samples[int(records[start_pos]['sample_idx'])],
+                'missing_junction_threshold_source',
+                area_start_s_m=float(area_start_s_m),
+                area_end_s_m=float(area_end_s_m),
+            )
+
+    for issue in junction_issues:
+        reason = str(issue.get('reason', 'none'))
+        if not reason.startswith('missing_'):
+            continue
+        issue_pos = int(np.clip(int(issue.get('pos', 0)), 0, len(records) - 1))
+        _annotate_junction_threshold_issue(
             samples[int(records[issue_pos]['sample_idx'])],
             reason,
         )
@@ -4893,6 +5484,14 @@ def _merge_threshold_info_from_record(record):
         'go_valid': float(np.isfinite(go_threshold)),
         'source': str(threshold_debug.get('source', 'future_merge_meet')),
         'source_frame': int(threshold_debug.get('source_frame', record.get('frame_id', -1))),
+        'cover_case': str(threshold_debug.get('cover_case', 'none')),
+        'd_ego_m': float(threshold_debug.get('d_ego_m', np.nan)),
+        'd_bg_m': float(threshold_debug.get('d_bg_m', np.nan)),
+        'bg_speed_mps': float(threshold_debug.get('bg_speed_mps', np.nan)),
+        'bg_clearance_m': float(threshold_debug.get('bg_clearance_m', np.nan)),
+        't_bg_s': float(threshold_debug.get('t_bg_s', np.nan)),
+        't_bg_clear_s': float(threshold_debug.get('t_bg_clear_s', np.nan)),
+        't_bg_exit_s': float(threshold_debug.get('t_bg_exit_s', np.nan)),
     })
     return info
 
@@ -5000,15 +5599,15 @@ def _apply_merge_threshold_per_frame_range(
     tail_source_frame=-1,
 ):
     valid_count = 0
-    for pos in range(int(start_pos), int(end_pos) + 1):
-        threshold_info = _merge_threshold_info_from_record(records[int(pos)])
-        if (
-            threshold_info is None or
-            (
-                float(threshold_info.get('yld_valid', 0.0)) <= 0.5 and
-                float(threshold_info.get('go_valid', 0.0)) <= 0.5
-            )
-        ):
+    frame_infos, has_explicit_source = _collect_window_threshold_infos(
+        records,
+        start_pos,
+        end_pos,
+        _merge_threshold_info_from_record,
+    )
+    for pos, threshold_info in frame_infos:
+        source = 'active_window_frame_merge_meet'
+        if threshold_info is None and not has_explicit_source:
             _annotate_merge_threshold_issue(
                 samples[int(records[int(pos)]['sample_idx'])],
                 'missing_merge_threshold_source_frame',
@@ -5018,6 +5617,19 @@ def _apply_merge_threshold_per_frame_range(
                 tail_source_frame=int(tail_source_frame),
             )
             continue
+        if threshold_info is None:
+            threshold_info, _ = _fill_unconstrained_threshold_bounds(
+                None,
+                _default_merge_threshold_debug,
+            )
+            source = 'active_window_unconstrained_merge_meet'
+        else:
+            threshold_info, filled_any = _fill_unconstrained_threshold_bounds(
+                threshold_info,
+                _default_merge_threshold_debug,
+            )
+            if filled_any:
+                source = 'active_window_partial_unconstrained_merge_meet'
         _apply_merge_threshold_frame(
             samples,
             records,
@@ -5027,6 +5639,7 @@ def _apply_merge_threshold_per_frame_range(
             collision_infractions=collision_infractions,
             tail_anchor_frame=tail_anchor_frame,
             tail_source_frame=tail_source_frame,
+            source=source,
         )
         valid_count += 1
     return int(valid_count)
@@ -5359,11 +5972,13 @@ def _set_stage1_speed_fallback(sample):
         borrow_motion=None,
         merge_thresholds=None,
         borrow_thresholds=None,
+        junction_thresholds=None,
     )
     _set_stage1_conflict_area_defaults(sample)
     _set_stage1_conflict_phase_defaults(sample)
     _set_stage1_merge_threshold_defaults(sample)
     _set_stage1_borrow_threshold_defaults(sample)
+    _set_stage1_junction_threshold_defaults(sample)
 
 
 def _cover_actor_id(cover):
@@ -6232,6 +6847,7 @@ def precompute(
                     borrow_motion=borrow_motion,
                     merge_thresholds=_build_merge_threshold_source_debug(
                         future_cover,
+                        current_cover=current_cover,
                         current_boxes=current_boxes_dynamic,
                         source_frame=int(sample.get('frame_id', -1)),
                     ),
@@ -6257,6 +6873,11 @@ def precompute(
                 scene_route_world=scene_route_polyline_world.get(base_dir),
             )
             _annotate_route_stage1_borrow_thresholds(
+                samples,
+                route_sample_indices,
+                scene_route_world=scene_route_polyline_world.get(base_dir),
+            )
+            _annotate_route_stage1_junction_thresholds(
                 samples,
                 route_sample_indices,
                 scene_route_world=scene_route_polyline_world.get(base_dir),

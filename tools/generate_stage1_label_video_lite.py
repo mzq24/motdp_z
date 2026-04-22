@@ -54,6 +54,13 @@ CONFLICT_DIR_NAMES = {
     2: "opposite",
     3: "cross",
 }
+CONFLICT_CONTROL_PHASE_NAMES = {
+    0: "none",
+    1: "coast_yld",
+    2: "slow_yld",
+    3: "stop_yld",
+    4: "go",
+}
 
 
 def _resolve_packed_path(dataset_path=None, packed_path=None):
@@ -620,7 +627,7 @@ def _fmt_int(x):
         return "NA"
 
 
-def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, borrow_threshold_debug):
+def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, borrow_threshold_debug, junction_threshold_debug):
     family_name = str(family_name or "none")
     phase = str(phase or "yld")
     if family_name == "borrow":
@@ -638,6 +645,12 @@ def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, bor
             extra = f"tail={int(float(sample.get('merge_threshold_train_only_negative_tail', 0.0)) > 0.5)}"
         else:
             extra = f"issue={debug.get('issue_reason', 'none')}"
+    elif family_name == "junction":
+        prefix = "junction th"
+        speed_field = "junction_yld_max_speed" if phase == "yld" else "junction_go_min_speed"
+        valid_field = "junction_yld_max_speed_valid" if phase == "yld" else "junction_go_min_speed_valid"
+        debug = junction_threshold_debug or {}
+        extra = f"case={debug.get('cover_case', 'none')}"
     else:
         prefix = f"{family_name} th"
         speed_field = ""
@@ -813,6 +826,7 @@ def _build_text_panel(sample, current_meas):
     conflict_phase = stage1_debug.get("conflict_phase") or {}
     merge_threshold_debug = stage1_debug.get("merge_thresholds") or {}
     borrow_threshold_debug = stage1_debug.get("borrow_thresholds") or {}
+    junction_threshold_debug = stage1_debug.get("junction_thresholds") or {}
 
     base_dir, _ = _resolve_feature_frame_info(sample)
     event_name = _scene_name_from_base_dir(base_dir) or "unknown"
@@ -826,6 +840,11 @@ def _build_text_panel(sample, current_meas):
     family_code = int(sample.get("conflict_area_family", 0))
     family_name = CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))
     dir_code = int(sample.get("conflict_area_dir", 0))
+    control_phase_code = int(sample.get("conflict_control_phase", 0))
+    control_phase = CONFLICT_CONTROL_PHASE_NAMES.get(
+        control_phase_code,
+        str(conflict_phase.get("control_phase", control_phase_code)),
+    )
     issue_count = int(conflict_area.get("issue_count", 0))
     issue_families = ",".join(str(x) for x in conflict_area.get("issue_families", [])) or "none"
     if issue_count > 0:
@@ -876,7 +895,7 @@ def _build_text_panel(sample, current_meas):
         col_w,
         "Phase",
         [
-            f"phase={conflict_phase.get('phase', 'none')} active={int(float(conflict_phase.get('active', 0.0)) > 0.5)} family={conflict_phase.get('family', 'none')}",
+            f"phase={conflict_phase.get('phase', 'none')} ctrl={control_phase} active={int(float(conflict_phase.get('active', 0.0)) > 0.5)}",
             f"go_frame={_fmt_int(sample.get('conflict_go_frame', -1))} entry={_fmt_int(conflict_phase.get('entry_frame', -1))} release={_fmt_int(conflict_phase.get('release_frame', -1))}",
             f"role={conflict_phase.get('frame_role', 'none')} src={conflict_phase.get('source', 'none')} issue={conflict_phase.get('issue_reason', 'none')}",
             f"reason={conflict_phase.get('release_reason', 'none')}",
@@ -930,6 +949,7 @@ def _build_text_panel(sample, current_meas):
                 sample,
                 merge_threshold_debug,
                 borrow_threshold_debug,
+                junction_threshold_debug,
             ),
             _threshold_panel_line(
                 family_name,
@@ -937,6 +957,7 @@ def _build_text_panel(sample, current_meas):
                 sample,
                 merge_threshold_debug,
                 borrow_threshold_debug,
+                junction_threshold_debug,
             ),
         ],
         (86, 86, 86),
