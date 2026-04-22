@@ -768,6 +768,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             [merge_go_valid, junction_go_valid, borrow_go_valid],
             dim=-1,
         ).to(device=device, dtype=model_dtype).clamp(0.0, 1.0)
+        # Boundary labels use NaN outside valid regions. Sanitize them before any
+        # weighted aggregation; otherwise 0 * NaN still becomes NaN and pollutes
+        # the branch condition fed back into the main diffusion path.
+        yld_stack = torch.where(
+            yld_valid_stack > 0.5,
+            torch.nan_to_num(yld_stack, nan=0.0, posinf=0.0, neginf=0.0),
+            torch.zeros_like(yld_stack),
+        )
+        go_stack = torch.where(
+            go_valid_stack > 0.5,
+            torch.nan_to_num(go_stack, nan=0.0, posinf=0.0, neginf=0.0),
+            torch.zeros_like(go_stack),
+        )
         weighted_family_yld = family_probs * yld_valid_stack
         weighted_family_go = family_probs * go_valid_stack
         weighted_yld_sum = weighted_family_yld.sum(dim=-1, keepdim=True)
