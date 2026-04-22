@@ -909,6 +909,66 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     print(f"[COLLATE] type mismatch '{key}': {sorted(types)}", flush=True)
             raise
 
+    def print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank):
+        if rank != 0:
+            return
+        print(f"[NONFINITE] total_loss became non-finite at batch {batch_idx}", flush=True)
+        scalar_items = []
+        for key, value in loss_dict.items():
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                value_detached = value.detach().float()
+                scalar_items.append(
+                    (
+                        key,
+                        float(value_detached.item()) if torch.isfinite(value_detached) else str(value_detached.item()),
+                        bool(torch.isfinite(value_detached).item()),
+                    )
+                )
+        scalar_items.sort(key=lambda item: item[0])
+        for key, value_repr, is_finite in scalar_items:
+            status = "finite" if is_finite else "NONFINITE"
+            print(f"[NONFINITE] loss[{key}]={value_repr} ({status})", flush=True)
+
+        debug_batch_keys = (
+            'conflict_area_family',
+            'conflict_area_dir',
+            'conflict_decision_phase',
+            'conflict_control_phase',
+            'merge_yld_max_speed',
+            'merge_go_min_speed',
+            'junction_yld_max_speed',
+            'junction_go_min_speed',
+            'borrow_yld_max_speed',
+            'borrow_go_min_speed',
+            'merge_yld_max_speed_valid',
+            'merge_go_min_speed_valid',
+            'junction_yld_max_speed_valid',
+            'junction_go_min_speed_valid',
+            'borrow_yld_max_speed_valid',
+            'borrow_go_min_speed_valid',
+            'borrow_cross_active_time_s',
+        )
+        for key in debug_batch_keys:
+            value = batch.get(key)
+            if not isinstance(value, torch.Tensor):
+                continue
+            value_detached = value.detach().float().cpu()
+            finite_mask = torch.isfinite(value_detached)
+            finite_count = int(finite_mask.sum().item())
+            total_count = int(value_detached.numel())
+            if finite_count > 0:
+                finite_values = value_detached[finite_mask]
+                min_value = float(finite_values.min().item())
+                max_value = float(finite_values.max().item())
+            else:
+                min_value = float('nan')
+                max_value = float('nan')
+            print(
+                f"[NONFINITE] batch[{key}] shape={tuple(value_detached.shape)} "
+                f"finite={finite_count}/{total_count} min={min_value} max={max_value}",
+                flush=True,
+            )
+
     # Use DistributedSampler for multi-GPU training
     if world_size > 1:
         if use_window_weighted_sampler:
@@ -1496,6 +1556,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if hasattr(policy_unwrapped, '_current_epoch'):
             policy_unwrapped._current_epoch = epoch
         train_losses = []
+        nonfinite_debug_budget = 3
 
         if rank == 0:
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
@@ -1525,29 +1586,37 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     if rank == 0:
                         print(f"Warning: NaN/Inf total_loss at batch {batch_idx}, skipping")
+                        if nonfinite_debug_budget > 0:
+                            print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
+                            nonfinite_debug_budget -= 1
                     continue
 
                 scaler.scale(total_loss).backward()
 
-                # Clip and step energy optimizer
                 scaler.unscale_(optimizer_energy)
-                torch.nn.utils.clip_grad_norm_(energy_params, max_norm=max_grad_norm)
-                scaler.step(optimizer_energy)
-
-                # Clip and step diffusion optimizer
                 scaler.unscale_(optimizer)
+                energy_grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(energy_params, max_norm=max_grad_norm)
                 diff_params_for_clip = [p for p in (policy.module if world_size > 1 else policy).parameters()
                                         if id(p) not in energy_param_ids]
                 grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(diff_params_for_clip, max_norm=max_grad_norm)
 
-                if torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip):
+                energy_grad_nonfinite = torch.isnan(energy_grad_norm_before_clip) or torch.isinf(energy_grad_norm_before_clip)
+                diff_grad_nonfinite = torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip)
+                if energy_grad_nonfinite or diff_grad_nonfinite:
                     if rank == 0:
-                        print(f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping")
+                        print(
+                            f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping "
+                            f"(energy_grad={energy_grad_norm_before_clip}, diff_grad={grad_norm_before_clip})"
+                        )
+                        if nonfinite_debug_budget > 0:
+                            print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
+                            nonfinite_debug_budget -= 1
                     optimizer.zero_grad()
                     optimizer_energy.zero_grad()
                     scaler.update()
                     continue
 
+                scaler.step(optimizer_energy)
                 scaler.step(optimizer)
                 scaler.update()
 
