@@ -100,6 +100,28 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
         if key not in final_sample:
             final_sample[key] = torch.tensor(default_value, dtype=torch.float32)
 
+    legacy_merge_float_defaults = {
+        'merge_episode_active': 0.0,
+        'merge_episode_no_go': 0.0,
+    }
+    legacy_merge_long_defaults = {
+        'merge_decision_phase': 0,
+        'merge_end_state': 0,
+        'merge_episode_id': -1,
+        'merge_episode_start_frame': -1,
+        'merge_episode_end_frame': -1,
+        'merge_go_frame': -1,
+        'merge_resolution_actor_id': -1,
+    }
+
+    for key, default_value in legacy_merge_float_defaults.items():
+        if key not in final_sample:
+            final_sample[key] = torch.tensor(default_value, dtype=torch.float32)
+
+    for key, default_value in legacy_merge_long_defaults.items():
+        if key not in final_sample:
+            final_sample[key] = torch.tensor(default_value, dtype=torch.long)
+
 
 class RouteBatchSampler:
     """Batch sampler that groups samples by route to maximize route_features.pt cache hits.
