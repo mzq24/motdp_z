@@ -16,7 +16,7 @@ except ImportError:
 import yaml
 import wandb
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 import torch.nn.functional as F
@@ -42,6 +42,148 @@ CURRENT_ADAPTIVE_WEIGHTS = {
     'high': [0.30, 0.37, 0.33],
 }
 REGIME_ORDER = ['startup', 'low', 'medium', 'high']
+
+
+class WeightedDistributedSampler(Sampler):
+    """Distributed weighted sampler for DDP.
+
+    Each rank builds the same weighted global draw for the epoch, then takes its
+    rank-specific strided slice. This keeps per-rank sample counts aligned.
+    """
+
+    def __init__(
+        self,
+        weights,
+        num_replicas=None,
+        rank=None,
+        replacement=True,
+        drop_last=True,
+        seed=0,
+    ):
+        if num_replicas is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                num_replicas = 1
+            else:
+                num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                rank = 0
+            else:
+                rank = torch.distributed.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank={rank}, num_replicas={num_replicas}")
+
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        if self.weights.dim() != 1:
+            raise ValueError(f"weights must be 1-D, got {tuple(self.weights.shape)}")
+        if len(self.weights) == 0:
+            raise ValueError("weights must be non-empty")
+        if not torch.isfinite(self.weights).all() or float(self.weights.sum()) <= 0.0:
+            raise ValueError("weights must be finite and have positive sum")
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.replacement = bool(replacement)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        dataset_len = len(self.weights)
+        if self.drop_last and dataset_len % self.num_replicas != 0:
+            self.num_samples = int(np.ceil(max(dataset_len - self.num_replicas, 0) / self.num_replicas))
+        else:
+            self.num_samples = int(np.ceil(dataset_len / self.num_replicas))
+        self.total_size = int(self.num_samples * self.num_replicas)
+        if not self.replacement and self.total_size > dataset_len:
+            raise ValueError(
+                "replacement=False requires total_size <= dataset length; "
+                f"got total_size={self.total_size}, dataset_len={dataset_len}"
+            )
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.weights,
+            self.total_size,
+            replacement=self.replacement,
+            generator=generator,
+        ).tolist()
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+
+def _sample_float(sample, keys, default=0.0):
+    for key in keys:
+        if key not in sample:
+            continue
+        try:
+            value = sample.get(key)
+            if isinstance(value, np.ndarray):
+                value = float(np.asarray(value).reshape(-1)[0])
+            else:
+                value = float(value)
+            if np.isfinite(value):
+                return value
+        except Exception:
+            continue
+    return float(default)
+
+
+def build_window_sample_weights(dataset, dataloader_cfg):
+    """Build simple window-aware sample weights from cached stage1 active fields."""
+    samples = getattr(dataset, '_sample_cache', None)
+    if samples is None:
+        raise AttributeError("window-aware sampler requires dataset._sample_cache")
+
+    weight_cfg = dataloader_cfg.get('window_sampler_weights', {}) or {}
+    none_weight = float(weight_cfg.get('none', dataloader_cfg.get('window_sampler_none_weight', 1.0)))
+    merge_weight = float(weight_cfg.get('merge', dataloader_cfg.get('window_sampler_merge_weight', 3.0)))
+    junction_weight = float(weight_cfg.get('junction', dataloader_cfg.get('window_sampler_junction_weight', 3.0)))
+    borrow_weight = float(weight_cfg.get('borrow', dataloader_cfg.get('window_sampler_borrow_weight', 5.0)))
+
+    weights = np.full(len(samples), none_weight, dtype=np.float64)
+    counts = {'none': 0, 'merge': 0, 'junction': 0, 'borrow': 0}
+    for idx, sample in enumerate(samples):
+        merge_active = _sample_float(sample, ('merge_active', 'merge_episode_active')) > 0.5
+        junction_active = _sample_float(
+            sample,
+            ('junction_cross_active', 'junction_cross_episode_active', 'cross_active', 'cross_episode_active'),
+        ) > 0.5
+        borrow_active = _sample_float(sample, ('borrow_cross_active', 'borrow_cross_episode_active')) > 0.5
+
+        sample_weight = none_weight
+        if merge_active:
+            sample_weight = max(sample_weight, merge_weight)
+            counts['merge'] += 1
+        if junction_active:
+            sample_weight = max(sample_weight, junction_weight)
+            counts['junction'] += 1
+        if borrow_active:
+            sample_weight = max(sample_weight, borrow_weight)
+            counts['borrow'] += 1
+        if not (merge_active or junction_active or borrow_active):
+            counts['none'] += 1
+        weights[idx] = sample_weight
+
+    weights = np.maximum(weights, 1e-6)
+    summary = {
+        'counts': counts,
+        'weights': {
+            'none': none_weight,
+            'merge': merge_weight,
+            'junction': junction_weight,
+            'borrow': borrow_weight,
+        },
+        'mean_weight': float(weights.mean()) if weights.size else 0.0,
+        'max_weight': float(weights.max()) if weights.size else 0.0,
+    }
+    return weights, summary
 
 
 def _speed_regime_masks(median3, current_speed, rough_threshold=2.5, high_threshold=10.0, startup_speed_threshold=0.2):
@@ -236,8 +378,18 @@ def validate_model(
                     'energy_junction_active_loss',
                     'energy_borrow_active_loss',
                     'energy_cross_active_loss',
+                    'energy_dir_loss',
+                    'energy_conflict_area_loss',
                     'energy_window_loss',
                     'energy_phase_loss',
+                    'energy_decision_phase_loss',
+                    'energy_control_phase_loss',
+                    'energy_merge_yld_max_loss',
+                    'energy_merge_go_min_loss',
+                    'energy_junction_yld_max_loss',
+                    'energy_junction_go_min_loss',
+                    'energy_borrow_yld_max_loss',
+                    'energy_borrow_go_min_loss',
                 ):
                     if key in loss_dict:
                         val_metrics[key].append(loss_dict[key].item())
@@ -672,6 +824,24 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     train_pin_memory = dataloader_cfg.get('train_pin_memory', base_pin_memory)
     val_pin_memory = dataloader_cfg.get('val_pin_memory', False)
     use_route_group_sampler = dataloader_cfg.get('use_route_group_sampler', False)
+    use_window_weighted_sampler = bool(dataloader_cfg.get('use_window_weighted_sampler', False))
+    window_sampler_replacement = bool(dataloader_cfg.get('window_sampler_replacement', True))
+    window_sampler_seed = int(dataloader_cfg.get('window_sampler_seed', 0))
+    train_sample_weights = None
+    if use_window_weighted_sampler:
+        train_sample_weights, weight_summary = build_window_sample_weights(train_dataset, dataloader_cfg)
+        if rank == 0:
+            counts = weight_summary['counts']
+            weights_cfg = weight_summary['weights']
+            print(
+                "Using window-aware weighted sampler: "
+                f"counts={counts}, weights={weights_cfg}, "
+                f"mean_weight={weight_summary['mean_weight']:.3f}, "
+                f"max_weight={weight_summary['max_weight']:.3f}, "
+                f"replacement={window_sampler_replacement}"
+            )
+            if use_route_group_sampler:
+                print("window-aware weighted sampler is enabled; route-grouped sampler will be ignored.")
 
     validation_freq = int(validation_cfg.get('freq', training_cfg.get('validation_freq', 1)))
     raw_val_max_batches = validation_cfg.get('max_batches', 16)
@@ -731,13 +901,23 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     # Use DistributedSampler for multi-GPU training
     if world_size > 1:
-        sampler_train = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            shuffle=True,
-            num_replicas=world_size,
-            rank=rank,
-            drop_last=True
-        )
+        if use_window_weighted_sampler:
+            sampler_train = WeightedDistributedSampler(
+                train_sample_weights,
+                num_replicas=world_size,
+                rank=rank,
+                replacement=window_sampler_replacement,
+                drop_last=True,
+                seed=window_sampler_seed,
+            )
+        else:
+            sampler_train = torch.utils.data.distributed.DistributedSampler(
+                train_dataset,
+                shuffle=True,
+                num_replicas=world_size,
+                rank=rank,
+                drop_last=True
+            )
         # For validation, only rank 0 needs the full dataset
         # Other ranks don't participate in validation
         sampler_val = None
@@ -755,7 +935,26 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     else:
         sampler_train = None
         sampler_val = None
-        if use_route_group_sampler:
+        if use_window_weighted_sampler:
+            sampler_train = torch.utils.data.WeightedRandomSampler(
+                weights=torch.as_tensor(train_sample_weights, dtype=torch.double),
+                num_samples=len(train_dataset),
+                replacement=window_sampler_replacement,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=train_batch_size,
+                sampler=sampler_train,
+                num_workers=train_num_workers,
+                pin_memory=train_pin_memory,
+                persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+                prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
+                drop_last=True,
+                collate_fn=safe_collate,
+            )
+            if rank == 0:
+                print("Using window-aware weighted sampler (single GPU)")
+        elif use_route_group_sampler:
             # Route-grouped batching: samples in the same batch come from the same/adjacent routes.
             train_batch_sampler = train_dataset.get_route_batch_sampler(
                 batch_size=train_batch_size, shuffle=True, drop_last=True)
@@ -1428,7 +1627,13 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                            'energy_merge_active_loss',
                            'energy_junction_active_loss', 'energy_borrow_active_loss',
                            'energy_cross_active_loss',
-                           'energy_window_loss', 'energy_phase_loss'):
+                           'energy_dir_loss',
+                           'energy_conflict_area_loss',
+                           'energy_window_loss', 'energy_phase_loss',
+                           'energy_decision_phase_loss', 'energy_control_phase_loss',
+                           'energy_merge_yld_max_loss', 'energy_merge_go_min_loss',
+                           'energy_junction_yld_max_loss', 'energy_junction_go_min_loss',
+                           'energy_borrow_yld_max_loss', 'energy_borrow_go_min_loss'):
                     if lk in loss_dict:
                         val = loss_dict[lk]
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val

@@ -735,8 +735,36 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'speed_cross_wait_time_s',
                 'speed_cross_wait_valid',
                 'borrow_cross_active_time_s',
+                'merge_yld_max_speed',
+                'merge_go_min_speed',
+                'merge_yld_max_speed_valid',
+                'merge_go_min_speed_valid',
+                'borrow_yld_max_speed',
+                'borrow_go_min_speed',
+                'borrow_yld_max_speed_valid',
+                'borrow_go_min_speed_valid',
+                'junction_yld_max_speed',
+                'junction_go_min_speed',
+                'junction_yld_max_speed_valid',
+                'junction_go_min_speed_valid',
+                'merge_threshold_train_only_negative_tail',
             }:
                 final_sample[key] = _from_numpy(value, key)
+            elif key in {
+                'conflict_area_family',
+                'conflict_area_dir',
+                'conflict_decision_phase',
+                'conflict_control_phase',
+                'conflict_go_frame',
+                'conflict_area_start_frame',
+                'conflict_area_end_frame',
+            }:
+                if isinstance(value, np.ndarray):
+                    final_sample[key] = torch.from_numpy(value).long()
+                else:
+                    final_sample[key] = torch.tensor(value).long()
+            elif key == 'conflict_area_active':
+                final_sample[key] = torch.as_tensor(value, dtype=torch.float32)
             elif key in {
                 'merge_active',
                 'merge_episode_active',

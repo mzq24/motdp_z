@@ -1752,13 +1752,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.ego_status_proj = nn.Linear(status_dim, n_emb)
         self.history_encoder = HistoryEncoder(status_dim, n_emb)
         self.traj_window_condition_dim = 4
-        self.traj_phase_condition_dim = 2
-        self.traj_phase_energy_dim = 2
+        self.traj_dir_condition_dim = 4
+        self.traj_decision_phase_condition_dim = 2
+        self.traj_control_phase_condition_dim = 4
+        self.traj_boundary_margin_dim = 2
         self.traj_borrow_aux_dim = 1
         self.traj_branch_condition_dim = (
             self.traj_window_condition_dim
-            + self.traj_phase_condition_dim
-            + self.traj_phase_energy_dim
+            + self.traj_dir_condition_dim
+            + self.traj_decision_phase_condition_dim
+            + self.traj_control_phase_condition_dim
+            + self.traj_boundary_margin_dim
             + self.traj_borrow_aux_dim
         )
         self.traj_window_condition_proj = nn.Sequential(
@@ -1766,13 +1770,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
-        self.traj_phase_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_phase_condition_dim, n_emb),
+        self.traj_dir_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_dir_condition_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
-        self.traj_phase_energy_proj = nn.Sequential(
-            nn.Linear(self.traj_phase_energy_dim, n_emb),
+        self.traj_decision_phase_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_decision_phase_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_control_phase_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_control_phase_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_boundary_margin_proj = nn.Sequential(
+            nn.Linear(self.traj_boundary_margin_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
@@ -1891,19 +1905,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 )
 
             self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.shared_stage1_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
-            self.shared_stage1_conflict_state_head = _make_shared_stage1_scalar_head(out_dim=3)
-            self.shared_stage1_merge_active_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_junction_active_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_borrow_active_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_chase_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_merge_yld_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_merge_go_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_junction_yld_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_junction_go_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_borrow_yld_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_borrow_go_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_pedestrian_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_go_min_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_yld_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_go_min_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_conflict_area_head = nn.Sequential(
                 nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
                 nn.Linear(n_emb // 2, 1),
@@ -2177,11 +2187,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         speed_out: torch.Tensor,
         route_points: torch.Tensor,
         conditioning: torch.Tensor,
-        speed_samples: torch.Tensor,
+        speed_samples: Optional[torch.Tensor] = None,
     ) -> dict:
-        if speed_samples.dim() != 2:
-            raise ValueError(f"shared stage1 speed_samples must be (B, K), got {speed_samples.shape}")
-
         context = self._build_shared_stage1_context(
             traj_out=traj_out,
             route_out=route_out,
@@ -2190,41 +2197,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
             conditioning=conditioning,
         )
         semantic_feature = context['semantic_feature']
-
-        speed_norm = (speed_samples / 20.0).unsqueeze(-1)
-        speed_queries = self.shared_stage1_speed_query_proj(speed_norm)
-        speed_queries = speed_queries + self.shared_stage1_query_token.expand(
-            speed_samples.shape[0], speed_samples.shape[1], -1
-        )
-        attn_out, _ = self.shared_stage1_query_attn(
-            query=speed_queries,
-            key=context['curve_memory'],
-            value=context['curve_memory'],
-            need_weights=False,
-        )
-        head_input = self.shared_stage1_query_norm(speed_queries + attn_out)
         conflict_area_input = torch.cat([route_out, context['route_geom_tokens']], dim=-1)
-
-        # 2-class alias kept for backward compatibility with agent-side smoothing/debug.
-        conflict_state_logits = self.shared_stage1_conflict_state_head(semantic_feature)
-        lane_dir_relation_logits = conflict_state_logits[:, 1:]
 
         return {
             'window_logits': self.shared_stage1_window_head(semantic_feature),
-            'phase_logits': self.shared_stage1_phase_head(semantic_feature),
-            'conflict_state_logits': conflict_state_logits,
-            'lane_dir_relation_logits': lane_dir_relation_logits,
-            'merge_active_logits': self.shared_stage1_merge_active_head(semantic_feature).squeeze(-1),
-            'junction_active_logits': self.shared_stage1_junction_active_head(semantic_feature).squeeze(-1),
-            'borrow_active_logits': self.shared_stage1_borrow_active_head(semantic_feature).squeeze(-1),
-            'chase': self.shared_stage1_chase_head(head_input).squeeze(-1),
-            'merge_yld': self.shared_stage1_merge_yld_head(head_input).squeeze(-1),
-            'merge_go': self.shared_stage1_merge_go_head(head_input).squeeze(-1),
-            'junction_yld': self.shared_stage1_junction_yld_head(head_input).squeeze(-1),
-            'junction_go': self.shared_stage1_junction_go_head(head_input).squeeze(-1),
-            'borrow_yld': self.shared_stage1_borrow_yld_head(head_input).squeeze(-1),
-            'borrow_go': self.shared_stage1_borrow_go_head(head_input).squeeze(-1),
-            'pedestrian': self.shared_stage1_pedestrian_head(head_input).squeeze(-1),
+            'dir_logits': self.shared_stage1_dir_head(semantic_feature),
+            'decision_phase_logits': self.shared_stage1_decision_phase_head(semantic_feature),
+            'control_phase_logits': self.shared_stage1_control_phase_head(semantic_feature),
+            'merge_yld_max': self.shared_stage1_merge_yld_max_head(semantic_feature).squeeze(-1),
+            'merge_go_min': self.shared_stage1_merge_go_min_head(semantic_feature).squeeze(-1),
+            'junction_yld_max': self.shared_stage1_junction_yld_max_head(semantic_feature).squeeze(-1),
+            'junction_go_min': self.shared_stage1_junction_go_min_head(semantic_feature).squeeze(-1),
+            'borrow_yld_max': self.shared_stage1_borrow_yld_max_head(semantic_feature).squeeze(-1),
+            'borrow_go_min': self.shared_stage1_borrow_go_min_head(semantic_feature).squeeze(-1),
             'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
         }
 
@@ -2235,7 +2220,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         speed_out: torch.Tensor,
         route_points: torch.Tensor,
         conditioning: torch.Tensor,
-        speed_samples: torch.Tensor,
+        speed_samples: Optional[torch.Tensor] = None,
     ) -> dict:
         return self._compute_shared_stage1_scores(
             traj_out=traj_out,
@@ -2403,30 +2388,39 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     f"(B, {self.traj_branch_condition_dim}), got {branch_condition.shape}"
                 )
             if branch_condition_schedule is None:
-                branch_condition_schedule = torch.ones(B, 4, device=device, dtype=model_dtype)
+                branch_condition_schedule = torch.ones(B, 5, device=device, dtype=model_dtype)
             else:
                 branch_condition_schedule = branch_condition_schedule.to(device=device, dtype=model_dtype)
-                if branch_condition_schedule.dim() != 2 or branch_condition_schedule.shape[-1] != 4:
+                if branch_condition_schedule.dim() != 2 or branch_condition_schedule.shape[-1] != 5:
                     raise ValueError(
                         "forward_ego expects branch_condition_schedule as "
-                        f"(B, 4), got {branch_condition_schedule.shape}"
+                        f"(B, 5), got {branch_condition_schedule.shape}"
                     )
             window_cond = branch_condition[:, :self.traj_window_condition_dim]
-            phase_start = self.traj_window_condition_dim
-            phase_end = phase_start + self.traj_phase_condition_dim
-            phase_cond = branch_condition[:, phase_start:phase_end]
-            energy_start = phase_end
-            energy_end = energy_start + self.traj_phase_energy_dim
-            phase_energy_cond = branch_condition[:, energy_start:energy_end]
-            borrow_aux = branch_condition[:, energy_end:]
+            dir_start = self.traj_window_condition_dim
+            dir_end = dir_start + self.traj_dir_condition_dim
+            dir_cond = branch_condition[:, dir_start:dir_end]
+            decision_start = dir_end
+            decision_end = decision_start + self.traj_decision_phase_condition_dim
+            decision_cond = branch_condition[:, decision_start:decision_end]
+            control_start = decision_end
+            control_end = control_start + self.traj_control_phase_condition_dim
+            control_cond = branch_condition[:, control_start:control_end]
+            boundary_start = control_end
+            boundary_end = boundary_start + self.traj_boundary_margin_dim
+            boundary_cond = branch_condition[:, boundary_start:boundary_end]
+            borrow_aux = branch_condition[:, boundary_end:]
             gate_window = branch_condition_schedule[:, 0:1]
-            gate_phase = branch_condition_schedule[:, 1:2]
-            gate_phase_energy = branch_condition_schedule[:, 2:3]
-            gate_borrow = branch_condition_schedule[:, 3:4]
+            gate_dir = branch_condition_schedule[:, 1:2]
+            gate_phase = branch_condition_schedule[:, 2:3]
+            gate_boundary = branch_condition_schedule[:, 3:4]
+            gate_borrow = branch_condition_schedule[:, 4:5]
             branch_cond_emb = (
                 self.traj_window_condition_proj(window_cond) * gate_window
-                + self.traj_phase_condition_proj(phase_cond) * gate_phase
-                + self.traj_phase_energy_proj(phase_energy_cond) * gate_phase_energy
+                + self.traj_dir_condition_proj(dir_cond) * gate_dir
+                + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
+                + self.traj_control_phase_condition_proj(control_cond) * gate_phase
+                + self.traj_boundary_margin_proj(boundary_cond) * gate_boundary
                 + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
             ) * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)

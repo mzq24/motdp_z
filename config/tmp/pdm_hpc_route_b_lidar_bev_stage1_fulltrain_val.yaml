@@ -27,6 +27,13 @@ dataloader:
   val_prefetch_factor: 1
   val_batch_size: 256
   shuffle: true
+  use_window_weighted_sampler: true
+  window_sampler_replacement: true
+  window_sampler_weights:
+    none: 1.0
+    merge: 3.0
+    junction: 3.0
+    borrow: 5.0
 
 obs_horizon: 4
 pred_horizon: 10
@@ -125,6 +132,7 @@ route_b:
   energy_ped_weight: 1.0
   energy_window_weight: 0.25
   energy_phase_weight: 0.25
+  energy_conflict_area_weight: 0.25
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0
   num_gt_augmentations: 0

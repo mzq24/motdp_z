@@ -56,10 +56,14 @@ def main():
     print("[infer-smoke] action shape:", np.asarray(pred['action']).shape)
     if 'traj_window_condition_probs' in pred:
         print("[infer-smoke] traj_window_condition_probs:", np.asarray(pred['traj_window_condition_probs']).reshape(-1).tolist())
-    if 'traj_phase_condition_probs' in pred:
-        print("[infer-smoke] traj_phase_condition_probs:", np.asarray(pred['traj_phase_condition_probs']).reshape(-1).tolist())
-    if 'traj_phase_energy_summary' in pred:
-        print("[infer-smoke] traj_phase_energy_summary:", np.asarray(pred['traj_phase_energy_summary']).reshape(-1).tolist())
+    if 'traj_dir_condition_probs' in pred:
+        print("[infer-smoke] traj_dir_condition_probs:", np.asarray(pred['traj_dir_condition_probs']).reshape(-1).tolist())
+    if 'traj_decision_phase_condition_probs' in pred:
+        print("[infer-smoke] traj_decision_phase_condition_probs:", np.asarray(pred['traj_decision_phase_condition_probs']).reshape(-1).tolist())
+    if 'traj_control_phase_condition_probs' in pred:
+        print("[infer-smoke] traj_control_phase_condition_probs:", np.asarray(pred['traj_control_phase_condition_probs']).reshape(-1).tolist())
+    if 'traj_boundary_margin_condition' in pred:
+        print("[infer-smoke] traj_boundary_margin_condition:", np.asarray(pred['traj_boundary_margin_condition']).reshape(-1).tolist())
     if 'lane_dir_relation_probs' in pred:
         print("[infer-smoke] lane_dir_relation_probs:", np.asarray(pred['lane_dir_relation_probs']).reshape(-1).tolist())
     if 'traj_borrow_time_condition' in pred:
