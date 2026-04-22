@@ -889,7 +889,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     def safe_collate(batch):
         try:
             return default_collate(batch)
-        except (RuntimeError, KeyError) as e:
+        except (RuntimeError, KeyError, AttributeError) as e:
             # Print mismatched shapes for quick diagnosis
             key_sets = [set(b.keys()) for b in batch if isinstance(b, dict)]
             if key_sets:
@@ -904,6 +904,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     shapes = set(v.shape for v in vals)
                     if len(shapes) > 1:
                         print(f"[COLLATE] shape mismatch '{key}': {shapes}", flush=True)
+                types = {type(b.get(key)).__name__ for b in batch if isinstance(b, dict) and key in b}
+                if len(types) > 1:
+                    print(f"[COLLATE] type mismatch '{key}': {sorted(types)}", flush=True)
             raise
 
     # Use DistributedSampler for multi-GPU training

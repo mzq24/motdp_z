@@ -847,6 +847,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 continue
             elif isinstance(value, np.ndarray):
                 final_sample[key] = _from_numpy(value, key)
+            elif isinstance(value, np.generic):
+                if np.issubdtype(value.dtype, np.bool_):
+                    final_sample[key] = torch.tensor(bool(value), dtype=torch.bool)
+                elif np.issubdtype(value.dtype, np.integer):
+                    final_sample[key] = torch.tensor(int(value), dtype=torch.long)
+                elif np.issubdtype(value.dtype, np.floating):
+                    final_sample[key] = torch.tensor(float(value), dtype=torch.float32)
+                else:
+                    final_sample[key] = value.item()
             else:
                 final_sample[key] = value
 
