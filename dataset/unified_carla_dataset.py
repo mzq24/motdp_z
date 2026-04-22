@@ -58,6 +58,49 @@ def _apply_stage1_near_zero_speed_snap(final_sample, eps_mps=0.1):
             final_sample[key] = value
 
 
+def _ensure_stage1_legacy_curve_defaults(final_sample):
+    """Keep legacy stage1 curve keys structurally present for collate stability.
+
+    New direct-label training no longer relies on these keys, but some packed
+    samples still contain a subset of the old curve fields. Dataloader
+    `default_collate` requires per-sample dict keys to match, so we inject
+    harmless zero defaults when any legacy field is missing.
+    """
+    legacy_curve_keys = (
+        'speed_risk_chase_values',
+        'speed_risk_meet_values',
+        'speed_risk_cross_yld_values',
+        'speed_risk_cross_go_values',
+        'speed_risk_junction_cross_yld_values',
+        'speed_risk_junction_cross_go_values',
+        'speed_risk_merge_yld_values',
+        'speed_risk_merge_go_values',
+        'speed_risk_borrow_yld_values',
+        'speed_risk_borrow_go_values',
+        'speed_risk_ped_values',
+    )
+    scalar_defaults = {
+        'speed_cross_wait_time_s': 0.0,
+        'speed_cross_wait_valid': 0.0,
+        'borrow_cross_active_time_s': 0.0,
+    }
+
+    speed_samples = final_sample.get('speed_sample_values')
+    if isinstance(speed_samples, torch.Tensor):
+        curve_template = torch.zeros_like(speed_samples)
+    else:
+        curve_template = torch.zeros(7, dtype=torch.float32)
+        final_sample.setdefault('speed_sample_values', curve_template.clone())
+
+    for key in legacy_curve_keys:
+        if key not in final_sample:
+            final_sample[key] = curve_template.clone()
+
+    for key, default_value in scalar_defaults.items():
+        if key not in final_sample:
+            final_sample[key] = torch.tensor(default_value, dtype=torch.float32)
+
+
 class RouteBatchSampler:
     """Batch sampler that groups samples by route to maximize route_features.pt cache hits.
 
@@ -800,6 +843,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample['vqa_anchor'] = torch.zeros(6, 2)
 
         _apply_stage1_near_zero_speed_snap(final_sample)
+        _ensure_stage1_legacy_curve_defaults(final_sample)
 
         # Add transfuser features to final_sample
         # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample

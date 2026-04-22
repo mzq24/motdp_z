@@ -889,8 +889,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     def safe_collate(batch):
         try:
             return default_collate(batch)
-        except RuntimeError as e:
+        except (RuntimeError, KeyError) as e:
             # Print mismatched shapes for quick diagnosis
+            key_sets = [set(b.keys()) for b in batch if isinstance(b, dict)]
+            if key_sets:
+                shared_keys = set.intersection(*key_sets)
+                union_keys = set.union(*key_sets)
+                missing_keys = sorted(union_keys - shared_keys)
+                if missing_keys:
+                    print(f"[COLLATE] missing keys across batch: {missing_keys}", flush=True)
             for key in batch[0]:
                 vals = [b[key] for b in batch if isinstance(b.get(key), torch.Tensor)]
                 if vals:
