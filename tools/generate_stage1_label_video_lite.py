@@ -620,6 +620,38 @@ def _fmt_int(x):
         return "NA"
 
 
+def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, borrow_threshold_debug):
+    family_name = str(family_name or "none")
+    phase = str(phase or "yld")
+    if family_name == "borrow":
+        prefix = "borrow th"
+        speed_field = "borrow_yld_max_speed" if phase == "yld" else "borrow_go_min_speed"
+        valid_field = "borrow_yld_max_speed_valid" if phase == "yld" else "borrow_go_min_speed_valid"
+        debug = borrow_threshold_debug or {}
+        extra = f"case={debug.get('cover_case', 'none')}"
+    elif family_name == "merge":
+        prefix = "merge th"
+        speed_field = "merge_yld_max_speed" if phase == "yld" else "merge_go_min_speed"
+        valid_field = "merge_yld_max_speed_valid" if phase == "yld" else "merge_go_min_speed_valid"
+        debug = merge_threshold_debug or {}
+        if phase == "go":
+            extra = f"tail={int(float(sample.get('merge_threshold_train_only_negative_tail', 0.0)) > 0.5)}"
+        else:
+            extra = f"issue={debug.get('issue_reason', 'none')}"
+    else:
+        prefix = f"{family_name} th"
+        speed_field = ""
+        valid_field = ""
+        debug = {}
+        extra = "issue=none"
+
+    value = sample.get(speed_field, np.nan) if speed_field else np.nan
+    valid = int(float(sample.get(valid_field, 0.0)) > 0.5) if valid_field else 0
+    if phase == "yld":
+        return f"{prefix} yld={_fmt_float(value)} valid={valid} {extra}"
+    return f"{prefix} go={_fmt_float(value)} valid={valid} {extra}"
+
+
 def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, future_cover_current_box=None):
     canvas = np.full((760, 760, 3), 248, dtype=np.uint8)
     route = np.asarray(sample.get("route", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
@@ -780,6 +812,7 @@ def _build_text_panel(sample, current_meas):
     conflict_area = stage1_debug.get("conflict_area") or {}
     conflict_phase = stage1_debug.get("conflict_phase") or {}
     merge_threshold_debug = stage1_debug.get("merge_thresholds") or {}
+    borrow_threshold_debug = stage1_debug.get("borrow_thresholds") or {}
 
     base_dir, _ = _resolve_feature_frame_info(sample)
     event_name = _scene_name_from_base_dir(base_dir) or "unknown"
@@ -791,6 +824,7 @@ def _build_text_panel(sample, current_meas):
     speed = 0.0 if current_meas is None else float(current_meas.get("speed", 0.0))
 
     family_code = int(sample.get("conflict_area_family", 0))
+    family_name = CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))
     dir_code = int(sample.get("conflict_area_dir", 0))
     issue_count = int(conflict_area.get("issue_count", 0))
     issue_families = ",".join(str(x) for x in conflict_area.get("issue_families", [])) or "none"
@@ -825,7 +859,7 @@ def _build_text_panel(sample, current_meas):
         col_w,
         "Conflict",
         [
-            f"family={CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
+            f"family={family_name} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
             f"frame start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
             f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
             f"borrow prog s={_fmt_float(conflict_area.get('borrow_conflict_start_progress_m', np.nan))} e={_fmt_float(conflict_area.get('borrow_conflict_end_progress_m', np.nan))}",
@@ -890,8 +924,20 @@ def _build_text_panel(sample, current_meas):
             f"yld f={_fmt_int(conflict_phase.get('yld_frame_count', 0))} low={_fmt_int(conflict_phase.get('yld_low_speed_frame_count', 0))} stop={_fmt_int(conflict_phase.get('yld_stop_frame_count', 0))}",
             f"v0={_fmt_float(conflict_phase.get('yld_start_speed_mps', np.nan))} vmin={_fmt_float(conflict_phase.get('window_min_speed_mps', np.nan))}@{_fmt_int(conflict_phase.get('window_min_speed_frame', -1))}/{conflict_phase.get('window_min_speed_phase', 'none')} vgo={_fmt_float(conflict_phase.get('yld_go_speed_mps', np.nan))}",
             f"drop={_fmt_float(conflict_phase.get('yld_speed_drop_from_start_mps', np.nan))} ratio={_fmt_float(conflict_phase.get('yld_speed_drop_ratio', np.nan))} prog={_fmt_float(conflict_phase.get('yld_progress_span_m', np.nan))}",
-            f"merge th yld={_fmt_float(sample.get('merge_yld_max_speed', np.nan))} valid={int(float(sample.get('merge_yld_max_speed_valid', 0.0)) > 0.5)} issue={merge_threshold_debug.get('issue_reason', 'none')}",
-            f"merge th go={_fmt_float(sample.get('merge_go_min_speed', np.nan))} valid={int(float(sample.get('merge_go_min_speed_valid', 0.0)) > 0.5)} tail={int(float(sample.get('merge_threshold_train_only_negative_tail', 0.0)) > 0.5)}",
+            _threshold_panel_line(
+                family_name,
+                "yld",
+                sample,
+                merge_threshold_debug,
+                borrow_threshold_debug,
+            ),
+            _threshold_panel_line(
+                family_name,
+                "go",
+                sample,
+                merge_threshold_debug,
+                borrow_threshold_debug,
+            ),
         ],
         (86, 86, 86),
     )
