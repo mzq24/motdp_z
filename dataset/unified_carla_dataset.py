@@ -83,6 +83,8 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
         'speed_cross_wait_time_s': 0.0,
         'speed_cross_wait_valid': 0.0,
         'borrow_cross_active_time_s': 0.0,
+        'chase_max_speed': float('nan'),
+        'chase_max_speed_valid': 0.0,
     }
 
     speed_samples = final_sample.get('speed_sample_values')
@@ -800,6 +802,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'speed_cross_wait_time_s',
                 'speed_cross_wait_valid',
                 'borrow_cross_active_time_s',
+                'chase_max_speed',
+                'chase_max_speed_valid',
                 'merge_yld_max_speed',
                 'merge_go_min_speed',
                 'merge_yld_max_speed_valid',

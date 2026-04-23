@@ -395,15 +395,9 @@ Interpretation:
 
 ### 3. What Is Implemented Right Now
 
-The training code now supports a new switch:
-
-- `route_b.use_front_route_risk_energy`
-
-When enabled:
-
-- the main split Route B path no longer reuses the old `energy_front_head`
-- instead, it uses a dedicated `front_route_risk_head`
-- supervision is applied on the GT trajectory only, not broadcast to all anchors
+The current training code uses the standard Route B energy heads directly.
+There is no separate front-route-risk head or front-route-risk switch in the
+active implementation anymore.
 
 Current target priority:
 
@@ -566,7 +560,6 @@ Practical result:
 For the current codebase:
 
 - keep LiDAR detail enabled for Route B LiDAR experiments
-- use `use_front_route_risk_energy: true` when the new front-route labels are available
 - keep validation enabled in full runs once `val/samples_packed.pkl` and labels are ready
 
 For overnight / lightweight experimentation:
@@ -1671,6 +1664,24 @@ Current scope decision:
   this stage
 - do **not** add scene-family conditioning yet
 - first get the three speed-energy heads trained and sanity-checked
+
+Historical note:
+
+- the paragraphs below were written for the older three-head stage1 setup
+- current Route B mainline has already moved beyond the old folded `meet`
+  supervision
+- current implemented mainline now uses:
+  - `chase`
+  - `merge_yld / merge_go + merge_active`
+  - `junction_yld / junction_go + junction_active`
+  - `borrow_yld / borrow_go + borrow_active`
+  - `pedestrian`
+- current trajectory conditioning is hierarchical:
+  - `window = [none, merge, junction, borrow]`
+  - `phase = [yld, go]`
+  - `borrow_cross_active_time_s`
+- `traj_from_route_progress` remains a later Stage1+ direction, not the current
+  Route B training mainline
 
 In short:
 

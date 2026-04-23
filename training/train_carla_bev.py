@@ -432,6 +432,7 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         )
 
     boundary_specs = (
+        ('stage1_chase_max', 'speed_energy_chase_max_mps', 'chase_max_speed', 'chase_max_speed_valid'),
         ('stage1_merge_yld_max', 'speed_energy_merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
         ('stage1_merge_go_min', 'speed_energy_merge_go_min_mps', 'merge_go_min_speed', 'merge_go_min_speed_valid'),
         ('stage1_junction_yld_max', 'speed_energy_junction_yld_max_mps', 'junction_yld_max_speed', 'junction_yld_max_speed_valid'),
@@ -787,6 +788,11 @@ def _print_validation_metrics(val_metrics, show_speed_metrics=False):
         'val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
         'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step'
     ]
+    hidden_loss_keys = {
+        'val_energy_phase_loss',
+        'val_energy_decision_phase_loss',
+        'val_energy_control_phase_loss',
+    }
     for key in l2_keys:
         if key in val_metrics:
             tag = " (1-step)" if "_1step" in key else ""
@@ -794,6 +800,8 @@ def _print_validation_metrics(val_metrics, show_speed_metrics=False):
 
     for key, value in val_metrics.items():
         if key in l2_keys:
+            continue
+        if key in hidden_loss_keys:
             continue
         if (not show_speed_metrics) and key.startswith('val_speed_') and (not key.endswith('_loss')):
             continue
@@ -1118,12 +1126,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             'conflict_area_dir',
             'conflict_decision_phase',
             'conflict_control_phase',
+            'chase_max_speed',
             'merge_yld_max_speed',
             'merge_go_min_speed',
             'junction_yld_max_speed',
             'junction_go_min_speed',
             'borrow_yld_max_speed',
             'borrow_go_min_speed',
+            'chase_max_speed_valid',
             'merge_yld_max_speed_valid',
             'merge_go_min_speed_valid',
             'junction_yld_max_speed_valid',

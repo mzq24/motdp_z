@@ -91,6 +91,70 @@ This is usually:
 If scene polyline extension is missing for a two-way corridor scene, the code is
 expected to fail instead of silently falling back.
 
+### Global route-extension rule
+
+For stage1 route-based geometry, the default rule should be:
+
+- use the extended route, not the raw planner front route
+- in practice this means `front route + extra 12 points`
+- effectively the `20 + 12` point route
+
+This should apply whenever the code is doing route-geometry work such as:
+
+- corridor start / end localization
+- conflict-area world-geometry localization
+- route-based direction / heading estimation
+- route-progress based collision / cover localization
+
+If a module reads the raw `sample['route']` 20-point route directly for one of
+the geometry tasks above, that should usually be treated as a bug unless the
+code path is explicitly marked as an exception.
+
+Current documented exception:
+
+- `HazardAtSideLane` local video validation
+- for that debug-only view, do **not** append the extra `12` route points
+- use the raw 20-point route only, because route reshaping / rerouting near the
+  event window can make the extension misleading for qualitative inspection
+- this exception is for local video validation only, not the main label logic
+
+### Debug note: `borrow_cover_shape_mismatch`
+
+`borrow_cover_shape_mismatch` is currently a debug-only issue, not a mainline
+borrow-window gate.
+
+Observed failure mode:
+
+- many `borrow_cover_shape_mismatch` routes are early-borrow routes
+- in those scenes, the local route used by the route-shape checker does not
+  extend far enough to include the "return to lane" part of the corridor
+- in practice this usually means the available local route only shows the
+  "merge out / borrow enter" heading change, but not the later "return / merge
+  back" heading change
+- the shape checker then sees something more monotonic / junction-like and
+  records `borrow_cover_shape_mismatch`
+
+Interpretation:
+
+- this issue often means the local route-shape debug view is truncated
+- it does **not** necessarily mean the scene-level two-way corridor or the
+  borrow conflict window is wrong
+- it should be treated as a route-shape visibility limitation first, especially
+  for early-borrow samples
+
+Impact on current labels:
+
+- this issue is attached after the borrow window start / end has already been
+  resolved
+- it does **not** change `borrow` family selection
+- it does **not** change `conflict_area_active`
+- it does **not** move borrow window start / end by itself
+- it mainly shows up as debug `missing_reason` / `issue_count`
+
+So a long pre-borrow corridor or an incomplete local route-shape view may make
+the debug issue fire, but by itself should not confuse the active borrow window.
+The main risk is qualitative debugging noise, not label-family drift.
+
 ## 4. Preferred corridor localization: scene-level blocker-route context
 
 This is the logic in `_build_event_two_way_borrow_context(...)`.
@@ -262,6 +326,35 @@ This produces a fixed scene-level corridor with fields such as:
 - `blocking_actor_id`
 
 This is the cleanest corridor definition for two-way scenes.
+
+### 4.7 Expected current-follow-chase start gate cases
+
+`merge_start_blocked_by_current_follow_chase` should not automatically be read
+as a merge failure.
+
+A checked group on `2026-04-19`:
+
+- `AccidentTwoWays/Town12_Rep0_26_0_route0_11_08_18_12_42`
+- `AccidentTwoWays/Town12_Rep0_866_0_route0_11_08_23_43_01`
+- `AccidentTwoWays/Town13_Rep0_1157_1_route0_11_08_23_47_31`
+
+showed the same pattern:
+
+- the route had already finished the borrow interaction
+- ego then encountered a current `follow_chase` state near the junction
+- a future merge hint existed in the background
+- the future merge start was blocked by the current-chase gate
+
+For this pattern, the gate firing is correct:
+
+- borrow had already ended
+- current chase semantics should dominate
+- blocking the future merge start avoids opening an unnecessary merge window
+
+So these cases should currently be treated as:
+
+- expected gate behavior
+- not a merge regression
 
 ## 5. Historical logic: wait/release-time corridor
 
@@ -964,6 +1057,214 @@ The expected benefit is:
 - cleaner merge direction
 - less contamination from slanted approach headings
 - more stable future auxiliary labels such as conflict direction
+
+## 12. What to compare after the unified conflict-area rerun
+
+Before designing new `yld / go / energy`, the first job is to check whether the
+new unified conflict-area windows are geometrically and statistically sane.
+
+The preferred evaluation order is:
+
+1. family coverage
+2. family purity by event
+3. issue distribution
+4. old-vs-new delta
+5. small-scene qualitative checks
+
+### 12.1 Family coverage
+
+At the full-dataset or shard-summary level, check:
+
+- `active_scenes_by_family`
+- `active_samples_by_family`
+- average / median window length by family
+- start/end frame count by family
+
+Goal:
+
+- `borrow`
+  - should stay concentrated in long two-way scenes
+- `merge`
+  - can be broad, but should not drift upward mainly because of clearly wrong
+    event families
+- `junction`
+  - should stay concentrated in route-turn / junction-related scenes
+
+### 12.2 Family purity by event
+
+For each family, compare:
+
+- active scenes by event
+- active samples by event
+- event-level coverage ratio
+
+Important watchpoints:
+
+- `borrow`
+  - should remain dominated by:
+    - `AccidentTwoWays`
+    - `ConstructionObstacleTwoWays`
+- `merge`
+  - should keep reasonable coverage in:
+    - `HighwayExit`
+    - `ParkingExit`
+    - `MergerIntoSlowTraffic*`
+    - `EnterActorFlow`
+    - `noScenarios`
+  - but should not remain heavily polluted by:
+    - `HazardAtSideLaneTwoWays`
+    - `VehicleOpensDoorTwoWays`
+- `junction`
+  - should remain strongest in:
+    - `NonSignalizedJunctionLeftTurn`
+    - `SignalizedJunctionLeftTurn`
+    - `VehicleTurningRoute`
+    - `Interurban*`
+
+### 12.3 Issue distribution
+
+The new framework intentionally records issues instead of silently repairing
+them, so issue summaries are part of the main acceptance criteria.
+
+Check:
+
+- `issue_scenes_by_family`
+- `issue_frames`
+- `missing_reason_counts`
+
+Important interpretation:
+
+- issue counts are not only "bad news"
+- they also tell us whether the new framework is exposing missing geometry
+  honestly instead of hiding it behind fallback behavior
+
+### 12.4 Old-vs-new delta
+
+After rerun, compare old and new labels at least at these levels:
+
+- active-scene delta by family
+- active-sample delta by family
+- event-level active-scene delta
+- per-scene start/end shifts for representative scenes
+- family disagreement table:
+  - old active -> new inactive
+  - old inactive -> new active
+  - old family -> new family
+
+Goal:
+
+- new framework should not be judged only by total counts
+- it should be judged by whether the changed scenes are the scenes we wanted to
+  change
+
+### 12.5 Small-scene qualitative validation
+
+Keep a tiny representative set for direct debug / video checks:
+
+- `AccidentTwoWays/Town12_Rep0_26_0_route0_11_08_18_12_42`
+- `Accident/Town12_Rep0_10_0_route0_11_08_23_53_07`
+- `NonSignalizedJunctionLeftTurn/Town12_Rep0_1105_0_route0_11_08_02_43_48`
+- `SignalizedJunctionLeftTurn/Town03_Rep0_Town03_Scenario7_32_route0_11_08_20_16_15`
+
+These are not enough for acceptance by themselves, but they are the fastest
+way to explain any large statistical delta.
+
+## 13. Positioning of `yld / go / energy`
+
+The current agreed design order is:
+
+1. build stable `conflict_area` windows first
+2. decide what `yld / go` is supposed to supervise
+3. only then choose numeric form / normalization for energy
+
+### 13.1 What `yld / go` should mean
+
+`yld / go` should not answer:
+
+- what family this scene belongs to
+- whether a conflict area exists
+
+Those belong to:
+
+- `family`
+- `dir`
+- `active`
+- `start/end`
+
+Instead, `yld / go` should answer:
+
+- inside an already-valid local conflict area window, what speed-phase decision
+  is currently preferred
+
+In other words:
+
+- `window` solves geometry and timing of *where / when the local conflict is*
+- `yld / go` solves *how ego should negotiate that local conflict*
+
+### 13.2 What problem `yld / go / energy` is expected to solve
+
+The label is meant to reduce failure modes like:
+
+- entering a valid conflict area too fast
+- hesitating in a window where ego should already commit
+- treating every conflict as a binary class instead of a speed-dependent choice
+- forcing traj prediction alone to encode local negotiation preference
+
+So the intended role is:
+
+- family / active
+  - localize the relevant conflict
+- `yld / go`
+  - express branch preference inside that conflict
+- energy
+  - make that preference speed-sensitive and smooth enough for closed-loop use
+
+### 13.3 Family-specific interpretation
+
+#### Borrow
+
+Inside a valid borrow conflict area:
+
+- `yld`
+  - oncoming occupancy or arrival dominates
+- `go`
+  - ego can clear the borrow conflict area before that occupancy matters
+
+#### Merge
+
+Inside a valid merge conflict area:
+
+- `yld`
+  - ego should pass behind the key competing actor
+- `go`
+  - ego should pass before / claim the downstream lane first
+
+#### Junction
+
+Inside a valid junction conflict area:
+
+- `yld`
+  - ego should let the crossing / turning actor clear first
+- `go`
+  - ego should commit through the conflict area first
+
+### 13.4 Design principle for the next step
+
+Before picking numeric targets, first agree on:
+
+- what object `yld / go` conditions on
+  - local conflict area
+- what it is trying to change in behavior
+  - speed-phase choice
+- what it is not trying to do
+  - re-derive family / area geometry
+
+Only after that should we decide:
+
+- raw energy vs relative energy
+- pairwise normalization
+- probability targets vs energy targets
+- temporal smoothing
 
 So older sessions may remember that "junction cross had go/yld ideas already".
 That memory is correct at the debug / formula level, but not at the stable

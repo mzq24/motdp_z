@@ -6,7 +6,7 @@ CONDA_ENV=z_dpauto
 CONFIG=config/tmp/pdm_hpc_route_b_lidar_bev_stage1_fulltrain_val.yaml
 GPUS=${GPUS:-4}
 MASTER_PORT=${MASTER_PORT:-29517}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
 
 cd "${CODE_DIR}"
 

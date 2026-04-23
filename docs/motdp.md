@@ -172,6 +172,17 @@
     - `route_distance_m <= 15`
     - 只影响 future-driven episode 的 **start**
     - 不影响已经开始的 episode 延续
+  - `2026-04-19` 的一组 spot check 也说明这个 gate 里至少有一类是
+    明确的“预期行为”，不该当成异常：
+    - `merge_start_blocked_by_current_follow_chase`
+      在
+      `Town12_Rep0_26_0_route0_11_08_18_12_42`
+      `Town12_Rep0_866_0_route0_11_08_23_43_01`
+      `Town13_Rep0_1157_1_route0_11_08_23_47_31`
+      这 3 条里都出现在 borrow 已经结束之后
+    - 此时 ego 前方已经进入 junction / chase 语义
+    - 所以 future-merge start 被 current follow-chase gate 挡住是合理的
+    - 这类 case 当前应记为“gate 正常工作”，不是 merge regression
   - 另外，最近对 `merge / junction / borrow` 的 candidate split 也有了新的
     认知：
     - 当前 `_interaction_signal_from_candidate(...)` 仍然 heavily 依赖
@@ -229,6 +240,30 @@
     - 这层是骨架，不是最终 conflict-area 语义：
       - `borrow conflict area` 后面还要从 corridor 里再提纯
       - `merge / junction direction` 后面还要改成 area-based approach direction
+  - 当前更推荐的下一步顺序不是马上设计 energy 数值，而是：
+    1. 先 rerun 新的 unified `conflict_area` 框架
+    2. 先看：
+       - `active_scenes_by_family`
+       - `active_samples_by_family`
+       - `issue_scenes_by_family`
+       - `missing_reason_counts`
+       - event-level purity / coverage
+    3. 再看 old-vs-new delta：
+       - 哪些 scene 变了
+       - 为什么变
+       - 是否正好是我们想改的 scene
+    4. 最后再设计 `yld / go / energy`
+  - 这里的设计边界也要保持清楚：
+    - `family / dir / active / start / end`
+      - 解决 conflict localization
+    - `yld / go`
+      - 解决 local conflict-area 内的 speed-phase choice
+    - `energy`
+      - 解决这个 speed-phase choice 的数值化表达
+  - 所以当前共识是：
+    - 先把 window/family/dir 框架跑稳
+    - 再决定 `yld/go` 到底要监督什么
+    - 最后再讨论数值形式、normalization 和 closed-loop smoothing
 
 ## 推荐工作流
 

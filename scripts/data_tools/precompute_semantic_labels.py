@@ -50,6 +50,8 @@ FAST_FIELDS = (
     'merge_yld_max_speed_valid',
     'merge_go_min_speed_valid',
     'merge_threshold_train_only_negative_tail',
+    'chase_max_speed',
+    'chase_max_speed_valid',
     'borrow_yld_max_speed',
     'borrow_go_min_speed',
     'borrow_yld_max_speed_valid',
@@ -121,6 +123,9 @@ STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
 STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
 STAGE1_MERGE_AREA_POST_MARGIN_M = 10.0
 STAGE1_BORROW_CROSS_SAFE_GAP_S = 1.0
+STAGE1_CHASE_SAFE_TTC_S = 3.0
+STAGE1_CHASE_FOLLOW_BASE_GAP_M = 3.0
+STAGE1_CHASE_FOLLOW_HEADWAY_S = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
@@ -158,6 +163,8 @@ STAGE1_SPEED_FIELDS = (
     'merge_yld_max_speed_valid',
     'merge_go_min_speed_valid',
     'merge_threshold_train_only_negative_tail',
+    'chase_max_speed',
+    'chase_max_speed_valid',
     'borrow_yld_max_speed',
     'borrow_go_min_speed',
     'borrow_yld_max_speed_valid',
@@ -1665,6 +1672,65 @@ def _build_merge_threshold_source_debug(
         'go_min_speed_mps': np.nan,
         'yld_valid': float(yld_valid),
         'go_valid': 0.0,
+    })
+    return debug
+
+
+def _build_chase_threshold_source_debug(
+    current_cover,
+    current_speed_mps=np.nan,
+    source_frame=-1,
+    safe_ttc_s=STAGE1_CHASE_SAFE_TTC_S,
+    chase_follow_base_gap_m=STAGE1_CHASE_FOLLOW_BASE_GAP_M,
+    chase_follow_headway_s=STAGE1_CHASE_FOLLOW_HEADWAY_S,
+):
+    debug = _default_chase_threshold_debug()
+    current_cover = current_cover or {}
+    if not _cover_is_chase(current_cover):
+        return debug
+
+    gap_m = float(current_cover.get('distance', np.nan))
+    lead_speed_mps = float(current_cover.get('other_speed', np.nan))
+    safe_gap_cur_m = np.nan
+    if np.isfinite(float(current_speed_mps)):
+        safe_gap_cur_m = float(
+            chase_follow_base_gap_m + chase_follow_headway_s * max(float(current_speed_mps), 0.0)
+        )
+
+    debug.update({
+        'active': 1.0,
+        'subtype': str(_cover_interaction_subtype(current_cover)),
+        'source': 'current_follow_chase',
+        'source_frame': int(source_frame),
+        'cover_case': 'current',
+        'gap_m': float(gap_m),
+        'lead_speed_mps': float(lead_speed_mps),
+        'safe_gap_cur_m': float(safe_gap_cur_m) if np.isfinite(safe_gap_cur_m) else np.nan,
+    })
+
+    if not (np.isfinite(gap_m) and np.isfinite(lead_speed_mps)):
+        debug.update({
+            'issue': 1,
+            'issue_reason': 'missing_chase_source_values',
+        })
+        return debug
+
+    safe_gap_cap_raw = np.inf
+    if float(chase_follow_headway_s) > 1e-6:
+        safe_gap_cap_raw = float(gap_m - float(chase_follow_base_gap_m)) / float(chase_follow_headway_s)
+    lead_speed_cap_raw = float(max(float(lead_speed_mps), 0.0))
+    ttc_cap_raw = np.inf
+    if float(safe_ttc_s) > 1e-6:
+        ttc_cap_raw = float(lead_speed_cap_raw + max(float(gap_m), 0.0) / float(safe_ttc_s))
+    chase_max_raw = min(float(safe_gap_cap_raw), float(lead_speed_cap_raw), float(ttc_cap_raw))
+    chase_max_speed_mps, valid = _threshold_speed_value_and_valid(chase_max_raw)
+
+    debug.update({
+        'chase_max_speed_mps': float(chase_max_speed_mps),
+        'valid': float(valid),
+        'safe_gap_cap_mps': float(_merge_speed_cap(safe_gap_cap_raw)),
+        'lead_speed_cap_mps': float(_merge_speed_cap(lead_speed_cap_raw)),
+        'ttc_cap_mps': float(_merge_speed_cap(ttc_cap_raw)),
     })
     return debug
 
@@ -3327,6 +3393,7 @@ def _build_stage1_speed_debug_payload(
     scene_borrow_context=None,
     borrow_motion=None,
     merge_thresholds=None,
+    chase_thresholds=None,
     borrow_thresholds=None,
     junction_thresholds=None,
 ):
@@ -3337,6 +3404,7 @@ def _build_stage1_speed_debug_payload(
         "scene_borrow_context": None if scene_borrow_context is None else dict(scene_borrow_context),
         "borrow_motion": dict(borrow_motion or {}),
         "merge_thresholds": _default_merge_threshold_debug() if merge_thresholds is None else dict(merge_thresholds),
+        "chase_thresholds": _default_chase_threshold_debug() if chase_thresholds is None else dict(chase_thresholds),
         "borrow_thresholds": _default_borrow_threshold_debug() if borrow_thresholds is None else dict(borrow_thresholds),
         "junction_thresholds": _default_junction_threshold_debug() if junction_thresholds is None else dict(junction_thresholds),
         "conflict_area": _default_conflict_area_debug(),
@@ -3444,6 +3512,26 @@ def _default_borrow_threshold_debug():
         'borrow_total_distance_m': np.nan,
         't_bg_to_end_s': np.nan,
         't_bg_exit_s': np.nan,
+        'issue': 0,
+        'issue_reason': 'none',
+    }
+
+
+def _default_chase_threshold_debug():
+    return {
+        'active': 0.0,
+        'subtype': 'none',
+        'chase_max_speed_mps': np.nan,
+        'valid': 0.0,
+        'source': 'none',
+        'source_frame': -1,
+        'cover_case': 'none',
+        'gap_m': np.nan,
+        'lead_speed_mps': np.nan,
+        'safe_gap_cur_m': np.nan,
+        'safe_gap_cap_mps': np.nan,
+        'lead_speed_cap_mps': np.nan,
+        'ttc_cap_mps': np.nan,
         'issue': 0,
         'issue_reason': 'none',
     }
@@ -3593,6 +3681,22 @@ def _set_stage1_merge_threshold_annotation(sample, threshold_info):
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['merge_thresholds'] = _to_stage1_debug_python(dict(threshold_info))
+
+
+def _set_stage1_chase_threshold_defaults(sample):
+    sample['chase_max_speed'] = np.float32(np.nan)
+    sample['chase_max_speed_valid'] = np.float32(0.0)
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['chase_thresholds'] = _default_chase_threshold_debug()
+
+
+def _set_stage1_chase_threshold_annotation(sample, threshold_info):
+    sample['chase_max_speed'] = np.float32(float(threshold_info.get('chase_max_speed_mps', np.nan)))
+    sample['chase_max_speed_valid'] = np.float32(float(threshold_info.get('valid', 0.0)))
+    stage1_debug = sample.get('stage1_speed_debug')
+    if isinstance(stage1_debug, dict):
+        stage1_debug['chase_thresholds'] = _to_stage1_debug_python(dict(threshold_info))
 
 
 def _set_stage1_borrow_threshold_defaults(sample):
@@ -3997,6 +4101,7 @@ def _build_route_conflict_records(samples, route_sample_indices, scene_route_wor
             'borrow_motion': stage1_debug.get('borrow_motion') or {},
             'scene_borrow_context': stage1_debug.get('scene_borrow_context') or {},
             'merge_thresholds': stage1_debug.get('merge_thresholds') or {},
+            'chase_thresholds': stage1_debug.get('chase_thresholds') or {},
             'borrow_thresholds': stage1_debug.get('borrow_thresholds') or {},
             'junction_thresholds': stage1_debug.get('junction_thresholds') or {},
             'stage1_speed_debug': stage1_debug if isinstance(stage1_debug, dict) else {},
@@ -5085,6 +5190,45 @@ def _threshold_info_has_any_valid(threshold_info):
     )
 
 
+def _chase_threshold_info_from_record(record):
+    threshold_debug = (record or {}).get('chase_thresholds') or {}
+    if str(threshold_debug.get('subtype', 'none')) != 'follow_chase':
+        return None
+    chase_max_speed = _merge_speed_cap(threshold_debug.get('chase_max_speed_mps', np.nan))
+    info = _default_chase_threshold_debug()
+    info.update({
+        'active': float(threshold_debug.get('active', 1.0)),
+        'subtype': 'follow_chase',
+        'chase_max_speed_mps': float(chase_max_speed),
+        'valid': float(float(threshold_debug.get('valid', 0.0)) > 0.5 and np.isfinite(chase_max_speed)),
+        'source': str(threshold_debug.get('source', 'current_follow_chase')),
+        'source_frame': int(threshold_debug.get('source_frame', record.get('frame_id', -1))),
+        'cover_case': str(threshold_debug.get('cover_case', 'current')),
+        'gap_m': float(threshold_debug.get('gap_m', np.nan)),
+        'lead_speed_mps': float(threshold_debug.get('lead_speed_mps', np.nan)),
+        'safe_gap_cur_m': float(threshold_debug.get('safe_gap_cur_m', np.nan)),
+        'safe_gap_cap_mps': float(threshold_debug.get('safe_gap_cap_mps', np.nan)),
+        'lead_speed_cap_mps': float(threshold_debug.get('lead_speed_cap_mps', np.nan)),
+        'ttc_cap_mps': float(threshold_debug.get('ttc_cap_mps', np.nan)),
+        'issue': int(threshold_debug.get('issue', 0)),
+        'issue_reason': str(threshold_debug.get('issue_reason', 'none')),
+    })
+    return info
+
+
+def _annotate_route_stage1_chase_thresholds(samples, route_sample_indices, scene_route_world=None):
+    records = _build_route_conflict_records(samples, route_sample_indices, scene_route_world=scene_route_world)
+    if not records:
+        return
+
+    for record in records:
+        sample = samples[int(record['sample_idx'])]
+        _set_stage1_chase_threshold_defaults(sample)
+        threshold_info = _chase_threshold_info_from_record(record)
+        if threshold_info is not None:
+            _set_stage1_chase_threshold_annotation(sample, threshold_info)
+
+
 def _fill_unconstrained_threshold_bounds(
     threshold_info,
     debug_factory,
@@ -5971,12 +6115,14 @@ def _set_stage1_speed_fallback(sample):
         scene_borrow_context=None,
         borrow_motion=None,
         merge_thresholds=None,
+        chase_thresholds=None,
         borrow_thresholds=None,
         junction_thresholds=None,
     )
     _set_stage1_conflict_area_defaults(sample)
     _set_stage1_conflict_phase_defaults(sample)
     _set_stage1_merge_threshold_defaults(sample)
+    _set_stage1_chase_threshold_defaults(sample)
     _set_stage1_borrow_threshold_defaults(sample)
     _set_stage1_junction_threshold_defaults(sample)
 
@@ -6851,6 +6997,11 @@ def precompute(
                         current_boxes=current_boxes_dynamic,
                         source_frame=int(sample.get('frame_id', -1)),
                     ),
+                    chase_thresholds=_build_chase_threshold_source_debug(
+                        current_cover,
+                        current_speed_mps=float(current_measurements.get('speed', np.nan)),
+                        source_frame=int(sample.get('frame_id', -1)),
+                    ),
                     borrow_thresholds=_build_borrow_threshold_source_debug(
                         current_cover,
                         future_cover,
@@ -6868,6 +7019,11 @@ def precompute(
                 scene_route_world=scene_route_polyline_world.get(base_dir),
             )
             _annotate_route_stage1_conflict_phases(
+                samples,
+                route_sample_indices,
+                scene_route_world=scene_route_polyline_world.get(base_dir),
+            )
+            _annotate_route_stage1_chase_thresholds(
                 samples,
                 route_sample_indices,
                 scene_route_world=scene_route_polyline_world.get(base_dir),

@@ -1910,6 +1910,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
             self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_chase_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_junction_go_min_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_borrow_yld_max_head = _make_shared_stage1_scalar_head()
@@ -2206,6 +2207,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'control_phase_logits': self.shared_stage1_control_phase_head(semantic_feature),
             'merge_yld_max': self.shared_stage1_merge_yld_max_head(semantic_feature).squeeze(-1),
             'merge_go_min': self.shared_stage1_merge_go_min_head(semantic_feature).squeeze(-1),
+            'chase_max': self.shared_stage1_chase_max_head(semantic_feature).squeeze(-1),
             'junction_yld_max': self.shared_stage1_junction_yld_max_head(semantic_feature).squeeze(-1),
             'junction_go_min': self.shared_stage1_junction_go_min_head(semantic_feature).squeeze(-1),
             'borrow_yld_max': self.shared_stage1_borrow_yld_max_head(semantic_feature).squeeze(-1),

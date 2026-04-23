@@ -107,7 +107,6 @@ route_b:
   lidar_history_frames: 4
   train_energy: true
   use_stage1_speed_energy: true
-  use_front_route_risk_energy: false
   use_speed_profile_head: true
   guidance_scale: 0.0
   energy_loss_weight: 1.0

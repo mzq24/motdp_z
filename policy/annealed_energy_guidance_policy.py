@@ -464,6 +464,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self._resolve_stage1_batch_key(batch, 'merge_go_min_speed'),
             self._resolve_stage1_batch_key(batch, 'merge_yld_max_speed_valid'),
             self._resolve_stage1_batch_key(batch, 'merge_go_min_speed_valid'),
+            self._resolve_stage1_batch_key(batch, 'chase_max_speed'),
+            self._resolve_stage1_batch_key(batch, 'chase_max_speed_valid'),
             self._resolve_stage1_batch_key(batch, 'junction_yld_max_speed'),
             self._resolve_stage1_batch_key(batch, 'junction_go_min_speed'),
             self._resolve_stage1_batch_key(batch, 'junction_yld_max_speed_valid'),
@@ -602,6 +604,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         family_probs = window_probs[:, 1:]
         merge_yld_max = self._boundary_norm_to_mps(raw_scores['merge_yld_max'])
         merge_go_min = self._boundary_norm_to_mps(raw_scores['merge_go_min'])
+        chase_max = self._boundary_norm_to_mps(raw_scores['chase_max'])
         junction_yld_max = self._boundary_norm_to_mps(raw_scores['junction_yld_max'])
         junction_go_min = self._boundary_norm_to_mps(raw_scores['junction_go_min'])
         borrow_yld_max = self._boundary_norm_to_mps(raw_scores['borrow_yld_max'])
@@ -627,6 +630,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'merge_yld_max_mps': merge_yld_max,
             'merge_go_min_mps': merge_go_min,
+            'chase_max_mps': chase_max,
             'junction_yld_max_mps': junction_yld_max,
             'junction_go_min_mps': junction_go_min,
             'borrow_yld_max_mps': borrow_yld_max,
@@ -815,16 +819,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             torch.full_like(same_opp, 0.5),
         )
 
-        borrow_window_score = window_probs[:, 3]
         if borrow_time_s is None:
             borrow_time_cond = zero
         else:
             borrow_time_cond = borrow_time_s.to(device=device, dtype=model_dtype).reshape(-1)
-            borrow_time_cond = torch.clamp(
-                borrow_time_cond / max(self.traj_branch_condition_borrow_time_scale, 1e-6),
-                min=0.0,
-                max=1.0,
-            ) * borrow_window_score
+            borrow_time_cond = borrow_time_cond / max(self.traj_branch_condition_borrow_time_scale, 1e-6)
 
         branch_condition = torch.cat(
             [
@@ -1425,12 +1424,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         window_target = self._window_target_from_family_codes(family_codes)
         merge_yld_target = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed', device=device, model_dtype=model_dtype)
         merge_go_target = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed', device=device, model_dtype=model_dtype)
+        chase_target = self._get_stage1_batch_tensor(batch, 'chase_max_speed', device=device, model_dtype=model_dtype)
         junction_yld_target = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed', device=device, model_dtype=model_dtype)
         junction_go_target = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed', device=device, model_dtype=model_dtype)
         borrow_yld_target = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed', device=device, model_dtype=model_dtype)
         borrow_go_target = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed', device=device, model_dtype=model_dtype)
         merge_yld_valid = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
         merge_go_valid = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        chase_valid = self._get_stage1_batch_tensor(batch, 'chase_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
         junction_yld_valid = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
         junction_go_valid = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
         borrow_yld_valid = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
@@ -1485,6 +1486,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         loss_merge_yld = _masked_boundary_loss(raw_stage1_scores['merge_yld_max'], merge_yld_target, merge_yld_valid)
         loss_merge_go = _masked_boundary_loss(raw_stage1_scores['merge_go_min'], merge_go_target, merge_go_valid)
+        loss_chase = _masked_boundary_loss(raw_stage1_scores['chase_max'], chase_target, chase_valid)
         loss_junction_yld = _masked_boundary_loss(raw_stage1_scores['junction_yld_max'], junction_yld_target, junction_yld_valid)
         loss_junction_go = _masked_boundary_loss(raw_stage1_scores['junction_go_min'], junction_go_target, junction_go_valid)
         loss_borrow_yld = _masked_boundary_loss(raw_stage1_scores['borrow_yld_max'], borrow_yld_target, borrow_yld_valid)
@@ -1541,10 +1543,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_junction_active = zero
         loss_borrow_active = zero
         loss_cross_active = zero
-        loss_chase = zero
         loss_ped = zero
 
         energy_loss = (
+            + self.energy_chase_weight * loss_chase
             + self.energy_merge_weight * loss_merge
             + self.energy_junction_weight * loss_junction
             + self.energy_borrow_weight * loss_borrow
@@ -3344,6 +3346,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_area_probs',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
+                'chase_max_mps',
                 'junction_yld_max_mps',
                 'junction_go_min_mps',
                 'borrow_yld_max_mps',
@@ -3361,6 +3364,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
+                'chase_max',
                 'junction_yld_max',
                 'junction_go_min',
                 'borrow_yld_max',
@@ -3380,6 +3384,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_area_probs',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
+                'chase_max_mps',
                 'junction_yld_max_mps',
                 'junction_go_min_mps',
                 'borrow_yld_max_mps',
@@ -3397,6 +3402,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
+                'chase_max',
                 'junction_yld_max',
                 'junction_go_min',
                 'borrow_yld_max',
