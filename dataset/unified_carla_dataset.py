@@ -195,6 +195,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._feat_mmap = None       # numpy memmap for bev_features
         self._ups_mmap = None        # numpy memmap for bev_upsamples
         self._feat_index = None      # dict: packed_path -> {offset, n_frames, frame_num_to_idx}
+        self._ups_cache_is_fullres = False
         # LRU fallback (used when memmap cache not built yet)
         self._route_pack_cache = {}
         self._route_pack_cache_maxsize = 32
@@ -399,21 +400,31 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             cache_dir = os.path.join(image_data_root, 'tmp_data')
         sfx = f'_{feature_suffix}' if feature_suffix else ''
         index_path = os.path.join(cache_dir, f'feature_index{sfx}.pkl')
+        fullres_index_path = os.path.join(cache_dir, f'feature_index{sfx}_fullres.pkl')
         feat_bin = os.path.join(cache_dir, f'bev_features_fp16{sfx}.bin')
         ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}.bin')
+        fullres_ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}_fullres.bin')
+
+        chosen_index_path = index_path
+        chosen_ups_bin = ups_bin
+        if os.path.exists(fullres_index_path) and os.path.exists(feat_bin) and os.path.exists(fullres_ups_bin):
+            chosen_index_path = fullres_index_path
+            chosen_ups_bin = fullres_ups_bin
 
         if skip_memmap:
             print(f"[Rank {rank}] Skipping memmap (will use inject_ram_features later).")
-        elif os.path.exists(index_path) and os.path.exists(feat_bin) and os.path.exists(ups_bin):
-            with open(index_path, 'rb') as f:
+        elif os.path.exists(chosen_index_path) and os.path.exists(feat_bin) and os.path.exists(chosen_ups_bin):
+            with open(chosen_index_path, 'rb') as f:
                 cache_meta = pickle.load(f)
             self._feat_index = cache_meta['index']
             self._feat_mmap = np.memmap(feat_bin, dtype=np.float16, mode='r',
                                         shape=tuple(cache_meta['bev_feat_shape']))
-            self._ups_mmap = np.memmap(ups_bin, dtype=np.float16, mode='r',
+            self._ups_mmap = np.memmap(chosen_ups_bin, dtype=np.float16, mode='r',
                                        shape=tuple(cache_meta['bev_ups_shape']))
+            self._ups_cache_is_fullres = tuple(cache_meta['bev_ups_shape'][-2:]) == (64, 64)
+            ups_variant = 'fullres_64x64' if self._ups_cache_is_fullres else 'downsampled_32x32'
             print(f"[Rank {rank}] Feature memmap loaded: {len(self._feat_index)} routes, "
-                  f"{cache_meta['total_frames']} frames (shared across ranks).")
+                  f"{cache_meta['total_frames']} frames (shared across ranks, upsample_cache={ups_variant}).")
         else:
             print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
                   f"Using LRU fallback (slow). Run: python scripts/data_tools/build_feature_cache_fp16.py")
@@ -539,6 +550,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'bev_upsamples': pack['bev_upsamples'].half(),
             }
         return self._route_pack_cache[packed_path]
+
+    @staticmethod
+    def _decode_cached_bev_upsample(ups_tensor: torch.Tensor) -> torch.Tensor:
+        """Convert cached BEV upsample tensor to the model-facing (64, 64, 64) layout."""
+        if tuple(ups_tensor.shape[-2:]) == (64, 64):
+            return ups_tensor.half()
+        return F.interpolate(
+            ups_tensor.unsqueeze(0).float(),
+            size=(64, 64),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).half()
 
     def _load_single_lidar_bev_frame(self, route_rel: str, frame_id: int, feat_rel: str) -> Optional[torch.Tensor]:
         if frame_id is None:
@@ -677,10 +700,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     cached = self._ram_features.get(abs_idx)
                     if cached is not None:
                         transfuser_bev_feature = cached[0]
-                        ups_ds = cached[1]
-                        transfuser_bev_feature_upsample = F.interpolate(
-                            ups_ds.unsqueeze(0).float(), size=(64, 64),
-                            mode='bilinear', align_corners=False).squeeze(0).half()
+                        transfuser_bev_feature_upsample = self._decode_cached_bev_upsample(cached[1])
             elif self._feat_index is not None:
                 # Fast path: memmap (zero IO after pages are faulted in)
                 route_info = self._feat_index.get(packed_path)
@@ -691,12 +711,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                         transfuser_bev_feature = torch.from_numpy(
                             self._feat_mmap[abs_idx].copy())  # (1512, 8, 8) float16
                         clone_keys.add('transfuser_bev_feature')
-                        # Stored as (64, 32, 32) after 2x downsample, interpolate back
-                        ups_ds = torch.from_numpy(
-                            self._ups_mmap[abs_idx].copy())           # (64, 32, 32) float16
-                        transfuser_bev_feature_upsample = F.interpolate(
-                            ups_ds.unsqueeze(0).float(), size=(64, 64),
-                            mode='bilinear', align_corners=False).squeeze(0).half()
+                        ups_cached = torch.from_numpy(self._ups_mmap[abs_idx].copy())
+                        transfuser_bev_feature_upsample = self._decode_cached_bev_upsample(ups_cached)
                     else:
                         import warnings
                         warnings.warn(
