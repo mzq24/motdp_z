@@ -47,17 +47,19 @@ STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_CHASE_MIN_SCORE
 STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_MEET_MIN_SCORE:-0.15}"
 STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE="${STAGE1_ENERGY_GRADIENT_PEDESTRIAN_MIN_SCORE:-0.08}"
 STUCK_HELPER_TARGET_INSERT_ENABLE="${STUCK_HELPER_TARGET_INSERT_ENABLE:-1}"
-STUCK_HELPER_TARGET_1_FORWARD_M="${STUCK_HELPER_TARGET_1_FORWARD_M:-1.63}"
-STUCK_HELPER_TARGET_2_FORWARD_M="${STUCK_HELPER_TARGET_2_FORWARD_M:-2.63}"
+STUCK_HELPER_TARGET_1_FORWARD_M="${STUCK_HELPER_TARGET_1_FORWARD_M:-3.63}"
+STUCK_HELPER_TARGET_2_FORWARD_M="${STUCK_HELPER_TARGET_2_FORWARD_M:-25.63}"
 STUCK_HELPER_TARGET_LATERAL_M="${STUCK_HELPER_TARGET_LATERAL_M:--3.145}"
 SAVE_TRANSFUSER_BEV_DEBUG="${SAVE_TRANSFUSER_BEV_DEBUG:-0}"
 ROUTES_SUBSET_LIST="${ROUTES_SUBSET_LIST:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
 GPU_RANK_LIST=(${GPU_RANK_LIST:-0})
+TASK_NUM="${TASK_NUM:-${#GPU_RANK_LIST[@]}}"
+TASK_LIST_RAW="${TASK_LIST:-}"
 TASK_LIST=()
-if [[ -n "${TASK_LIST:-}" ]]; then
-  TASK_LIST=(${TASK_LIST})
+if [[ -n "${TASK_LIST_RAW}" ]]; then
+  TASK_LIST=(${TASK_LIST_RAW})
 else
   for ((i=0; i<${#GPU_RANK_LIST[@]}; i++)); do
     TASK_LIST+=("${i}")
@@ -98,21 +100,27 @@ if [[ ${#GPU_RANK_LIST[@]} -ne ${#TASK_LIST[@]} ]]; then
   exit 1
 fi
 
+# Some local conda activate hooks assume PYTHONPATH is already defined.
+# Initialize it defensively before `set -u` would make activation fail.
+export PYTHONPATH="${PYTHONPATH-}"
+
 source "${CONDA_SH}"
 conda activate "${CONDA_ENV}"
 
 cd "${B2D_ROOT}"
 
 export CARLA_ROOT
+export SCENARIO_RUNNER_ROOT="${B2D_ROOT}/scenario_runner"
+export LEADERBOARD_ROOT="${B2D_ROOT}/leaderboard"
 export PYTHONPATH="${B2D_ROOT}/leaderboard:${B2D_ROOT}/scenario_runner:${CARLA_ROOT}/PythonAPI:${CARLA_ROOT}/PythonAPI/carla:${CODE_DIR}:${PYTHONPATH:-}"
 
 mkdir -p "${SAVE_PATH}" "${RESULT_DIR}" "${LOG_DIR}"
 
 if [[ ${#ROUTES_SUBSET_ARR[@]} -eq 0 ]]; then
-  SPLIT_FLAG="${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_${#GPU_RANK_LIST[@]}tasks_split_done.flag"
+  SPLIT_FLAG="${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_${TASK_NUM}tasks_split_done.flag"
   if [[ ! -f "${SPLIT_FLAG}" ]]; then
-    echo "[INFO] Splitting routes into ${#GPU_RANK_LIST[@]} tasks..."
-    python tools/split_xml.py "${BASE_ROUTES}" "${#GPU_RANK_LIST[@]}" "${ALGO}" "${PLANNER_TYPE}"
+    echo "[INFO] Splitting routes into ${TASK_NUM} tasks..."
+    python tools/split_xml.py "${BASE_ROUTES}" "${TASK_NUM}" "${ALGO}" "${PLANNER_TYPE}"
     touch "${SPLIT_FLAG}"
   fi
 fi
