@@ -283,6 +283,189 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return metrics
 
+
+def _to_numpy_array(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _append_classification_val_metrics(
+    val_metrics,
+    prefix,
+    probs,
+    target,
+    valid_mask=None,
+    class_names=None,
+    active_is_nonzero=False,
+):
+    probs_np = _to_numpy_array(probs)
+    target_np = _to_numpy_array(target)
+    if probs_np is None or target_np is None:
+        return
+
+    probs_np = np.asarray(probs_np)
+    target_np = np.asarray(target_np).reshape(-1).astype(np.int64)
+    if probs_np.ndim == 1:
+        probs_np = probs_np.reshape(1, -1)
+    elif probs_np.ndim > 2:
+        probs_np = probs_np.reshape(-1, probs_np.shape[-1])
+    if probs_np.shape[0] != target_np.shape[0]:
+        return
+
+    pred_np = np.argmax(probs_np, axis=-1).astype(np.int64)
+    finite_mask = np.isfinite(probs_np).all(axis=-1)
+    if valid_mask is not None:
+        valid_np = _to_numpy_array(valid_mask)
+        valid_np = np.asarray(valid_np).reshape(-1).astype(bool)
+        if valid_np.shape[0] != target_np.shape[0]:
+            return
+        finite_mask &= valid_np
+    if not np.any(finite_mask):
+        return
+
+    pred_valid = pred_np[finite_mask]
+    target_valid = target_np[finite_mask]
+    val_metrics[f'{prefix}_acc'].append(float(np.mean(pred_valid == target_valid)))
+    val_metrics[f'{prefix}_count'].append(float(target_valid.shape[0]))
+
+    if active_is_nonzero:
+        pred_active = pred_valid != 0
+        target_active = target_valid != 0
+        tp = float(np.sum(pred_active & target_active))
+        fp = float(np.sum(pred_active & ~target_active))
+        fn = float(np.sum(~pred_active & target_active))
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        f1 = 2.0 * precision * recall / max(precision + recall, 1e-6)
+        val_metrics[f'{prefix}_active_precision'].append(precision)
+        val_metrics[f'{prefix}_active_recall'].append(recall)
+        val_metrics[f'{prefix}_active_f1'].append(f1)
+
+    if class_names is not None:
+        for class_idx, class_name in enumerate(class_names):
+            class_mask = target_valid == class_idx
+            if np.any(class_mask):
+                val_metrics[f'{prefix}_{class_name}_recall'].append(
+                    float(np.mean(pred_valid[class_mask] == class_idx))
+                )
+
+
+def _append_boundary_val_metric(val_metrics, prefix, pred, target, valid):
+    pred_np = _to_numpy_array(pred)
+    target_np = _to_numpy_array(target)
+    valid_np = _to_numpy_array(valid)
+    if pred_np is None or target_np is None or valid_np is None:
+        return
+
+    pred_np = np.asarray(pred_np).reshape(-1).astype(np.float32)
+    target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
+    valid_np = np.asarray(valid_np).reshape(-1) > 0.5
+    if pred_np.shape[0] != target_np.shape[0] or pred_np.shape[0] != valid_np.shape[0]:
+        return
+
+    finite_mask = valid_np & np.isfinite(pred_np) & np.isfinite(target_np)
+    if not np.any(finite_mask):
+        return
+    mae = np.abs(pred_np[finite_mask] - target_np[finite_mask])
+    val_metrics[f'{prefix}_mae'].append(float(np.mean(mae)))
+    val_metrics[f'{prefix}_count'].append(float(np.sum(finite_mask)))
+
+
+def _append_new_stage1_val_metrics(val_metrics, batch, result):
+    """Evaluate new direct-label stage1 heads on inference outputs."""
+    family = batch.get('conflict_area_family')
+    if family is not None and 'speed_energy_window_probs' in result:
+        family_np = _to_numpy_array(family).reshape(-1).astype(np.int64)
+        # Label order: 0 none, 1 borrow, 2 merge, 3 junction.
+        # Window head order: 0 none, 1 merge, 2 junction, 3 borrow.
+        window_target = np.zeros_like(family_np)
+        window_target[family_np == 2] = 1
+        window_target[family_np == 3] = 2
+        window_target[family_np == 1] = 3
+        _append_classification_val_metrics(
+            val_metrics,
+            'stage1_window',
+            result.get('speed_energy_window_probs'),
+            window_target,
+            class_names=('none', 'merge', 'junction', 'borrow'),
+            active_is_nonzero=True,
+        )
+
+    if 'speed_energy_dir_probs' in result and batch.get('conflict_area_dir') is not None:
+        dir_target = np.clip(_to_numpy_array(batch['conflict_area_dir']).reshape(-1).astype(np.int64), 0, 3)
+        _append_classification_val_metrics(
+            val_metrics,
+            'stage1_dir',
+            result.get('speed_energy_dir_probs'),
+            dir_target,
+            class_names=('none', 'same', 'opposite', 'cross'),
+            active_is_nonzero=True,
+        )
+
+    if 'speed_energy_decision_phase_probs' in result and batch.get('conflict_decision_phase') is not None:
+        decision_codes = _to_numpy_array(batch['conflict_decision_phase']).reshape(-1).astype(np.int64)
+        decision_valid = decision_codes > 0
+        decision_target = np.clip(decision_codes - 1, 0, 1)
+        _append_classification_val_metrics(
+            val_metrics,
+            'stage1_decision_phase',
+            result.get('speed_energy_decision_phase_probs'),
+            decision_target,
+            valid_mask=decision_valid,
+            class_names=('yld', 'go'),
+        )
+
+    if 'speed_energy_control_phase_probs' in result and batch.get('conflict_control_phase') is not None:
+        control_codes = _to_numpy_array(batch['conflict_control_phase']).reshape(-1).astype(np.int64)
+        control_valid = control_codes > 0
+        control_target = np.clip(control_codes - 1, 0, 3)
+        _append_classification_val_metrics(
+            val_metrics,
+            'stage1_control_phase',
+            result.get('speed_energy_control_phase_probs'),
+            control_target,
+            valid_mask=control_valid,
+            class_names=('coast_yld', 'slow_yld', 'stop_yld', 'go'),
+        )
+
+    boundary_specs = (
+        ('stage1_merge_yld_max', 'speed_energy_merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
+        ('stage1_merge_go_min', 'speed_energy_merge_go_min_mps', 'merge_go_min_speed', 'merge_go_min_speed_valid'),
+        ('stage1_junction_yld_max', 'speed_energy_junction_yld_max_mps', 'junction_yld_max_speed', 'junction_yld_max_speed_valid'),
+        ('stage1_junction_go_min', 'speed_energy_junction_go_min_mps', 'junction_go_min_speed', 'junction_go_min_speed_valid'),
+        ('stage1_borrow_yld_max', 'speed_energy_borrow_yld_max_mps', 'borrow_yld_max_speed', 'borrow_yld_max_speed_valid'),
+        ('stage1_borrow_go_min', 'speed_energy_borrow_go_min_mps', 'borrow_go_min_speed', 'borrow_go_min_speed_valid'),
+    )
+    all_abs_errors = []
+    all_valid_counts = []
+    for metric_prefix, pred_key, target_key, valid_key in boundary_specs:
+        _append_boundary_val_metric(
+            val_metrics,
+            metric_prefix,
+            result.get(pred_key),
+            batch.get(target_key),
+            batch.get(valid_key),
+        )
+        pred_np = _to_numpy_array(result.get(pred_key))
+        target_np = _to_numpy_array(batch.get(target_key))
+        valid_np = _to_numpy_array(batch.get(valid_key))
+        if pred_np is None or target_np is None or valid_np is None:
+            continue
+        pred_np = np.asarray(pred_np).reshape(-1).astype(np.float32)
+        target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
+        valid_np = np.asarray(valid_np).reshape(-1) > 0.5
+        finite_mask = valid_np & np.isfinite(pred_np) & np.isfinite(target_np)
+        if np.any(finite_mask):
+            all_abs_errors.append(np.abs(pred_np[finite_mask] - target_np[finite_mask]))
+            all_valid_counts.append(float(np.sum(finite_mask)))
+    if all_abs_errors:
+        merged_errors = np.concatenate(all_abs_errors, axis=0)
+        val_metrics['stage1_boundary_mae'].append(float(np.mean(merged_errors)))
+        val_metrics['stage1_boundary_count'].append(float(np.sum(all_valid_counts)))
+
 def validate_model(
     policy,
     val_loader,
@@ -431,6 +614,7 @@ def validate_model(
                     )
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
+                    _append_new_stage1_val_metrics(val_metrics, batch, result)
 
                     target_speed = result.get('target_speed', None)
                     if target_speed is not None and target_actions_eval.shape[1] >= 3:
