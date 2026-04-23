@@ -1337,6 +1337,15 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         mask[route_start:, traj_start:route_start] = float('-inf')
         return mask
 
+    @staticmethod
+    def _create_full_mask(
+        total_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Fully-connected self-attention mask (all tokens attend to each other)."""
+        return torch.zeros((total_tokens, total_tokens), device=device, dtype=dtype)
+
     def _build_traj_detail_points(self, traj_points: torch.Tensor) -> torch.Tensor:
         """Expand each traj waypoint with ego detail offsets. (B, T, 2) -> (B, T, 14, 2)"""
         offsets = self.ego_detail_offsets.to(device=traj_points.device, dtype=traj_points.dtype)
@@ -1432,6 +1441,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         transfuser_bev_feature_upsample: torch.Tensor,  # (B, 64, 64, 64)
         conditioning: torch.Tensor,                 # (B, d_model)
         speed_emb: Optional[torch.Tensor] = None,   # (B, 1, d_model) - optional speed token embedding
+        extra_emb: Optional[torch.Tensor] = None,   # (B, T_extra, d_model) - optional state tokens
         traj_points: Optional[torch.Tensor] = None,  # (B, T_traj, 2) or (B, T_traj, horizon, 2) for GridSampleCrossBEVAttention
         route_emb: Optional[torch.Tensor] = None,   # (B, T_route, d_model) - route query embeddings for ego diffusion
         route_points: Optional[torch.Tensor] = None,  # (B, T_route, 2) absolute route points for BEV sampling
@@ -1479,6 +1489,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         T_traj = traj_emb.shape[1]
         T_route = self.num_waypoints
         T_speed = 1 if speed_emb is not None else 0
+        T_extra = extra_emb.shape[1] if extra_emb is not None else 0
 
         # ========== Unified Position Encoding ==========
         # Get sinusoidal position encoding for trajectory
@@ -1497,14 +1508,24 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         if speed_emb is not None:
             speed_emb = speed_emb + self.speed_segment_emb
 
-        # Concatenate queries: [speed | trajectory | route]
+        if extra_emb is not None:
+            extra_emb = extra_emb + self.speed_segment_emb
+
+        # Concatenate queries: [speed | trajectory | route | extra]
         if speed_emb is not None:
-            x = torch.cat([speed_emb, traj_emb, route_emb], dim=1)
+            pieces = [speed_emb, traj_emb, route_emb]
         else:
-            x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
+            pieces = [traj_emb, route_emb]
+        if extra_emb is not None:
+            pieces.append(extra_emb)
+        x = torch.cat(pieces, dim=1)
 
         if self_attn_mask is None:
-            if speed_emb is not None:
+            if extra_emb is not None:
+                self_attn_mask = self._create_full_mask(
+                    x.shape[1], device=x.device, dtype=x.dtype
+                )
+            elif speed_emb is not None:
                 self_attn_mask = self._create_ego_speed_mask(
                     T_traj, T_route, device=x.device, dtype=x.dtype
                 )
@@ -1530,6 +1551,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         if traj_points is not None:
             x_speed = x[:, :T_speed, :] if T_speed > 0 else None
             x_traj = x[:, T_speed:T_speed + T_traj, :]  # (B, T_traj, d_model)
+            x_extra = x[:, T_speed + T_traj + T_route:, :] if T_extra > 0 else None
             if spatial_mode == "ego":
                 if traj_points.dim() != 3:
                     raise ValueError(f"Ego traj_points must be (B, T, 2), got {traj_points.shape}")
@@ -1555,7 +1577,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                 if lidar_feat is not None:
                     traj_lidar_detail = self.traj_lidar_detail_attn(x_traj, traj_detail_points, lidar_feat) - x_traj
                 x_traj = x_traj_center + detail_gate * (traj_local_detail + traj_route_detail + traj_route_far + traj_lidar_detail)
-                x_route = x[:, T_speed + T_traj:, :]
+                x_route = x[:, T_speed + T_traj:T_speed + T_traj + T_route, :]
                 if route_points is not None:
                     if route_points.dim() != 3:
                         raise ValueError(f"Ego route_points must be (B, T_route, 2), got {route_points.shape}")
@@ -1586,7 +1608,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                         self.traj_lidar_spatial_attn(x_traj, traj_points, lidar_feat) - x_traj
                     )
                 x_traj = x_traj_base + detail_gate * detail_residual
-                x_route = x[:, T_speed + T_traj:, :]
+                x_route = x[:, T_speed + T_traj:T_speed + T_traj + T_route, :]
                 if route_points is not None:
                     if route_points.dim() != 3:
                         raise ValueError(f"Anchor route_points must be (B, T_route, 2), got {route_points.shape}")
@@ -1596,9 +1618,12 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                         transfuser_bev_feature_upsample,
                     )
             if x_speed is not None:
-                x = torch.cat([x_speed, x_traj, x_route], dim=1)
+                pieces = [x_speed, x_traj, x_route]
             else:
-                x = torch.cat([x_traj, x_route], dim=1)
+                pieces = [x_traj, x_route]
+            if x_extra is not None:
+                pieces.append(x_extra)
+            x = torch.cat(pieces, dim=1)
 
         # Decoder layers with multi-source attention
         # Pass separate feature tokens and T_traj for route-specific processing
@@ -1618,7 +1643,8 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Split outputs
         speed_out = x[:, :T_speed, :] if T_speed > 0 else None
         traj_out = x[:, T_speed:T_speed + T_traj, :]
-        route_out = x[:, T_speed + T_traj:, :]
+        route_out = x[:, T_speed + T_traj:T_speed + T_traj + T_route, :]
+        extra_out = x[:, T_speed + T_traj + T_route:, :] if T_extra > 0 else None
         
         # ========== Route Residual Path (Stability Enhancement) ==========
         # Add route-specific residual from initial queries (bypasses shared decoder)
@@ -1627,6 +1653,8 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         route_residual = self.route_residual_path(route_emb)
         route_out = route_out + torch.sigmoid(self.route_residual_gate) * route_residual
         
+        if extra_emb is not None:
+            return traj_out, route_out, speed_out, extra_out
         return traj_out, route_out, speed_out
 
 
@@ -1684,6 +1712,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         use_lidar_bev_detail: bool = False,
         lidar_bev_history_frames: int = 1,
         use_condition_group_dropout: bool = False,
+        use_joint_state_diffusion: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1706,6 +1735,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.use_lidar_bev_detail = use_lidar_bev_detail
         self.lidar_bev_history_frames = max(int(lidar_bev_history_frames), 1)
         self.use_condition_group_dropout = use_condition_group_dropout
+        self.use_joint_state_diffusion = use_joint_state_diffusion
         
         # ========== Anchor Embedding ==========
         # Encode full noisy trajectory shape per mode (not just mean point) to preserve
@@ -1950,6 +1980,46 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.ReLU(inplace=True),
             nn.Linear(n_emb, horizon),
         )
+
+        self.joint_state_window_dim = 4
+        self.joint_state_dir_dim = 4
+        self.joint_state_decision_dim = 2
+        self.joint_state_control_dim = 4
+        self.joint_state_boundary_dim = 7
+        self.joint_state_speed_dim = len(self.speed_classes)
+        self.joint_state_conflict_area_dim = num_waypoints
+        self.joint_state_token_count = 6
+        self.joint_state_token_names = (
+            'window',
+            'dir',
+            'decision_phase',
+            'control_phase',
+            'boundary_bundle',
+            'borrow_time',
+        )
+
+        def _make_joint_state_proj(in_dim: int):
+            return nn.Sequential(
+                nn.Linear(in_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+
+        self.joint_state_window_proj = _make_joint_state_proj(self.joint_state_window_dim)
+        self.joint_state_dir_proj = _make_joint_state_proj(self.joint_state_dir_dim)
+        self.joint_state_decision_proj = _make_joint_state_proj(self.joint_state_decision_dim)
+        self.joint_state_control_proj = _make_joint_state_proj(self.joint_state_control_dim)
+        self.joint_state_boundary_proj = _make_joint_state_proj(self.joint_state_boundary_dim)
+        self.joint_state_speed_proj = _make_joint_state_proj(self.joint_state_speed_dim)
+        self.joint_state_conflict_area_proj = _make_joint_state_proj(1)
+        self.joint_state_borrow_time_proj = _make_joint_state_proj(1)
+
+        self.joint_state_window_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.joint_state_dir_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.joint_state_decision_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.joint_state_control_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.joint_state_boundary_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.joint_state_borrow_time_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
 
         self.apply(self._init_weights)
         
@@ -2233,6 +2303,102 @@ class TransformerForDiffusion(ModuleAttrMixin):
             speed_samples=speed_samples,
         )
 
+    def _build_joint_state_extra_tokens(
+        self,
+        state_t: dict,
+        borrow_time_s: Optional[torch.Tensor],
+        conditioning: torch.Tensor,
+    ) -> torch.Tensor:
+        device = conditioning.device
+        model_dtype = conditioning.dtype
+        B = conditioning.shape[0]
+
+        def _state_value(key: str, dim: int) -> torch.Tensor:
+            value = state_t.get(key, None)
+            if value is None:
+                return torch.zeros(B, dim, device=device, dtype=model_dtype)
+            return value.to(device=device, dtype=model_dtype)
+
+        window_token = (
+            self.joint_state_window_proj(_state_value('window_logits', self.joint_state_window_dim))
+            + self.joint_state_window_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
+        dir_token = (
+            self.joint_state_dir_proj(_state_value('dir_logits', self.joint_state_dir_dim))
+            + self.joint_state_dir_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
+        decision_token = (
+            self.joint_state_decision_proj(_state_value('decision_phase_logits', self.joint_state_decision_dim))
+            + self.joint_state_decision_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
+        control_token = (
+            self.joint_state_control_proj(_state_value('control_phase_logits', self.joint_state_control_dim))
+            + self.joint_state_control_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
+        boundary_token = (
+            self.joint_state_boundary_proj(_state_value('boundary_values', self.joint_state_boundary_dim))
+            + self.joint_state_boundary_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
+        if borrow_time_s is None:
+            borrow_time = torch.zeros(B, 1, device=device, dtype=model_dtype)
+        else:
+            borrow_time = borrow_time_s.to(device=device, dtype=model_dtype).reshape(-1, 1)
+        borrow_token = (
+            self.joint_state_borrow_time_proj(borrow_time)
+            + self.joint_state_borrow_time_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
+        tokens = torch.stack(
+            [window_token, dir_token, decision_token, control_token, boundary_token, borrow_token],
+            dim=1,
+        )
+        return self.pre_decoder_norm(self.drop(tokens))
+
+    def _predict_joint_state_outputs(
+        self,
+        *,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        extra_out: torch.Tensor,
+    ) -> dict:
+        if extra_out is None or extra_out.shape[1] != self.joint_state_token_count:
+            raise ValueError(
+                f"joint state decoding expects extra_out as (B, {self.joint_state_token_count}, n_emb), "
+                f"got {None if extra_out is None else extra_out.shape}"
+            )
+        window_token = extra_out[:, 0]
+        dir_token = extra_out[:, 1]
+        decision_token = extra_out[:, 2]
+        control_token = extra_out[:, 3]
+        boundary_token = extra_out[:, 4]
+
+        route_geom = self.shared_stage1_route_geom_proj(route_points.reshape(route_points.shape[0], -1))
+        route_geom_tokens = route_geom.unsqueeze(1).expand(-1, route_out.shape[1], -1)
+        conflict_area_input = torch.cat([route_out, route_geom_tokens], dim=-1)
+
+        return {
+            'window_logits': self.shared_stage1_window_head(window_token),
+            'dir_logits': self.shared_stage1_dir_head(dir_token),
+            'decision_phase_logits': self.shared_stage1_decision_phase_head(decision_token),
+            'control_phase_logits': self.shared_stage1_control_phase_head(control_token),
+            'merge_yld_max': self.shared_stage1_merge_yld_max_head(boundary_token).squeeze(-1),
+            'merge_go_min': self.shared_stage1_merge_go_min_head(boundary_token).squeeze(-1),
+            'chase_max': self.shared_stage1_chase_max_head(boundary_token).squeeze(-1),
+            'junction_yld_max': self.shared_stage1_junction_yld_max_head(boundary_token).squeeze(-1),
+            'junction_go_min': self.shared_stage1_junction_go_min_head(boundary_token).squeeze(-1),
+            'borrow_yld_max': self.shared_stage1_borrow_yld_max_head(boundary_token).squeeze(-1),
+            'borrow_go_min': self.shared_stage1_borrow_go_min_head(boundary_token).squeeze(-1),
+            'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
+        }
+
     def _forward_traj_energy_context(
         self,
         x_t: torch.Tensor,
@@ -2503,6 +2669,155 @@ class TransformerForDiffusion(ModuleAttrMixin):
             return result
 
         return poses_reg, route_pred, traj_out, conditioning, speed_pred, speed_profile_pred
+
+    def forward_ego_joint(
+        self,
+        x_t: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        state_t: dict,
+        borrow_time_s: Optional[torch.Tensor] = None,
+        x_t_abs: Optional[torch.Tensor] = None,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
+        return_intermediates: bool = False,
+    ):
+        model_dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
+
+        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
+        ego_status = ego_status.to(device=device, dtype=model_dtype)
+
+        joint_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
+        if joint_points.dim() == 4:
+            if joint_points.shape[1] != 1:
+                raise ValueError(f"forward_ego_joint expects a single joint ego sample, got shape {joint_points.shape}")
+            joint_points = joint_points[:, 0, :, :]
+        if joint_points.dim() != 3:
+            raise ValueError(f"forward_ego_joint expects (B, 1, T_joint, 2) or (B, T_joint, 2), got {joint_points.shape}")
+        if joint_points.shape[1] != self.ego_joint_horizon:
+            raise ValueError(
+                f"forward_ego_joint expects T_joint={self.ego_joint_horizon}, got {joint_points.shape[1]}"
+            )
+
+        traj_points = joint_points[:, :self.horizon, :]
+        route_points = joint_points[:, self.horizon:self.ego_joint_horizon, :]
+        B, T_traj, _ = traj_points.shape
+        T_route = route_points.shape[1]
+
+        conditioning, current_status, route_conditioning = self._compute_conditioning(
+            timestep, ego_status, device, model_dtype
+        )
+
+        wp_emb = self._embed_waypoint_tokens(traj_points)
+        diff_query = self.diff_mode_query.expand(B, T_traj, -1)
+        traj_emb = self.pre_decoder_norm(self.drop(wp_emb + diff_query + conditioning.unsqueeze(1)))
+
+        route_wp_emb = self._embed_route_waypoint_tokens(route_points)
+        route_diff_query = self.route_diff_query.expand(B, T_route, -1)
+        conflict_area_logits = state_t.get('conflict_area_logits', None)
+        if conflict_area_logits is None:
+            conflict_area_logits = torch.zeros(B, T_route, device=device, dtype=model_dtype)
+        else:
+            conflict_area_logits = conflict_area_logits.to(device=device, dtype=model_dtype)
+            if conflict_area_logits.dim() != 2 or conflict_area_logits.shape[1] != T_route:
+                raise ValueError(
+                    f"forward_ego_joint expects conflict_area_logits as (B, {T_route}), got {conflict_area_logits.shape}"
+                )
+        route_conflict_emb = self.joint_state_conflict_area_proj(conflict_area_logits.unsqueeze(-1))
+        route_emb = self.pre_decoder_norm(
+            self.drop(route_wp_emb + route_diff_query + route_conflict_emb + conditioning.unsqueeze(1))
+        )
+
+        speed_logits = state_t.get('speed_logits', None)
+        if speed_logits is None:
+            speed_logits = torch.zeros(B, self.joint_state_speed_dim, device=device, dtype=model_dtype)
+        else:
+            speed_logits = speed_logits.to(device=device, dtype=model_dtype)
+            if speed_logits.dim() != 2 or speed_logits.shape[1] != self.joint_state_speed_dim:
+                raise ValueError(
+                    f"forward_ego_joint expects speed_logits as (B, {self.joint_state_speed_dim}), got {speed_logits.shape}"
+                )
+        speed_emb = self.pre_decoder_norm(
+            self.drop(
+                self.joint_state_speed_proj(speed_logits).unsqueeze(1)
+                + conditioning.unsqueeze(1)
+            )
+        )
+
+        extra_tokens = self._build_joint_state_extra_tokens(
+            state_t=state_t,
+            borrow_time_s=borrow_time_s,
+            conditioning=conditioning,
+        )
+        full_mask = self.decoder._create_full_mask(
+            total_tokens=1 + T_traj + T_route + extra_tokens.shape[1],
+            device=device,
+            dtype=model_dtype,
+        )
+        traj_out, route_out, speed_out, extra_out = self.decoder(
+            speed_emb=speed_emb,
+            extra_emb=extra_tokens,
+            traj_emb=traj_emb,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            conditioning=conditioning,
+            traj_points=traj_points,
+            route_emb=route_emb,
+            route_points=route_points,
+            timesteps=timestep,
+            route_conditioning=route_conditioning,
+            bev_proj_cached=bev_proj_cached,
+            self_attn_mask=full_mask,
+            route_pos_offset=T_traj,
+            spatial_mode="ego",
+            transfuser_lidar_bev=transfuser_lidar_bev,
+        )
+        if speed_out is None:
+            raise RuntimeError("forward_ego_joint expected a speed token output")
+
+        traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
+        poses_reg = traj_pred.unsqueeze(1)
+        route_pred = self.route_norm_head(route_out, conditioning, current_status)
+        speed_input = torch.cat([
+            speed_out.squeeze(1),
+            conditioning,
+        ], dim=-1)
+        speed_pred = self.speed_head(speed_input)
+        speed_profile_input = torch.cat([
+            speed_out.squeeze(1),
+            traj_out.mean(dim=1),
+            conditioning,
+        ], dim=-1)
+        speed_profile_pred = self.speed_profile_head(speed_profile_input)
+        state_pred_dict = self._predict_joint_state_outputs(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+            extra_out=extra_out,
+        )
+        state_pred_dict['speed_logits'] = speed_pred
+        if return_intermediates:
+            return {
+                'poses_reg': poses_reg,
+                'route_pred': route_pred,
+                'traj_out': traj_out,
+                'route_out': route_out,
+                'speed_out': speed_out,
+                'extra_out': extra_out,
+                'route_points': route_points,
+                'conditioning': conditioning,
+                'speed_pred': speed_pred,
+                'speed_profile_pred': speed_profile_pred,
+                'state_pred_dict': state_pred_dict,
+            }
+        return poses_reg, route_pred, traj_out, conditioning, speed_pred, speed_profile_pred, state_pred_dict
 
     def forward_energy(
         self,

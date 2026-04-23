@@ -183,6 +183,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.stage1_query_accel_mps2 = float(route_b_cfg.get('stage1_query_accel_mps2', 2.5))
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
         self.use_traj_branch_condition = bool(route_b_cfg.get('use_traj_branch_condition', False))
+        self.use_joint_state_diffusion = bool(route_b_cfg.get('use_joint_state_diffusion', False))
+        self.joint_state_diffusion_loss_weight = float(
+            route_b_cfg.get('joint_state_diffusion_loss_weight', 1.0)
+        )
+        self.joint_state_label_smoothing = float(
+            route_b_cfg.get('joint_state_label_smoothing', 0.05)
+        )
+        self.joint_state_conflict_area_pos_prob = float(
+            route_b_cfg.get('joint_state_conflict_area_pos_prob', 0.95)
+        )
+        self.joint_state_conflict_area_neg_prob = float(
+            route_b_cfg.get('joint_state_conflict_area_neg_prob', 0.05)
+        )
         self.traj_branch_condition_scale = float(route_b_cfg.get('traj_branch_condition_scale', 2.0))
         self.traj_branch_condition_detach = bool(route_b_cfg.get('traj_branch_condition_detach', True))
         self.traj_branch_condition_gt_prob_start = float(route_b_cfg.get('traj_branch_condition_gt_prob_start', 1.0))
@@ -274,6 +287,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             use_lidar_bev_detail=self.use_lidar_bev_detail,
             lidar_bev_history_frames=self.lidar_history_frames,
             use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
+            use_joint_state_diffusion=self.use_joint_state_diffusion,
         )
         self.model = model
 
@@ -587,6 +601,423 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 target[idx, start_idx:end_idx + 1] = 1.0
         return target
 
+    def _smooth_distribution(
+        self,
+        probs: torch.Tensor,
+        eps: Optional[float] = None,
+    ) -> torch.Tensor:
+        eps = self.joint_state_label_smoothing if eps is None else float(eps)
+        K = probs.shape[-1]
+        smoothed = probs * (1.0 - eps) + (eps / max(K, 1))
+        return smoothed / smoothed.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    @staticmethod
+    def _log_prob_target(probs: torch.Tensor) -> torch.Tensor:
+        return torch.log(probs.clamp(min=1e-4, max=1.0))
+
+    @staticmethod
+    def _logit_prob_target(probs: torch.Tensor) -> torch.Tensor:
+        probs = probs.clamp(min=1e-4, max=1.0 - 1e-4)
+        return torch.log(probs / (1.0 - probs))
+
+    def _stack_boundary_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_names = (
+            'merge_yld_max_speed',
+            'merge_go_min_speed',
+            'chase_max_speed',
+            'junction_yld_max_speed',
+            'junction_go_min_speed',
+            'borrow_yld_max_speed',
+            'borrow_go_min_speed',
+        )
+        valid_names = (
+            'merge_yld_max_speed_valid',
+            'merge_go_min_speed_valid',
+            'chase_max_speed_valid',
+            'junction_yld_max_speed_valid',
+            'junction_go_min_speed_valid',
+            'borrow_yld_max_speed_valid',
+            'borrow_go_min_speed_valid',
+        )
+        target_list = [
+            self._get_stage1_batch_tensor(batch, name, device=device, model_dtype=model_dtype)
+            for name in target_names
+        ]
+        valid_list = [
+            self._get_stage1_batch_tensor(batch, name, device=device, model_dtype=model_dtype)
+            for name in valid_names
+        ]
+        targets = torch.stack(target_list, dim=-1)
+        valid_mask = torch.stack(valid_list, dim=-1) > 0.5
+        return targets, valid_mask
+
+    @staticmethod
+    def _stack_boundary_predictions(raw_stage1_scores: dict) -> torch.Tensor:
+        return torch.stack(
+            [
+                raw_stage1_scores['merge_yld_max'],
+                raw_stage1_scores['merge_go_min'],
+                raw_stage1_scores['chase_max'],
+                raw_stage1_scores['junction_yld_max'],
+                raw_stage1_scores['junction_go_min'],
+                raw_stage1_scores['borrow_yld_max'],
+                raw_stage1_scores['borrow_go_min'],
+            ],
+            dim=-1,
+        )
+
+    def _project_raw_state_to_diffusion_state(
+        self,
+        raw_state: dict,
+    ) -> dict:
+        return {
+            'window_logits': raw_state['window_logits'],
+            'dir_logits': raw_state['dir_logits'],
+            'decision_phase_logits': raw_state['decision_phase_logits'],
+            'control_phase_logits': raw_state['control_phase_logits'],
+            'conflict_area_logits': raw_state['conflict_area_logits'],
+            'boundary_values': self._stack_boundary_predictions(raw_state),
+            'speed_logits': raw_state['speed_logits'],
+        }
+
+    def _build_joint_state_clean_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        trajectory: torch.Tensor,
+        ego_status: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Tuple[dict, dict]:
+        family_codes = self._get_stage1_long_target(batch, 'conflict_area_family', device=device)
+        dir_codes = self._get_stage1_long_target(batch, 'conflict_area_dir', device=device)
+        decision_phase_codes = self._get_stage1_long_target(batch, 'conflict_decision_phase', device=device)
+        control_phase_codes = self._get_stage1_long_target(batch, 'conflict_control_phase', device=device)
+        if family_codes is None or dir_codes is None or decision_phase_codes is None or control_phase_codes is None:
+            raise ValueError("joint state diffusion requires new conflict family/dir/phase labels")
+
+        B = family_codes.shape[0]
+        window_target = self._window_target_from_family_codes(family_codes)
+        window_probs = F.one_hot(window_target, num_classes=4).to(device=device, dtype=model_dtype)
+        dir_probs = F.one_hot(dir_codes.clamp(min=0, max=3), num_classes=4).to(device=device, dtype=model_dtype)
+
+        decision_active = decision_phase_codes > 0
+        decision_probs = torch.full((B, 2), 0.5, device=device, dtype=model_dtype)
+        if decision_active.any():
+            decision_probs[decision_active] = F.one_hot(
+                (decision_phase_codes[decision_active] - 1).clamp(min=0, max=1), num_classes=2
+            ).to(device=device, dtype=model_dtype)
+
+        control_active = control_phase_codes > 0
+        control_probs = torch.full((B, 4), 0.25, device=device, dtype=model_dtype)
+        if control_active.any():
+            control_probs[control_active] = F.one_hot(
+                (control_phase_codes[control_active] - 1).clamp(min=0, max=3), num_classes=4
+            ).to(device=device, dtype=model_dtype)
+
+        speed_target = self._compute_speed_target(trajectory, device, batch=batch)
+        if speed_target is None:
+            speed_target = torch.full(
+                (B, len(self.model.speed_classes)),
+                1.0 / len(self.model.speed_classes),
+                device=device,
+                dtype=model_dtype,
+            )
+        else:
+            speed_target = speed_target.to(device=device, dtype=model_dtype)
+
+        conflict_area_target = self._build_conflict_area_route_target(
+            batch=batch,
+            route_steps=self.num_waypoints,
+            device=device,
+            model_dtype=model_dtype,
+        )
+        if conflict_area_target is None:
+            conflict_area_target = torch.zeros(B, self.num_waypoints, device=device, dtype=model_dtype)
+        conflict_area_probs = torch.where(
+            conflict_area_target > 0.5,
+            torch.full_like(conflict_area_target, self.joint_state_conflict_area_pos_prob),
+            torch.full_like(conflict_area_target, self.joint_state_conflict_area_neg_prob),
+        )
+
+        boundary_targets_mps, boundary_valid_mask = self._stack_boundary_targets(
+            batch=batch,
+            device=device,
+            model_dtype=model_dtype,
+        )
+        boundary_targets_norm = (boundary_targets_mps / max(self.stage1_boundary_norm_scale, 1e-6)).clamp(0.0, 1.0)
+        boundary_targets_norm = torch.where(
+            boundary_valid_mask,
+            boundary_targets_norm,
+            torch.zeros_like(boundary_targets_norm),
+        )
+        borrow_time_s = self._get_stage1_borrow_time_target(batch, device=device, model_dtype=model_dtype)
+
+        clean_state = {
+            'window_logits': self._log_prob_target(self._smooth_distribution(window_probs)),
+            'dir_logits': self._log_prob_target(self._smooth_distribution(dir_probs)),
+            'decision_phase_logits': self._log_prob_target(self._smooth_distribution(decision_probs)),
+            'control_phase_logits': self._log_prob_target(self._smooth_distribution(control_probs)),
+            'speed_logits': self._log_prob_target(self._smooth_distribution(speed_target)),
+            'conflict_area_logits': self._logit_prob_target(conflict_area_probs),
+            'boundary_values': boundary_targets_norm,
+        }
+        metadata = {
+            'window_target': window_target,
+            'dir_target': dir_codes.clamp(min=0, max=3),
+            'decision_phase_codes': decision_phase_codes,
+            'control_phase_codes': control_phase_codes,
+            'decision_phase_valid_mask': decision_active,
+            'control_phase_valid_mask': control_active,
+            'speed_target_probs': speed_target,
+            'conflict_area_target': conflict_area_target,
+            'boundary_targets_norm': boundary_targets_norm,
+            'boundary_valid_mask': boundary_valid_mask,
+            'borrow_time_s': borrow_time_s,
+            'boundary_targets_mps': boundary_targets_mps,
+        }
+        return clean_state, metadata
+
+    def _add_noise_to_state_dict(
+        self,
+        clean_state: dict,
+        timesteps: torch.Tensor,
+    ) -> dict:
+        noisy_state = {}
+        for key, clean_value in clean_state.items():
+            noise = torch.randn_like(clean_value, dtype=torch.float32)
+            noisy_state[key] = self.diffusion_scheduler.add_noise(
+                original_samples=clean_value.float(),
+                noise=noise,
+                timesteps=timesteps,
+            )
+        return noisy_state
+
+    def _ddim_step_state_dict(
+        self,
+        pred_clean_state: dict,
+        noisy_state: dict,
+        timestep: int,
+    ) -> dict:
+        pred_state_for_diffusion = self._project_raw_state_to_diffusion_state(pred_clean_state)
+        next_state = {}
+        for key, sample in noisy_state.items():
+            pred = pred_state_for_diffusion[key]
+            next_state[key] = self.diffusion_scheduler.step(
+                model_output=pred.float(),
+                timestep=timestep,
+                sample=sample.float(),
+                eta=0.0,
+            ).prev_sample
+        return next_state
+
+    def _compute_joint_state_recon_loss(
+        self,
+        pred_state: dict,
+        clean_state: dict,
+        metadata: dict,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        zero = torch.tensor(0.0, device=device, dtype=model_dtype)
+        decision_mask = metadata['decision_phase_valid_mask'].to(device=device, dtype=torch.bool)
+        control_mask = metadata['control_phase_valid_mask'].to(device=device, dtype=torch.bool)
+        boundary_valid_mask = metadata['boundary_valid_mask'].to(device=device, dtype=torch.bool)
+
+        def _masked_mse(pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+            if valid_mask.sum() <= 0:
+                return zero
+            return F.mse_loss(pred[valid_mask], target[valid_mask])
+
+        window_recon = F.mse_loss(pred_state['window_logits'], clean_state['window_logits'])
+        dir_recon = F.mse_loss(pred_state['dir_logits'], clean_state['dir_logits'])
+        decision_recon = _masked_mse(
+            pred_state['decision_phase_logits'],
+            clean_state['decision_phase_logits'],
+            decision_mask,
+        )
+        control_recon = _masked_mse(
+            pred_state['control_phase_logits'],
+            clean_state['control_phase_logits'],
+            control_mask,
+        )
+        speed_recon = F.mse_loss(pred_state['speed_logits'], clean_state['speed_logits'])
+        conflict_area_recon = F.mse_loss(pred_state['conflict_area_logits'], clean_state['conflict_area_logits'])
+        boundary_pred = self._stack_boundary_predictions(pred_state)
+        boundary_recon = _masked_mse(
+            boundary_pred,
+            clean_state['boundary_values'],
+            boundary_valid_mask,
+        )
+        total = (
+            window_recon
+            + dir_recon
+            + decision_recon
+            + control_recon
+            + speed_recon
+            + conflict_area_recon
+            + boundary_recon
+        )
+        return {
+            'state_diffusion_recon_loss': total,
+            'state_window_recon_loss': window_recon,
+            'state_dir_recon_loss': dir_recon,
+            'state_decision_phase_recon_loss': decision_recon,
+            'state_control_phase_recon_loss': control_recon,
+            'state_speed_recon_loss': speed_recon,
+            'state_conflict_area_recon_loss': conflict_area_recon,
+            'state_boundary_recon_loss': boundary_recon,
+        }
+
+    def _compute_stage1_direct_losses(
+        self,
+        batch: Dict[str, torch.Tensor],
+        raw_stage1_scores: dict,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        family_codes = self._get_stage1_long_target(batch, 'conflict_area_family', device=device)
+        dir_target = self._get_stage1_long_target(batch, 'conflict_area_dir', device=device)
+        decision_phase_codes = self._get_stage1_long_target(batch, 'conflict_decision_phase', device=device)
+        control_phase_codes = self._get_stage1_long_target(batch, 'conflict_control_phase', device=device)
+        if family_codes is None or dir_target is None or decision_phase_codes is None or control_phase_codes is None:
+            raise ValueError("shared stage1 training requires new conflict family/dir/phase labels")
+
+        window_target = self._window_target_from_family_codes(family_codes)
+        merge_yld_target = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed', device=device, model_dtype=model_dtype)
+        merge_go_target = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed', device=device, model_dtype=model_dtype)
+        chase_target = self._get_stage1_batch_tensor(batch, 'chase_max_speed', device=device, model_dtype=model_dtype)
+        junction_yld_target = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed', device=device, model_dtype=model_dtype)
+        junction_go_target = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed', device=device, model_dtype=model_dtype)
+        borrow_yld_target = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed', device=device, model_dtype=model_dtype)
+        borrow_go_target = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed', device=device, model_dtype=model_dtype)
+        merge_yld_valid = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        merge_go_valid = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        chase_valid = self._get_stage1_batch_tensor(batch, 'chase_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        junction_yld_valid = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        junction_go_valid = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        borrow_yld_valid = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        borrow_go_valid = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+
+        zero = torch.tensor(0.0, device=device, dtype=model_dtype)
+
+        def _masked_boundary_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+            valid_mask = valid_mask.to(dtype=torch.bool)
+            if valid_mask.sum() <= 0:
+                return zero
+            target_norm = (target_mps / max(self.stage1_boundary_norm_scale, 1e-6)).clamp(0.0, 1.0)
+            return F.smooth_l1_loss(pred_norm[valid_mask], target_norm[valid_mask])
+
+        loss_merge_yld = _masked_boundary_loss(raw_stage1_scores['merge_yld_max'], merge_yld_target, merge_yld_valid)
+        loss_merge_go = _masked_boundary_loss(raw_stage1_scores['merge_go_min'], merge_go_target, merge_go_valid)
+        loss_chase = _masked_boundary_loss(raw_stage1_scores['chase_max'], chase_target, chase_valid)
+        loss_junction_yld = _masked_boundary_loss(raw_stage1_scores['junction_yld_max'], junction_yld_target, junction_yld_valid)
+        loss_junction_go = _masked_boundary_loss(raw_stage1_scores['junction_go_min'], junction_go_target, junction_go_valid)
+        loss_borrow_yld = _masked_boundary_loss(raw_stage1_scores['borrow_yld_max'], borrow_yld_target, borrow_yld_valid)
+        loss_borrow_go = _masked_boundary_loss(raw_stage1_scores['borrow_go_min'], borrow_go_target, borrow_go_valid)
+        loss_merge = 0.5 * (loss_merge_yld + loss_merge_go)
+        loss_junction = 0.5 * (loss_junction_yld + loss_junction_go)
+        loss_borrow = 0.5 * (loss_borrow_yld + loss_borrow_go)
+        loss_cross = loss_junction + loss_borrow
+
+        loss_window = F.cross_entropy(raw_stage1_scores['window_logits'].float(), window_target)
+        loss_dir = F.cross_entropy(raw_stage1_scores['dir_logits'].float(), dir_target.clamp(min=0, max=3))
+        conflict_area_target = self._build_conflict_area_route_target(
+            batch=batch,
+            route_steps=raw_stage1_scores['conflict_area_logits'].shape[1],
+            device=device,
+            model_dtype=model_dtype,
+        )
+        loss_conflict_area = zero
+        if conflict_area_target is not None:
+            area_loss_raw = F.binary_cross_entropy_with_logits(
+                raw_stage1_scores['conflict_area_logits'].float(),
+                conflict_area_target.float(),
+                reduction='none',
+            )
+            pos_mask = conflict_area_target > 0.5
+            neg_mask = ~pos_mask
+            if pos_mask.any() and neg_mask.any():
+                loss_conflict_area = 0.5 * (area_loss_raw[pos_mask].mean() + area_loss_raw[neg_mask].mean())
+            elif pos_mask.any():
+                loss_conflict_area = area_loss_raw[pos_mask].mean()
+            elif neg_mask.any():
+                loss_conflict_area = area_loss_raw[neg_mask].mean()
+
+        decision_phase_valid_mask = decision_phase_codes > 0
+        decision_phase_target = (decision_phase_codes - 1).clamp(min=0, max=1)
+        loss_decision_phase = zero
+        if decision_phase_valid_mask.any():
+            loss_decision_phase = F.cross_entropy(
+                raw_stage1_scores['decision_phase_logits'][decision_phase_valid_mask].float(),
+                decision_phase_target[decision_phase_valid_mask],
+            )
+
+        control_phase_valid_mask = control_phase_codes > 0
+        control_phase_target = (control_phase_codes - 1).clamp(min=0, max=3)
+        loss_control_phase = zero
+        if control_phase_valid_mask.any():
+            loss_control_phase = F.cross_entropy(
+                raw_stage1_scores['control_phase_logits'][control_phase_valid_mask].float(),
+                control_phase_target[control_phase_valid_mask],
+            )
+
+        loss_phase = loss_decision_phase + loss_control_phase
+        loss_merge_active = zero
+        loss_junction_active = zero
+        loss_borrow_active = zero
+        loss_cross_active = zero
+        loss_ped = zero
+
+        energy_loss = (
+            + self.energy_chase_weight * loss_chase
+            + self.energy_merge_weight * loss_merge
+            + self.energy_junction_weight * loss_junction
+            + self.energy_borrow_weight * loss_borrow
+            + self.energy_relation_weight * loss_dir
+            + self.energy_window_weight * loss_window
+            + self.energy_phase_weight * loss_phase
+            + self.energy_conflict_area_weight * loss_conflict_area
+        )
+        return {
+            'energy_loss': energy_loss,
+            'chase_loss': loss_chase,
+            'merge_loss': loss_merge,
+            'junction_loss': loss_junction,
+            'borrow_loss': loss_borrow,
+            'cross_loss': loss_cross,
+            'pedestrian_loss': loss_ped,
+            'merge_yld_loss': loss_merge_yld,
+            'merge_go_loss': loss_merge_go,
+            'junction_yld_loss': loss_junction_yld,
+            'junction_go_loss': loss_junction_go,
+            'borrow_yld_loss': loss_borrow_yld,
+            'borrow_go_loss': loss_borrow_go,
+            'cross_yld_loss': loss_junction_yld + loss_borrow_yld,
+            'cross_go_loss': loss_junction_go + loss_borrow_go,
+            'merge_active_loss': loss_merge_active,
+            'junction_active_loss': loss_junction_active,
+            'borrow_active_loss': loss_borrow_active,
+            'cross_active_loss': loss_cross_active,
+            'relation_loss': loss_dir,
+            'dir_loss': loss_dir,
+            'conflict_area_loss': loss_conflict_area,
+            'window_loss': loss_window,
+            'phase_loss': loss_phase,
+            'decision_phase_loss': loss_decision_phase,
+            'control_phase_loss': loss_control_phase,
+            'merge_yld_max_loss': loss_merge_yld,
+            'merge_go_min_loss': loss_merge_go,
+            'junction_yld_max_loss': loss_junction_yld,
+            'junction_go_min_loss': loss_junction_go,
+            'borrow_yld_max_loss': loss_borrow_yld,
+            'borrow_go_min_loss': loss_borrow_go,
+        }
+
     def _compose_stage1_speed_energy_outputs(self, raw_scores: dict) -> dict:
         window_probs = torch.softmax(raw_scores['window_logits'], dim=-1)
         dir_probs = torch.softmax(raw_scores['dir_logits'], dim=-1)
@@ -823,7 +1254,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             borrow_time_cond = zero
         else:
             borrow_time_cond = borrow_time_s.to(device=device, dtype=model_dtype).reshape(-1)
-            borrow_time_cond = borrow_time_cond / max(self.traj_branch_condition_borrow_time_scale, 1e-6)
 
         branch_condition = torch.cat(
             [
@@ -1414,28 +1844,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         gt_abs = trajectory.unsqueeze(1)
         gt_joint_normed = self.joint_abs_to_norm(trajectory, route_gt).unsqueeze(1)
         gt_joint_abs = self.joint_norm_to_abs(gt_joint_normed)
-        family_codes = self._get_stage1_long_target(batch, 'conflict_area_family', device=device)
-        dir_target = self._get_stage1_long_target(batch, 'conflict_area_dir', device=device)
-        decision_phase_codes = self._get_stage1_long_target(batch, 'conflict_decision_phase', device=device)
-        control_phase_codes = self._get_stage1_long_target(batch, 'conflict_control_phase', device=device)
-        if family_codes is None or dir_target is None or decision_phase_codes is None or control_phase_codes is None:
-            raise ValueError("shared stage1 training requires new conflict family/dir/phase labels")
-
-        window_target = self._window_target_from_family_codes(family_codes)
-        merge_yld_target = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed', device=device, model_dtype=model_dtype)
-        merge_go_target = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed', device=device, model_dtype=model_dtype)
-        chase_target = self._get_stage1_batch_tensor(batch, 'chase_max_speed', device=device, model_dtype=model_dtype)
-        junction_yld_target = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed', device=device, model_dtype=model_dtype)
-        junction_go_target = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed', device=device, model_dtype=model_dtype)
-        borrow_yld_target = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed', device=device, model_dtype=model_dtype)
-        borrow_go_target = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed', device=device, model_dtype=model_dtype)
-        merge_yld_valid = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        merge_go_valid = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        chase_valid = self._get_stage1_batch_tensor(batch, 'chase_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        junction_yld_valid = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        junction_go_valid = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        borrow_yld_valid = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        borrow_go_valid = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
 
         if self.shared_stage1_training_source == 'noisy':
             if noisy_joint is None or noisy_joint_abs is None or diff_timesteps is None:
@@ -1474,121 +1882,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_points=shared_forward['route_points'],
             conditioning=shared_forward['conditioning'],
         )
-
-        zero = gt_abs.new_tensor(0.0)
-
-        def _masked_boundary_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-            valid_mask = valid_mask.to(dtype=torch.bool)
-            if valid_mask.sum() <= 0:
-                return zero
-            target_norm = (target_mps / max(self.stage1_boundary_norm_scale, 1e-6)).clamp(0.0, 1.0)
-            return F.smooth_l1_loss(pred_norm[valid_mask], target_norm[valid_mask])
-
-        loss_merge_yld = _masked_boundary_loss(raw_stage1_scores['merge_yld_max'], merge_yld_target, merge_yld_valid)
-        loss_merge_go = _masked_boundary_loss(raw_stage1_scores['merge_go_min'], merge_go_target, merge_go_valid)
-        loss_chase = _masked_boundary_loss(raw_stage1_scores['chase_max'], chase_target, chase_valid)
-        loss_junction_yld = _masked_boundary_loss(raw_stage1_scores['junction_yld_max'], junction_yld_target, junction_yld_valid)
-        loss_junction_go = _masked_boundary_loss(raw_stage1_scores['junction_go_min'], junction_go_target, junction_go_valid)
-        loss_borrow_yld = _masked_boundary_loss(raw_stage1_scores['borrow_yld_max'], borrow_yld_target, borrow_yld_valid)
-        loss_borrow_go = _masked_boundary_loss(raw_stage1_scores['borrow_go_min'], borrow_go_target, borrow_go_valid)
-        loss_merge = 0.5 * (loss_merge_yld + loss_merge_go)
-        loss_junction = 0.5 * (loss_junction_yld + loss_junction_go)
-        loss_borrow = 0.5 * (loss_borrow_yld + loss_borrow_go)
-        loss_cross = loss_junction + loss_borrow
-
-        loss_window = F.cross_entropy(raw_stage1_scores['window_logits'].float(), window_target)
-        loss_dir = F.cross_entropy(raw_stage1_scores['dir_logits'].float(), dir_target.clamp(min=0, max=3))
-        conflict_area_target = self._build_conflict_area_route_target(
+        return self._compute_stage1_direct_losses(
             batch=batch,
-            route_steps=raw_stage1_scores['conflict_area_logits'].shape[1],
+            raw_stage1_scores=raw_stage1_scores,
             device=device,
             model_dtype=model_dtype,
         )
-        loss_conflict_area = zero
-        if conflict_area_target is not None:
-            area_loss_raw = F.binary_cross_entropy_with_logits(
-                raw_stage1_scores['conflict_area_logits'].float(),
-                conflict_area_target.float(),
-                reduction='none',
-            )
-            pos_mask = conflict_area_target > 0.5
-            neg_mask = ~pos_mask
-            if pos_mask.any() and neg_mask.any():
-                loss_conflict_area = 0.5 * (area_loss_raw[pos_mask].mean() + area_loss_raw[neg_mask].mean())
-            elif pos_mask.any():
-                loss_conflict_area = area_loss_raw[pos_mask].mean()
-            elif neg_mask.any():
-                loss_conflict_area = area_loss_raw[neg_mask].mean()
-
-        decision_phase_valid_mask = decision_phase_codes > 0
-        decision_phase_target = (decision_phase_codes - 1).clamp(min=0, max=1)
-        loss_decision_phase = zero
-        if decision_phase_valid_mask.any():
-            loss_decision_phase = F.cross_entropy(
-                raw_stage1_scores['decision_phase_logits'][decision_phase_valid_mask].float(),
-                decision_phase_target[decision_phase_valid_mask],
-            )
-
-        control_phase_valid_mask = control_phase_codes > 0
-        control_phase_target = (control_phase_codes - 1).clamp(min=0, max=3)
-        loss_control_phase = zero
-        if control_phase_valid_mask.any():
-            loss_control_phase = F.cross_entropy(
-                raw_stage1_scores['control_phase_logits'][control_phase_valid_mask].float(),
-                control_phase_target[control_phase_valid_mask],
-            )
-
-        loss_phase = loss_decision_phase + loss_control_phase
-        loss_merge_active = zero
-        loss_junction_active = zero
-        loss_borrow_active = zero
-        loss_cross_active = zero
-        loss_ped = zero
-
-        energy_loss = (
-            + self.energy_chase_weight * loss_chase
-            + self.energy_merge_weight * loss_merge
-            + self.energy_junction_weight * loss_junction
-            + self.energy_borrow_weight * loss_borrow
-            + self.energy_relation_weight * loss_dir
-            + self.energy_window_weight * loss_window
-            + self.energy_phase_weight * loss_phase
-            + self.energy_conflict_area_weight * loss_conflict_area
-        )
-        return {
-            'energy_loss': energy_loss,
-            'chase_loss': loss_chase,
-            'merge_loss': loss_merge,
-            'junction_loss': loss_junction,
-            'borrow_loss': loss_borrow,
-            'cross_loss': loss_cross,
-            'pedestrian_loss': loss_ped,
-            'merge_yld_loss': loss_merge_yld,
-            'merge_go_loss': loss_merge_go,
-            'junction_yld_loss': loss_junction_yld,
-            'junction_go_loss': loss_junction_go,
-            'borrow_yld_loss': loss_borrow_yld,
-            'borrow_go_loss': loss_borrow_go,
-            'cross_yld_loss': loss_junction_yld + loss_borrow_yld,
-            'cross_go_loss': loss_junction_go + loss_borrow_go,
-            'merge_active_loss': loss_merge_active,
-            'junction_active_loss': loss_junction_active,
-            'borrow_active_loss': loss_borrow_active,
-            'cross_active_loss': loss_cross_active,
-            'relation_loss': loss_dir,
-            'dir_loss': loss_dir,
-            'conflict_area_loss': loss_conflict_area,
-            'window_loss': loss_window,
-            'phase_loss': loss_phase,
-            'decision_phase_loss': loss_decision_phase,
-            'control_phase_loss': loss_control_phase,
-            'merge_yld_max_loss': loss_merge_yld,
-            'merge_go_min_loss': loss_merge_go,
-            'junction_yld_max_loss': loss_junction_yld,
-            'junction_go_min_loss': loss_junction_go,
-            'borrow_yld_max_loss': loss_borrow_yld,
-            'borrow_go_min_loss': loss_borrow_go,
-        }
 
     def _train_branch_enabled_with_schedule(self, until_epoch, after_update_every) -> bool:
         """1-based epoch cutoff with optional lower-frequency updates after the cutoff."""
@@ -1702,10 +2001,29 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         noisy_joint = noisy_flat.unsqueeze(1)  # (B, 1, T_joint, 2)
         noisy_joint_abs = self.joint_norm_to_abs(noisy_joint)
 
+        joint_state_clean = None
+        joint_state_metadata = None
+        noisy_state = None
+        state_pred_dict = None
+        state_recon_loss_dict = {}
         traj_branch_condition = None
         traj_branch_condition_details = None
         branch_condition_schedule = None
-        if self.use_traj_branch_condition and has_stage1_speed_energy:
+        if self.use_joint_state_diffusion:
+            if not has_stage1_speed_energy:
+                raise ValueError("joint state diffusion requires stage1 labels in the training batch")
+            joint_state_clean, joint_state_metadata = self._build_joint_state_clean_targets(
+                batch=batch,
+                trajectory=trajectory,
+                ego_status=ego_status,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            noisy_state = self._add_noise_to_state_dict(
+                clean_state=joint_state_clean,
+                timesteps=diff_timesteps,
+            )
+        elif self.use_traj_branch_condition and has_stage1_speed_energy:
             traj_branch_condition, traj_branch_condition_details = self._build_stage1_branch_condition_gt(
                 batch=batch,
                 ego_status=ego_status,
@@ -1735,9 +2053,39 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 branch_condition_schedule=branch_condition_schedule if branch_input is not None else None,
             )
 
-        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = _forward_ego_with_branch(
-            traj_branch_condition
-        )
+        if self.use_joint_state_diffusion:
+            borrow_time_s = None if joint_state_metadata is None else joint_state_metadata.get('borrow_time_s')
+            (
+                poses_reg,
+                route_pred,
+                _,
+                _,
+                speed_pred,
+                speed_profile_pred,
+                state_pred_dict,
+            ) = self.model.forward_ego_joint(
+                x_t=noisy_joint,
+                x_t_abs=noisy_joint_abs,
+                timestep=diff_timesteps,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                state_t=noisy_state,
+                borrow_time_s=borrow_time_s,
+                bev_proj_cached=bev_proj,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+            )
+            state_recon_loss_dict = self._compute_joint_state_recon_loss(
+                pred_state=state_pred_dict,
+                clean_state=joint_state_clean,
+                metadata=joint_state_metadata,
+                device=device,
+                model_dtype=model_dtype,
+            )
+        else:
+            poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = _forward_ego_with_branch(
+                traj_branch_condition
+            )
         poses_reg_abs = self.norm_to_abs(poses_reg)
         route_pred_abs = self.route_norm_to_abs(route_pred)
         traj_target = trajectory.unsqueeze(1)
@@ -1800,25 +2148,33 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         stage1_extra_losses = {}
 
         if train_stage1_speed_energy_active:
-            stage1_loss_dict = self._compute_shared_stage1_speed_energy_loss(
-                batch=batch,
-                trajectory=trajectory,
-                route_gt=route_gt,
-                transfuser_bev_feature=transfuser_bev_feature,
-                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                transfuser_lidar_bev=transfuser_lidar_bev,
-                ego_status=ego_status,
-                bev_proj=bev_proj,
-                device=device,
-                model_dtype=model_dtype,
-                noisy_joint=noisy_joint,
-                noisy_joint_abs=noisy_joint_abs,
-                diff_timesteps=diff_timesteps,
-                branch_condition=traj_branch_condition.detach() if (
-                    traj_branch_condition is not None and self.traj_branch_condition_detach
-                ) else traj_branch_condition,
-                branch_condition_schedule=branch_condition_schedule,
-            )
+            if self.use_joint_state_diffusion:
+                stage1_loss_dict = self._compute_stage1_direct_losses(
+                    batch=batch,
+                    raw_stage1_scores=state_pred_dict,
+                    device=device,
+                    model_dtype=model_dtype,
+                )
+            else:
+                stage1_loss_dict = self._compute_shared_stage1_speed_energy_loss(
+                    batch=batch,
+                    trajectory=trajectory,
+                    route_gt=route_gt,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    transfuser_lidar_bev=transfuser_lidar_bev,
+                    ego_status=ego_status,
+                    bev_proj=bev_proj,
+                    device=device,
+                    model_dtype=model_dtype,
+                    noisy_joint=noisy_joint,
+                    noisy_joint_abs=noisy_joint_abs,
+                    diff_timesteps=diff_timesteps,
+                    branch_condition=traj_branch_condition.detach() if (
+                        traj_branch_condition is not None and self.traj_branch_condition_detach
+                    ) else traj_branch_condition,
+                    branch_condition_schedule=branch_condition_schedule,
+                )
             energy_loss = stage1_loss_dict['energy_loss']
             loss_front = stage1_loss_dict['chase_loss']
             loss_left = stage1_loss_dict['merge_loss']
@@ -1852,6 +2208,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'energy_borrow_yld_max_loss': stage1_loss_dict.get('borrow_yld_max_loss', zero_t),
                 'energy_borrow_go_min_loss': stage1_loss_dict.get('borrow_go_min_loss', zero_t),
             }
+            if self.use_joint_state_diffusion:
+                stage1_extra_losses.update({
+                    'state_diffusion_recon_loss': state_recon_loss_dict.get('state_diffusion_recon_loss', zero_t),
+                    'state_window_recon_loss': state_recon_loss_dict.get('state_window_recon_loss', zero_t),
+                    'state_dir_recon_loss': state_recon_loss_dict.get('state_dir_recon_loss', zero_t),
+                    'state_decision_phase_recon_loss': state_recon_loss_dict.get('state_decision_phase_recon_loss', zero_t),
+                    'state_control_phase_recon_loss': state_recon_loss_dict.get('state_control_phase_recon_loss', zero_t),
+                    'state_speed_recon_loss': state_recon_loss_dict.get('state_speed_recon_loss', zero_t),
+                    'state_conflict_area_recon_loss': state_recon_loss_dict.get('state_conflict_area_recon_loss', zero_t),
+                    'state_boundary_recon_loss': state_recon_loss_dict.get('state_boundary_recon_loss', zero_t),
+                })
         elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
             (
                 M_anchor,
@@ -2043,6 +2410,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     + self.energy_offroad_weight * torch.sigmoid(a_off).mean()
                 )
 
+        state_diffusion_recon_loss = stage1_extra_losses.get('state_diffusion_recon_loss', zero_t)
         total_loss = (
             self.energy_loss_weight * energy_loss
             + self.reg_loss_weight * loss_reg
@@ -2050,6 +2418,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.alignment_loss_weight * alignment_loss
             + self.speed_loss_weight * speed_loss
             + self.speed_profile_loss_weight * speed_profile_loss
+            + self.joint_state_diffusion_loss_weight * state_diffusion_recon_loss
         )
 
         loss_dict = {
@@ -2070,6 +2439,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'route_loss': route_loss,
             'speed_loss': speed_loss,
             'alignment_loss': alignment_loss,
+            'joint_state_diffusion_loss': state_diffusion_recon_loss,
         }
         if self.use_speed_profile_head:
             loss_dict['speed_profile_loss'] = speed_profile_loss
@@ -2789,6 +3159,263 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             roll_timesteps = roll_timesteps.to(device)
         return roll_timesteps
 
+    def _init_joint_state_noise(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> dict:
+        return {
+            'window_logits': torch.randn(batch_size, 4, device=device, dtype=torch.float32),
+            'dir_logits': torch.randn(batch_size, 4, device=device, dtype=torch.float32),
+            'decision_phase_logits': torch.randn(batch_size, 2, device=device, dtype=torch.float32),
+            'control_phase_logits': torch.randn(batch_size, 4, device=device, dtype=torch.float32),
+            'conflict_area_logits': torch.randn(batch_size, self.num_waypoints, device=device, dtype=torch.float32),
+            'boundary_values': torch.randn(batch_size, 7, device=device, dtype=torch.float32),
+            'speed_logits': torch.randn(batch_size, len(self.model.speed_classes), device=device, dtype=torch.float32),
+        }
+
+    @torch.no_grad()
+    def _conditional_sample_joint_state(
+        self,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        ego_status: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        route_for_guidance: Optional[torch.Tensor] = None,
+        energy_weights: Optional[Dict[str, float]] = None,
+        transfuser_lidar_bev: Optional[torch.Tensor] = None,
+        borrow_time_s: Optional[torch.Tensor] = None,
+        prev_relation_probs: Optional[torch.Tensor] = None,
+    ):
+        B = transfuser_bev_feature.shape[0]
+        M = self.num_samples
+        joint_T = self.horizon + self.num_waypoints
+        if M != 1:
+            raise NotImplementedError(f"Joint Route B ego diffusion currently expects num_samples=1, got {M}")
+        self._require_route_abs_stats()
+
+        def _w(key, default):
+            return energy_weights.get(key, default) if energy_weights else default
+        w_front_cfg = _w('front', self.energy_front_weight)
+        w_left_cfg = _w('left', self.energy_left_weight)
+        w_right_cfg = _w('right', self.energy_right_weight)
+        w_ped_cfg = _w('pedestrian', self.energy_pedestrian_weight)
+        w_off_cfg = _w('offroad', self.energy_offroad_weight)
+
+        x_t = torch.randn(B, M, joint_T, 2, device=device, dtype=torch.float32)
+        state_t = self._init_joint_state_noise(B, device)
+        bev_proj = self.model.decoder.compute_bev_proj(
+            transfuser_bev_feature.to(device=device, dtype=model_dtype)
+        )
+        self.diffusion_scheduler.set_timesteps(self.num_inference_steps, device=device)
+        roll_timesteps = self.diffusion_scheduler.timesteps.to(device)
+
+        poses_cls = None
+        route_pred = None
+        energy_scores = None
+        speed_pred = None
+        speed_profile_pred = None
+        final_state_scores = None
+        pass1_trajectory = None
+
+        for k in roll_timesteps:
+            t_cur = int(k.item())
+            t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
+            _, w_veh, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
+            use_guidance = self.guidance_scale > 0 and (w_veh + w_off) > 0
+
+            x_input = x_t.to(dtype=model_dtype)
+            x_t_abs = self.joint_norm_to_abs(x_input)
+
+            poses_reg, route_pred, _, _, speed_pred, speed_profile_pred, state_pred_dict = self.model.forward_ego_joint(
+                x_t=x_input,
+                x_t_abs=x_t_abs,
+                timestep=t_tensor,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                state_t=state_t,
+                borrow_time_s=borrow_time_s,
+                bev_proj_cached=bev_proj,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+            )
+            pass1_trajectory = self.norm_to_abs(poses_reg.detach())
+            final_state_scores = state_pred_dict
+
+            if use_guidance:
+                pred_x0 = poses_reg.detach()
+                route_context = route_for_guidance if route_for_guidance is not None else self.route_norm_to_abs(route_pred.detach())
+                route_pred_norm = route_pred.detach().unsqueeze(1)
+                pred_x0_for_grad = pred_x0.clone().requires_grad_(True)
+
+                with torch.enable_grad():
+                    pred_x0_abs = self.norm_to_abs(pred_x0_for_grad)
+                    front_route_scores = None
+                    needs_legacy_energy = (
+                        (not self.use_front_route_risk_energy and w_front_cfg != 0)
+                        or w_left_cfg != 0
+                        or w_right_cfg != 0
+                        or w_ped_cfg != 0
+                        or (w_off_cfg != 0 and w_off > 0)
+                    )
+                    if needs_legacy_energy:
+                        energy_scores, _ = self.model.forward_energy_eval(
+                            x_t=pred_x0_for_grad,
+                            x_t_abs=pred_x0_abs,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            traj_for_energy=pred_x0_abs,
+                            bev_proj_cached=bev_proj,
+                            route_points=route_context,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                        )
+                    else:
+                        energy_scores = None
+                    if self.use_front_route_risk_energy and w_front_cfg != 0:
+                        front_route_scores, _ = self.model.forward_front_route_risk_eval(
+                            x_t=pred_x0_for_grad,
+                            x_t_abs=pred_x0_abs,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            traj_for_energy=pred_x0_abs,
+                            bev_proj_cached=bev_proj,
+                            route_points=route_context,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                        )
+
+                    total_energy = torch.zeros(1, device=device)
+                    if energy_scores is not None:
+                        total_energy = (
+                            w_veh * (
+                                ((0.0 if self.use_front_route_risk_energy else w_front_cfg) * energy_scores['front'].sum())
+                                + w_left_cfg * energy_scores['left'].sum()
+                                + w_right_cfg * energy_scores['right'].sum()
+                                + w_ped_cfg * energy_scores['pedestrian'].sum()
+                            )
+                            + w_off_cfg * w_off * energy_scores['offroad'].sum()
+                        )
+                    if front_route_scores is not None:
+                        total_energy = total_energy + w_veh * w_front_cfg * front_route_scores.sum()
+
+                    if total_energy.requires_grad and pred_x0_for_grad.requires_grad:
+                        grad = torch.autograd.grad(total_energy, pred_x0_for_grad, allow_unused=True)[0]
+                        if grad is None:
+                            grad = torch.zeros_like(pred_x0_for_grad)
+                        grad = grad.detach().to(dtype=torch.float32)
+                        grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                        grad = grad * torch.clamp(self.energy_grad_clip_norm / grad_norm, max=1.0)
+                    else:
+                        grad = torch.zeros_like(pred_x0_for_grad)
+
+                pred_joint_corrected = torch.cat(
+                    [pred_x0.float() - self.guidance_scale * grad, route_pred_norm.float()],
+                    dim=2,
+                )
+            else:
+                energy_scores = None
+                pred_joint_corrected = torch.cat(
+                    [poses_reg.float(), route_pred.unsqueeze(1).float()],
+                    dim=2,
+                )
+
+            x_t = self.diffusion_scheduler.step(
+                model_output=pred_joint_corrected.float(),
+                timestep=t_cur,
+                sample=x_t.float(),
+                eta=0.0,
+            ).prev_sample
+            state_t = self._ddim_step_state_dict(
+                pred_clean_state=state_pred_dict,
+                noisy_state=state_t,
+                timestep=t_cur,
+            )
+
+        final_joint_abs = self.joint_norm_to_abs(pred_joint_corrected)
+        final_traj_abs = final_joint_abs[:, :, :self.horizon, :]
+        route_pred = final_joint_abs[:, 0, self.horizon:, :]
+        best_trajectory = final_traj_abs.squeeze(1)
+
+        target_speed_pred = None
+        if speed_pred is not None:
+            target_speed_pred = self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
+
+        speed_energy_scores = None
+        speed_energy_query_center = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+        speed_energy_ref_speeds = None
+        speed_energy_ref_scores = None
+        traj_branch_condition_probs = None
+        traj_branch_condition_details = None
+        if final_state_scores is not None:
+            speed_energy_scores = self._compose_stage1_speed_energy_outputs(final_state_scores)
+            branch_speed_ref = (
+                target_speed_pred if target_speed_pred is not None
+                else speed_energy_query_center
+            )
+            traj_branch_condition_probs, traj_branch_condition_details = self._build_traj_branch_condition_from_stage1_raw(
+                raw_scores=final_state_scores,
+                speed_ref=branch_speed_ref.detach(),
+                borrow_time_s=borrow_time_s,
+                prev_relation_probs=prev_relation_probs,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            traj_speed_1s_ref, traj_speed_05s_ref = self._compute_inference_traj_speed_refs(
+                best_trajectory, model_dtype
+            )
+            speed_energy_ref_speeds = torch.stack(
+                [branch_speed_ref, traj_speed_1s_ref, traj_speed_05s_ref], dim=-1
+            ).clamp_(0.0, 20.0)
+
+        return {
+            'best_trajectory': best_trajectory,
+            'route_pred': route_pred,
+            'all_trajectories': final_traj_abs,
+            'energy_scores': energy_scores,
+            'speed_energy_scores': speed_energy_scores,
+            'speed_energy_samples': None,
+            'speed_energy_query_center': speed_energy_query_center,
+            'speed_energy_ref_speeds': speed_energy_ref_speeds,
+            'speed_energy_ref_scores': speed_energy_ref_scores,
+            'traj_branch_condition_probs': traj_branch_condition_probs,
+            'traj_window_condition_probs': (
+                traj_branch_condition_details['window_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_dir_condition_probs': (
+                traj_branch_condition_details['dir_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_decision_phase_condition_probs': (
+                traj_branch_condition_details['decision_phase_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_control_phase_condition_probs': (
+                traj_branch_condition_details['control_phase_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_boundary_margin_condition': (
+                traj_branch_condition_details['boundary_margins']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_borrow_time_condition': (
+                traj_branch_condition_details['borrow_time_condition']
+                if traj_branch_condition_details is not None else None
+            ),
+            'lane_dir_relation_probs': (
+                traj_branch_condition_details['lane_dir_relation_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'pass1_trajectory': best_trajectory,
+            'pass2_trajectory': best_trajectory,
+            'poses_cls': poses_cls,
+            'best_idx': torch.zeros(B, dtype=torch.long, device=device),
+            'target_speed': target_speed_pred,
+            'target_speed_profile': speed_profile_pred if self.use_speed_profile_head else None,
+        }
+
     # ========== Inference with Energy Guidance ==========
     @torch.no_grad()
     def conditional_sample(
@@ -2814,6 +3441,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         Returns:
             dict with best_trajectory, route_pred, all_trajectories, energy_scores, etc.
         """
+        if self.use_joint_state_diffusion:
+            return self._conditional_sample_joint_state(
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                device=device,
+                model_dtype=model_dtype,
+                route_for_guidance=route_for_guidance,
+                energy_weights=energy_weights,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+                borrow_time_s=borrow_time_s,
+                prev_relation_probs=prev_relation_probs,
+            )
         B = transfuser_bev_feature.shape[0]
         M = self.num_samples
         T = self.horizon
