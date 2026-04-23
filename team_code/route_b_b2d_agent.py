@@ -145,6 +145,13 @@ STUCK_HELPER_RELEASE_HEADING_DEG = float(os.environ.get('STUCK_HELPER_RELEASE_HE
 STUCK_HELPER_STARTUP_DISTANCE_M = float(os.environ.get('STUCK_HELPER_STARTUP_DISTANCE_M', '10.0'))
 STUCK_HELPER_STARTUP_THRESHOLD = int(os.environ.get('STUCK_HELPER_STARTUP_THRESHOLD', '100'))
 STUCK_HELPER_POSTSTART_THRESHOLD = int(os.environ.get('STUCK_HELPER_POSTSTART_THRESHOLD', '300'))
+JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE = os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE', '1').lower() in (
+    '1', 'true', 'yes', 'on'
+)
+JUNCTION_WINDOW_SOFT_SPEED_CAP_MS = float(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_MS', '20.0'))
+JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD = float(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD', '0.2'))
+JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD = float(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD', '0.1'))
+JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES = max(1, int(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES', '3')))
 EARLY_TARGET_PROMOTE_ENABLE = os.environ.get('EARLY_TARGET_PROMOTE_ENABLE', '1').lower() in (
     '1', 'true', 'yes', 'on'
 )
@@ -374,7 +381,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_bev_pixels_per_meter = 2.0
 		self.semantic_tl_min_pixels = 6
 		self.semantic_tl_brake_distance_m = float(
-			os.environ.get('SEMANTIC_TL_BRAKE_DISTANCE_M', '18.0')
+			os.environ.get('SEMANTIC_TL_BRAKE_DISTANCE_M', '1.0')
 		)
 		self.semantic_stop_min_pixels = 3
 		self.semantic_tl_min_models = max(
@@ -387,7 +394,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		)
 		self.semantic_tl_roi = (0.0, 25.0, -10.0, 10.0)
 		self.semantic_tl_green_release_delay_frames = int(
-			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_DELAY_FRAMES', '10')
+			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_DELAY_FRAMES', '0')
 		)
 		self.semantic_tl_green_release_speed_threshold = float(
 			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_SPEED_THRESHOLD', '0.5')
@@ -915,7 +922,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.stuck_detector = 0
 			self._reset_stuck_helper_state()
 
-		if force_move_blocked_reason is None and self.stuck_detector > self.stuck_threshold:
+		# Away from the startup point, keep the old stuck recovery path: creep only,
+		# no target-point rewrite.
+		if (
+			force_move_blocked_reason is None
+			and (not self.stuck_helper_in_startup_zone)
+			and self.stuck_detector > self.stuck_threshold
+		):
 			self.force_move = self.creep_duration
 
 		if self.force_move > 0:
@@ -1361,6 +1374,63 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"[front_route_risk_debug] failed: {exc}")
 			return None
 
+	def _get_junction_window_soft_speed_cap(self):
+		debug = {
+			'active': False,
+			'reason': None,
+			'speed_cap_ms': None,
+			'junction_prob': None,
+			'streak_frames': int(self.junction_window_soft_cap_streak),
+			'source': None,
+		}
+
+		if not JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE:
+			self.junction_window_soft_cap_streak = 0
+			return debug
+
+		window_probs = self.last_branch_condition_debug.get('traj_window_condition_probs')
+		source = 'traj_window_condition_probs'
+		if window_probs is None:
+			window_probs = self.last_branch_condition_debug.get('speed_energy_window_probs')
+			source = 'speed_energy_window_probs'
+		if window_probs is None:
+			self.junction_window_soft_cap_streak = 0
+			return debug
+
+		window_probs = np.asarray(window_probs, dtype=np.float32).reshape(-1)
+		if window_probs.size < 3:
+			self.junction_window_soft_cap_streak = 0
+			return debug
+
+		junction_prob = float(window_probs[2])
+		if junction_prob > JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD:
+			self.junction_window_soft_cap_streak += 1
+		else:
+			self.junction_window_soft_cap_streak = 0
+
+		debug.update({
+			'junction_prob': junction_prob,
+			'streak_frames': int(self.junction_window_soft_cap_streak),
+			'source': source,
+		})
+
+		if junction_prob > JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD:
+			debug.update({
+				'active': True,
+				'reason': 'junction_window_single_high',
+				'speed_cap_ms': float(JUNCTION_WINDOW_SOFT_SPEED_CAP_MS),
+			})
+			return debug
+
+		if self.junction_window_soft_cap_streak >= JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES:
+			debug.update({
+				'active': True,
+				'reason': 'junction_window_streak',
+				'speed_cap_ms': float(JUNCTION_WINDOW_SOFT_SPEED_CAP_MS),
+			})
+
+		return debug
+
 	def _get_stage1_energy_speed_cap(self, tick_data, ego_speed):
 		debug = {
 			'active': False,
@@ -1799,10 +1869,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.brake_ratio = 1.1
 		self.clip_delta = 1.0
 		self.clip_throttle = 1.0
-		self.stuck_threshold = 300 #800
-		self.stuck_helper_threshold = STUCK_HELPER_STARTUP_THRESHOLD
 		self.stuck_helper_startup_threshold = STUCK_HELPER_STARTUP_THRESHOLD
 		self.stuck_helper_poststart_threshold = STUCK_HELPER_POSTSTART_THRESHOLD
+		# Startup stuck uses helper target override; once ego leaves the startup zone we
+		# fall back to the legacy creep-based stuck recovery.
+		self.stuck_threshold = int(self.stuck_helper_poststart_threshold)
+		self.stuck_helper_threshold = STUCK_HELPER_STARTUP_THRESHOLD
 		self.stuck_helper_startup_distance_m = STUCK_HELPER_STARTUP_DISTANCE_M
 		self.creep_duration = 15
 		self.creep_throttle = 0.4
@@ -1942,6 +2014,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.stage1_energy_cap_value_ms = None
 		self.last_stage1_energy_cap_debug = {}
 		self.last_terminal_route_debug = {}
+		self.last_junction_window_soft_cap_debug = {}
+		self.junction_window_soft_cap_streak = 0
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
 		self.prev_debug_raw_xy = None
@@ -2212,6 +2286,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		):
 			return None
 
+		# Only the startup stuck helper is allowed to rewrite target points. Once ego
+		# has moved away from the startup point, stuck handling falls back to legacy
+		# creep recovery without touching the planner targets.
 		helper_ego_points = np.array([
 			[STUCK_HELPER_TARGET_1_FORWARD_M, STUCK_HELPER_TARGET_LATERAL_M],
 			[STUCK_HELPER_TARGET_2_FORWARD_M, STUCK_HELPER_TARGET_LATERAL_M],
@@ -2913,6 +2990,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		velocity,
 		speed_waypoints,
 		target_point=None,
+		junction_window_soft_cap_ms=None,
 		terminal_speed_cap_ms=None,
 		front_route_risk_cap_ms=None,
 		stage1_energy_cap_ms=None,
@@ -3029,7 +3107,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		desired_speed_after_soft_cap = float(desired_speed)
 		if SOFT_SPEED_LIMIT_MS > 0.0:
 			desired_speed_after_soft_cap = min(desired_speed_after_soft_cap, SOFT_SPEED_LIMIT_MS)
-		desired_speed_after_terminal_cap = float(desired_speed_after_soft_cap)
+		desired_speed_after_junction_window_soft_cap = float(desired_speed_after_soft_cap)
+		junction_window_soft_cap_applied = False
+		if junction_window_soft_cap_ms is not None and junction_window_soft_cap_ms > 0.0:
+			junction_window_soft_cap_applied = (
+				desired_speed_after_junction_window_soft_cap > float(junction_window_soft_cap_ms)
+			)
+			desired_speed_after_junction_window_soft_cap = min(
+				desired_speed_after_junction_window_soft_cap,
+				junction_window_soft_cap_ms,
+			)
+		desired_speed_after_terminal_cap = float(desired_speed_after_junction_window_soft_cap)
 		terminal_speed_cap_applied = False
 		if terminal_speed_cap_ms is not None and terminal_speed_cap_ms > 0.0:
 			terminal_speed_cap_applied = desired_speed_after_terminal_cap > float(terminal_speed_cap_ms)
@@ -3077,6 +3165,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
 			'desired_speed_after_soft_cap': float(desired_speed_after_soft_cap),
+			'desired_speed_after_junction_window_soft_cap': float(desired_speed_after_junction_window_soft_cap),
+			'junction_window_soft_cap_ms': float(junction_window_soft_cap_ms) if junction_window_soft_cap_ms is not None else None,
+			'junction_window_soft_cap_applied': bool(junction_window_soft_cap_applied),
 			'desired_speed_after_terminal_cap': float(desired_speed_after_terminal_cap),
 			'desired_speed_after_front_route_risk_cap': float(desired_speed_after_front_route_risk_cap),
 			'desired_speed_after_stage1_energy_adjust': float(desired_speed_after_stage1_energy_adjust),
@@ -3455,15 +3546,45 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			self.last_energy_debug = {}
+			traj_decision_phase_condition_names = list(
+				getattr(
+					self.net,
+					'traj_decision_phase_condition_names',
+					getattr(self.net, 'traj_phase_condition_names', ('yld', 'go')),
+				)
+			)
 			self.last_branch_condition_debug = {
 				'traj_branch_condition_enabled': bool(getattr(self.net, 'use_traj_branch_condition', False)),
 				'traj_branch_condition_scale': float(getattr(self.net, 'traj_branch_condition_scale', 0.0) or 0.0),
 				'traj_branch_condition_detach': bool(getattr(self.net, 'traj_branch_condition_detach', False)),
+				'traj_branch_condition_affinity_scale': float(
+					getattr(self.net, 'traj_branch_condition_affinity_scale', 0.0) or 0.0
+				),
+				'traj_branch_condition_borrow_time_scale': float(
+					getattr(self.net, 'traj_branch_condition_borrow_time_scale', 0.0) or 0.0
+				),
+				'traj_branch_condition_boundary_margin_scale': float(
+					getattr(self.net, 'traj_branch_condition_boundary_margin_scale', 0.0) or 0.0
+				),
+				'stage1_boundary_norm_scale': float(
+					getattr(self.net, 'stage1_boundary_norm_scale', 0.0) or 0.0
+				),
+				'traj_branch_condition_names': list(
+					getattr(self.net, 'traj_branch_condition_names', ())
+				),
 				'traj_window_condition_names': list(
 					getattr(self.net, 'traj_window_condition_names', ('none', 'merge', 'junction', 'borrow'))
 				),
-				'traj_phase_condition_names': list(
-					getattr(self.net, 'traj_phase_condition_names', ('yld', 'go'))
+				'traj_dir_condition_names': list(
+					getattr(self.net, 'traj_dir_condition_names', ('none', 'same', 'opposite', 'cross'))
+				),
+				'traj_decision_phase_condition_names': traj_decision_phase_condition_names,
+				'traj_phase_condition_names': traj_decision_phase_condition_names,
+				'traj_control_phase_condition_names': list(
+					getattr(self.net, 'traj_control_phase_condition_names', ('coast_yld', 'slow_yld', 'stop_yld', 'go'))
+				),
+				'traj_boundary_condition_names': list(
+					getattr(self.net, 'traj_boundary_condition_names', ('yld_margin', 'go_margin'))
 				),
 				'traj_phase_energy_condition_names': list(
 					getattr(self.net, 'traj_phase_energy_condition_names', ('phase_energy_yld', 'phase_energy_go'))
@@ -3473,6 +3594,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			for semantic_key in [
 				'traj_branch_condition_probs',
 				'traj_window_condition_probs',
+				'traj_dir_condition_probs',
+				'traj_decision_phase_condition_probs',
+				'traj_control_phase_condition_probs',
+				'traj_boundary_margin_condition',
 				'traj_phase_condition_probs',
 				'traj_phase_energy_summary',
 				'lane_dir_relation_probs',
@@ -3483,6 +3608,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				semantic_array = np.asarray(semantic_value).reshape(-1)
 				if semantic_array.size > 0:
 					self.last_branch_condition_debug[semantic_key] = semantic_array.astype(np.float32).tolist()
+			if (
+				'traj_phase_condition_probs' not in self.last_branch_condition_debug
+				and 'traj_decision_phase_condition_probs' in self.last_branch_condition_debug
+			):
+				self.last_branch_condition_debug['traj_phase_condition_probs'] = (
+					self.last_branch_condition_debug['traj_decision_phase_condition_probs']
+				)
 			traj_borrow_time_condition = dp_pred_traj.get('traj_borrow_time_condition')
 			if traj_borrow_time_condition is not None:
 				traj_borrow_time_condition = np.asarray(traj_borrow_time_condition).reshape(-1)
@@ -3545,6 +3677,33 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				scalar_array = np.asarray(scalar_value).reshape(-1)
 				if scalar_array.size > 0:
 					self.last_branch_condition_debug[f'speed_energy_{scalar_key}'] = float(scalar_array[0])
+			for stage1_key in [
+				'window_probs',
+				'dir_probs',
+				'decision_phase_probs',
+				'control_phase_probs',
+				'conflict_area_probs',
+				'merge_yld_max_mps',
+				'merge_go_min_mps',
+				'junction_yld_max_mps',
+				'junction_go_min_mps',
+				'borrow_yld_max_mps',
+				'borrow_go_min_mps',
+				'selected_yld_max_mps',
+				'selected_go_min_mps',
+			]:
+				for prefix in ['speed_energy', 'speed_energy_ref']:
+					stage1_value = dp_pred_traj.get(f'{prefix}_{stage1_key}')
+					if stage1_value is None:
+						continue
+					stage1_array = np.asarray(stage1_value).reshape(-1)
+					if stage1_array.size == 0:
+						continue
+					out_key = f'{prefix}_{stage1_key}'
+					if stage1_array.size == 1:
+						self.last_branch_condition_debug[out_key] = float(stage1_array[0])
+					else:
+						self.last_branch_condition_debug[out_key] = stage1_array.astype(np.float32).tolist()
 			for raw_curve_key in [
 				'merge_yld',
 				'merge_go',
@@ -3738,6 +3897,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			terminal_route_debug = self._get_terminal_route_speed_cap(tick_data)
 			self.last_terminal_route_debug = terminal_route_debug
+			junction_window_soft_cap_debug = self._get_junction_window_soft_speed_cap()
+			self.last_junction_window_soft_cap_debug = junction_window_soft_cap_debug
 			front_route_risk_cap_debug = self._get_front_route_risk_speed_cap(
 				tick_data,
 				gt_velocity,
@@ -3757,6 +3918,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				gt_velocity,
 				speed_waypoints,
 				target_point=target_point,
+				junction_window_soft_cap_ms=(
+					junction_window_soft_cap_debug.get('speed_cap_ms')
+					if junction_window_soft_cap_debug.get('active')
+					else None
+				),
 				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
 				front_route_risk_cap_ms=front_route_risk_cap_debug.get('speed_cap_ms'),
 				stage1_energy_cap_ms=stage1_energy_cap_debug.get('speed_cap_ms') if STAGE1_ENERGY_SPEED_CAP_ENABLE else None,
@@ -3807,6 +3973,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
 				'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
 				'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
+				'junction_window_soft_cap_active': bool(junction_window_soft_cap_debug.get('active', False)),
+				'junction_window_soft_cap_reason': junction_window_soft_cap_debug.get('reason'),
+				'junction_window_soft_cap_ms': self.last_speed_debug.get('junction_window_soft_cap_ms'),
+				'junction_window_soft_cap_applied': bool(self.last_speed_debug.get('junction_window_soft_cap_applied', False)),
+				'junction_window_soft_cap_junction_prob': junction_window_soft_cap_debug.get('junction_prob'),
+				'junction_window_soft_cap_streak_frames': int(junction_window_soft_cap_debug.get('streak_frames', 0)),
+				'junction_window_soft_cap_source': junction_window_soft_cap_debug.get('source'),
 				'terminal_speed_cap_ms': self.last_speed_debug.get('terminal_speed_cap_ms'),
 				'hard_speed_limit_ms': self.last_speed_debug.get('hard_speed_limit_ms'),
 				'terminal_route_speed_cap_active': bool(terminal_route_debug.get('active', False)),
@@ -4212,15 +4385,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cond_enabled = int(bool(self.pid_metadata.get('traj_branch_condition_enabled', False)))
 		cond_scale = self._format_debug_value(self.pid_metadata.get('traj_branch_condition_scale'), '.1f')
 		cond_detach = int(bool(self.pid_metadata.get('traj_branch_condition_detach', False)))
-		merge_active_prob = self._format_debug_value(self.pid_metadata.get('speed_energy_merge_active_prob'), '.2f')
-		junction_active_prob = self._format_debug_value(self.pid_metadata.get('speed_energy_junction_active_prob'), '.2f')
-		borrow_active_prob = self._format_debug_value(self.pid_metadata.get('speed_energy_borrow_active_prob'), '.2f')
-		merge_yld_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_merge_yld'), '.2f')
-		merge_go_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_merge_go'), '.2f')
-		junction_yld_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_junction_yld'), '.2f')
-		junction_go_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_junction_go'), '.2f')
-		borrow_yld_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_borrow_yld'), '.2f')
-		borrow_go_head = self._format_debug_first(self.pid_metadata.get('speed_energy_ref_borrow_go'), '.2f')
+		cond_boundary_scale = self._format_debug_value(
+			self.pid_metadata.get('traj_branch_condition_boundary_margin_scale'), '.1f'
+		)
+		cond_borrow_scale = self._format_debug_value(
+			self.pid_metadata.get('traj_branch_condition_borrow_time_scale'), '.1f'
+		)
 
 		left_status_lines = [
 			f"frm: {self.step}",
@@ -4233,8 +4403,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"dV(E): {self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')}",
 			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
 			f"v_tgt: {self._format_debug_value(self.pid_metadata.get('stage1_energy_target_speed_ms'), '.1f')} ({self.pid_metadata.get('stage1_energy_target_source', 'NA')})",
-			f"dE/dv,dV: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}",
-			f"dEc/g/x/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_chase_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_merge_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_cross_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_pedestrian_dedv'), '.2f')}",
+			f"vY/G(q): {self._format_debug_first(self.pid_metadata.get('speed_energy_selected_yld_max_mps'), '.1f')}/{self._format_debug_first(self.pid_metadata.get('speed_energy_selected_go_min_mps'), '.1f')}",
+			f"vY@ref: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_selected_yld_max_mps'), fmt='.1f', max_items=3)}",
+			f"vG@ref: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_selected_go_min_mps'), fmt='.1f', max_items=3)}",
 			f"E*: {self._format_energy_peak_with_speed()}",
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
 			f"thr: {float(self.pid_metadata.get('throttle', 0.0)):.2f}",
@@ -4249,12 +4420,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"herr: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.1f}",
 			f"sidx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
 			f"sctl: {float(self.pid_metadata.get('steer_controller', 0.0)):.2f}",
-			f"cond cfg: {cond_enabled} nmjb+yg+bt",
+			f"cond cfg: {cond_enabled} w+d+dp+cp+bm",
 			f"cond sc/dt: {cond_scale}/{cond_detach}",
-			f"act m/j/b: {merge_active_prob}/{junction_active_prob}/{borrow_active_prob}",
-			f"m y/g@h: {merge_yld_head}/{merge_go_head}",
-			f"j y/g@h: {junction_yld_head}/{junction_go_head}",
-			f"b y/g@h: {borrow_yld_head}/{borrow_go_head}",
+			f"bm/bt sc: {cond_boundary_scale}/{cond_borrow_scale}",
+			f"sW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_window_probs'), fmt='.2f', max_items=4)}",
+			f"sP[y/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_decision_phase_probs'), fmt='.2f', max_items=2)}",
+			f"sC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_control_phase_probs'), fmt='.2f', max_items=4)}",
 			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
@@ -4270,19 +4441,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		right_status_lines = [
 			f"pred h/1/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')} m/s",
 			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=7)}",
-			f"Et@h/1/.5: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_total'), fmt='.3f', max_items=3)}",
-			f"Et: {self._format_debug_curve(self.pid_metadata.get('speed_energy_total'), fmt='.3f', max_items=7)}",
-			f"Ec: {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.3f', max_items=7)}",
-			f"Ep: {self._format_debug_curve(self.pid_metadata.get('speed_energy_pedestrian'), fmt='.3f', max_items=7)}",
-			f"Em y: {self._format_debug_curve(self.pid_metadata.get('speed_energy_merge_yld'), fmt='.3f', max_items=7)}",
-			f"Em g: {self._format_debug_curve(self.pid_metadata.get('speed_energy_merge_go'), fmt='.3f', max_items=7)}",
-			f"Ej y: {self._format_debug_curve(self.pid_metadata.get('speed_energy_junction_yld'), fmt='.3f', max_items=7)}",
-			f"Ej g: {self._format_debug_curve(self.pid_metadata.get('speed_energy_junction_go'), fmt='.3f', max_items=7)}",
-			f"Eb y: {self._format_debug_curve(self.pid_metadata.get('speed_energy_borrow_yld'), fmt='.3f', max_items=7)}",
-			f"Eb g: {self._format_debug_curve(self.pid_metadata.get('speed_energy_borrow_go'), fmt='.3f', max_items=7)}",
-			f"cw[nmjb]: {self._format_debug_curve(self.pid_metadata.get('traj_window_condition_probs'), fmt='.2f', max_items=4)}",
-			f"cp[yg]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
-			f"ce[yg]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_phase_energy_summary'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
+			f"sD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_dir_probs'), fmt='.2f', max_items=4)}",
+			f"sA: {self._format_debug_curve(self.pid_metadata.get('speed_energy_conflict_area_probs'), fmt='.2f', max_items=7)}",
+			f"vY*: {self._format_debug_curve(self.pid_metadata.get('speed_energy_selected_yld_max_mps'), fmt='.1f', max_items=7)}",
+			f"vG*: {self._format_debug_curve(self.pid_metadata.get('speed_energy_selected_go_min_mps'), fmt='.1f', max_items=7)}",
+			f"bcW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('traj_window_condition_probs'), fmt='.2f', max_items=4)}",
+			f"bcD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('traj_dir_condition_probs'), fmt='.2f', max_items=4)}",
+			f"bcP[y/g]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_decision_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
+			f"bcC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('traj_control_phase_condition_probs'), fmt='.2f', max_items=4)}",
+			f"bm[y/g]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_boundary_margin_condition'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
 		]
 
 		line_gap = 18
