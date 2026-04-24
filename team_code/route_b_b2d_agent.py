@@ -386,7 +386,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_bev_pixels_per_meter = 2.0
 		self.semantic_tl_min_pixels = 6
 		self.semantic_tl_brake_distance_m = float(
-			os.environ.get('SEMANTIC_TL_BRAKE_DISTANCE_M', '1.0')
+			os.environ.get('SEMANTIC_TL_BRAKE_DISTANCE_M', '0.1')
 		)
 		self.semantic_stop_min_pixels = 3
 		self.semantic_tl_min_models = max(
@@ -404,8 +404,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.semantic_tl_green_release_speed_threshold = float(
 			os.environ.get('SEMANTIC_TL_GREEN_RELEASE_SPEED_THRESHOLD', '0.5')
 		)
-		self.semantic_stop_roi = (0.0, 12.0, -8.0, 8.0)
-		self.semantic_stop_brake_distance_m = 12.0
+		self.semantic_stop_roi = (0.0, 25.0, -10.0, 10.0)
+		self.semantic_stop_brake_distance_m = 6.0
 		self.semantic_stop_min_stop_frames = 10
 		self.semantic_stop_reset_missing_frames = 5
 		self.semantic_stop_arm_speed_threshold = float(
