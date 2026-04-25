@@ -174,6 +174,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.train_stage1_speed_energy_after_update_every = route_b_cfg.get(
             'train_stage1_speed_energy_after_update_every', None
         )
+        self.train_stage1_phase_until_epoch = route_b_cfg.get('train_stage1_phase_until_epoch', None)
+        self.train_stage1_phase_after_update_every = route_b_cfg.get(
+            'train_stage1_phase_after_update_every', None
+        )
         self.train_speed_head_after_update_every = route_b_cfg.get(
             'train_speed_head_after_update_every', None
         )
@@ -967,6 +971,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
 
         loss_phase = loss_decision_phase + loss_control_phase
+        phase_loss_active = self._train_branch_enabled_with_schedule(
+            self.train_stage1_phase_until_epoch,
+            self.train_stage1_phase_after_update_every,
+        )
+        phase_weight = self.energy_phase_weight if phase_loss_active else 0.0
         loss_merge_active = zero
         loss_junction_active = zero
         loss_borrow_active = zero
@@ -980,7 +989,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.energy_borrow_weight * loss_borrow
             + self.energy_relation_weight * loss_dir
             + self.energy_window_weight * loss_window
-            + self.energy_phase_weight * loss_phase
+            + phase_weight * loss_phase
             + self.energy_conflict_area_weight * loss_conflict_area
         )
         return {

@@ -467,6 +467,161 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         val_metrics['stage1_boundary_mae'].append(float(np.mean(merged_errors)))
         val_metrics['stage1_boundary_count'].append(float(np.sum(all_valid_counts)))
 
+
+_REDUNDANT_VAL_LOSS_KEYS = frozenset({
+    # These semantic heads have direct validation metrics that are easier to read
+    # in W&B: active precision/recall/F1, class recalls, and boundary MAE.
+    'energy_front_loss',
+    'energy_chase_loss',
+    'energy_left_loss',
+    'energy_merge_loss',
+    'energy_ped_loss',
+    'energy_pedestrian_loss',
+    'energy_right_loss',
+    'energy_cross_loss',
+    'energy_off_loss',
+    'energy_route_loss',
+    'energy_merge_yld_loss',
+    'energy_merge_go_loss',
+    'energy_junction_yld_loss',
+    'energy_junction_go_loss',
+    'energy_borrow_yld_loss',
+    'energy_borrow_go_loss',
+    'energy_cross_yld_loss',
+    'energy_cross_go_loss',
+    'energy_merge_active_loss',
+    'energy_junction_active_loss',
+    'energy_borrow_active_loss',
+    'energy_cross_active_loss',
+    'energy_dir_loss',
+    'energy_conflict_area_loss',
+    'energy_window_loss',
+    'energy_phase_loss',
+    'energy_decision_phase_loss',
+    'energy_control_phase_loss',
+    'energy_merge_yld_max_loss',
+    'energy_merge_go_min_loss',
+    'energy_junction_yld_max_loss',
+    'energy_junction_go_min_loss',
+    'energy_borrow_yld_max_loss',
+    'energy_borrow_go_min_loss',
+})
+
+
+def _is_redundant_val_loss_metric(metric_name):
+    """Hide detailed val losses when clearer semantic metrics are available."""
+    key = metric_name.removeprefix('val_')
+    if key in _REDUNDANT_VAL_LOSS_KEYS:
+        return True
+    return key.startswith('speed_profile_step') and key.endswith('_loss')
+
+
+def _metric_float(metrics, key, default=None):
+    value = metrics.get(key, default)
+    if value is None:
+        return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if np.isfinite(value) else default
+
+
+def _mean_available(values, default=None):
+    valid = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+    if not valid:
+        return default
+    return float(np.mean(valid))
+
+
+def _error_to_quality(error_value):
+    if error_value is None or not np.isfinite(float(error_value)):
+        return None
+    return 1.0 / (1.0 + max(float(error_value), 0.0))
+
+
+def _compute_phase_balanced_best_score(val_metrics):
+    """Higher-is-better score for closed-loop-relevant semantic stability."""
+    decision_yld = _metric_float(val_metrics, 'val_stage1_decision_phase_yld_recall')
+    decision_go = _metric_float(val_metrics, 'val_stage1_decision_phase_go_recall')
+    control_yld = _mean_available((
+        _metric_float(val_metrics, 'val_stage1_control_phase_coast_yld_recall'),
+        _metric_float(val_metrics, 'val_stage1_control_phase_slow_yld_recall'),
+        _metric_float(val_metrics, 'val_stage1_control_phase_stop_yld_recall'),
+    ))
+    control_go = _metric_float(val_metrics, 'val_stage1_control_phase_go_recall')
+
+    required_phase = [decision_yld, decision_go, control_yld, control_go]
+    if any(v is None for v in required_phase):
+        return -float('inf'), {
+            'mode': 'phase_balanced',
+            'missing_phase_metric': 1.0,
+        }
+
+    phase_floor = float(min(required_phase))
+    phase_mean = float(np.mean(required_phase))
+    context_score = _mean_available((
+        _metric_float(val_metrics, 'val_stage1_window_active_f1'),
+        _metric_float(val_metrics, 'val_stage1_dir_active_f1'),
+        _metric_float(val_metrics, 'val_stage1_window_merge_recall'),
+        _metric_float(val_metrics, 'val_stage1_window_junction_recall'),
+        _metric_float(val_metrics, 'val_stage1_window_borrow_recall'),
+        _metric_float(val_metrics, 'val_stage1_dir_same_recall'),
+        _metric_float(val_metrics, 'val_stage1_dir_opposite_recall'),
+        _metric_float(val_metrics, 'val_stage1_dir_cross_recall'),
+    ), default=0.0)
+    route_quality = _error_to_quality(_metric_float(val_metrics, 'val_route_L2_final')) or 0.0
+    traj_quality = _error_to_quality(_metric_float(val_metrics, 'val_L2_avg')) or 0.0
+
+    score = (
+        0.55 * phase_floor +
+        0.25 * phase_mean +
+        0.10 * context_score +
+        0.05 * route_quality +
+        0.05 * traj_quality
+    )
+    return float(score), {
+        'mode': 'phase_balanced',
+        'phase_balanced_score': float(score),
+        'phase_floor': phase_floor,
+        'phase_mean': phase_mean,
+        'context_score': float(context_score),
+        'route_quality': float(route_quality),
+        'traj_quality': float(traj_quality),
+        'decision_yld_recall': float(decision_yld),
+        'decision_go_recall': float(decision_go),
+        'control_yld_recall': float(control_yld),
+        'control_go_recall': float(control_go),
+    }
+
+
+def _compute_best_checkpoint_score(val_metrics, metric_name='L2_avg', metric_mode=None):
+    """Return a higher-is-better checkpoint selection score plus a summary."""
+    metric_name = str(metric_name or 'L2_avg')
+    metric_lower = metric_name.lower()
+    if metric_lower in ('phase', 'phase_balanced', 'phase_safety'):
+        return _compute_phase_balanced_best_score(val_metrics)
+
+    metric_key = metric_name if metric_name.startswith('val_') else f'val_{metric_name}'
+    metric_value = _metric_float(val_metrics, metric_key)
+    if metric_value is None:
+        return -float('inf'), {
+            'mode': metric_name,
+            'missing_metric': 1.0,
+        }
+
+    mode = str(metric_mode or '').lower()
+    if mode not in ('min', 'max'):
+        lower_key = metric_key.lower()
+        mode = 'min' if any(token in lower_key for token in ('loss', 'l2', 'ade', 'mae', 'error')) else 'max'
+    score = -metric_value if mode == 'min' else metric_value
+    return float(score), {
+        'mode': metric_name,
+        'metric_value': float(metric_value),
+        'metric_min_mode': 1.0 if mode == 'min' else 0.0,
+    }
+
+
 def validate_model(
     policy,
     val_loader,
@@ -721,7 +876,11 @@ def validate_model(
             pbar.close()
 
     # Compute averaged metrics
-    averaged_metrics = {f'val_{k}': np.mean(v) for k, v in val_metrics.items() if v}
+    averaged_metrics = {
+        f'val_{k}': np.mean(v)
+        for k, v in val_metrics.items()
+        if v and not _is_redundant_val_loss_metric(k)
+    }
 
     if rank == 0 and speed_adaptive_cache.get('gt_speed'):
         gt_all = np.concatenate(speed_adaptive_cache['gt_speed'])
@@ -788,11 +947,6 @@ def _print_validation_metrics(val_metrics, show_speed_metrics=False):
         'val_ADE', 'val_L2_1s', 'val_L2_2s', 'val_L2_3s', 'val_L2_avg',
         'val_ADE_1step', 'val_L2_1s_1step', 'val_L2_2s_1step', 'val_L2_3s_1step', 'val_L2_avg_1step'
     ]
-    hidden_loss_keys = {
-        'val_energy_phase_loss',
-        'val_energy_decision_phase_loss',
-        'val_energy_control_phase_loss',
-    }
     for key in l2_keys:
         if key in val_metrics:
             tag = " (1-step)" if "_1step" in key else ""
@@ -801,7 +955,7 @@ def _print_validation_metrics(val_metrics, show_speed_metrics=False):
     for key, value in val_metrics.items():
         if key in l2_keys:
             continue
-        if key in hidden_loss_keys:
+        if _is_redundant_val_loss_metric(key):
             continue
         if (not show_speed_metrics) and key.startswith('val_speed_') and (not key.endswith('_loss')):
             continue
@@ -1692,7 +1846,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
-    best_l2_avg = float('inf')  # Use average L2 error as best metric
+    best_l2_avg = float('inf')
+    best_checkpoint_score = -float('inf')
+    best_checkpoint_summary = {}
+    best_checkpoint_metric = config.get('training', {}).get('best_checkpoint_metric', 'L2_avg')
+    best_checkpoint_mode = config.get('training', {}).get('best_checkpoint_mode', None)
     val_loss = None  # 初始化验证损失
     val_metrics = {}  # 初始化验证指标
 
@@ -2015,19 +2173,32 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             torch.cuda.empty_cache()
 
             if rank == 0:
+                val_loss = val_metrics.get('val_loss', float('inf'))
+                l2_avg = val_metrics.get('val_L2_avg', float('inf'))
+                if l2_avg < best_l2_avg:
+                    best_l2_avg = l2_avg
+                best_score, best_summary = _compute_best_checkpoint_score(
+                    val_metrics,
+                    metric_name=best_checkpoint_metric,
+                    metric_mode=best_checkpoint_mode,
+                )
+
                 log_dict = {"epoch": epoch, "train/loss": avg_train_loss}
                 for key, value in val_metrics.items():
                     log_dict[f"val/{key.removeprefix('val_')}"] = value
+                if np.isfinite(best_score):
+                    log_dict["val/best_checkpoint_score"] = best_score
+                for key, value in best_summary.items():
+                    if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                        log_dict[f"val/best_select_{key}"] = float(value)
                 safe_wandb_log(log_dict, use_wandb)
 
                 _print_validation_metrics(val_metrics, show_speed_metrics=False)
-
-                val_loss = val_metrics.get('val_loss', float('inf'))
-                l2_avg = val_metrics.get('val_L2_avg', float('inf'))
                 
-                # Save best model based on L2_avg (average L2 error across all timesteps)
-                if l2_avg < best_l2_avg:
-                    best_l2_avg = l2_avg
+                # Save best model with the configured closed-loop selection metric.
+                if best_score > best_checkpoint_score:
+                    best_checkpoint_score = best_score
+                    best_checkpoint_summary = dict(best_summary)
                     # Append epoch number to filename if epoch > 100 to avoid overwriting
                     if epoch > 100:
                         # best_model_filename = f"dit_policy_best_epoch{epoch}.pt"
@@ -2042,16 +2213,28 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                             'epoch': epoch,
                             'val_loss': val_loss,
                             'train_loss': avg_train_loss,
-                            'val_metrics': val_metrics
+                            'val_metrics': val_metrics,
+                            'best_checkpoint_metric': best_checkpoint_metric,
+                            'best_checkpoint_score': best_checkpoint_score,
+                            'best_checkpoint_summary': best_checkpoint_summary,
                             }, os.path.join(checkpoint_dir, best_model_filename))
-                    print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
+                    print(
+                        "✓ New best model saved with "
+                        f"{best_checkpoint_metric}: score={best_checkpoint_score:.4f} "
+                        f"(L2_avg: {l2_avg:.4f}, val_loss: {val_loss:.4f})"
+                    )
                    
-                    safe_wandb_log({
+                    best_log = {
                             "best_model/epoch": epoch,
+                            "best_model/checkpoint_score": best_checkpoint_score,
                             "best_model/L2_avg": l2_avg,
                             "best_model/val_loss": val_loss,
                             "best_model/train_loss": avg_train_loss
-                        }, use_wandb)
+                    }
+                    for key, value in best_checkpoint_summary.items():
+                        if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                            best_log[f"best_model/select_{key}"] = float(value)
+                    safe_wandb_log(best_log, use_wandb)
 
             # Restore training weights after validation/save
             ema_model.restore(model_for_ema.parameters())
@@ -2060,12 +2243,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         print("Training completed!")
         if val_loader is not None:
             print(f"Best L2_avg: {best_l2_avg:.4f}")
+            if np.isfinite(best_checkpoint_score):
+                print(f"Best checkpoint score ({best_checkpoint_metric}): {best_checkpoint_score:.4f}")
         else:
             print("Validation was disabled for this run.")
         safe_wandb_log({
             "training/completed": 0.0,
             "training/total_epochs": num_epochs,
             "training/best_l2_avg": best_l2_avg,
+            "training/best_checkpoint_score": best_checkpoint_score if np.isfinite(best_checkpoint_score) else 0.0,
             "training/final_train_loss": avg_train_loss
         }, use_wandb)
         
