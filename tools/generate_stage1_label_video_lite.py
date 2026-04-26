@@ -627,6 +627,18 @@ def _fmt_int(x):
         return "NA"
 
 
+def _fmt_bit_vector(values, expected_len=7):
+    if values is None:
+        return "-" * int(expected_len)
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return "-" * int(expected_len)
+    bits = ["1" if float(arr[idx]) > 0.5 else "0" for idx in range(min(int(expected_len), arr.size))]
+    if len(bits) < int(expected_len):
+        bits.extend(["0"] * (int(expected_len) - len(bits)))
+    return "".join(bits[: int(expected_len)])
+
+
 def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, borrow_threshold_debug, junction_threshold_debug):
     family_name = str(family_name or "none")
     phase = str(phase or "yld")
@@ -663,6 +675,54 @@ def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, bor
     if phase == "yld":
         return f"{prefix} yld={_fmt_float(value)} valid={valid} {extra}"
     return f"{prefix} go={_fmt_float(value)} valid={valid} {extra}"
+
+
+def _chase_panel_line(sample, chase_threshold_debug):
+    debug = chase_threshold_debug or {}
+    chase_max = sample.get("chase_max_speed", np.nan)
+    valid = int(float(sample.get("chase_max_speed_valid", 0.0)) > 0.5)
+    return (
+        f"chase : max={_fmt_float(chase_max)} valid={valid} "
+        f"gap={_fmt_float(debug.get('gap_m', np.nan))} "
+        f"safe={_fmt_float(debug.get('safe_gap_cur_m', np.nan))} "
+        f"lead={_fmt_float(debug.get('lead_speed_mps', np.nan))}"
+    )
+
+
+def _temporary_occupancy_cover_panel_lines(sample):
+    bins = sample.get("temporary_occupancy_cover_bins", None)
+    valid = sample.get("temporary_occupancy_cover_valid", None)
+    tempocc_debug = ((sample.get("stage1_speed_debug") or {}).get("temporary_occupancy_cover") or {})
+    go_prob = sample.get("go_opportunity_prob", np.nan)
+    yld_prob = sample.get("yld_pressure_prob", np.nan)
+    go_valid = int(float(sample.get("go_opportunity_valid", 0.0)) > 0.5)
+    return [
+        f"tempocc bins={_fmt_bit_vector(bins, expected_len=13)}",
+        f"tempocc valid={_fmt_bit_vector(valid, expected_len=13)}",
+        f"tempocc go={_fmt_float(go_prob)} yld={_fmt_float(yld_prob)} valid={go_valid} cyc={_fmt_int(tempocc_debug.get('cycle_id', -1))} acc={_fmt_int(tempocc_debug.get('accepted_cycle', 0))}",
+        f"tempocc ref rs exp={_fmt_int(tempocc_debug.get('reference_run_start_expert', -1))} geom={_fmt_int(tempocc_debug.get('reference_run_start_geom', -1))} fin={_fmt_int(tempocc_debug.get('reference_run_start_final', -1))}",
+        f"tempocc ref len={_fmt_int(tempocc_debug.get('reference_run_len', -1))} raw={_fmt_int(tempocc_debug.get('raw_reference_pass_time_bins', -1))} areaf={_fmt_int(tempocc_debug.get('area_start_frame', -1))}",
+        f"tempocc cur rs={_fmt_int(tempocc_debug.get('current_run_start', -1))} len={_fmt_int(tempocc_debug.get('current_run_len', -1))} rem={_fmt_int(tempocc_debug.get('current_remaining_run_len', -1))} adjrs={_fmt_int(tempocc_debug.get('adjusted_run_start_bins', -1))} goable={_fmt_int(tempocc_debug.get('goable', 0))}",
+        f"tempocc distA={_fmt_float(tempocc_debug.get('distance_to_area_start_m', np.nan))} extra={_fmt_int(tempocc_debug.get('distance_adjustment_bins', -1))} src={tempocc_debug.get('area_start_source', 'none')}",
+        f"tempocc issue={tempocc_debug.get('issue_reason', 'none')}",
+    ]
+
+
+def _draw_junction_window_start_marker(canvas, conflict_area, merge_motion, route_xy, ego_matrix, x_range, y_range):
+    color = (0, 140, 255)
+    window_start_world = np.asarray((conflict_area or {}).get("window_start_world_xyz", []), dtype=np.float32).reshape(-1)
+    if ego_matrix is not None and window_start_world.shape[0] >= 3:
+        _draw_world_xyz_marker(canvas, window_start_world[:3], ego_matrix, color, "start", x_range, y_range)
+        return
+
+    window_start_s_m = float((conflict_area or {}).get("window_start_s_m", np.nan))
+    scene_front_s_m = float((merge_motion or {}).get("scene_route_front_s_m", np.nan))
+    if not (np.isfinite(window_start_s_m) and np.isfinite(scene_front_s_m)):
+        return
+    local_progress_m = float(window_start_s_m - scene_front_s_m)
+    if local_progress_m < 0.0:
+        return
+    _draw_route_progress_marker(canvas, route_xy, local_progress_m, color, None, x_range, y_range)
 
 
 def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, future_cover_current_box=None):
@@ -708,6 +768,7 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
     future_cover = stage1_debug.get("future_cover") or {}
     conflict_area = stage1_debug.get("conflict_area") or {}
     scene_borrow_context = stage1_debug.get("scene_borrow_context") or {}
+    merge_motion = stage1_debug.get("merge_motion") or {}
     ego_matrix = None if current_meas is None else current_meas.get("ego_matrix", None)
 
     current_box = _find_box_by_id(current_boxes, current_cover.get("actor_id"))
@@ -813,12 +874,22 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
                 scale_x = canvas.shape[1] / max(float(x_range[1] - x_range[0]), 1e-6)
                 radius_px = int(max(radius_m * scale_x, 2.0))
                 cv2.circle(canvas, tuple(center_px), radius_px, (180, 0, 180), 3, cv2.LINE_AA)
+        if int(sample.get("conflict_area_family", 0)) == 3:
+            _draw_junction_window_start_marker(
+                canvas,
+                conflict_area=conflict_area,
+                merge_motion=merge_motion,
+                route_xy=route_xy,
+                ego_matrix=ego_matrix,
+                x_range=x_range,
+                y_range=y_range,
+            )
 
     return canvas
 
 
 def _build_text_panel(sample, current_meas):
-    panel = np.full((460, 960, 3), 248, dtype=np.uint8)
+    panel = np.full((600, 960, 3), 248, dtype=np.uint8)
     stage1_debug = sample.get("stage1_speed_debug") or {}
     current_cover = stage1_debug.get("current_cover") or {}
     future_cover = stage1_debug.get("future_cover") or {}
@@ -827,6 +898,7 @@ def _build_text_panel(sample, current_meas):
     merge_threshold_debug = stage1_debug.get("merge_thresholds") or {}
     borrow_threshold_debug = stage1_debug.get("borrow_thresholds") or {}
     junction_threshold_debug = stage1_debug.get("junction_thresholds") or {}
+    chase_threshold_debug = stage1_debug.get("chase_thresholds") or {}
 
     base_dir, _ = _resolve_feature_frame_info(sample)
     event_name = _scene_name_from_base_dir(base_dir) or "unknown"
@@ -880,7 +952,7 @@ def _build_text_panel(sample, current_meas):
         [
             f"family={family_name} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
             f"frame start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
-            f"area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
+            f"win s={_fmt_float(conflict_area.get('window_start_s_m', np.nan))} area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
             f"borrow prog s={_fmt_float(conflict_area.get('borrow_conflict_start_progress_m', np.nan))} e={_fmt_float(conflict_area.get('borrow_conflict_end_progress_m', np.nan))}",
             f"src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')}",
             f"reason={conflict_area.get('selection_reason', 'none')}",
@@ -911,7 +983,8 @@ def _build_text_panel(sample, current_meas):
         "Area Debug",
         [
             f"issue_count={issue_count} issue_families={issue_families}",
-            f"dir src={conflict_area.get('dir_source', 'none')} cover={conflict_area.get('dir_cover_key', 'none')} frame={_fmt_int(conflict_area.get('dir_frame_id', -1))}",
+            f"dir src={conflict_area.get('dir_source', 'none')} frame={_fmt_int(conflict_area.get('dir_frame_id', -1))}",
+            f"cover={conflict_area.get('dir_cover_key', 'none')}",
             f"angle={_fmt_float(conflict_area.get('dir_angle_deg', np.nan))} route={_fmt_float(conflict_area.get('route_heading_deg', np.nan))} actor={_fmt_float(conflict_area.get('actor_heading_deg', np.nan))}",
         ],
         (120, 90, 44),
@@ -925,6 +998,7 @@ def _build_text_panel(sample, current_meas):
         [
             f"current: name={_cover_name(current_cover)} subtype={_cover_subtype(current_cover)} actor={_fmt_int(current_cover.get('actor_id', -1))}",
             f"current: dist={_fmt_float(current_cover.get('distance', np.nan))} route_d={_fmt_float(current_cover.get('route_distance_m', np.nan))} cp_s={_fmt_float(current_cover.get('scene_route_conflict_s_m', np.nan))}",
+            _chase_panel_line(sample, chase_threshold_debug),
             f"future : name={_cover_name(future_cover)} subtype={_cover_subtype(future_cover)} actor={_fmt_int(future_cover.get('actor_id', -1))}",
             f"future : dE={_fmt_float(future_cover.get('d_ego', np.nan))} dB={_fmt_float(future_cover.get('d_bg', np.nan))} route_d={_fmt_float(future_cover.get('route_distance_m', np.nan))}",
             f"future : conflict_s={_fmt_float(future_cover.get('scene_route_conflict_s_m', np.nan))}",
@@ -943,6 +1017,7 @@ def _build_text_panel(sample, current_meas):
             f"yld f={_fmt_int(conflict_phase.get('yld_frame_count', 0))} low={_fmt_int(conflict_phase.get('yld_low_speed_frame_count', 0))} stop={_fmt_int(conflict_phase.get('yld_stop_frame_count', 0))}",
             f"v0={_fmt_float(conflict_phase.get('yld_start_speed_mps', np.nan))} vmin={_fmt_float(conflict_phase.get('window_min_speed_mps', np.nan))}@{_fmt_int(conflict_phase.get('window_min_speed_frame', -1))}/{conflict_phase.get('window_min_speed_phase', 'none')} vgo={_fmt_float(conflict_phase.get('yld_go_speed_mps', np.nan))}",
             f"drop={_fmt_float(conflict_phase.get('yld_speed_drop_from_start_mps', np.nan))} ratio={_fmt_float(conflict_phase.get('yld_speed_drop_ratio', np.nan))} prog={_fmt_float(conflict_phase.get('yld_progress_span_m', np.nan))}",
+            *_temporary_occupancy_cover_panel_lines(sample),
             _threshold_panel_line(
                 family_name,
                 "yld",

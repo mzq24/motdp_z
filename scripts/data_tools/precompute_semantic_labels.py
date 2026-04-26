@@ -121,7 +121,7 @@ STAGE1_MERGE_START_CONFIRM_FRAMES = 2
 STAGE1_MERGE_SPEED_CAP_MPS = 30.0
 STAGE1_MERGE_CONFLICT_LOOKAHEAD_PROGRESS_M = 15.0
 STAGE1_MERGE_CONFLICT_CLUSTER_GAP_M = 4.0
-STAGE1_MERGE_AREA_POST_MARGIN_M = 10.0
+STAGE1_MERGE_AREA_POST_MARGIN_M = 8.0
 STAGE1_BORROW_CROSS_SAFE_GAP_S = 1.0
 STAGE1_CHASE_SAFE_TTC_S = 3.0
 STAGE1_CHASE_FOLLOW_BASE_GAP_M = 3.0
@@ -130,7 +130,7 @@ STAGE1_FUTURE_START_GATE_CHASE_SPEED_THRESH_MPS = 0.5
 STAGE1_FUTURE_START_GATE_CHASE_DISTANCE_THRESH_M = 15.0
 STAGE1_JUNCTION_CROSS_MIN_CLUSTER_POINTS = 2
 STAGE1_JUNCTION_CROSS_FALLBACK_RADIUS_M = 7.5
-STAGE1_JUNCTION_AREA_PRE_MARGIN_M = 10.0
+STAGE1_JUNCTION_WINDOW_PRE_MARGIN_M = 15.0
 STAGE1_JUNCTION_AREA_POST_MARGIN_M = 7.0
 STAGE1_CONFLICT_GO_STOP_SPEED_THRESH_MPS = 0.1
 STAGE1_CONFLICT_GO_START_SPEED_THRESH_MPS = 0.5
@@ -208,7 +208,6 @@ CONFLICT_CONTROL_PHASE_TO_CODE = {
     'stop_yld': 3,
     'go': 4,
 }
-
 
 def _has_all_fast_fields(sample):
     return all(field in sample for field in FAST_FIELDS)
@@ -1935,23 +1934,28 @@ def _segment_intersects_oriented_box(point_a, point_b, box, margin_m=0.0):
     return False
 
 
-def _polyline_has_ego_cover(polyline_points_xy, ego_box):
+def _polyline_has_box_cover(polyline_points_xy, box, margin_m=0.0):
     pts = np.asarray(polyline_points_xy, dtype=np.float32)
     if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
         return False
     if np.any(
         _points_inside_oriented_box(
             pts[:, :2],
-            center=np.asarray(ego_box.get("position", [0.0, 0.0])[:2], dtype=np.float32),
-            extent=np.asarray(ego_box.get("extent", DEFAULT_EGO_EXTENT_2D)[:2], dtype=np.float32),
-            yaw=float(ego_box.get("yaw", 0.0)),
+            center=np.asarray(box.get("position", [0.0, 0.0])[:2], dtype=np.float32),
+            extent=np.asarray(box.get("extent", DEFAULT_EGO_EXTENT_2D)[:2], dtype=np.float32),
+            yaw=float(box.get("yaw", 0.0)),
+            margin_m=margin_m,
         )
     ):
         return True
     for idx in range(pts.shape[0] - 1):
-        if _segment_intersects_oriented_box(pts[idx], pts[idx + 1], ego_box):
+        if _segment_intersects_oriented_box(pts[idx], pts[idx + 1], box, margin_m=margin_m):
             return True
     return False
+
+
+def _polyline_has_ego_cover(polyline_points_xy, ego_box):
+    return _polyline_has_box_cover(polyline_points_xy, ego_box, margin_m=0.0)
 
 
 def _actor_has_ego_cover_before_future_cover(
@@ -3432,6 +3436,8 @@ def _default_conflict_area_debug():
         'issue_families': [],
         'missing_reason': 'none',
         'area_type': 'none',
+        'window_start_s_m': np.nan,
+        'window_start_world_xyz': [],
         'area_start_s_m': np.nan,
         'area_end_s_m': np.nan,
         'area_start_world_xyz': [],
@@ -4552,13 +4558,14 @@ def _build_junction_conflict_windows(records, samples):
             issues.append(_conflict_area_issue(samples[records[cluster_positions[0]]['sample_idx']], 'junction', 'missing_junction_conflict_s', pos=int(cluster_positions[0])))
             continue
 
-        area_start_s_m = float(max(cluster_conflict_s_m - float(STAGE1_JUNCTION_AREA_PRE_MARGIN_M), 0.0))
+        window_start_s_m = float(max(cluster_conflict_s_m - float(STAGE1_JUNCTION_WINDOW_PRE_MARGIN_M), 0.0))
+        area_start_s_m = float(max(first_conflict_s_m, 0.0))
         area_end_s_m = float(max(cluster_conflict_s_m + float(STAGE1_JUNCTION_AREA_POST_MARGIN_M), area_start_s_m))
 
         start_pos = None
         for pos in range(int(max(int(prev_end_pos) + 1, 0)), len(records)):
             front_s = _record_scene_front_s(records[pos])
-            if np.isfinite(front_s) and float(front_s) >= float(area_start_s_m):
+            if np.isfinite(front_s) and float(front_s) >= float(window_start_s_m):
                 start_pos = int(pos)
                 break
         if start_pos is None:
@@ -4568,6 +4575,7 @@ def _build_junction_conflict_windows(records, samples):
                 'missing_junction_start',
                 pos=int(cluster_positions[0]),
                 cluster_conflict_s_m=float(cluster_conflict_s_m),
+                window_start_s_m=float(window_start_s_m),
             ))
             continue
 
@@ -4616,6 +4624,13 @@ def _build_junction_conflict_windows(records, samples):
             area_start_s_m=area_start_s_m,
             area_end_s_m=area_end_s_m,
         ) or {}
+        window_start_geometry = _window_s_interval_world_geometry(
+            records,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            area_start_s_m=window_start_s_m,
+            area_end_s_m=window_start_s_m,
+        ) or {}
         windows.append({
             'family': 'junction',
             'family_code': int(CONFLICT_FAMILY_TO_CODE['junction']),
@@ -4629,6 +4644,8 @@ def _build_junction_conflict_windows(records, samples):
             'end_pos': int(end_pos),
             'start_frame': int(records[start_pos]['frame_id']),
             'end_frame': int(records[end_pos]['frame_id']),
+            'window_start_s_m': float(window_start_s_m),
+            'window_start_world_xyz': list(window_start_geometry.get('area_start_world_xyz', [])),
             'area_start_s_m': float(area_start_s_m),
             'area_end_s_m': float(area_end_s_m),
             'area_start_world_xyz': list(world_geometry.get('area_start_world_xyz', [])),
@@ -4745,10 +4762,10 @@ def _conflict_window_entry_pos(records, family, conflict_info, start_pos, end_po
         return None
 
     if family == 'junction':
-        first_conflict_s_m = float(conflict_info.get('junction_first_conflict_s_m', np.nan))
-        if not np.isfinite(first_conflict_s_m):
+        area_start_s_m = float(conflict_info.get('area_start_s_m', np.nan))
+        if not np.isfinite(area_start_s_m):
             return None
-        target_front_s_m = float(first_conflict_s_m + entry_post_margin_m)
+        target_front_s_m = float(area_start_s_m + entry_post_margin_m)
         for pos in range(int(start_pos), int(end_pos) + 1):
             front_s_m = _record_scene_front_s(records[int(pos)])
             if not np.isfinite(front_s_m):
