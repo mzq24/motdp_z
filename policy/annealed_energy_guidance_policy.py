@@ -911,11 +911,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 torch.full_like(temporary_occupancy_targets['bins'], self.temporary_occupancy_neg_prob),
             )
             temp_clean = self._logit_prob_target(temp_probs)
-            temp_clean = torch.where(
-                temporary_occupancy_targets['valid'],
-                temp_clean,
-                torch.zeros_like(temp_clean),
-            )
+            # Keep valid as a loss/metric mask only. If invalid bins are zeroed in
+            # the noisy state, the model can recover the GT valid pattern and use it
+            # as a shortcut for window-active recall; inference never has that mask.
             clean_state['temporary_occupancy_logits'] = temp_clean
             metadata.update({
                 'temporary_occupancy_bins': temporary_occupancy_targets['bins'],
