@@ -1938,6 +1938,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
             self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
             self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.shared_stage1_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
             self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_chase_max_head = _make_shared_stage1_scalar_head()
@@ -1988,13 +1990,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.joint_state_boundary_dim = 7
         self.joint_state_speed_dim = len(self.speed_classes)
         self.joint_state_conflict_area_dim = num_waypoints
-        self.joint_state_token_count = 6
+        self.joint_state_temporary_occupancy_dim = 13
+        self.joint_state_token_count = 7
         self.joint_state_token_names = (
             'window',
             'dir',
             'decision_phase',
             'control_phase',
             'boundary_bundle',
+            'temporary_occupancy',
             'borrow_time',
         )
 
@@ -2012,6 +2016,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.joint_state_boundary_proj = _make_joint_state_proj(self.joint_state_boundary_dim)
         self.joint_state_speed_proj = _make_joint_state_proj(self.joint_state_speed_dim)
         self.joint_state_conflict_area_proj = _make_joint_state_proj(1)
+        self.joint_state_temporary_occupancy_proj = _make_joint_state_proj(self.joint_state_temporary_occupancy_dim)
         self.joint_state_borrow_time_proj = _make_joint_state_proj(1)
 
         self.joint_state_window_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
@@ -2019,6 +2024,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.joint_state_decision_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
         self.joint_state_control_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
         self.joint_state_boundary_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.joint_state_temporary_occupancy_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
         self.joint_state_borrow_time_token_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
 
         self.apply(self._init_weights)
@@ -2344,17 +2350,34 @@ class TransformerForDiffusion(ModuleAttrMixin):
             + self.joint_state_boundary_token_emb.expand(B, -1, -1).squeeze(1)
             + conditioning
         )
+        temporary_occupancy_token = (
+            self.joint_state_temporary_occupancy_proj(
+                _state_value('temporary_occupancy_logits', self.joint_state_temporary_occupancy_dim)
+            )
+            + self.joint_state_temporary_occupancy_token_emb.expand(B, -1, -1).squeeze(1)
+            + conditioning
+        )
         if borrow_time_s is None:
             borrow_time = torch.zeros(B, 1, device=device, dtype=model_dtype)
         else:
             borrow_time = borrow_time_s.to(device=device, dtype=model_dtype).reshape(-1, 1)
+        # Conditioning-only side state: borrow_time is allowed to attend with all
+        # joint tokens, but we intentionally do not decode/predict it back.
         borrow_token = (
             self.joint_state_borrow_time_proj(borrow_time)
             + self.joint_state_borrow_time_token_emb.expand(B, -1, -1).squeeze(1)
             + conditioning
         )
         tokens = torch.stack(
-            [window_token, dir_token, decision_token, control_token, boundary_token, borrow_token],
+            [
+                window_token,
+                dir_token,
+                decision_token,
+                control_token,
+                boundary_token,
+                temporary_occupancy_token,
+                borrow_token,
+            ],
             dim=1,
         )
         return self.pre_decoder_norm(self.drop(tokens))
@@ -2379,16 +2402,21 @@ class TransformerForDiffusion(ModuleAttrMixin):
         decision_token = extra_out[:, 2]
         control_token = extra_out[:, 3]
         boundary_token = extra_out[:, 4]
+        temporary_occupancy_token = extra_out[:, 5]
 
         route_geom = self.shared_stage1_route_geom_proj(route_points.reshape(route_points.shape[0], -1))
         route_geom_tokens = route_geom.unsqueeze(1).expand(-1, route_out.shape[1], -1)
         conflict_area_input = torch.cat([route_out, route_geom_tokens], dim=-1)
+        decision_phase_logits_base = self.shared_stage1_decision_phase_head(decision_token)
 
         return {
             'window_logits': self.shared_stage1_window_head(window_token),
             'dir_logits': self.shared_stage1_dir_head(dir_token),
-            'decision_phase_logits': self.shared_stage1_decision_phase_head(decision_token),
+            'decision_phase_logits': decision_phase_logits_base,
+            'decision_phase_logits_base': decision_phase_logits_base,
             'control_phase_logits': self.shared_stage1_control_phase_head(control_token),
+            'go_opportunity_logits': self.shared_stage1_go_opportunity_head(temporary_occupancy_token),
+            'temporary_occupancy_logits': self.shared_stage1_temporary_occupancy_head(temporary_occupancy_token),
             'merge_yld_max': self.shared_stage1_merge_yld_max_head(boundary_token).squeeze(-1),
             'merge_go_min': self.shared_stage1_merge_go_min_head(boundary_token).squeeze(-1),
             'chase_max': self.shared_stage1_chase_max_head(boundary_token).squeeze(-1),

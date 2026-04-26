@@ -18,14 +18,15 @@ import random
 from filterpy.kalman import MerweScaledSigmaPoints
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 
-project_root = str(pathlib.Path(__file__).parent.parent.parent)
+project_root = str(pathlib.Path(__file__).resolve().parent.parent)
 leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
 scenario_runner_root = str(os.path.join(project_root, 'scenario_runner'))
-mot_dp_root = str(os.path.join(project_root, 'MoT-DP'))
-carla_api_root = str(os.path.join(project_root.replace('Bench2Drive', 'carla'), 'PythonAPI', 'carla'))
+carla_root = os.environ.get('CARLA_ROOT', '')
+carla_python_root = str(os.path.join(carla_root, 'PythonAPI')) if carla_root else ''
+carla_api_root = str(os.path.join(carla_root, 'PythonAPI', 'carla')) if carla_root else ''
 
-for path in [project_root, leaderboard_root, scenario_runner_root, mot_dp_root, carla_api_root]:
-    if os.path.exists(path) and path not in sys.path:
+for path in [project_root, leaderboard_root, scenario_runner_root, carla_python_root, carla_api_root]:
+    if path and os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
 
 sys.path = [str(p) for p in sys.path]
@@ -48,15 +49,11 @@ from model.transfuser_extractor.config import GlobalConfig as TransfuserConfig
 import model.transfuser_extractor.transfuser_utils as transfuser_t_u
 
 # mot dependencies
-# This agent file now lives inside the MoT-DP repo itself, so the repo root is
-# simply the parent directory of team_code/. Do not reconstruct a sibling
-# "MoT-DP" path from a Bench2Drive-style layout.
-project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(project_root)
 mot_dp_path = project_root
 mot_path = str(os.path.join(mot_dp_path, 'mot'))
-sys.path.append(mot_dp_path)
-sys.path.append(mot_path)
+for path in [mot_dp_path, mot_path]:
+    if path not in sys.path:
+        sys.path.append(path)
 sys.path = [str(p) for p in sys.path]
 
 # ===== MoT LLM switch: set False to run DP-only without loading LLM =====

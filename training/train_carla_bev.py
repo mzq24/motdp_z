@@ -431,6 +431,81 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
             class_names=('coast_yld', 'slow_yld', 'stop_yld', 'go'),
         )
 
+    if (
+        'speed_energy_temporary_occupancy_probs' in result
+        and batch.get('temporary_occupancy_cover_bins') is not None
+        and batch.get('temporary_occupancy_cover_valid') is not None
+    ):
+        pred_np = _to_numpy_array(result.get('speed_energy_temporary_occupancy_probs'))
+        target_np = _to_numpy_array(batch.get('temporary_occupancy_cover_bins'))
+        valid_np = _to_numpy_array(batch.get('temporary_occupancy_cover_valid'))
+        if pred_np is not None and target_np is not None and valid_np is not None:
+            pred_np = np.asarray(pred_np).astype(np.float32)
+            target_np = np.asarray(target_np).astype(np.float32)
+            valid_np = np.asarray(valid_np).astype(np.float32) > 0.5
+            if pred_np.shape == target_np.shape == valid_np.shape:
+                finite_mask = valid_np & np.isfinite(pred_np) & np.isfinite(target_np)
+                if np.any(finite_mask):
+                    pred_clip = np.clip(pred_np[finite_mask], 1e-6, 1.0 - 1e-6)
+                    target_flat = np.clip(target_np[finite_mask], 0.0, 1.0)
+                    bce = -(target_flat * np.log(pred_clip) + (1.0 - target_flat) * np.log(1.0 - pred_clip))
+                    val_metrics['stage1_tempocc_bce'].append(float(np.mean(bce)))
+                    val_metrics['stage1_tempocc_count'].append(float(np.sum(finite_mask)))
+
+    if (
+        'speed_energy_go_opportunity_probs' in result
+        and batch.get('go_opportunity_prob') is not None
+        and batch.get('go_opportunity_valid') is not None
+    ):
+        go_pred = _to_numpy_array(result.get('speed_energy_go_opportunity_probs'))
+        yld_pred = _to_numpy_array(result.get('speed_energy_yld_pressure_probs'))
+        go_target = _to_numpy_array(batch.get('go_opportunity_prob'))
+        yld_target = _to_numpy_array(batch.get('yld_pressure_prob'))
+        valid_np = _to_numpy_array(batch.get('go_opportunity_valid'))
+        if go_pred is not None and go_target is not None and valid_np is not None:
+            go_pred = np.asarray(go_pred).reshape(-1).astype(np.float32)
+            go_target = np.asarray(go_target).reshape(-1).astype(np.float32)
+            valid_np = np.asarray(valid_np).reshape(-1).astype(np.float32) > 0.5
+            if yld_pred is None:
+                yld_pred = 1.0 - go_pred
+            else:
+                yld_pred = np.asarray(yld_pred).reshape(-1).astype(np.float32)
+            if yld_target is None:
+                yld_target = 1.0 - go_target
+            else:
+                yld_target = np.asarray(yld_target).reshape(-1).astype(np.float32)
+            if (
+                go_pred.shape[0] == go_target.shape[0] == yld_pred.shape[0]
+                and go_pred.shape[0] == np.asarray(yld_target).reshape(-1).shape[0]
+                and go_pred.shape[0] == valid_np.shape[0]
+            ):
+                yld_target = np.asarray(yld_target).reshape(-1).astype(np.float32)
+                finite_mask = (
+                    valid_np
+                    & np.isfinite(go_pred)
+                    & np.isfinite(yld_pred)
+                    & np.isfinite(go_target)
+                    & np.isfinite(yld_target)
+                )
+                if np.any(finite_mask):
+                    gp = np.clip(go_pred[finite_mask], 1e-6, 1.0 - 1e-6)
+                    yp = np.clip(yld_pred[finite_mask], 1e-6, 1.0 - 1e-6)
+                    gt = np.clip(go_target[finite_mask], 0.0, 1.0)
+                    yt = np.clip(yld_target[finite_mask], 0.0, 1.0)
+                    denom = np.clip(gp + yp, 1e-6, None)
+                    gp = gp / denom
+                    yp = yp / denom
+                    target_denom = np.clip(gt + yt, 1e-6, None)
+                    missing_target = (gt + yt) <= 1e-6
+                    gt = np.where(missing_target, 0.5, gt / target_denom)
+                    yt = np.where(missing_target, 0.5, yt / target_denom)
+                    ce = -(yt * np.log(yp) + gt * np.log(gp))
+                    target_entropy = -(yt * np.log(np.clip(yt, 1e-6, 1.0)) + gt * np.log(np.clip(gt, 1e-6, 1.0)))
+                    val_metrics['stage1_go_opportunity_mae'].append(float(np.mean(np.abs(gp - gt))))
+                    val_metrics['stage1_go_opportunity_ce'].append(float(np.mean(ce)))
+                    val_metrics['stage1_go_opportunity_kl'].append(float(np.mean(ce - target_entropy)))
+                    val_metrics['stage1_go_opportunity_count'].append(float(np.sum(finite_mask)))
+
     boundary_specs = (
         ('stage1_chase_max', 'speed_energy_chase_max_mps', 'chase_max_speed', 'chase_max_speed_valid'),
         ('stage1_merge_yld_max', 'speed_energy_merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
@@ -499,12 +574,15 @@ _REDUNDANT_VAL_LOSS_KEYS = frozenset({
     'energy_phase_loss',
     'energy_decision_phase_loss',
     'energy_control_phase_loss',
+    'energy_temporary_occupancy_loss',
+    'energy_go_opportunity_loss',
     'energy_merge_yld_max_loss',
     'energy_merge_go_min_loss',
     'energy_junction_yld_max_loss',
     'energy_junction_go_min_loss',
     'energy_borrow_yld_max_loss',
     'energy_borrow_go_min_loss',
+    'state_temporary_occupancy_recon_loss',
 })
 
 
@@ -723,12 +801,15 @@ def validate_model(
                     'energy_phase_loss',
                     'energy_decision_phase_loss',
                     'energy_control_phase_loss',
+                    'energy_temporary_occupancy_loss',
+                    'energy_go_opportunity_loss',
                     'energy_merge_yld_max_loss',
                     'energy_merge_go_min_loss',
                     'energy_junction_yld_max_loss',
                     'energy_junction_go_min_loss',
                     'energy_borrow_yld_max_loss',
                     'energy_borrow_go_min_loss',
+                    'state_temporary_occupancy_recon_loss',
                 ):
                     if key in loss_dict:
                         val_metrics[key].append(loss_dict[key].item())
@@ -2062,9 +2143,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                            'energy_conflict_area_loss',
                            'energy_window_loss', 'energy_phase_loss',
                            'energy_decision_phase_loss', 'energy_control_phase_loss',
+                           'energy_temporary_occupancy_loss', 'energy_go_opportunity_loss',
                            'energy_merge_yld_max_loss', 'energy_merge_go_min_loss',
                            'energy_junction_yld_max_loss', 'energy_junction_go_min_loss',
-                           'energy_borrow_yld_max_loss', 'energy_borrow_go_min_loss'):
+                           'energy_borrow_yld_max_loss', 'energy_borrow_go_min_loss',
+                           'state_temporary_occupancy_recon_loss'):
                     if lk in loss_dict:
                         val = loss_dict[lk]
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val

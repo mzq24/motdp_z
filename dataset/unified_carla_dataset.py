@@ -833,6 +833,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'junction_yld_max_speed_valid',
                 'junction_go_min_speed_valid',
                 'merge_threshold_train_only_negative_tail',
+                'temporary_occupancy_cover_bins',
+                'temporary_occupancy_cover_valid',
+                'go_opportunity_prob',
+                'yld_pressure_prob',
+                'go_opportunity_valid',
+                'adjusted_run_start_bins',
+                'reference_run_len',
             }:
                 final_sample[key] = _from_numpy(value, key)
             elif key in {

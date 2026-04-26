@@ -200,6 +200,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.joint_state_conflict_area_neg_prob = float(
             route_b_cfg.get('joint_state_conflict_area_neg_prob', 0.05)
         )
+        self.use_temporary_occupancy_phase = bool(route_b_cfg.get('use_temporary_occupancy_phase', False))
+        self.temporary_occupancy_dim = int(route_b_cfg.get('temporary_occupancy_dim', 13))
+        self.temporary_occupancy_pos_prob = float(route_b_cfg.get('temporary_occupancy_pos_prob', 0.95))
+        self.temporary_occupancy_neg_prob = float(route_b_cfg.get('temporary_occupancy_neg_prob', 0.05))
+        self.temporary_occupancy_loss_weight = float(route_b_cfg.get('temporary_occupancy_loss_weight', 0.25))
+        self.go_opportunity_loss_weight = float(route_b_cfg.get('go_opportunity_loss_weight', 0.25))
+        self.temporary_occupancy_phase_alpha = float(route_b_cfg.get('temporary_occupancy_phase_alpha', 0.5))
         self.traj_branch_condition_scale = float(route_b_cfg.get('traj_branch_condition_scale', 2.0))
         self.traj_branch_condition_detach = bool(route_b_cfg.get('traj_branch_condition_detach', True))
         self.traj_branch_condition_gt_prob_start = float(route_b_cfg.get('traj_branch_condition_gt_prob_start', 1.0))
@@ -493,6 +500,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self._resolve_stage1_batch_key(batch, 'borrow_yld_max_speed_valid'),
             self._resolve_stage1_batch_key(batch, 'borrow_go_min_speed_valid'),
         )
+        if self.use_temporary_occupancy_phase:
+            required = required + (
+                self._resolve_stage1_batch_key(batch, 'temporary_occupancy_cover_bins'),
+                self._resolve_stage1_batch_key(batch, 'temporary_occupancy_cover_valid'),
+                self._resolve_stage1_batch_key(batch, 'go_opportunity_prob'),
+                self._resolve_stage1_batch_key(batch, 'yld_pressure_prob'),
+                self._resolve_stage1_batch_key(batch, 'go_opportunity_valid'),
+            )
         return not any(key is None for key in required)
 
     @staticmethod
@@ -624,6 +639,101 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         probs = probs.clamp(min=1e-4, max=1.0 - 1e-4)
         return torch.log(probs / (1.0 - probs))
 
+    def _get_temporary_occupancy_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        family_codes: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        *,
+        require: bool,
+    ):
+        bins = self._get_stage1_batch_tensor(
+            batch, 'temporary_occupancy_cover_bins', device=device, model_dtype=model_dtype
+        )
+        valid = self._get_stage1_batch_tensor(
+            batch, 'temporary_occupancy_cover_valid', device=device, model_dtype=model_dtype
+        )
+        go_prob = self._get_stage1_batch_tensor(
+            batch, 'go_opportunity_prob', device=device, model_dtype=model_dtype
+        )
+        yld_prob = self._get_stage1_batch_tensor(
+            batch, 'yld_pressure_prob', device=device, model_dtype=model_dtype
+        )
+        go_valid = self._get_stage1_batch_tensor(
+            batch, 'go_opportunity_valid', device=device, model_dtype=model_dtype
+        )
+        if bins is None or valid is None or go_prob is None or yld_prob is None or go_valid is None:
+            if require:
+                raise ValueError(
+                    "temporary occupancy training requires temporary_occupancy_cover_bins/valid "
+                    "and go_opportunity_prob/yld_pressure_prob/go_opportunity_valid"
+                )
+            return None
+
+        B = family_codes.shape[0]
+        bins = bins.reshape(B, -1).to(device=device, dtype=model_dtype)
+        valid = valid.reshape(B, -1).to(device=device, dtype=model_dtype)
+        if bins.shape[1] != self.temporary_occupancy_dim:
+            raise ValueError(
+                f"expected temporary_occupancy_cover_bins shape (B, {self.temporary_occupancy_dim}), "
+                f"got {tuple(bins.shape)}"
+            )
+        if valid.shape[1] != self.temporary_occupancy_dim:
+            raise ValueError(
+                f"expected temporary_occupancy_cover_valid shape (B, {self.temporary_occupancy_dim}), "
+                f"got {tuple(valid.shape)}"
+            )
+        valid = valid > 0.5
+
+        # Merge bins after ego commitment can be factual-but-counterfactual-contaminated.
+        # If the postprocess wrote the prefix fields, restrict merge occupancy loss to
+        # the launch-relevant prefix; otherwise preserve the full valid mask.
+        adjusted_start = self._get_stage1_batch_tensor(
+            batch, 'adjusted_run_start_bins', device=device, model_dtype=model_dtype
+        )
+        reference_len = self._get_stage1_batch_tensor(
+            batch, 'reference_run_len', device=device, model_dtype=model_dtype
+        )
+        if adjusted_start is not None and reference_len is not None:
+            horizon = (adjusted_start.reshape(-1) + reference_len.reshape(-1)).clamp(
+                min=0.0, max=float(self.temporary_occupancy_dim)
+            )
+            bin_index = torch.arange(self.temporary_occupancy_dim, device=device, dtype=model_dtype).unsqueeze(0)
+            prefix_mask = bin_index < horizon.unsqueeze(-1)
+            merge_mask = family_codes.reshape(-1, 1).to(device=device) == 2
+            valid = torch.where(merge_mask, valid & prefix_mask, valid)
+
+        go_prob = go_prob.reshape(B).to(device=device, dtype=model_dtype).clamp(0.0, 1.0)
+        yld_prob = yld_prob.reshape(B).to(device=device, dtype=model_dtype).clamp(0.0, 1.0)
+        prob_sum_raw = go_prob + yld_prob
+        prob_sum = prob_sum_raw.clamp(min=1e-6)
+        missing_prob = prob_sum_raw <= 1e-6
+        go_prob = torch.where(missing_prob, torch.full_like(go_prob, 0.5), go_prob / prob_sum)
+        yld_prob = torch.where(missing_prob, torch.full_like(yld_prob, 0.5), yld_prob / prob_sum)
+        go_valid = go_valid.reshape(B).to(device=device, dtype=model_dtype) > 0.5
+
+        return {
+            'bins': bins.clamp(0.0, 1.0),
+            'valid': valid,
+            'go_prob': go_prob,
+            'yld_prob': yld_prob,
+            'go_valid': go_valid,
+        }
+
+    def _apply_temporary_occupancy_phase_prior(self, raw_scores: dict) -> dict:
+        if (
+            not self.use_temporary_occupancy_phase
+            or 'go_opportunity_logits' not in raw_scores
+            or 'decision_phase_logits_base' not in raw_scores
+        ):
+            return raw_scores
+        raw_scores = dict(raw_scores)
+        base_logits = raw_scores['decision_phase_logits_base']
+        prior_logits = raw_scores['go_opportunity_logits']
+        raw_scores['decision_phase_logits'] = base_logits + self.temporary_occupancy_phase_alpha * prior_logits
+        return raw_scores
+
     def _stack_boundary_targets(
         self,
         batch: Dict[str, torch.Tensor],
@@ -679,7 +789,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self,
         raw_state: dict,
     ) -> dict:
-        return {
+        projected = {
             'window_logits': raw_state['window_logits'],
             'dir_logits': raw_state['dir_logits'],
             'decision_phase_logits': raw_state['decision_phase_logits'],
@@ -688,6 +798,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'boundary_values': self._stack_boundary_predictions(raw_state),
             'speed_logits': raw_state['speed_logits'],
         }
+        if 'temporary_occupancy_logits' in raw_state:
+            projected['temporary_occupancy_logits'] = raw_state['temporary_occupancy_logits']
+        return projected
 
     def _build_joint_state_clean_targets(
         self,
@@ -747,6 +860,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             torch.full_like(conflict_area_target, self.joint_state_conflict_area_pos_prob),
             torch.full_like(conflict_area_target, self.joint_state_conflict_area_neg_prob),
         )
+        temporary_occupancy_targets = self._get_temporary_occupancy_targets(
+            batch=batch,
+            family_codes=family_codes,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_temporary_occupancy_phase,
+        )
 
         boundary_targets_mps, boundary_valid_mask = self._stack_boundary_targets(
             batch=batch,
@@ -784,6 +904,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'borrow_time_s': borrow_time_s,
             'boundary_targets_mps': boundary_targets_mps,
         }
+        if temporary_occupancy_targets is not None:
+            temp_probs = torch.where(
+                temporary_occupancy_targets['bins'] > 0.5,
+                torch.full_like(temporary_occupancy_targets['bins'], self.temporary_occupancy_pos_prob),
+                torch.full_like(temporary_occupancy_targets['bins'], self.temporary_occupancy_neg_prob),
+            )
+            temp_clean = self._logit_prob_target(temp_probs)
+            temp_clean = torch.where(
+                temporary_occupancy_targets['valid'],
+                temp_clean,
+                torch.zeros_like(temp_clean),
+            )
+            clean_state['temporary_occupancy_logits'] = temp_clean
+            metadata.update({
+                'temporary_occupancy_bins': temporary_occupancy_targets['bins'],
+                'temporary_occupancy_valid_mask': temporary_occupancy_targets['valid'],
+                'go_opportunity_prob': temporary_occupancy_targets['go_prob'],
+                'yld_pressure_prob': temporary_occupancy_targets['yld_prob'],
+                'go_opportunity_valid_mask': temporary_occupancy_targets['go_valid'],
+            })
         return clean_state, metadata
 
     def _add_noise_to_state_dict(
@@ -851,6 +991,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         speed_recon = F.mse_loss(pred_state['speed_logits'], clean_state['speed_logits'])
         conflict_area_recon = F.mse_loss(pred_state['conflict_area_logits'], clean_state['conflict_area_logits'])
+        temp_occ_recon = zero
+        if 'temporary_occupancy_logits' in clean_state and 'temporary_occupancy_logits' in pred_state:
+            temp_valid_mask = metadata['temporary_occupancy_valid_mask'].to(device=device, dtype=torch.bool)
+            temp_occ_recon = _masked_mse(
+                pred_state['temporary_occupancy_logits'],
+                clean_state['temporary_occupancy_logits'],
+                temp_valid_mask,
+            )
         boundary_pred = self._stack_boundary_predictions(pred_state)
         boundary_recon = _masked_mse(
             boundary_pred,
@@ -864,6 +1012,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + control_recon
             + speed_recon
             + conflict_area_recon
+            + temp_occ_recon
             + boundary_recon
         )
         return {
@@ -874,6 +1023,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'state_control_phase_recon_loss': control_recon,
             'state_speed_recon_loss': speed_recon,
             'state_conflict_area_recon_loss': conflict_area_recon,
+            'state_temporary_occupancy_recon_loss': temp_occ_recon,
             'state_boundary_recon_loss': boundary_recon,
         }
 
@@ -952,6 +1102,38 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             elif neg_mask.any():
                 loss_conflict_area = area_loss_raw[neg_mask].mean()
 
+        temporary_occupancy_targets = self._get_temporary_occupancy_targets(
+            batch=batch,
+            family_codes=family_codes,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_temporary_occupancy_phase,
+        )
+        loss_temporary_occupancy = zero
+        loss_go_opportunity = zero
+        if temporary_occupancy_targets is not None:
+            if 'temporary_occupancy_logits' not in raw_stage1_scores or 'go_opportunity_logits' not in raw_stage1_scores:
+                raise ValueError("temporary occupancy training requires model temporary_occupancy_logits and go_opportunity_logits")
+            temp_valid = temporary_occupancy_targets['valid']
+            if temp_valid.any():
+                temp_loss_raw = F.binary_cross_entropy_with_logits(
+                    raw_stage1_scores['temporary_occupancy_logits'].float(),
+                    temporary_occupancy_targets['bins'].float(),
+                    reduction='none',
+                )
+                loss_temporary_occupancy = temp_loss_raw[temp_valid].mean()
+            go_valid = temporary_occupancy_targets['go_valid']
+            if go_valid.any():
+                go_target = torch.stack(
+                    [
+                        temporary_occupancy_targets['yld_prob'],
+                        temporary_occupancy_targets['go_prob'],
+                    ],
+                    dim=-1,
+                ).to(device=device, dtype=model_dtype)
+                go_log_probs = F.log_softmax(raw_stage1_scores['go_opportunity_logits'].float(), dim=-1)
+                loss_go_opportunity = -(go_target.float() * go_log_probs).sum(dim=-1)[go_valid].mean()
+
         decision_phase_valid_mask = decision_phase_codes > 0
         decision_phase_target = (decision_phase_codes - 1).clamp(min=0, max=1)
         loss_decision_phase = zero
@@ -991,6 +1173,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.energy_window_weight * loss_window
             + phase_weight * loss_phase
             + self.energy_conflict_area_weight * loss_conflict_area
+            + self.temporary_occupancy_loss_weight * loss_temporary_occupancy
+            + self.go_opportunity_loss_weight * loss_go_opportunity
         )
         return {
             'energy_loss': energy_loss,
@@ -1015,6 +1199,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'relation_loss': loss_dir,
             'dir_loss': loss_dir,
             'conflict_area_loss': loss_conflict_area,
+            'temporary_occupancy_loss': loss_temporary_occupancy,
+            'go_opportunity_loss': loss_go_opportunity,
             'window_loss': loss_window,
             'phase_loss': loss_phase,
             'decision_phase_loss': loss_decision_phase,
@@ -1031,8 +1217,21 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         window_probs = torch.softmax(raw_scores['window_logits'], dim=-1)
         dir_probs = torch.softmax(raw_scores['dir_logits'], dim=-1)
         decision_phase_probs = torch.softmax(raw_scores['decision_phase_logits'], dim=-1)
+        decision_phase_base_probs = torch.softmax(
+            raw_scores.get('decision_phase_logits_base', raw_scores['decision_phase_logits']),
+            dim=-1,
+        )
         control_phase_probs = torch.softmax(raw_scores['control_phase_logits'], dim=-1)
         conflict_area_probs = torch.sigmoid(raw_scores['conflict_area_logits'])
+        temporary_occupancy_probs = None
+        if 'temporary_occupancy_logits' in raw_scores:
+            temporary_occupancy_probs = torch.sigmoid(raw_scores['temporary_occupancy_logits'])
+        go_opportunity_probs = None
+        yld_pressure_probs = None
+        if 'go_opportunity_logits' in raw_scores:
+            opportunity_probs = torch.softmax(raw_scores['go_opportunity_logits'], dim=-1)
+            yld_pressure_probs = opportunity_probs[:, 0]
+            go_opportunity_probs = opportunity_probs[:, 1]
 
         same_opp = dir_probs[:, 1:3]
         lane_dir_relation_probs = torch.where(
@@ -1065,6 +1264,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'window_probs': window_probs,
             'dir_probs': dir_probs,
             'decision_phase_probs': decision_phase_probs,
+            'decision_phase_base_probs': decision_phase_base_probs,
             'control_phase_probs': control_phase_probs,
             'conflict_area_probs': conflict_area_probs,
             'lane_dir_relation_probs': lane_dir_relation_probs,
@@ -1078,6 +1278,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'selected_yld_max_mps': selected_yld_max,
             'selected_go_min_mps': selected_go_min,
         })
+        if temporary_occupancy_probs is not None:
+            composed['temporary_occupancy_probs'] = temporary_occupancy_probs
+        if go_opportunity_probs is not None:
+            composed['go_opportunity_probs'] = go_opportunity_probs
+            composed['yld_pressure_probs'] = yld_pressure_probs
         return composed
 
     def _get_traj_branch_condition_gt_prob(self) -> float:
@@ -2084,6 +2289,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
+            # In temp-occ mode the denoised decision state is the final,
+            # opportunity-modulated phase logits. The base logits are kept for
+            # debug, but the DDIM state/recon target follows the final logits.
+            state_pred_dict = self._apply_temporary_occupancy_phase_prior(state_pred_dict)
             state_recon_loss_dict = self._compute_joint_state_recon_loss(
                 pred_state=state_pred_dict,
                 clean_state=joint_state_clean,
@@ -2210,6 +2419,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'energy_phase_loss': stage1_loss_dict.get('phase_loss', zero_t),
                 'energy_decision_phase_loss': stage1_loss_dict.get('decision_phase_loss', zero_t),
                 'energy_control_phase_loss': stage1_loss_dict.get('control_phase_loss', zero_t),
+                'energy_temporary_occupancy_loss': stage1_loss_dict.get('temporary_occupancy_loss', zero_t),
+                'energy_go_opportunity_loss': stage1_loss_dict.get('go_opportunity_loss', zero_t),
                 'energy_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),
                 'energy_merge_go_min_loss': stage1_loss_dict.get('merge_go_min_loss', zero_t),
                 'energy_junction_yld_max_loss': stage1_loss_dict.get('junction_yld_max_loss', zero_t),
@@ -2226,6 +2437,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     'state_control_phase_recon_loss': state_recon_loss_dict.get('state_control_phase_recon_loss', zero_t),
                     'state_speed_recon_loss': state_recon_loss_dict.get('state_speed_recon_loss', zero_t),
                     'state_conflict_area_recon_loss': state_recon_loss_dict.get('state_conflict_area_recon_loss', zero_t),
+                    'state_temporary_occupancy_recon_loss': state_recon_loss_dict.get('state_temporary_occupancy_recon_loss', zero_t),
                     'state_boundary_recon_loss': state_recon_loss_dict.get('state_boundary_recon_loss', zero_t),
                 })
         elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
@@ -3173,7 +3385,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         batch_size: int,
         device: torch.device,
     ) -> dict:
-        return {
+        state = {
             'window_logits': torch.randn(batch_size, 4, device=device, dtype=torch.float32),
             'dir_logits': torch.randn(batch_size, 4, device=device, dtype=torch.float32),
             'decision_phase_logits': torch.randn(batch_size, 2, device=device, dtype=torch.float32),
@@ -3182,6 +3394,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'boundary_values': torch.randn(batch_size, 7, device=device, dtype=torch.float32),
             'speed_logits': torch.randn(batch_size, len(self.model.speed_classes), device=device, dtype=torch.float32),
         }
+        if self.use_temporary_occupancy_phase:
+            state['temporary_occupancy_logits'] = torch.randn(
+                batch_size,
+                self.temporary_occupancy_dim,
+                device=device,
+                dtype=torch.float32,
+            )
+        return state
 
     @torch.no_grad()
     def _conditional_sample_joint_state(
@@ -3249,6 +3469,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
+            state_pred_dict = self._apply_temporary_occupancy_phase_prior(state_pred_dict)
             pass1_trajectory = self.norm_to_abs(poses_reg.detach())
             final_state_scores = state_pred_dict
 
@@ -3416,6 +3637,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'lane_dir_relation_probs': (
                 traj_branch_condition_details['lane_dir_relation_probs']
                 if traj_branch_condition_details is not None else None
+            ),
+            'temporary_occupancy_probs': (
+                speed_energy_scores.get('temporary_occupancy_probs')
+                if speed_energy_scores is not None else None
+            ),
+            'go_opportunity_probs': (
+                speed_energy_scores.get('go_opportunity_probs')
+                if speed_energy_scores is not None else None
+            ),
+            'yld_pressure_probs': (
+                speed_energy_scores.get('yld_pressure_probs')
+                if speed_energy_scores is not None else None
+            ),
+            'decision_phase_base_probs': (
+                speed_energy_scores.get('decision_phase_base_probs')
+                if speed_energy_scores is not None else None
             ),
             'pass1_trajectory': best_trajectory,
             'pass2_trajectory': best_trajectory,
@@ -3965,6 +4202,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['lane_dir_relation_probs'] = (
                 sample_result['lane_dir_relation_probs'].detach().float().cpu().numpy()
             )
+        for key in (
+            'temporary_occupancy_probs',
+            'go_opportunity_probs',
+            'yld_pressure_probs',
+            'decision_phase_base_probs',
+        ):
+            if sample_result.get(key) is not None:
+                result[key] = sample_result[key].detach().float().cpu().numpy()
         if sample_result.get('pass1_trajectory') is not None:
             result['pass1_trajectory'] = (
                 sample_result['pass1_trajectory'].detach().float().cpu().numpy()
@@ -3991,8 +4236,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'window_probs',
                 'dir_probs',
                 'decision_phase_probs',
+                'decision_phase_base_probs',
                 'control_phase_probs',
                 'conflict_area_probs',
+                'temporary_occupancy_probs',
+                'go_opportunity_probs',
+                'yld_pressure_probs',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'chase_max_mps',
@@ -4009,8 +4258,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'window_logits',
                 'dir_logits',
                 'decision_phase_logits',
+                'decision_phase_logits_base',
                 'control_phase_logits',
                 'conflict_area_logits',
+                'temporary_occupancy_logits',
+                'go_opportunity_logits',
                 'merge_yld_max',
                 'merge_go_min',
                 'chase_max',
@@ -4029,8 +4281,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'window_probs',
                 'dir_probs',
                 'decision_phase_probs',
+                'decision_phase_base_probs',
                 'control_phase_probs',
                 'conflict_area_probs',
+                'temporary_occupancy_probs',
+                'go_opportunity_probs',
+                'yld_pressure_probs',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'chase_max_mps',
@@ -4047,8 +4303,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'window_logits',
                 'dir_logits',
                 'decision_phase_logits',
+                'decision_phase_logits_base',
                 'control_phase_logits',
                 'conflict_area_logits',
+                'temporary_occupancy_logits',
+                'go_opportunity_logits',
                 'merge_yld_max',
                 'merge_go_min',
                 'chase_max',
