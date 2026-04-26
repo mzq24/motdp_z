@@ -25,19 +25,19 @@
 # bash codex_bash/merge_stage1_full.sh
 
 
+# temporary occupancy postprocess on padded relabel
+# python scripts/data_tools/postprocess_stage1_temporary_occupancy_cover.py \
+#   --input_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.pkl \
+#   --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.pkl \
+#   --overwrite_existing
+
+
 # project back to training index
 # python scripts/data_tools/project_stage1_fields_from_padded.py \
 #   --base /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.pkl \
-#   --padded_relabel /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.pkl \
-#   --output /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.pkl \
+#   --padded_relabel /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.pkl \
+#   --output /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.tempocc_v2.pkl \
 #   --overwrite
-
-
-# temporary occupancy postprocess on final merged file
-# python scripts/data_tools/postprocess_stage1_temporary_occupancy_cover.py \
-#   --input_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.pkl \
-#   --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.tempocc_v2.pkl \
-#   --overwrite_existing
 
 
 # split train val again for holdout
