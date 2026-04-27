@@ -141,6 +141,10 @@ STAGE1_CONFLICT_DEEP_SLOWDOWN_RESTART_DELTA_MPS = 0.5
 STAGE1_CONFLICT_AREA_ENTRY_POST_MARGIN_M = 3.0
 STAGE1_CONFLICT_AREA_ENTRY_TOL_M = 0.5
 STAGE1_CONFLICT_DEBUG_LOW_SPEED_THRESH_MPS = 2.0
+STAGE1_CONFLICT_AREA_ROUTE_MASK_POINTS = 20
+STAGE1_CONFLICT_AREA_ROUTE_MASK_MARGIN_M = 0.75
+STAGE1_CONFLICT_TIME_TO_ENTRY_SPEED_FLOOR_MPS = 0.5
+STAGE1_CONFLICT_TIME_TO_ENTRY_CAP_S = 10.0
 MERGE_THRESHOLD_NEGATIVE_TAIL_FRAMES = 12
 
 MERGE_COLLISION_INFRACTION_KEYS = {
@@ -155,6 +159,12 @@ STAGE1_SPEED_FIELDS = (
     'conflict_area_active',
     'conflict_area_start_frame',
     'conflict_area_end_frame',
+    'conflict_dist_to_entry_m',
+    'conflict_dist_to_exit_m',
+    'conflict_time_to_entry_s',
+    'conflict_area_status',
+    'conflict_area_route_mask',
+    'conflict_area_route_mask_valid',
     'conflict_decision_phase',
     'conflict_control_phase',
     'conflict_go_frame',
@@ -199,6 +209,13 @@ CONFLICT_DECISION_PHASE_TO_CODE = {
     'none': 0,
     'yld': 1,
     'go': 2,
+}
+
+CONFLICT_AREA_STATUS_TO_CODE = {
+    'none': 0,
+    'before': 1,
+    'inside': 2,
+    'after': 3,
 }
 
 CONFLICT_CONTROL_PHASE_TO_CODE = {
@@ -3423,6 +3440,8 @@ def _default_conflict_area_debug():
         'dir': 'none',
         'dir_code': int(CONFLICT_DIR_TO_CODE['none']),
         'active': 0.0,
+        'status': 'none',
+        'status_code': int(CONFLICT_AREA_STATUS_TO_CODE['none']),
         'start_frame': -1,
         'end_frame': -1,
         'frame_role': 'none',
@@ -3440,6 +3459,14 @@ def _default_conflict_area_debug():
         'window_start_world_xyz': [],
         'area_start_s_m': np.nan,
         'area_end_s_m': np.nan,
+        'conflict_dist_to_entry_m': np.nan,
+        'conflict_dist_to_exit_m': np.nan,
+        'conflict_time_to_entry_s': np.nan,
+        'route_mask_source': 'none',
+        'route_mask_positive_count': 0,
+        'route_mask_valid_count': 0,
+        'route_mask_local_start_m': np.nan,
+        'route_mask_local_end_m': np.nan,
         'area_start_world_xyz': [],
         'area_end_world_xyz': [],
         'area_segment_world_xyz': [],
@@ -3461,6 +3488,191 @@ def _default_conflict_area_debug():
         'dir_cover_key': 'none',
         'dir_frame_id': -1,
     }
+
+
+def _default_conflict_area_route_mask(valid_value=1.0):
+    mask = np.zeros(int(STAGE1_CONFLICT_AREA_ROUTE_MASK_POINTS), dtype=np.float32)
+    valid = np.full_like(mask, float(valid_value), dtype=np.float32)
+    return mask, valid
+
+
+def _conflict_area_scene_progress_interval(record, conflict_info):
+    area_start_s_m = float((conflict_info or {}).get('area_start_s_m', np.nan))
+    area_end_s_m = float((conflict_info or {}).get('area_end_s_m', np.nan))
+    if np.isfinite(area_start_s_m) and np.isfinite(area_end_s_m):
+        return float(area_start_s_m), float(area_end_s_m), 'conflict_info_scene_route_s'
+
+    single_record = [record] if record is not None else []
+    area_start_world_xyz = np.asarray((conflict_info or {}).get('area_start_world_xyz', []), dtype=np.float32).reshape(-1)
+    area_end_world_xyz = np.asarray((conflict_info or {}).get('area_end_world_xyz', []), dtype=np.float32).reshape(-1)
+    if single_record and area_start_world_xyz.size >= 3 and area_end_world_xyz.size >= 3:
+        area_start_s_m = _scene_route_progress_from_world_xyz(single_record, area_start_world_xyz, start_pos=0, end_pos=0)
+        area_end_s_m = _scene_route_progress_from_world_xyz(single_record, area_end_world_xyz, start_pos=0, end_pos=0)
+        if np.isfinite(area_start_s_m) and np.isfinite(area_end_s_m):
+            return float(area_start_s_m), float(area_end_s_m), 'projected_area_world_xyz'
+
+    return np.nan, np.nan, 'missing_scene_route_s'
+
+
+def _conflict_area_distances_from_record(record, conflict_info):
+    front_s = _record_scene_front_s(record)
+    area_start_s_m, area_end_s_m, source = _conflict_area_scene_progress_interval(record, conflict_info)
+    if np.isfinite(front_s) and np.isfinite(area_start_s_m) and np.isfinite(area_end_s_m):
+        return (
+            float(area_start_s_m - front_s),
+            float(area_end_s_m - front_s),
+            str(source),
+        )
+
+    local_start, local_end, local_source = _conflict_area_local_interval_from_record(record, conflict_info)
+    return float(local_start), float(local_end), str(local_source)
+
+
+def _conflict_area_status_from_distances(dist_to_entry_m, dist_to_exit_m, tol_m=STAGE1_CONFLICT_AREA_ENTRY_TOL_M):
+    dist_to_entry_m = float(dist_to_entry_m)
+    dist_to_exit_m = float(dist_to_exit_m)
+    tol_m = float(tol_m)
+    if not np.isfinite(dist_to_entry_m) or not np.isfinite(dist_to_exit_m):
+        return 'none'
+    if dist_to_exit_m < -tol_m:
+        return 'after'
+    if dist_to_entry_m > tol_m:
+        return 'before'
+    return 'inside'
+
+
+def _conflict_area_aux_labels_from_record(record, conflict_info):
+    out = {
+        'dist_to_entry_m': np.nan,
+        'dist_to_exit_m': np.nan,
+        'time_to_entry_s': np.nan,
+        'status': 'none',
+        'status_code': int(CONFLICT_AREA_STATUS_TO_CODE['none']),
+        'distance_source': 'inactive',
+    }
+    if float((conflict_info or {}).get('active', 0.0)) <= 0.5:
+        return out
+
+    dist_to_entry_m, dist_to_exit_m, source = _conflict_area_distances_from_record(record, conflict_info)
+    status = _conflict_area_status_from_distances(dist_to_entry_m, dist_to_exit_m)
+    family = str((conflict_info or {}).get('family', 'none'))
+    speed_mps = abs(float(_record_conflict_speed_mps(record, family)))
+    speed_floor_mps = float(STAGE1_CONFLICT_TIME_TO_ENTRY_SPEED_FLOOR_MPS)
+    time_cap_s = float(STAGE1_CONFLICT_TIME_TO_ENTRY_CAP_S)
+    if np.isfinite(dist_to_entry_m):
+        time_to_entry_s = float(np.clip(max(float(dist_to_entry_m), 0.0) / max(speed_mps, speed_floor_mps), 0.0, time_cap_s))
+    else:
+        time_to_entry_s = np.nan
+    out.update({
+        'dist_to_entry_m': float(dist_to_entry_m),
+        'dist_to_exit_m': float(dist_to_exit_m),
+        'time_to_entry_s': float(time_to_entry_s) if np.isfinite(time_to_entry_s) else np.nan,
+        'status': str(status),
+        'status_code': int(CONFLICT_AREA_STATUS_TO_CODE.get(status, 0)),
+        'distance_source': str(source),
+    })
+    return out
+
+
+def _route_token_arclengths(route_local, route_steps=STAGE1_CONFLICT_AREA_ROUTE_MASK_POINTS):
+    route_local = np.asarray(route_local, dtype=np.float32)
+    route_steps = int(route_steps)
+    out_s = np.full((route_steps,), np.nan, dtype=np.float32)
+    out_valid = np.zeros((route_steps,), dtype=bool)
+    if route_steps <= 0 or route_local.ndim != 2 or route_local.shape[0] == 0 or route_local.shape[1] < 2:
+        return out_s, out_valid
+    route_local = route_local[:route_steps, :2]
+    route_poly = _route_with_origin(route_local)
+    if route_poly is None or route_poly.ndim != 2 or route_poly.shape[0] < 2:
+        return out_s, out_valid
+    seg_len = np.linalg.norm(np.diff(route_poly[:, :2], axis=0), axis=1)
+    cumulative = np.concatenate([np.zeros((1,), dtype=np.float32), np.cumsum(seg_len).astype(np.float32)], axis=0)
+    offset = 0 if np.linalg.norm(route_local[0, :2]) < 1e-4 else 1
+    n = min(route_local.shape[0], max(cumulative.shape[0] - offset, 0), route_steps)
+    if n > 0:
+        out_s[:n] = cumulative[offset:offset + n]
+        out_valid[:n] = np.isfinite(out_s[:n])
+    return out_s, out_valid
+
+
+def _borrow_conflict_local_distance(record, conflict_progress_m):
+    scene_borrow_context = (record or {}).get('scene_borrow_context') or {}
+    borrow_motion = (record or {}).get('borrow_motion') or {}
+    conflict_progress_m = float(conflict_progress_m)
+    if not np.isfinite(conflict_progress_m):
+        return np.nan
+    borrow_start_distance_m = float(borrow_motion.get('borrow_start_distance_m', np.nan))
+    if np.isfinite(borrow_start_distance_m):
+        return float(borrow_start_distance_m + conflict_progress_m)
+    borrow_distance_m = float(scene_borrow_context.get('borrow_distance_m', np.nan))
+    borrow_end_distance_m = float(borrow_motion.get('borrow_end_distance_m', np.nan))
+    if np.isfinite(borrow_distance_m) and np.isfinite(borrow_end_distance_m):
+        return float(borrow_end_distance_m - max(float(borrow_distance_m) - conflict_progress_m, 0.0))
+    return np.nan
+
+
+def _conflict_area_local_interval_from_record(record, conflict_info):
+    family = str((conflict_info or {}).get('family', 'none'))
+    if family == 'borrow':
+        local_start = _borrow_conflict_local_distance(
+            record, float((conflict_info or {}).get('borrow_conflict_start_progress_m', np.nan))
+        )
+        local_end = _borrow_conflict_local_distance(
+            record, float((conflict_info or {}).get('borrow_conflict_end_progress_m', np.nan))
+        )
+        return local_start, local_end, 'borrow_conflict_progress'
+
+    area_start_s_m = float((conflict_info or {}).get('area_start_s_m', np.nan))
+    area_end_s_m = float((conflict_info or {}).get('area_end_s_m', np.nan))
+    front_s = _record_scene_front_s(record)
+    if not (np.isfinite(area_start_s_m) and np.isfinite(area_end_s_m) and np.isfinite(front_s)):
+        return np.nan, np.nan, 'missing_scene_progress'
+    return float(area_start_s_m - front_s), float(area_end_s_m - front_s), 'scene_route_s_interval'
+
+
+def _build_conflict_area_route_mask(record, conflict_info):
+    active = float((conflict_info or {}).get('active', 0.0)) > 0.5
+    route_s, route_valid = _route_token_arclengths((record or {}).get('route_local', np.zeros((0, 2), dtype=np.float32)))
+    mask = np.zeros(int(STAGE1_CONFLICT_AREA_ROUTE_MASK_POINTS), dtype=np.float32)
+    valid = route_valid.astype(np.float32)
+    debug = {
+        'route_mask_source': 'inactive' if not active else 'missing_geometry',
+        'route_mask_positive_count': 0,
+        'route_mask_valid_count': int(np.sum(valid > 0.5)),
+        'route_mask_local_start_m': np.nan,
+        'route_mask_local_end_m': np.nan,
+    }
+    if not active:
+        return mask, valid, debug
+    if not np.any(route_valid):
+        valid[:] = 0.0
+        return mask, valid, debug
+
+    local_start, local_end, source = _conflict_area_local_interval_from_record(record, conflict_info)
+    if not (np.isfinite(local_start) and np.isfinite(local_end)):
+        valid[:] = 0.0
+        debug['route_mask_source'] = source
+        return mask, valid, debug
+    if local_end < local_start:
+        local_start, local_end = local_end, local_start
+    margin = float(STAGE1_CONFLICT_AREA_ROUTE_MASK_MARGIN_M)
+    positive = route_valid & (route_s >= float(local_start) - margin) & (route_s <= float(local_end) + margin)
+    if not np.any(positive):
+        finite_idx = np.where(route_valid & np.isfinite(route_s))[0]
+        if finite_idx.size > 0:
+            mid = 0.5 * (float(local_start) + float(local_end))
+            nearest = int(finite_idx[np.argmin(np.abs(route_s[finite_idx] - mid))])
+            positive[nearest] = True
+            source = f'{source}:nearest_fallback'
+    mask[positive] = 1.0
+    debug.update({
+        'route_mask_source': source,
+        'route_mask_positive_count': int(np.sum(mask > 0.5)),
+        'route_mask_valid_count': int(np.sum(valid > 0.5)),
+        'route_mask_local_start_m': float(local_start),
+        'route_mask_local_end_m': float(local_end),
+    })
+    return mask, valid, debug
 
 
 def _default_merge_threshold_debug():
@@ -3629,22 +3841,47 @@ def _set_stage1_conflict_area_defaults(sample):
     sample['conflict_area_active'] = np.float32(0.0)
     sample['conflict_area_start_frame'] = np.int64(-1)
     sample['conflict_area_end_frame'] = np.int64(-1)
+    sample['conflict_dist_to_entry_m'] = np.float32(np.nan)
+    sample['conflict_dist_to_exit_m'] = np.float32(np.nan)
+    sample['conflict_time_to_entry_s'] = np.float32(np.nan)
+    sample['conflict_area_status'] = np.int64(CONFLICT_AREA_STATUS_TO_CODE['none'])
+    route_mask, route_mask_valid = _default_conflict_area_route_mask(valid_value=1.0)
+    sample['conflict_area_route_mask'] = route_mask
+    sample['conflict_area_route_mask_valid'] = route_mask_valid
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
         stage1_debug['conflict_area'] = _default_conflict_area_debug()
 
 
-def _set_stage1_conflict_area_annotation(sample, conflict_info):
+def _set_stage1_conflict_area_annotation(sample, conflict_info, record=None):
     family = str(conflict_info.get('family', 'none'))
     direction = str(conflict_info.get('dir', 'none'))
+    aux = _conflict_area_aux_labels_from_record(record, conflict_info)
     sample['conflict_area_family'] = np.int64(CONFLICT_FAMILY_TO_CODE.get(family, 0))
     sample['conflict_area_dir'] = np.int64(CONFLICT_DIR_TO_CODE.get(direction, 0))
     sample['conflict_area_active'] = np.float32(float(conflict_info.get('active', 0.0)))
     sample['conflict_area_start_frame'] = np.int64(int(conflict_info.get('start_frame', -1)))
     sample['conflict_area_end_frame'] = np.int64(int(conflict_info.get('end_frame', -1)))
+    sample['conflict_dist_to_entry_m'] = np.float32(aux.get('dist_to_entry_m', np.nan))
+    sample['conflict_dist_to_exit_m'] = np.float32(aux.get('dist_to_exit_m', np.nan))
+    sample['conflict_time_to_entry_s'] = np.float32(aux.get('time_to_entry_s', np.nan))
+    sample['conflict_area_status'] = np.int64(int(aux.get('status_code', CONFLICT_AREA_STATUS_TO_CODE['none'])))
+    route_mask, route_mask_valid, route_mask_debug = _build_conflict_area_route_mask(record, conflict_info)
+    sample['conflict_area_route_mask'] = route_mask
+    sample['conflict_area_route_mask_valid'] = route_mask_valid
     stage1_debug = sample.get('stage1_speed_debug')
     if isinstance(stage1_debug, dict):
-        stage1_debug['conflict_area'] = _to_stage1_debug_python(dict(conflict_info))
+        debug_info = dict(conflict_info)
+        debug_info.update({
+            'status': str(aux.get('status', 'none')),
+            'status_code': int(aux.get('status_code', CONFLICT_AREA_STATUS_TO_CODE['none'])),
+            'conflict_dist_to_entry_m': float(aux.get('dist_to_entry_m', np.nan)),
+            'conflict_dist_to_exit_m': float(aux.get('dist_to_exit_m', np.nan)),
+            'conflict_time_to_entry_s': float(aux.get('time_to_entry_s', np.nan)),
+            'distance_source': str(aux.get('distance_source', 'none')),
+        })
+        debug_info.update(route_mask_debug)
+        stage1_debug['conflict_area'] = _to_stage1_debug_python(debug_info)
 
 
 def _set_stage1_conflict_phase_defaults(sample):
@@ -6107,7 +6344,7 @@ def _annotate_route_stage1_conflict_areas(samples, route_sample_indices, scene_r
             selected['issue_families'] = [str(item.get('family', 'none')) for item in frame_issues]
             selected['missing_reason'] = str(frame_issues[0].get('reason', 'none')) if frame_issues else 'none'
             selected['topology_override'] = str(frame_issues[0].get('topology_override', 'none')) if frame_issues else 'none'
-            _set_stage1_conflict_area_annotation(sample, selected)
+            _set_stage1_conflict_area_annotation(sample, selected, record=record)
             continue
 
         info = _default_conflict_area_debug()
@@ -6117,7 +6354,7 @@ def _annotate_route_stage1_conflict_areas(samples, route_sample_indices, scene_r
             info['missing_reason'] = str(frame_issues[0].get('reason', 'unknown'))
             info['selection_reason'] = 'issue_only'
             info['topology_override'] = str(frame_issues[0].get('topology_override', 'none'))
-        _set_stage1_conflict_area_annotation(sample, info)
+        _set_stage1_conflict_area_annotation(sample, info, record=record)
 
 
 def _has_stage1_speed_fields(sample):

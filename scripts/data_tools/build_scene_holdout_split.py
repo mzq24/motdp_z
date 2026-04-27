@@ -12,6 +12,10 @@ Outputs:
   <out_root>/val/samples_packed.pkl
   <out_root>/scene_holdout_manifest.json
   <out_root>/val_scenes.json
+
+Optional:
+  - exclude specific scenes/routes from validation via a text list
+  - listed scenes are forced into train and never sampled into val
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import os
 import pickle
 import random
 from collections import Counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 
 def _load_packed_samples(path: str) -> List[Dict[str, Any]]:
@@ -88,12 +92,51 @@ def _count_scene_samples(samples: List[Dict[str, Any]]) -> Counter:
     return counts
 
 
+def _scene_match_keys(scene_name: str) -> Set[str]:
+    scene_name = str(scene_name or "")
+    keys = {scene_name}
+    if "/" in scene_name:
+        keys.add(scene_name.split("/", 1)[1])
+    return keys
+
+
+def _parse_scene_list_line(line: str, lineno: int, list_path: str) -> str:
+    parts = line.split()
+    if len(parts) == 1:
+        token = str(parts[0]).strip()
+        return token
+    if len(parts) == 2:
+        scene_name = str(parts[0]).strip()
+        route_name = str(parts[1]).strip()
+        return f"{scene_name}/{route_name}"
+    raise ValueError(
+        f"Invalid scene list line {lineno} in {list_path}: expected "
+        f"'route_name', 'scene_name route_name', or 'scene_name/route_name', got: {line}"
+    )
+
+
+def _load_excluded_val_scenes(list_path: str) -> Set[str]:
+    excluded: Set[str] = set()
+    if not list_path:
+        return excluded
+    if not os.path.exists(list_path):
+        raise FileNotFoundError(f"Excluded val scene list not found: {list_path}")
+    with open(list_path, "r", encoding="utf-8") as f:
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            excluded.add(_parse_scene_list_line(line, lineno, list_path))
+    return excluded
+
+
 def build_scene_holdout(
     packed_path: str,
     out_root: str,
     val_scene_ratio: float,
     seed: int,
     overwrite: bool,
+    exclude_val_scene_list: str,
 ) -> None:
     samples = _load_packed_samples(packed_path)
     if not samples:
@@ -107,9 +150,25 @@ def build_scene_holdout(
     if total_scenes < 2:
         raise ValueError(f"Need at least 2 scenes to split, got {total_scenes}")
 
+    excluded_val_scenes = _load_excluded_val_scenes(exclude_val_scene_list)
+    matched_excluded_val_scenes: Set[str] = set()
+    matched_exclusion_tokens: Set[str] = set()
+    for scene_name in ordered_scenes:
+        match_keys = _scene_match_keys(scene_name)
+        if match_keys & excluded_val_scenes:
+            matched_excluded_val_scenes.add(scene_name)
+            matched_exclusion_tokens.update(match_keys & excluded_val_scenes)
+    unmatched_excluded_val_scenes = excluded_val_scenes - matched_exclusion_tokens
+    eligible_val_scenes = [scene for scene in ordered_scenes if scene not in matched_excluded_val_scenes]
+    if not eligible_val_scenes:
+        raise ValueError(
+            "No scenes left for validation after applying excluded val scene list"
+        )
+
     val_scene_count = max(1, min(total_scenes - 1, int(math.ceil(total_scenes * float(val_scene_ratio)))))
+    val_scene_count = min(val_scene_count, len(eligible_val_scenes))
     rng = random.Random(seed)
-    shuffled_scenes = list(ordered_scenes)
+    shuffled_scenes = list(eligible_val_scenes)
     rng.shuffle(shuffled_scenes)
     val_scene_set = set(shuffled_scenes[:val_scene_count])
 
@@ -153,8 +212,14 @@ def build_scene_holdout(
         "out_root": os.path.abspath(out_root),
         "seed": int(seed),
         "val_scene_ratio": float(val_scene_ratio),
+        "exclude_val_scene_list": os.path.abspath(exclude_val_scene_list) if exclude_val_scene_list else "",
         "total_samples": len(samples),
         "total_scenes": total_scenes,
+        "eligible_val_scenes": len(eligible_val_scenes),
+        "requested_excluded_val_scenes": len(excluded_val_scenes),
+        "matched_excluded_val_scenes": len(matched_excluded_val_scenes),
+        "unmatched_excluded_val_scenes": len(unmatched_excluded_val_scenes),
+        "unmatched_excluded_val_scene_examples": sorted(unmatched_excluded_val_scenes)[:20],
         "train_samples": len(train_samples),
         "val_samples": len(val_samples),
         "train_sample_ratio": len(train_samples) / float(len(samples)),
@@ -176,6 +241,7 @@ def build_scene_holdout(
     print(f"Val samples:         {len(val_samples)}")
     print(f"Val scene ratio:     {len(val_scene_counts) / float(total_scenes):.4%}")
     print(f"Val sample ratio:    {len(val_samples) / float(len(samples)):.4%}")
+    print(f"Excluded val scenes: {len(matched_excluded_val_scenes)}")
     print(f"Manifest:            {manifest_path}")
     print(f"Val scenes:          {val_scenes_path}")
     print("========================================")
@@ -210,6 +276,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing outputs under out-root",
     )
+    parser.add_argument(
+        "--exclude-val-scene-list",
+        type=str,
+        default="",
+        help=(
+            "Optional txt list of scenes/routes that must stay in train. "
+            "Each line may be 'route_name', 'scene_name route_name', or 'scene_name/route_name'."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -221,6 +296,7 @@ def main() -> None:
         val_scene_ratio=args.val_scene_ratio,
         seed=args.seed,
         overwrite=args.overwrite,
+        exclude_val_scene_list=args.exclude_val_scene_list,
     )
 
 
