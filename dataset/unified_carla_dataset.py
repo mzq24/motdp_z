@@ -85,6 +85,9 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
         'borrow_cross_active_time_s': 0.0,
         'chase_max_speed': float('nan'),
         'chase_max_speed_valid': 0.0,
+        'conflict_dist_to_entry_m': float('nan'),
+        'conflict_dist_to_exit_m': float('nan'),
+        'conflict_time_to_entry_s': float('nan'),
     }
 
     speed_samples = final_sample.get('speed_sample_values')
@@ -101,6 +104,15 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
     for key, default_value in scalar_defaults.items():
         if key not in final_sample:
             final_sample[key] = torch.tensor(default_value, dtype=torch.float32)
+
+    # Sentinel valid=-1 means the packed sample predates offline conflict-area
+    # route masks. The policy will fall back to the legacy frame-window target.
+    if 'conflict_area_route_mask' not in final_sample:
+        final_sample['conflict_area_route_mask'] = torch.zeros(20, dtype=torch.float32)
+    if 'conflict_area_route_mask_valid' not in final_sample:
+        final_sample['conflict_area_route_mask_valid'] = torch.full((20,), -1.0, dtype=torch.float32)
+    if 'conflict_area_status' not in final_sample:
+        final_sample['conflict_area_status'] = torch.tensor(0, dtype=torch.long)
 
     legacy_merge_float_defaults = {
         'merge_episode_active': 0.0,
@@ -840,6 +852,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'go_opportunity_valid',
                 'adjusted_run_start_bins',
                 'reference_run_len',
+                'conflict_dist_to_entry_m',
+                'conflict_dist_to_exit_m',
+                'conflict_time_to_entry_s',
+                'conflict_area_route_mask',
+                'conflict_area_route_mask_valid',
             }:
                 final_sample[key] = _from_numpy(value, key)
             elif key in {
@@ -850,6 +867,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'conflict_go_frame',
                 'conflict_area_start_frame',
                 'conflict_area_end_frame',
+                'conflict_area_status',
             }:
                 if isinstance(value, np.ndarray):
                     final_sample[key] = torch.from_numpy(value).long()

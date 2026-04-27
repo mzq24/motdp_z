@@ -123,11 +123,11 @@ route_b:
   use_joint_state_diffusion: true
   use_traj_branch_condition: false
   shared_stage1_training_source: clean
-  use_speed_profile_head: true
+  use_speed_profile_head: false
   guidance_scale: 0.0
   energy_loss_weight: 1.0
   speed_loss_weight: 0.2
-  speed_profile_loss_weight: 0.1
+  speed_profile_loss_weight: 0.0
   speed_profile_dt: 0.5
   energy_chase_weight: 1.0
   energy_meet_weight: 1.0
@@ -139,6 +139,18 @@ route_b:
   joint_state_label_smoothing: 0.05
   joint_state_conflict_area_pos_prob: 0.95
   joint_state_conflict_area_neg_prob: 0.05
+  use_temporary_occupancy_phase: true
+  temporary_occupancy_dim: 13
+  temporary_occupancy_pos_prob: 0.95
+  temporary_occupancy_neg_prob: 0.05
+  temporary_occupancy_loss_weight: 0.25
+  go_opportunity_loss_weight: 0.25
+  temporary_occupancy_phase_alpha: 0.5
+  use_conflict_timing_state: true
+  conflict_area_status_loss_weight: 0.25
+  conflict_timing_loss_weight: 0.25
+  conflict_timing_dist_norm_scale: 30.0
+  conflict_timing_time_norm_scale: 10.0
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0
   num_gt_augmentations: 0
@@ -179,7 +191,7 @@ training:
   warmup_epochs: 10
   use_lr_scheduler: true
   scheduler_total_epochs: 100
-  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data
+  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5
   image_data_root: /workspace1/z_project/dataset/pdm_lite
   sample_interval: 1
   lr_final: 1e-8
@@ -187,7 +199,7 @@ training:
   save_freq: 5
   max_keep_ckpts: 20
   early_stopping_patience: 15
-  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_joint_state_fulltrain_val
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_joint_state/checkpoints/route_b_lidar_bev_stage1_joint_state_fulltrain_val
 
 validation:
   enabled: true
@@ -199,8 +211,8 @@ validation:
 logging:
   use_wandb: true
   wandb_project: route_b_lidar_bev
-  run_name: route_b_lidar_bev_stage1_joint_state_fulltrain_val
-  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_joint_state_fulltrain_val
+  run_name: route_b_lidar_bev_stage1_joint_state_fulltrain_val_tempocc_timing
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_joint_state/checkpoints/route_b_lidar_bev_stage1_joint_state_fulltrain_val
   save_every: 5
   log_freq: 50
 
