@@ -212,6 +212,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.conflict_timing_loss_weight = float(route_b_cfg.get('conflict_timing_loss_weight', 0.25))
         self.conflict_timing_dist_norm_scale = float(route_b_cfg.get('conflict_timing_dist_norm_scale', 30.0))
         self.conflict_timing_time_norm_scale = float(route_b_cfg.get('conflict_timing_time_norm_scale', 10.0))
+        self.use_borrow_time_in_joint_state = bool(route_b_cfg.get('use_borrow_time_in_joint_state', False))
+        self.use_state_diffusion_scheduler = bool(route_b_cfg.get('use_state_diffusion_scheduler', False))
+        self.state_scheduler_beta_schedule = str(route_b_cfg.get('state_scheduler_beta_schedule', 'squaredcos_cap_v2'))
+        self.use_state_consistency_loss = bool(route_b_cfg.get('use_state_consistency_loss', False))
+        self.state_consistency_loss_weight = float(route_b_cfg.get('state_consistency_loss_weight', 0.05))
+        self.state_consistency_prob = float(route_b_cfg.get('state_consistency_prob', 0.25))
+        self.use_hierarchical_joint_denoise = bool(route_b_cfg.get('use_hierarchical_joint_denoise', False))
+        self.hierarchical_joint_state_route_steps = max(
+            int(route_b_cfg.get('hierarchical_joint_state_route_steps', 3)), 0
+        )
+        self.hierarchical_freeze_traj = bool(route_b_cfg.get('hierarchical_freeze_traj', True))
         self.traj_branch_condition_scale = float(route_b_cfg.get('traj_branch_condition_scale', 2.0))
         self.traj_branch_condition_detach = bool(route_b_cfg.get('traj_branch_condition_detach', True))
         self.traj_branch_condition_gt_prob_start = float(route_b_cfg.get('traj_branch_condition_gt_prob_start', 1.0))
@@ -344,6 +355,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             beta_schedule="scaled_linear",
             prediction_type=self.prediction_type,
         )
+        self.state_diffusion_scheduler = None
+        if self.use_state_diffusion_scheduler:
+            self.state_diffusion_scheduler = DDIMScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                steps_offset=1,
+                beta_schedule=self.state_scheduler_beta_schedule,
+                prediction_type=self.prediction_type,
+            )
 
         self.action_dim = action_dim
         self.horizon = policy_cfg.get('horizon', 6)
@@ -558,6 +577,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if not isinstance(value, torch.Tensor):
             value = torch.as_tensor(value)
         return value.to(device=device, dtype=model_dtype).reshape(-1)
+
+    def _borrow_time_for_joint_state(
+        self,
+        borrow_time_s: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        # Raw borrow_time is runtime-observable, but feeding the GT timer into
+        # the joint decoder lets window/dir tokens use it as a shortcut during
+        # dataset validation. Keep it out of joint state by default; re-enable
+        # only for explicit ablations.
+        return borrow_time_s if self.use_borrow_time_in_joint_state else None
 
     def _get_stage1_long_target(
         self,
@@ -1054,15 +1083,27 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             })
         return clean_state, metadata
 
+    def _get_state_scheduler(self):
+        return self.state_diffusion_scheduler if self.state_diffusion_scheduler is not None else self.diffusion_scheduler
+
+    def _set_state_scheduler_timesteps(self, device: torch.device) -> torch.Tensor:
+        scheduler = self._get_state_scheduler()
+        # Avoid resetting the shared scheduler twice when state uses the main
+        # trajectory schedule.
+        if scheduler is not self.diffusion_scheduler:
+            scheduler.set_timesteps(self.num_inference_steps, device=device)
+        return scheduler.timesteps.to(device)
+
     def _add_noise_to_state_dict(
         self,
         clean_state: dict,
         timesteps: torch.Tensor,
     ) -> dict:
+        scheduler = self._get_state_scheduler()
         noisy_state = {}
         for key, clean_value in clean_state.items():
             noise = torch.randn_like(clean_value, dtype=torch.float32)
-            noisy_state[key] = self.diffusion_scheduler.add_noise(
+            noisy_state[key] = scheduler.add_noise(
                 original_samples=clean_value.float(),
                 noise=noise,
                 timesteps=timesteps,
@@ -1075,11 +1116,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         noisy_state: dict,
         timestep: int,
     ) -> dict:
+        scheduler = self._get_state_scheduler()
         pred_state_for_diffusion = self._project_raw_state_to_diffusion_state(pred_clean_state)
         next_state = {}
         for key, sample in noisy_state.items():
             pred = pred_state_for_diffusion[key]
-            next_state[key] = self.diffusion_scheduler.step(
+            next_state[key] = scheduler.step(
                 model_output=pred.float(),
                 timestep=timestep,
                 sample=sample.float(),
@@ -1180,6 +1222,79 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'state_conflict_area_status_recon_loss': area_status_recon,
             'state_conflict_timing_recon_loss': conflict_timing_recon,
             'state_boundary_recon_loss': boundary_recon,
+        }
+
+    def _compute_state_consistency_loss(
+        self,
+        pred_state_a: dict,
+        pred_state_b: dict,
+        metadata: dict,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        zero = torch.tensor(0.0, device=device, dtype=model_dtype)
+        state_a = self._project_raw_state_to_diffusion_state(pred_state_a)
+        state_b = self._project_raw_state_to_diffusion_state(pred_state_b)
+
+        def _symmetric_mse(
+            key: str,
+            valid_mask: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            if key not in state_a or key not in state_b:
+                return zero
+            value_a = state_a[key]
+            value_b = state_b[key]
+            if valid_mask is not None:
+                mask = valid_mask.to(device=device, dtype=torch.bool)
+                if mask.sum() <= 0:
+                    return zero
+                value_a = value_a[mask]
+                value_b = value_b[mask]
+            return 0.5 * (
+                F.mse_loss(value_a, value_b.detach())
+                + F.mse_loss(value_b, value_a.detach())
+            )
+
+        decision_mask = metadata['decision_phase_valid_mask']
+        control_mask = metadata['control_phase_valid_mask']
+        conflict_area_mask = metadata.get('conflict_area_valid_mask')
+        temp_occ_mask = metadata.get('temporary_occupancy_valid_mask')
+        timing_mask = metadata.get('conflict_timing_valid_mask')
+        boundary_mask = metadata.get('boundary_valid_mask')
+
+        window_loss = _symmetric_mse('window_logits')
+        dir_loss = _symmetric_mse('dir_logits')
+        decision_loss = _symmetric_mse('decision_phase_logits', decision_mask)
+        control_loss = _symmetric_mse('control_phase_logits', control_mask)
+        speed_loss = _symmetric_mse('speed_logits')
+        conflict_area_loss = _symmetric_mse('conflict_area_logits', conflict_area_mask)
+        temp_occ_loss = _symmetric_mse('temporary_occupancy_logits', temp_occ_mask)
+        area_status_loss = _symmetric_mse('conflict_area_status_logits')
+        timing_loss = _symmetric_mse('conflict_timing_values', timing_mask)
+        boundary_loss = _symmetric_mse('boundary_values', boundary_mask)
+        phase_loss = decision_loss + control_loss
+        total = (
+            window_loss
+            + dir_loss
+            + phase_loss
+            + speed_loss
+            + conflict_area_loss
+            + temp_occ_loss
+            + area_status_loss
+            + timing_loss
+            + boundary_loss
+        )
+        return {
+            'state_consistency_loss': total,
+            'state_consistency_window_loss': window_loss,
+            'state_consistency_dir_loss': dir_loss,
+            'state_consistency_phase_loss': phase_loss,
+            'state_consistency_speed_loss': speed_loss,
+            'state_consistency_conflict_area_loss': conflict_area_loss,
+            'state_consistency_temporary_occupancy_loss': temp_occ_loss,
+            'state_consistency_conflict_area_status_loss': area_status_loss,
+            'state_consistency_timing_loss': timing_loss,
+            'state_consistency_boundary_loss': boundary_loss,
         }
 
     def _compute_stage1_direct_losses(
@@ -2424,6 +2539,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         noisy_state = None
         state_pred_dict = None
         state_recon_loss_dict = {}
+        state_consistency_loss_dict = {}
         traj_branch_condition = None
         traj_branch_condition_details = None
         branch_condition_schedule = None
@@ -2473,6 +2589,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         if self.use_joint_state_diffusion:
             borrow_time_s = None if joint_state_metadata is None else joint_state_metadata.get('borrow_time_s')
+            joint_borrow_time_s = self._borrow_time_for_joint_state(borrow_time_s)
             (
                 poses_reg,
                 route_pred,
@@ -2489,7 +2606,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                 ego_status=ego_status,
                 state_t=noisy_state,
-                borrow_time_s=borrow_time_s,
+                borrow_time_s=joint_borrow_time_s,
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
@@ -2504,6 +2621,61 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 device=device,
                 model_dtype=model_dtype,
             )
+            consistency_enabled = (
+                self.use_state_consistency_loss
+                and self.state_consistency_loss_weight > 0.0
+                and self.state_consistency_prob > 0.0
+            )
+            if consistency_enabled and torch.rand((), device=device).item() < self.state_consistency_prob:
+                diff_timesteps_consistency = torch.randint(
+                    0, self.train_max_timesteps, (B,), device=device
+                ).long()
+                noise_consistency = torch.randn(
+                    B, self.horizon + self.num_waypoints, D,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                noisy_flat_consistency = self.diffusion_scheduler.add_noise(
+                    original_samples=traj_route_normed,
+                    noise=noise_consistency,
+                    timesteps=diff_timesteps_consistency,
+                )
+                noisy_joint_consistency = noisy_flat_consistency.unsqueeze(1)
+                noisy_joint_abs_consistency = self.joint_norm_to_abs(noisy_joint_consistency)
+                noisy_state_consistency = self._add_noise_to_state_dict(
+                    clean_state=joint_state_clean,
+                    timesteps=diff_timesteps_consistency,
+                )
+                (
+                    _poses_reg_consistency,
+                    _route_pred_consistency,
+                    _,
+                    _,
+                    _speed_pred_consistency,
+                    _speed_profile_pred_consistency,
+                    state_pred_dict_consistency,
+                ) = self.model.forward_ego_joint(
+                    x_t=noisy_joint_consistency,
+                    x_t_abs=noisy_joint_abs_consistency,
+                    timestep=diff_timesteps_consistency,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    ego_status=ego_status,
+                    state_t=noisy_state_consistency,
+                    borrow_time_s=joint_borrow_time_s,
+                    bev_proj_cached=bev_proj,
+                    transfuser_lidar_bev=transfuser_lidar_bev,
+                )
+                state_pred_dict_consistency = self._apply_temporary_occupancy_phase_prior(
+                    state_pred_dict_consistency
+                )
+                state_consistency_loss_dict = self._compute_state_consistency_loss(
+                    pred_state_a=state_pred_dict,
+                    pred_state_b=state_pred_dict_consistency,
+                    metadata=joint_state_metadata,
+                    device=device,
+                    model_dtype=model_dtype,
+                )
         else:
             poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = _forward_ego_with_branch(
                 traj_branch_condition
@@ -2647,6 +2819,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     'state_conflict_area_status_recon_loss': state_recon_loss_dict.get('state_conflict_area_status_recon_loss', zero_t),
                     'state_conflict_timing_recon_loss': state_recon_loss_dict.get('state_conflict_timing_recon_loss', zero_t),
                     'state_boundary_recon_loss': state_recon_loss_dict.get('state_boundary_recon_loss', zero_t),
+                    'state_consistency_loss': state_consistency_loss_dict.get('state_consistency_loss', zero_t),
+                    'state_consistency_window_loss': state_consistency_loss_dict.get('state_consistency_window_loss', zero_t),
+                    'state_consistency_dir_loss': state_consistency_loss_dict.get('state_consistency_dir_loss', zero_t),
+                    'state_consistency_phase_loss': state_consistency_loss_dict.get('state_consistency_phase_loss', zero_t),
+                    'state_consistency_speed_loss': state_consistency_loss_dict.get('state_consistency_speed_loss', zero_t),
+                    'state_consistency_conflict_area_loss': state_consistency_loss_dict.get('state_consistency_conflict_area_loss', zero_t),
+                    'state_consistency_temporary_occupancy_loss': state_consistency_loss_dict.get('state_consistency_temporary_occupancy_loss', zero_t),
+                    'state_consistency_conflict_area_status_loss': state_consistency_loss_dict.get('state_consistency_conflict_area_status_loss', zero_t),
+                    'state_consistency_timing_loss': state_consistency_loss_dict.get('state_consistency_timing_loss', zero_t),
+                    'state_consistency_boundary_loss': state_consistency_loss_dict.get('state_consistency_boundary_loss', zero_t),
                 })
         elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
             (
@@ -2840,6 +3022,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
 
         state_diffusion_recon_loss = stage1_extra_losses.get('state_diffusion_recon_loss', zero_t)
+        state_consistency_loss = stage1_extra_losses.get(
+            'state_consistency_loss',
+            state_consistency_loss_dict.get('state_consistency_loss', zero_t),
+        )
         total_loss = (
             self.energy_loss_weight * energy_loss
             + self.reg_loss_weight * loss_reg
@@ -2848,6 +3034,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.speed_loss_weight * speed_loss
             + self.speed_profile_loss_weight * speed_profile_loss
             + self.joint_state_diffusion_loss_weight * state_diffusion_recon_loss
+            + self.state_consistency_loss_weight * state_consistency_loss
         )
 
         loss_dict = {
@@ -2869,6 +3056,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_loss': speed_loss,
             'alignment_loss': alignment_loss,
             'joint_state_diffusion_loss': state_diffusion_recon_loss,
+            'state_consistency_loss': state_consistency_loss,
         }
         if self.use_speed_profile_head:
             loss_dict['speed_profile_loss'] = speed_profile_loss
@@ -3649,7 +3837,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             transfuser_bev_feature.to(device=device, dtype=model_dtype)
         )
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps, device=device)
+        self._set_state_scheduler_timesteps(device)
         roll_timesteps = self.diffusion_scheduler.timesteps.to(device)
+        hierarchical_steps = (
+            min(self.hierarchical_joint_state_route_steps, max(len(roll_timesteps) - 1, 0))
+            if self.use_hierarchical_joint_denoise else 0
+        )
 
         poses_cls = None
         route_pred = None
@@ -3658,8 +3851,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         speed_profile_pred = None
         final_state_scores = None
         pass1_trajectory = None
+        joint_borrow_time_s = self._borrow_time_for_joint_state(borrow_time_s)
 
-        for k in roll_timesteps:
+        for step_idx, k in enumerate(roll_timesteps):
             t_cur = int(k.item())
             t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
             _, w_veh, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
@@ -3676,7 +3870,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
                 ego_status=ego_status,
                 state_t=state_t,
-                borrow_time_s=borrow_time_s,
+                borrow_time_s=joint_borrow_time_s,
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
@@ -3762,12 +3956,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     dim=2,
                 )
 
-            x_t = self.diffusion_scheduler.step(
+            next_x_t = self.diffusion_scheduler.step(
                 model_output=pred_joint_corrected.float(),
                 timestep=t_cur,
                 sample=x_t.float(),
                 eta=0.0,
             ).prev_sample
+            if (
+                self.use_hierarchical_joint_denoise
+                and self.hierarchical_freeze_traj
+                and step_idx < hierarchical_steps
+            ):
+                next_x_t = torch.cat(
+                    [x_t[:, :, :self.horizon, :], next_x_t[:, :, self.horizon:, :]],
+                    dim=2,
+                )
+            x_t = next_x_t
             state_t = self._ddim_step_state_dict(
                 pred_clean_state=state_pred_dict,
                 noisy_state=state_t,
@@ -3798,7 +4002,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             traj_branch_condition_probs, traj_branch_condition_details = self._build_traj_branch_condition_from_stage1_raw(
                 raw_scores=final_state_scores,
                 speed_ref=branch_speed_ref.detach(),
-                borrow_time_s=borrow_time_s,
+                borrow_time_s=joint_borrow_time_s,
                 prev_relation_probs=prev_relation_probs,
                 device=device,
                 model_dtype=model_dtype,
@@ -3820,6 +4024,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_energy_query_center': speed_energy_query_center,
             'speed_energy_ref_speeds': speed_energy_ref_speeds,
             'speed_energy_ref_scores': speed_energy_ref_scores,
+            'joint_hierarchical_denoise_enabled': torch.full(
+                (B,),
+                float(self.use_hierarchical_joint_denoise),
+                device=device,
+                dtype=model_dtype,
+            ),
+            'joint_hierarchical_state_route_steps': torch.full(
+                (B,),
+                float(hierarchical_steps),
+                device=device,
+                dtype=model_dtype,
+            ),
             'traj_branch_condition_probs': traj_branch_condition_probs,
             'traj_window_condition_probs': (
                 traj_branch_condition_details['window_probs']
