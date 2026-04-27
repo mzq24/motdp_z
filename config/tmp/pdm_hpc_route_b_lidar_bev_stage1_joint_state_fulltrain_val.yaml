@@ -151,6 +151,15 @@ route_b:
   conflict_timing_loss_weight: 0.25
   conflict_timing_dist_norm_scale: 30.0
   conflict_timing_time_norm_scale: 10.0
+  use_borrow_time_in_joint_state: false
+  use_state_diffusion_scheduler: false
+  state_scheduler_beta_schedule: squaredcos_cap_v2
+  use_state_consistency_loss: false
+  state_consistency_loss_weight: 0.05
+  state_consistency_prob: 0.25
+  use_hierarchical_joint_denoise: false
+  hierarchical_joint_state_route_steps: 3
+  hierarchical_freeze_traj: true
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0
   num_gt_augmentations: 0
