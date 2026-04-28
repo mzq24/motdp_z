@@ -852,6 +852,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         raw_scores['decision_phase_logits'] = base_logits + self.temporary_occupancy_phase_alpha * prior_logits
         return raw_scores
 
+    @staticmethod
+    def _use_base_decision_phase_for_supervision(raw_scores: dict) -> dict:
+        if 'decision_phase_logits_base' not in raw_scores:
+            return raw_scores
+        raw_scores = dict(raw_scores)
+        raw_scores['decision_phase_logits'] = raw_scores['decision_phase_logits_base']
+        return raw_scores
+
     def _stack_boundary_targets(
         self,
         batch: Dict[str, torch.Tensor],
@@ -2538,6 +2546,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         joint_state_metadata = None
         noisy_state = None
         state_pred_dict = None
+        state_supervision_dict = None
         state_recon_loss_dict = {}
         state_consistency_loss_dict = {}
         traj_branch_condition = None
@@ -2610,12 +2619,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
             )
-            # In temp-occ mode the denoised decision state is the final,
-            # opportunity-modulated phase logits. The base logits are kept for
-            # debug, but the DDIM state/recon target follows the final logits.
-            state_pred_dict = self._apply_temporary_occupancy_phase_prior(state_pred_dict)
+            # Expert decision phase is an observed action label, while
+            # go-opportunity/temp-occ are counterfactual state labels. Keep the
+            # phase supervision on the denoised base logits so the virtual prior
+            # does not rewrite the expert target during training.
+            state_supervision_dict = self._use_base_decision_phase_for_supervision(state_pred_dict)
             state_recon_loss_dict = self._compute_joint_state_recon_loss(
-                pred_state=state_pred_dict,
+                pred_state=state_supervision_dict,
                 clean_state=joint_state_clean,
                 metadata=joint_state_metadata,
                 device=device,
@@ -2666,11 +2676,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     bev_proj_cached=bev_proj,
                     transfuser_lidar_bev=transfuser_lidar_bev,
                 )
-                state_pred_dict_consistency = self._apply_temporary_occupancy_phase_prior(
+                state_pred_dict_consistency = self._use_base_decision_phase_for_supervision(
                     state_pred_dict_consistency
                 )
                 state_consistency_loss_dict = self._compute_state_consistency_loss(
-                    pred_state_a=state_pred_dict,
+                    pred_state_a=state_supervision_dict,
                     pred_state_b=state_pred_dict_consistency,
                     metadata=joint_state_metadata,
                     device=device,
@@ -2745,7 +2755,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if self.use_joint_state_diffusion:
                 stage1_loss_dict = self._compute_stage1_direct_losses(
                     batch=batch,
-                    raw_stage1_scores=state_pred_dict,
+                    raw_stage1_scores=state_supervision_dict,
                     device=device,
                     model_dtype=model_dtype,
                 )
