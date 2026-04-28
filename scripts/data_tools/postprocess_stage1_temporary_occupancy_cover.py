@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import json
 import os
 import pickle
 
@@ -20,6 +22,8 @@ GO_OPPORTUNITY_VALID_KEY = "go_opportunity_valid"
 DISTANCE_EXTRA_BIN_THRESH_1_M = 4.0
 DISTANCE_EXTRA_BIN_THRESH_2_M = 8.0
 MERGE_CURRENT_COVER_AREA_START_MARGIN_M = 1.0
+GO_PROB_GO_PHASE_FLOOR_NON_COLLISION = 0.5
+CONFLICT_DECISION_GO_CODE = 2
 
 CONFLICT_FAMILY_CODE_TO_NAME = {
     0: "none",
@@ -35,6 +39,44 @@ def _atomic_pickle_dump(obj, path: str) -> None:
     with open(tmp_path, "wb") as f:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp_path, path)
+
+
+def _load_json_gz_if_exists(path: str):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _has_nonempty_infraction(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        try:
+            return float(value) > 0.0
+        except Exception:
+            return False
+    if isinstance(value, str):
+        return len(value.strip()) > 0
+    if isinstance(value, dict):
+        return any(_has_nonempty_infraction(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_nonempty_infraction(v) for v in value)
+    return True
+
+
+def _infer_image_data_root_from_packed_path(path: str) -> str:
+    cur = os.path.abspath(str(path or ""))
+    while cur and cur != os.path.dirname(cur):
+        if os.path.basename(cur) == "tmp_data":
+            return os.path.dirname(cur)
+        cur = os.path.dirname(cur)
+    return ""
 
 
 def _base_dir_from_sample(sample: dict) -> str:
@@ -209,6 +251,7 @@ def _default_temporary_occupancy_cover_debug() -> dict:
         "goable": 0.0,
         "cycle_id": -1,
         "accepted_cycle": 0.0,
+        "go_prob_floor_clamped": 0.0,
         "issue_reason": "none",
         # Backward-compatible aliases kept for existing local debug readers.
         "reference_lead_blocked_len": -1,
@@ -252,7 +295,8 @@ def _should_write_sample(sample: dict, overwrite_existing: bool) -> bool:
         GO_OPPORTUNITY_VALID_KEY not in sample or
         not has_debug or
         "goable" not in tempocc_debug or
-        "cycle_id" not in tempocc_debug
+        "cycle_id" not in tempocc_debug or
+        "go_prob_floor_clamped" not in tempocc_debug
     )
 
 
@@ -283,6 +327,7 @@ def _set_go_opportunity_annotation(
     cycle_id: int,
     accepted_cycle: float,
     goable: float,
+    go_prob_floor_clamped: float,
     reference_frame: int,
     reference_run_start_expert: int,
     reference_run_start_geom: int,
@@ -327,6 +372,7 @@ def _set_go_opportunity_annotation(
         "goable": float(goable),
         "cycle_id": int(cycle_id),
         "accepted_cycle": float(accepted_cycle),
+        "go_prob_floor_clamped": float(go_prob_floor_clamped),
         "issue_reason": str(issue_reason),
         # Backward-compatible aliases.
         "reference_lead_blocked_len": int(reference_run_start_expert),
@@ -558,6 +604,54 @@ def _segment_probability(offset_in_segment: int, segment_len: int) -> float:
     return float(max(1.0 - (float(offset_in_segment) / float(segment_len)), 1.0 / float(segment_len)))
 
 
+def _route_collision_info(sample: dict, image_data_root: str, cache: dict) -> dict:
+    base_dir = str(_base_dir_from_sample(sample) or "")
+    cache_key = (str(image_data_root or ""), base_dir)
+    if cache_key in cache:
+        return dict(cache[cache_key])
+
+    info = {
+        "known": False,
+        "non_collision": False,
+        "collision_route": False,
+        "results_path": "",
+        "issue_reason": "none",
+    }
+    if not image_data_root:
+        info["issue_reason"] = "missing_image_data_root"
+        cache[cache_key] = dict(info)
+        return info
+    if not base_dir:
+        info["issue_reason"] = "missing_base_dir"
+        cache[cache_key] = dict(info)
+        return info
+
+    results_path = os.path.join(str(image_data_root), base_dir, "results.json.gz")
+    payload = _load_json_gz_if_exists(results_path)
+    info["results_path"] = str(results_path)
+    if not isinstance(payload, dict):
+        info["issue_reason"] = "missing_route_results"
+        cache[cache_key] = dict(info)
+        return info
+
+    infractions = payload.get("infractions", {})
+    collision_route = False
+    for key in ("collisions_vehicle", "collisions_pedestrian", "collisions_layout"):
+        value = infractions.get(key) if isinstance(infractions, dict) else None
+        if _has_nonempty_infraction(value):
+            collision_route = True
+            break
+
+    info.update({
+        "known": True,
+        "non_collision": not bool(collision_route),
+        "collision_route": bool(collision_route),
+        "issue_reason": "none",
+    })
+    cache[cache_key] = dict(info)
+    return info
+
+
 def _fill_bins_for_route(samples, route_indices, can_write):
     assigned = 0
     family_counts = {"borrow": 0, "merge": 0, "junction": 0}
@@ -591,10 +685,18 @@ def _fill_bins_for_route(samples, route_indices, can_write):
     return route_has_active, int(assigned), family_counts
 
 
-def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos: int, end_pos: int, family: str):
+def _annotate_window_go_opportunity(
+    samples,
+    route_indices,
+    can_write,
+    start_pos: int,
+    end_pos: int,
+    family: str,
+    non_collision_good_route: bool,
+):
     go_route_pos, reference_frame = _window_go_frame(route_indices, samples, start_pos, end_pos)
     if go_route_pos is None:
-        return 0, 0
+        return 0, 0, 0
     area_start_route_pos, area_start_frame, area_start_source = _window_area_start_pos(
         route_indices,
         samples,
@@ -651,6 +753,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
                 cycle_id=-1,
                 accepted_cycle=0.0,
                 goable=0.0,
+                go_prob_floor_clamped=0.0,
                 reference_frame=reference_frame,
                 reference_run_start_expert=ref_run_start_expert,
                 reference_run_start_geom=reference_run_start_geom,
@@ -667,7 +770,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
                 area_start_source=area_start_source,
                 issue_reason=base_issue_reason,
             )
-        return 0, 0
+        return 0, 0, 0
 
     goable_flags = []
     current_goable_by_pos = []
@@ -719,6 +822,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
             accepted_cycle_id = int(cycle_id)
             break
 
+    clamped_frame_count = 0
     for rel_pos, route_pos in enumerate(range(int(start_pos), int(end_pos) + 1)):
         sample_idx = int(route_indices[int(route_pos)])
         if not can_write[sample_idx]:
@@ -732,6 +836,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
                 cycle_id=int(accepted_cycle_id),
                 accepted_cycle=1.0 if int(accepted_cycle_id) >= 0 else 0.0,
                 goable=1.0 if current_goable_by_pos[int(rel_pos)] else 0.0,
+                go_prob_floor_clamped=0.0,
                 reference_frame=reference_frame,
                 reference_run_start_expert=ref_run_start_expert,
                 reference_run_start_geom=reference_run_start_geom,
@@ -754,6 +859,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
         accepted_cycle = 0.0
         go_prob = 0.0
         goable = 1.0 if current_goable_by_pos[int(rel_pos)] else 0.0
+        go_prob_floor_clamped = 0.0
         for current_cycle_id, (seg_start_rel, seg_end_rel) in enumerate(segments):
             if int(seg_start_rel) <= int(rel_pos) <= int(seg_end_rel):
                 cycle_id = int(current_cycle_id)
@@ -762,6 +868,15 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
                 go_prob = _segment_probability(int(rel_pos) - int(seg_start_rel), seg_len)
                 break
 
+        if (
+            bool(non_collision_good_route)
+            and int(samples[sample_idx].get("conflict_decision_phase", 0)) == int(CONFLICT_DECISION_GO_CODE)
+            and float(go_prob) < float(GO_PROB_GO_PHASE_FLOOR_NON_COLLISION)
+        ):
+            go_prob = float(GO_PROB_GO_PHASE_FLOOR_NON_COLLISION)
+            go_prob_floor_clamped = 1.0
+            clamped_frame_count += 1
+
         _set_go_opportunity_annotation(
             samples[sample_idx],
             go_prob=go_prob,
@@ -769,6 +884,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
             cycle_id=cycle_id,
             accepted_cycle=accepted_cycle,
             goable=goable,
+            go_prob_floor_clamped=go_prob_floor_clamped,
             reference_frame=reference_frame,
             reference_run_start_expert=ref_run_start_expert,
             reference_run_start_geom=reference_run_start_geom,
@@ -785,7 +901,7 @@ def _annotate_window_go_opportunity(samples, route_indices, can_write, start_pos
             area_start_source=area_start_source,
             issue_reason=per_pos_issue_reason[int(rel_pos)],
         )
-    return len(segments), int(accepted_cycle_id >= 0)
+    return len(segments), int(accepted_cycle_id >= 0), int(clamped_frame_count)
 
 
 def main() -> None:
@@ -813,6 +929,12 @@ def main() -> None:
     window_count = 0
     cycle_count = 0
     accepted_cycle_count = 0
+    non_collision_route_count = 0
+    collision_route_count = 0
+    go_phase_floor_clamp_frames = 0
+    go_phase_floor_clamp_windows = 0
+    image_data_root = _infer_image_data_root_from_packed_path(args.input_path)
+    route_results_cache = {}
 
     can_write = []
     for sample in samples:
@@ -826,6 +948,20 @@ def main() -> None:
             skipped_existing += 1
 
     for _, route_indices in _group_indices_by_route(samples):
+        route_collision_info = (
+            _route_collision_info(samples[int(route_indices[0])], image_data_root=image_data_root, cache=route_results_cache)
+            if route_indices else
+            {"known": False, "non_collision": False, "collision_route": False}
+        )
+        non_collision_good_route = bool(
+            route_collision_info.get("known", False) and
+            route_collision_info.get("non_collision", False)
+        )
+        if bool(route_collision_info.get("known", False)):
+            if bool(route_collision_info.get("collision_route", False)):
+                collision_route_count += 1
+            else:
+                non_collision_route_count += 1
         route_has_active, route_assigned, route_family_counts = _fill_bins_for_route(samples, route_indices, can_write)
         assigned_active += int(route_assigned)
         for family_name, family_count in route_family_counts.items():
@@ -835,17 +971,21 @@ def main() -> None:
 
         for start_pos, end_pos, window_id in _iter_route_windows(route_indices, samples):
             family = str(window_id[0])
-            num_cycles, has_accepted_cycle = _annotate_window_go_opportunity(
+            num_cycles, has_accepted_cycle, clamped_frame_count = _annotate_window_go_opportunity(
                 samples,
                 route_indices,
                 can_write,
                 start_pos=start_pos,
                 end_pos=end_pos,
                 family=family,
+                non_collision_good_route=non_collision_good_route,
             )
             window_count += 1
             cycle_count += int(num_cycles)
             accepted_cycle_count += int(has_accepted_cycle)
+            go_phase_floor_clamp_frames += int(clamped_frame_count)
+            if int(clamped_frame_count) > 0:
+                go_phase_floor_clamp_windows += 1
 
     _atomic_pickle_dump(samples, args.output_path)
     print(
@@ -860,6 +1000,10 @@ def main() -> None:
         f"windows={window_count} "
         f"cycles={cycle_count} "
         f"accepted_cycles={accepted_cycle_count} "
+        f"non_collision_routes={non_collision_route_count} "
+        f"collision_routes={collision_route_count} "
+        f"go_phase_floor_clamp_frames={go_phase_floor_clamp_frames} "
+        f"go_phase_floor_clamp_windows={go_phase_floor_clamp_windows} "
         f"skipped_existing={skipped_existing} "
         f"key={TEMP_OCCUPANCY_COVER_KEY} "
         f"valid_key={TEMP_OCCUPANCY_COVER_VALID_KEY} "
