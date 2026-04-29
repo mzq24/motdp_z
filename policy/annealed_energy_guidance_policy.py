@@ -3311,15 +3311,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         else:
             raise ValueError("route_abs_stats_path is required for joint Route B ego diffusion")
 
-        # Register anchors only for the legacy anchor-energy path. Direct
-        # stage1/tempocc checkpoints do not depend on anchor files anymore.
-        route_b_cfg = config.get('route_b', {})
-        needs_legacy_anchor_energy = (
-            bool(route_b_cfg.get('train_energy', True))
-            and not bool(route_b_cfg.get('use_stage1_speed_energy', True))
-        )
+        # Register anchor centers
         anchor_path = config.get('anchor_path')
-        if needs_legacy_anchor_energy and anchor_path:
+        if anchor_path:
             if anchor_path.endswith('.npy'):
                 ac = np.load(anchor_path)
             else:

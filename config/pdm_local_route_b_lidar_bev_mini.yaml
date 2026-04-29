@@ -2,6 +2,7 @@
 # Based on 0331_clean config, adapted for local mini training
 
 policy_type: anchor_free
+anchor_path: dd_baseline/anchors/carla_kmeans_32.npy
 global_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/global_abs_stats.npz
 route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
 
