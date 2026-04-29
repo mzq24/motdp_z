@@ -374,10 +374,17 @@ def _append_boundary_val_metric(val_metrics, prefix, pred, target, valid):
     val_metrics[f'{prefix}_count'].append(float(np.sum(finite_mask)))
 
 
+def _get_stage1_result(result, suffix):
+    """Prefer renamed stage1 outputs while accepting older speed_energy aliases."""
+    if f'stage1_{suffix}' in result:
+        return result.get(f'stage1_{suffix}')
+    return result.get(f'speed_energy_{suffix}')
+
+
 def _append_new_stage1_val_metrics(val_metrics, batch, result):
     """Evaluate new direct-label stage1 heads on inference outputs."""
     family = batch.get('conflict_area_family')
-    if family is not None and 'speed_energy_window_probs' in result:
+    if family is not None and _get_stage1_result(result, 'window_probs') is not None:
         family_np = _to_numpy_array(family).reshape(-1).astype(np.int64)
         # Label order: 0 none, 1 borrow, 2 merge, 3 junction.
         # Window head order: 0 none, 1 merge, 2 junction, 3 borrow.
@@ -388,50 +395,50 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         _append_classification_val_metrics(
             val_metrics,
             'stage1_window',
-            result.get('speed_energy_window_probs'),
+            _get_stage1_result(result, 'window_probs'),
             window_target,
             class_names=('none', 'merge', 'junction', 'borrow'),
             active_is_nonzero=True,
         )
 
-    if 'speed_energy_dir_probs' in result and batch.get('conflict_area_dir') is not None:
+    if _get_stage1_result(result, 'dir_probs') is not None and batch.get('conflict_area_dir') is not None:
         dir_target = np.clip(_to_numpy_array(batch['conflict_area_dir']).reshape(-1).astype(np.int64), 0, 3)
         _append_classification_val_metrics(
             val_metrics,
             'stage1_dir',
-            result.get('speed_energy_dir_probs'),
+            _get_stage1_result(result, 'dir_probs'),
             dir_target,
             class_names=('none', 'same', 'opposite', 'cross'),
             active_is_nonzero=True,
         )
 
-    if 'speed_energy_decision_phase_probs' in result and batch.get('conflict_decision_phase') is not None:
+    if _get_stage1_result(result, 'decision_phase_probs') is not None and batch.get('conflict_decision_phase') is not None:
         decision_codes = _to_numpy_array(batch['conflict_decision_phase']).reshape(-1).astype(np.int64)
         decision_valid = decision_codes > 0
         decision_target = np.clip(decision_codes - 1, 0, 1)
         _append_classification_val_metrics(
             val_metrics,
             'stage1_decision_phase',
-            result.get('speed_energy_decision_phase_probs'),
+            _get_stage1_result(result, 'decision_phase_probs'),
             decision_target,
             valid_mask=decision_valid,
             class_names=('yld', 'go'),
         )
 
-    if 'speed_energy_control_phase_probs' in result and batch.get('conflict_control_phase') is not None:
+    if _get_stage1_result(result, 'control_phase_probs') is not None and batch.get('conflict_control_phase') is not None:
         control_codes = _to_numpy_array(batch['conflict_control_phase']).reshape(-1).astype(np.int64)
         control_valid = control_codes > 0
         control_target = np.clip(control_codes - 1, 0, 3)
         _append_classification_val_metrics(
             val_metrics,
             'stage1_control_phase',
-            result.get('speed_energy_control_phase_probs'),
+            _get_stage1_result(result, 'control_phase_probs'),
             control_target,
             valid_mask=control_valid,
             class_names=('coast_yld', 'slow_yld', 'stop_yld', 'go'),
         )
 
-    temp_probs = _to_numpy_array(result.get('speed_energy_temporary_occupancy_probs'))
+    temp_probs = _to_numpy_array(_get_stage1_result(result, 'temporary_occupancy_probs'))
     temp_bins = _to_numpy_array(batch.get('temporary_occupancy_cover_bins'))
     temp_valid = _to_numpy_array(batch.get('temporary_occupancy_cover_valid'))
     if temp_probs is not None and temp_bins is not None and temp_valid is not None:
@@ -444,7 +451,7 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
             val_metrics['stage1_tempocc_bce'].append(float(np.mean(bce[temp_valid])))
             val_metrics['stage1_tempocc_count'].append(float(np.sum(temp_valid)))
 
-    go_probs = _to_numpy_array(result.get('speed_energy_go_opportunity_probs'))
+    go_probs = _to_numpy_array(_get_stage1_result(result, 'go_opportunity_probs'))
     yld_target = _to_numpy_array(batch.get('yld_pressure_prob'))
     go_target = _to_numpy_array(batch.get('go_opportunity_prob'))
     go_valid = _to_numpy_array(batch.get('go_opportunity_valid'))
@@ -469,7 +476,7 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
             val_metrics['stage1_go_opportunity_mae'].append(float(np.mean(mae)))
             val_metrics['stage1_go_opportunity_count'].append(float(np.sum(finite)))
 
-    if 'speed_energy_conflict_area_status_probs' in result and batch.get('conflict_area_status') is not None:
+    if _get_stage1_result(result, 'conflict_area_status_probs') is not None and batch.get('conflict_area_status') is not None:
         status_target = np.clip(
             _to_numpy_array(batch['conflict_area_status']).reshape(-1).astype(np.int64),
             0,
@@ -478,22 +485,22 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         _append_classification_val_metrics(
             val_metrics,
             'stage1_conflict_area_status',
-            result.get('speed_energy_conflict_area_status_probs'),
+            _get_stage1_result(result, 'conflict_area_status_probs'),
             status_target,
             class_names=('none', 'approaching', 'inside', 'past'),
             active_is_nonzero=True,
         )
 
     timing_specs = (
-        ('stage1_conflict_dist_to_entry', 'speed_energy_conflict_dist_to_entry_m', 'conflict_dist_to_entry_m'),
-        ('stage1_conflict_dist_to_exit', 'speed_energy_conflict_dist_to_exit_m', 'conflict_dist_to_exit_m'),
-        ('stage1_conflict_time_to_entry', 'speed_energy_conflict_time_to_entry_s', 'conflict_time_to_entry_s'),
+        ('stage1_conflict_dist_to_entry', 'conflict_dist_to_entry_m', 'conflict_dist_to_entry_m'),
+        ('stage1_conflict_dist_to_exit', 'conflict_dist_to_exit_m', 'conflict_dist_to_exit_m'),
+        ('stage1_conflict_time_to_entry', 'conflict_time_to_entry_s', 'conflict_time_to_entry_s'),
     )
     timing_valid = None
     if batch.get('conflict_area_family') is not None:
         timing_valid = _to_numpy_array(batch['conflict_area_family']).reshape(-1).astype(np.int64) > 0
     for metric_prefix, pred_key, target_key in timing_specs:
-        pred_np = _to_numpy_array(result.get(pred_key))
+        pred_np = _to_numpy_array(_get_stage1_result(result, pred_key))
         target_np = _to_numpy_array(batch.get(target_key))
         if pred_np is None or target_np is None:
             continue
@@ -507,12 +514,12 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
             val_metrics[f'{metric_prefix}_count'].append(float(np.sum(finite)))
 
     boundary_specs = (
-        ('stage1_merge_yld_max', 'speed_energy_merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
-        ('stage1_merge_go_min', 'speed_energy_merge_go_min_mps', 'merge_go_min_speed', 'merge_go_min_speed_valid'),
-        ('stage1_junction_yld_max', 'speed_energy_junction_yld_max_mps', 'junction_yld_max_speed', 'junction_yld_max_speed_valid'),
-        ('stage1_junction_go_min', 'speed_energy_junction_go_min_mps', 'junction_go_min_speed', 'junction_go_min_speed_valid'),
-        ('stage1_borrow_yld_max', 'speed_energy_borrow_yld_max_mps', 'borrow_yld_max_speed', 'borrow_yld_max_speed_valid'),
-        ('stage1_borrow_go_min', 'speed_energy_borrow_go_min_mps', 'borrow_go_min_speed', 'borrow_go_min_speed_valid'),
+        ('stage1_merge_yld_max', 'merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
+        ('stage1_merge_go_min', 'merge_go_min_mps', 'merge_go_min_speed', 'merge_go_min_speed_valid'),
+        ('stage1_junction_yld_max', 'junction_yld_max_mps', 'junction_yld_max_speed', 'junction_yld_max_speed_valid'),
+        ('stage1_junction_go_min', 'junction_go_min_mps', 'junction_go_min_speed', 'junction_go_min_speed_valid'),
+        ('stage1_borrow_yld_max', 'borrow_yld_max_mps', 'borrow_yld_max_speed', 'borrow_yld_max_speed_valid'),
+        ('stage1_borrow_go_min', 'borrow_go_min_mps', 'borrow_go_min_speed', 'borrow_go_min_speed_valid'),
     )
     all_abs_errors = []
     all_valid_counts = []
@@ -520,11 +527,11 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         _append_boundary_val_metric(
             val_metrics,
             metric_prefix,
-            result.get(pred_key),
+            _get_stage1_result(result, pred_key),
             batch.get(target_key),
             batch.get(valid_key),
         )
-        pred_np = _to_numpy_array(result.get(pred_key))
+        pred_np = _to_numpy_array(_get_stage1_result(result, pred_key))
         target_np = _to_numpy_array(batch.get(target_key))
         valid_np = _to_numpy_array(batch.get(valid_key))
         if pred_np is None or target_np is None or valid_np is None:
@@ -585,8 +592,11 @@ def validate_model(
 
             with autocast_cuda(use_amp, amp_dtype):
                 # Route B can explicitly choose unified or split-forward validation.
+                # Do not gate this on anchors: current stage1/tempocc runs are
+                # anchor-free, while the legacy compute_loss path still expects the
+                # old decoder return contract.
                 if hasattr(model_for_inference, 'compute_unified_loss') and \
-                   getattr(model_for_inference, 'anchor_centers_abs', None) is not None:
+                   hasattr(model_for_inference, 'compute_split_loss'):
                     loss_dict = model_for_inference(batch, return_loss_dict=True, phase=route_b_phase)
                 else:
                     loss_dict = model_for_inference.compute_loss(batch)
@@ -596,7 +606,11 @@ def validate_model(
                 val_metrics['cls_loss'].append(loss_dict['cls_loss'].item())
                 val_metrics['reg_loss'].append(loss_dict['reg_loss'].item())
                 val_metrics['route_loss'].append(loss_dict['route_loss'].item())
-                if 'energy_loss' in loss_dict:
+                if 'stage1_loss' in loss_dict:
+                    val_metrics['stage1_loss'].append(loss_dict['stage1_loss'].item())
+                    val_metrics['energy_loss'].append(loss_dict['stage1_loss'].item())
+                    val_metrics['alignment_loss'].append(loss_dict['alignment_loss'].item())
+                elif 'energy_loss' in loss_dict:
                     val_metrics['energy_loss'].append(loss_dict['energy_loss'].item())
                     val_metrics['alignment_loss'].append(loss_dict['alignment_loss'].item())
                 if 'energy_front_loss' in loss_dict:
@@ -624,6 +638,38 @@ def validate_model(
                 if 'speed_profile_loss' in loss_dict:
                     val_metrics['speed_profile_loss'].append(loss_dict['speed_profile_loss'].item())
                 for key in (
+                    'stage1_merge_yld_loss',
+                    'stage1_merge_go_loss',
+                    'stage1_junction_yld_loss',
+                    'stage1_junction_go_loss',
+                    'stage1_borrow_yld_loss',
+                    'stage1_borrow_go_loss',
+                    'stage1_cross_yld_loss',
+                    'stage1_cross_go_loss',
+                    'stage1_merge_active_loss',
+                    'stage1_junction_active_loss',
+                    'stage1_borrow_active_loss',
+                    'stage1_cross_active_loss',
+                    'stage1_dir_loss',
+                    'stage1_conflict_area_loss',
+                    'stage1_window_loss',
+                    'stage1_phase_loss',
+                    'stage1_decision_phase_loss',
+                    'stage1_control_phase_loss',
+                    'stage1_temporary_occupancy_loss',
+                    'stage1_go_opportunity_loss',
+                    'stage1_conflict_area_status_loss',
+                    'stage1_conflict_timing_loss',
+                    'stage1_state_consistency_loss',
+                    'stage1_state_consistency_window_loss',
+                    'stage1_state_consistency_phase_loss',
+                    'stage1_state_consistency_timing_loss',
+                    'stage1_merge_yld_max_loss',
+                    'stage1_merge_go_min_loss',
+                    'stage1_junction_yld_max_loss',
+                    'stage1_junction_go_min_loss',
+                    'stage1_borrow_yld_max_loss',
+                    'stage1_borrow_go_min_loss',
                     'energy_merge_yld_loss',
                     'energy_merge_go_loss',
                     'energy_junction_yld_loss',
@@ -1507,7 +1553,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     route_b_phase = 'split' if route_b_cfg.get('use_split_forward', False) else 'unified'
 
     if policy_type == 'anchor_free':
-        # Separate energy head params from decoder params
+        # Separate stage1/state head params from decoder params.
         energy_param_ids = set()
         energy_params = []
         energy_param_prefixes = (
@@ -1530,7 +1576,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         optimizer = torch.optim.AdamW(diff_params, lr=lr, weight_decay=weight_decay)
         optimizer_energy = torch.optim.AdamW(energy_params, lr=lr, weight_decay=weight_decay)
         if rank == 0:
-            print(f"✓ Dual optimizers: decoder ({len(diff_params)} param groups) + energy ({len(energy_params)} param groups)")
+            print(f"✓ Dual optimizers: decoder ({len(diff_params)} param groups) + stage1 ({len(energy_params)} param groups)")
     else:
         optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -1576,7 +1622,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 milestones=[warmup_epochs]
             )
 
-        # Energy optimizer also gets a scheduler (Route B+)
+        # Stage1 optimizer also gets a scheduler (Route B+)
         scheduler_energy = None
         if optimizer_energy is not None:
             warmup_energy = LinearLR(optimizer_energy, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
@@ -1676,14 +1722,19 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             except Exception:
                 if rank == 0:
                     print("  ⚠ Could not restore optimizer state (param groups changed)")
-        if optimizer_energy is not None and 'optimizer_energy_state_dict' in checkpoint:
+        stage1_optim_key = (
+            'optimizer_stage1_state_dict'
+            if 'optimizer_stage1_state_dict' in checkpoint
+            else 'optimizer_energy_state_dict'
+        )
+        if optimizer_energy is not None and stage1_optim_key in checkpoint:
             try:
-                optimizer_energy.load_state_dict(checkpoint['optimizer_energy_state_dict'])
+                optimizer_energy.load_state_dict(checkpoint[stage1_optim_key])
                 if rank == 0:
-                    print("  ✓ Energy optimizer state restored")
+                    print("  ✓ Stage1 optimizer state restored")
             except Exception:
                 if rank == 0:
-                    print("  ⚠ Could not restore energy optimizer state")
+                    print("  ⚠ Could not restore stage1 optimizer state")
         if scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
             if resume_rebuild_scheduler:
                 if rank == 0:
@@ -1696,18 +1747,23 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 except Exception:
                     if rank == 0:
                         print("  ⚠ Could not restore scheduler state")
-        if scheduler_energy is not None and 'scheduler_energy_state_dict' in checkpoint and checkpoint['scheduler_energy_state_dict'] is not None:
+        stage1_sched_key = (
+            'scheduler_stage1_state_dict'
+            if 'scheduler_stage1_state_dict' in checkpoint
+            else 'scheduler_energy_state_dict'
+        )
+        if scheduler_energy is not None and stage1_sched_key in checkpoint and checkpoint[stage1_sched_key] is not None:
             if resume_rebuild_scheduler:
                 if rank == 0:
-                    print("  ↺ Skipping energy scheduler state restore (resume_rebuild_scheduler=true)")
+                    print("  ↺ Skipping stage1 scheduler state restore (resume_rebuild_scheduler=true)")
             else:
                 try:
-                    scheduler_energy.load_state_dict(checkpoint['scheduler_energy_state_dict'])
+                    scheduler_energy.load_state_dict(checkpoint[stage1_sched_key])
                     if rank == 0:
-                        print("  ✓ Energy scheduler state restored")
+                        print("  ✓ Stage1 scheduler state restored")
                 except Exception:
                     if rank == 0:
-                        print("  ⚠ Could not restore energy scheduler state")
+                        print("  ⚠ Could not restore stage1 scheduler state")
 
         resume_override_lr = config.get('optimizer', {}).get('resume_override_lr', None)
         resume_override_lr_energy = config.get('optimizer', {}).get('resume_override_lr_energy', resume_override_lr)
@@ -1728,7 +1784,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             _set_optimizer_lr(optimizer_energy, resume_override_lr_energy)
             _set_scheduler_base_lrs(scheduler_energy, resume_override_lr_energy)
             if rank == 0:
-                print(f"  ✓ Resume override energy lr -> {resume_override_lr_energy:.2e}")
+                print(f"  ✓ Resume override stage1 lr -> {resume_override_lr_energy:.2e}")
 
         if resume_rebuild_scheduler:
             if scheduler is not None:
@@ -1865,7 +1921,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     if rank == 0:
                         print(
                             f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping "
-                            f"(energy_grad={energy_grad_norm_before_clip}, diff_grad={grad_norm_before_clip})"
+                            f"(stage1_grad={energy_grad_norm_before_clip}, diff_grad={grad_norm_before_clip})"
                         )
                         if nonfinite_debug_budget > 0:
                             print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
@@ -1927,7 +1983,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 if 'route_loss' in loss_dict:
                     postfix['route'] = f'{loss_dict["route_loss"].item():.3f}'
                 postfix['grad'] = f'{grad_norm_value:.2f}{"✂" if was_clipped else ""}'
-                if 'energy_loss' in loss_dict:
+                if 'stage1_loss' in loss_dict:
+                    postfix['S1'] = f'{loss_dict["stage1_loss"].item():.3f}'
+                elif 'energy_loss' in loss_dict:
                     postfix['E'] = f'{loss_dict["energy_loss"].item():.3f}'
                 if 'alignment_loss' in loss_dict:
                     postfix['align'] = f'{loss_dict["alignment_loss"].item():.3f}'
@@ -1953,11 +2011,31 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 }
                 # Individual losses
                 for lk in ('cls_loss', 'reg_loss', 'route_loss', 'speed_loss', 'speed_profile_loss',
-                           'energy_loss', 'alignment_loss',
+                           'stage1_loss', 'energy_loss', 'alignment_loss',
                            'energy_front_loss', 'energy_left_loss', 'energy_right_loss',
                            'energy_chase_loss', 'energy_merge_loss', 'energy_cross_loss',
                            'energy_ped_loss', 'energy_pedestrian_loss',
                            'energy_off_loss', 'energy_route_loss',
+                           'stage1_merge_yld_loss', 'stage1_merge_go_loss',
+                           'stage1_junction_yld_loss', 'stage1_junction_go_loss',
+                           'stage1_borrow_yld_loss', 'stage1_borrow_go_loss',
+                           'stage1_cross_yld_loss', 'stage1_cross_go_loss',
+                           'stage1_merge_active_loss',
+                           'stage1_junction_active_loss', 'stage1_borrow_active_loss',
+                           'stage1_cross_active_loss',
+                           'stage1_dir_loss',
+                           'stage1_conflict_area_loss',
+                           'stage1_window_loss', 'stage1_phase_loss',
+                           'stage1_decision_phase_loss', 'stage1_control_phase_loss',
+                           'stage1_temporary_occupancy_loss', 'stage1_go_opportunity_loss',
+                           'stage1_conflict_area_status_loss', 'stage1_conflict_timing_loss',
+                           'stage1_state_consistency_loss',
+                           'stage1_state_consistency_window_loss',
+                           'stage1_state_consistency_phase_loss',
+                           'stage1_state_consistency_timing_loss',
+                           'stage1_merge_yld_max_loss', 'stage1_merge_go_min_loss',
+                           'stage1_junction_yld_max_loss', 'stage1_junction_go_min_loss',
+                           'stage1_borrow_yld_max_loss', 'stage1_borrow_go_min_loss',
                            'energy_merge_yld_loss', 'energy_merge_go_loss',
                            'energy_junction_yld_loss', 'energy_junction_go_loss',
                            'energy_borrow_yld_loss', 'energy_borrow_go_loss',
@@ -1992,8 +2070,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 if 'behavior_loss' in loss_dict:
                     log_data["train/behavior_loss"] = loss_dict['behavior_loss'].item()
                     log_data["train/allowed_loss"] = loss_dict['allowed_loss'].item()
-                # Energy optimizer LR (Route B+)
+                # Stage1 optimizer LR (Route B+)
                 if optimizer_energy is not None:
+                    log_data["train/lr_stage1"] = optimizer_energy.param_groups[0]['lr']
                     log_data["train/lr_energy"] = optimizer_energy.param_groups[0]['lr']
                 safe_wandb_log(log_data, use_wandb)
         
@@ -2014,7 +2093,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             scheduler_energy.step()
             if rank == 0:
                 current_lr_e = optimizer_energy.param_groups[0]['lr']
-                print(f"  Learning rate (energy): {current_lr_e:.2e}")
+                print(f"  Learning rate (stage1): {current_lr_e:.2e}")
         
         # Get model state dict (handle DDP wrapper)
         model_to_save = policy.module if world_size > 1 else policy
@@ -2037,6 +2116,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         'val_metrics': val_metrics,
                         }
             if optimizer_energy is not None:
+                ckpt_data['optimizer_stage1_state_dict'] = optimizer_energy.state_dict()
+                ckpt_data['scheduler_stage1_state_dict'] = scheduler_energy.state_dict() if scheduler_energy is not None else None
+                # Backward-compatible aliases for old resume scripts.
                 ckpt_data['optimizer_energy_state_dict'] = optimizer_energy.state_dict()
                 ckpt_data['scheduler_energy_state_dict'] = scheduler_energy.state_dict() if scheduler_energy is not None else None
             torch.save(ckpt_data, ckpt_path)

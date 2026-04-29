@@ -127,15 +127,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.route_energy_norm   = route_b_cfg.get('route_energy_norm', 5.0)     # normalization factor (m)
 
         # Route B+ config
-        self.energy_grad_clip_norm = route_b_cfg.get('energy_grad_clip_norm', 1.0)
+        self.energy_grad_clip_norm = route_b_cfg.get('stage1_grad_clip_norm', route_b_cfg.get('energy_grad_clip_norm', 1.0))
         self.alignment_loss_weight = route_b_cfg.get('alignment_loss_weight', 0.1)
         self.num_gt_augmentations = route_b_cfg.get('num_gt_augmentations', 4)
         self.use_safe_anchors = route_b_cfg.get('use_safe_anchors', False)
-        self.energy_noisy_training = route_b_cfg.get('energy_noisy_training', False)
+        self.energy_noisy_training = route_b_cfg.get('stage1_noisy_training', route_b_cfg.get('energy_noisy_training', False))
         self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
-        self.train_energy = route_b_cfg.get('train_energy', True)
+        self.train_energy = route_b_cfg.get('train_stage1', route_b_cfg.get('train_energy', True))
         self.use_front_route_risk_energy = route_b_cfg.get('use_front_route_risk_energy', False)
-        self.use_stage1_speed_energy = route_b_cfg.get('use_stage1_speed_energy', True)
+        self.use_stage1_state = route_b_cfg.get(
+            'use_stage1_state',
+            route_b_cfg.get('use_stage1_speed_energy', True),
+        )
+        # Backward-compatible alias for older checkpoints/configs.
+        self.use_stage1_speed_energy = self.use_stage1_state
         self.shared_stage1_training_source = str(
             route_b_cfg.get('shared_stage1_training_source', 'clean')
         ).lower()
@@ -150,13 +155,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_lidar_bev_detail = route_b_cfg.get('use_lidar_bev_detail', False)
         self.lidar_history_frames = max(int(route_b_cfg.get('lidar_history_frames', self.n_obs_steps)), 1)
 
-        self.energy_chase_weight = route_b_cfg.get('energy_chase_weight', route_b_cfg.get('energy_front_weight', 1.0))
-        self.energy_meet_weight = route_b_cfg.get('energy_meet_weight', route_b_cfg.get('energy_left_weight', 1.0))
+        self.energy_chase_weight = route_b_cfg.get(
+            'stage1_chase_weight',
+            route_b_cfg.get('energy_chase_weight', route_b_cfg.get('energy_front_weight', 1.0)),
+        )
+        self.energy_meet_weight = route_b_cfg.get(
+            'stage1_meet_weight',
+            route_b_cfg.get('energy_meet_weight', route_b_cfg.get('energy_left_weight', 1.0)),
+        )
         self.energy_merge_weight = route_b_cfg.get('energy_merge_weight', self.energy_meet_weight)
         self.energy_cross_weight = route_b_cfg.get('energy_cross_weight', self.energy_meet_weight)
         self.energy_junction_weight = route_b_cfg.get('energy_junction_weight', self.energy_cross_weight)
         self.energy_borrow_weight = route_b_cfg.get('energy_borrow_weight', self.energy_cross_weight)
-        self.energy_ped_weight = route_b_cfg.get('energy_ped_weight', route_b_cfg.get('energy_pedestrian_weight', 1.0))
+        self.energy_ped_weight = route_b_cfg.get(
+            'stage1_ped_weight',
+            route_b_cfg.get('energy_ped_weight', route_b_cfg.get('energy_pedestrian_weight', 1.0)),
+        )
         self.energy_merge_active_weight = route_b_cfg.get('energy_merge_active_weight', 0.25)
         self.energy_cross_active_weight = route_b_cfg.get('energy_cross_active_weight', 0.25)
         self.energy_junction_active_weight = route_b_cfg.get(
@@ -166,13 +180,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'energy_borrow_active_weight', self.energy_cross_active_weight
         )
         self.energy_relation_weight = float(route_b_cfg.get('energy_relation_weight', 0.25))
-        self.energy_window_weight = float(route_b_cfg.get('energy_window_weight', 0.25))
-        self.energy_phase_weight = float(route_b_cfg.get('energy_phase_weight', 0.25))
-        self.energy_conflict_area_weight = float(route_b_cfg.get('energy_conflict_area_weight', 0.25))
-        self.train_stage1_speed_energy_until_epoch = route_b_cfg.get('train_stage1_speed_energy_until_epoch', None)
+        self.stage1_loss_weight = float(route_b_cfg.get(
+            'stage1_loss_weight',
+            route_b_cfg.get('energy_loss_weight', 1.0),
+        ))
+        self.energy_loss_weight = self.stage1_loss_weight
+        self.energy_window_weight = float(route_b_cfg.get('stage1_window_weight', route_b_cfg.get('energy_window_weight', 0.25)))
+        self.energy_phase_weight = float(route_b_cfg.get('stage1_phase_weight', route_b_cfg.get('energy_phase_weight', 0.25)))
+        self.energy_conflict_area_weight = float(route_b_cfg.get('stage1_conflict_area_weight', route_b_cfg.get('energy_conflict_area_weight', 0.25)))
+        self.train_stage1_speed_energy_until_epoch = route_b_cfg.get(
+            'train_stage1_until_epoch',
+            route_b_cfg.get('train_stage1_speed_energy_until_epoch', None),
+        )
         self.train_speed_head_until_epoch = route_b_cfg.get('train_speed_head_until_epoch', None)
         self.train_stage1_speed_energy_after_update_every = route_b_cfg.get(
-            'train_stage1_speed_energy_after_update_every', None
+            'train_stage1_after_update_every',
+            route_b_cfg.get('train_stage1_speed_energy_after_update_every', None),
         )
         self.train_speed_head_after_update_every = route_b_cfg.get(
             'train_speed_head_after_update_every', None
@@ -360,7 +383,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.reg_loss_weight = config.get('reg_loss_weight', 1.0)
         self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
         self.route_final_loss_weight = diffusion_cfg.get('route_final_loss_weight', 1.0)
-        self.energy_loss_weight = route_b_cfg.get('energy_loss_weight', 1.0)
+        self.stage1_loss_weight = float(route_b_cfg.get(
+            'stage1_loss_weight',
+            route_b_cfg.get('energy_loss_weight', getattr(self, 'stage1_loss_weight', 1.0)),
+        ))
+        self.energy_loss_weight = self.stage1_loss_weight
         self.speed_loss_weight = route_b_cfg.get('speed_loss_weight', 1.0)
         self.speed_profile_loss_weight = route_b_cfg.get('speed_profile_loss_weight', 1.0)
 
@@ -506,7 +533,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         speed_profile = displacements.norm(dim=-1) / max(self.speed_profile_dt, 1e-6)
         return speed_profile.to(device=device, dtype=model_dtype).clamp(min=0.0, max=20.0)
 
-    def _has_stage1_speed_energy_labels(self, batch: Dict[str, torch.Tensor]) -> bool:
+    def _has_stage1_labels(self, batch: Dict[str, torch.Tensor]) -> bool:
         if not self.use_stage1_speed_energy:
             return False
         required = (
@@ -820,7 +847,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         valid_target_mask[fallback_rows] = legacy_valid_mask[fallback_rows]
         return target, valid_target_mask
 
-    def _compose_stage1_speed_energy_outputs(self, raw_scores: dict) -> dict:
+    def _compose_stage1_outputs(self, raw_scores: dict) -> dict:
         window_probs = torch.softmax(raw_scores['window_logits'], dim=-1)
         dir_probs = torch.softmax(raw_scores['dir_logits'], dim=-1)
         decision_phase_base_logits = raw_scores.get(
@@ -1757,7 +1784,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         x = F.linear(x, head[2].weight.detach(), head[2].bias.detach())
         return x
 
-    def _compute_shared_stage1_speed_energy_loss(
+    def _compute_shared_stage1_loss(
         self,
         batch: Dict[str, torch.Tensor],
         trajectory: torch.Tensor,
@@ -2104,7 +2131,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 + loss_state_consistency_timing
             )
 
-        energy_loss = (
+        stage1_loss = (
             + self.energy_merge_weight * loss_merge
             + self.energy_junction_weight * loss_junction
             + self.energy_borrow_weight * loss_borrow
@@ -2119,7 +2146,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.state_consistency_loss_weight * loss_state_consistency
         )
         return {
-            'energy_loss': energy_loss,
+            'stage1_loss': stage1_loss,
+            # Backward-compatible alias while downstream logs/agents migrate.
+            'energy_loss': stage1_loss,
             'chase_loss': loss_chase,
             'merge_loss': loss_merge,
             'junction_loss': loss_junction,
@@ -2240,7 +2269,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         allowed_flags = batch.get('allowed_flags', None)
         energy_targets = batch.get('energy_targets', None)
         energy_active_mask = batch.get('energy_active_mask', None)
-        has_stage1_speed_energy = self._has_stage1_speed_energy_labels(batch)
+        has_stage1_labels = self._has_stage1_labels(batch)
         has_energy = (self.anchor_centers_abs is not None
                       and behavior_labels is not None
                       and allowed_flags is not None)
@@ -2248,8 +2277,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self.train_speed_head_until_epoch,
             self.train_speed_head_after_update_every,
         )
-        train_stage1_speed_energy_active = (
-            has_stage1_speed_energy
+        train_stage1_active = (
+            has_stage1_labels
             and self.train_energy
             and self._train_branch_enabled_with_schedule(
                 self.train_stage1_speed_energy_until_epoch,
@@ -2276,7 +2305,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         traj_branch_condition = None
         traj_branch_condition_details = None
         branch_condition_schedule = None
-        if self.use_traj_branch_condition and has_stage1_speed_energy:
+        if self.use_traj_branch_condition and has_stage1_labels:
             traj_branch_condition, traj_branch_condition_details = self._build_stage1_branch_condition_gt(
                 batch=batch,
                 ego_status=ego_status,
@@ -2363,15 +2392,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 ).sum(dim=-1) / step_weights.sum().clamp(min=1e-6)
                 speed_profile_loss = self._masked_batch_mean(profile_per_sample, good_route_mask)
 
-        # ===== Forward 2: Energy training (anchors + GT) =====
+        # ===== Forward 2: Stage1 state training (clean/noisy shared path) =====
         zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
         energy_loss = zero_t
         loss_front = loss_left = loss_right = loss_ped = loss_off = zero_t
         loss_route = zero_t
         stage1_extra_losses = {}
 
-        if train_stage1_speed_energy_active:
-            stage1_loss_dict = self._compute_shared_stage1_speed_energy_loss(
+        if train_stage1_active:
+            stage1_loss_dict = self._compute_shared_stage1_loss(
                 batch=batch,
                 trajectory=trajectory,
                 route_gt=route_gt,
@@ -2390,47 +2419,52 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 ) else traj_branch_condition,
                 branch_condition_schedule=branch_condition_schedule,
             )
-            energy_loss = stage1_loss_dict['energy_loss']
+            energy_loss = stage1_loss_dict['stage1_loss']
             loss_front = stage1_loss_dict['chase_loss']
             loss_left = stage1_loss_dict['merge_loss']
             loss_right = stage1_loss_dict['cross_loss']
             loss_ped = stage1_loss_dict['pedestrian_loss']
             loss_off = zero_t
             stage1_extra_losses = {
-                'energy_merge_yld_loss': stage1_loss_dict['merge_yld_loss'],
-                'energy_merge_go_loss': stage1_loss_dict['merge_go_loss'],
-                'energy_junction_yld_loss': stage1_loss_dict['junction_yld_loss'],
-                'energy_junction_go_loss': stage1_loss_dict['junction_go_loss'],
-                'energy_borrow_yld_loss': stage1_loss_dict['borrow_yld_loss'],
-                'energy_borrow_go_loss': stage1_loss_dict['borrow_go_loss'],
-                'energy_cross_yld_loss': stage1_loss_dict['cross_yld_loss'],
-                'energy_cross_go_loss': stage1_loss_dict['cross_go_loss'],
-                'energy_merge_active_loss': stage1_loss_dict['merge_active_loss'],
-                'energy_junction_active_loss': stage1_loss_dict['junction_active_loss'],
-                'energy_borrow_active_loss': stage1_loss_dict['borrow_active_loss'],
-                'energy_cross_active_loss': stage1_loss_dict['cross_active_loss'],
-                'energy_relation_loss': stage1_loss_dict['relation_loss'],
-                'energy_dir_loss': stage1_loss_dict['dir_loss'],
-                'energy_conflict_area_loss': stage1_loss_dict.get('conflict_area_loss', zero_t),
-                'energy_window_loss': stage1_loss_dict.get('window_loss', zero_t),
-                'energy_phase_loss': stage1_loss_dict.get('phase_loss', zero_t),
-                'energy_decision_phase_loss': stage1_loss_dict.get('decision_phase_loss', zero_t),
-                'energy_control_phase_loss': stage1_loss_dict.get('control_phase_loss', zero_t),
-                'energy_temporary_occupancy_loss': stage1_loss_dict.get('temporary_occupancy_loss', zero_t),
-                'energy_go_opportunity_loss': stage1_loss_dict.get('go_opportunity_loss', zero_t),
-                'energy_conflict_area_status_loss': stage1_loss_dict.get('conflict_area_status_loss', zero_t),
-                'energy_conflict_timing_loss': stage1_loss_dict.get('conflict_timing_loss', zero_t),
-                'energy_state_consistency_loss': stage1_loss_dict.get('state_consistency_loss', zero_t),
-                'energy_state_consistency_window_loss': stage1_loss_dict.get('state_consistency_window_loss', zero_t),
-                'energy_state_consistency_phase_loss': stage1_loss_dict.get('state_consistency_phase_loss', zero_t),
-                'energy_state_consistency_timing_loss': stage1_loss_dict.get('state_consistency_timing_loss', zero_t),
-                'energy_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),
-                'energy_merge_go_min_loss': stage1_loss_dict.get('merge_go_min_loss', zero_t),
-                'energy_junction_yld_max_loss': stage1_loss_dict.get('junction_yld_max_loss', zero_t),
-                'energy_junction_go_min_loss': stage1_loss_dict.get('junction_go_min_loss', zero_t),
-                'energy_borrow_yld_max_loss': stage1_loss_dict.get('borrow_yld_max_loss', zero_t),
-                'energy_borrow_go_min_loss': stage1_loss_dict.get('borrow_go_min_loss', zero_t),
+                'stage1_merge_yld_loss': stage1_loss_dict['merge_yld_loss'],
+                'stage1_merge_go_loss': stage1_loss_dict['merge_go_loss'],
+                'stage1_junction_yld_loss': stage1_loss_dict['junction_yld_loss'],
+                'stage1_junction_go_loss': stage1_loss_dict['junction_go_loss'],
+                'stage1_borrow_yld_loss': stage1_loss_dict['borrow_yld_loss'],
+                'stage1_borrow_go_loss': stage1_loss_dict['borrow_go_loss'],
+                'stage1_cross_yld_loss': stage1_loss_dict['cross_yld_loss'],
+                'stage1_cross_go_loss': stage1_loss_dict['cross_go_loss'],
+                'stage1_merge_active_loss': stage1_loss_dict['merge_active_loss'],
+                'stage1_junction_active_loss': stage1_loss_dict['junction_active_loss'],
+                'stage1_borrow_active_loss': stage1_loss_dict['borrow_active_loss'],
+                'stage1_cross_active_loss': stage1_loss_dict['cross_active_loss'],
+                'stage1_relation_loss': stage1_loss_dict['relation_loss'],
+                'stage1_dir_loss': stage1_loss_dict['dir_loss'],
+                'stage1_conflict_area_loss': stage1_loss_dict.get('conflict_area_loss', zero_t),
+                'stage1_window_loss': stage1_loss_dict.get('window_loss', zero_t),
+                'stage1_phase_loss': stage1_loss_dict.get('phase_loss', zero_t),
+                'stage1_decision_phase_loss': stage1_loss_dict.get('decision_phase_loss', zero_t),
+                'stage1_control_phase_loss': stage1_loss_dict.get('control_phase_loss', zero_t),
+                'stage1_temporary_occupancy_loss': stage1_loss_dict.get('temporary_occupancy_loss', zero_t),
+                'stage1_go_opportunity_loss': stage1_loss_dict.get('go_opportunity_loss', zero_t),
+                'stage1_conflict_area_status_loss': stage1_loss_dict.get('conflict_area_status_loss', zero_t),
+                'stage1_conflict_timing_loss': stage1_loss_dict.get('conflict_timing_loss', zero_t),
+                'stage1_state_consistency_loss': stage1_loss_dict.get('state_consistency_loss', zero_t),
+                'stage1_state_consistency_window_loss': stage1_loss_dict.get('state_consistency_window_loss', zero_t),
+                'stage1_state_consistency_phase_loss': stage1_loss_dict.get('state_consistency_phase_loss', zero_t),
+                'stage1_state_consistency_timing_loss': stage1_loss_dict.get('state_consistency_timing_loss', zero_t),
+                'stage1_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),
+                'stage1_merge_go_min_loss': stage1_loss_dict.get('merge_go_min_loss', zero_t),
+                'stage1_junction_yld_max_loss': stage1_loss_dict.get('junction_yld_max_loss', zero_t),
+                'stage1_junction_go_min_loss': stage1_loss_dict.get('junction_go_min_loss', zero_t),
+                'stage1_borrow_yld_max_loss': stage1_loss_dict.get('borrow_yld_max_loss', zero_t),
+                'stage1_borrow_go_min_loss': stage1_loss_dict.get('borrow_go_min_loss', zero_t),
             }
+            stage1_extra_losses.update({
+                key.replace('stage1_', 'energy_', 1): value
+                for key, value in stage1_extra_losses.items()
+                if key.startswith('stage1_')
+            })
         elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
             (
                 M_anchor,
@@ -2549,7 +2583,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
             energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
 
-        if (not has_stage1_speed_energy) and self.use_front_route_risk_energy:
+        if (not has_stage1_labels) and self.use_front_route_risk_energy:
             gt_abs = trajectory.unsqueeze(1)
             gt_normed = self.abs_to_norm(gt_abs)
             front_route_logits, _ = self.model.forward_front_route_risk(
@@ -2575,7 +2609,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and alignment_active and not has_stage1_speed_energy:
+        if self.alignment_loss_weight > 0 and alignment_active and not has_stage1_labels:
             if self.use_front_route_risk_energy:
                 _, mode_out_front = self.model.forward_front_route_risk_eval(
                     x_t=poses_reg,
@@ -2654,6 +2688,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             loss_dict['speed_profile_loss'] = speed_profile_loss
             for step_idx, step_loss in enumerate(speed_profile_step_losses):
                 loss_dict[f'speed_profile_step{step_idx}_loss'] = step_loss
+        if stage1_extra_losses:
+            loss_dict['stage1_loss'] = energy_loss
         loss_dict.update(stage1_extra_losses)
         return loss_dict
 
@@ -3702,19 +3738,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 speed_pred, self.model.speed_classes
             )  # (B,)
 
-        speed_energy_scores = None
-        speed_energy_samples = None
-        speed_energy_query_center = None
-        speed_energy_ref_speeds = None
-        speed_energy_ref_scores = None
+        stage1_scores = None
+        stage1_speed_samples = None
+        stage1_speed_query_center = None
+        stage1_speed_ref_speeds = None
+        stage1_ref_scores = None
         if self.use_stage1_speed_energy:
-            # Query stage1 speed energy around the current feasible ego speed rather than
+            # Query stage1 state heads around the current feasible ego speed rather than
             # around the nominal speed-head output. This keeps the queried bucket locally
             # reachable during closed-loop control, especially when the speed head wants to
             # stop but the vehicle is still moving quickly.
             center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
-            speed_energy_query_center = center_speed
-            speed_energy_samples = self._build_stage1_speed_samples(center_speed, device, model_dtype)
+            stage1_speed_query_center = center_speed
+            stage1_speed_samples = self._build_stage1_speed_samples(center_speed, device, model_dtype)
             best_joint_norm = self.joint_abs_to_norm(best_trajectory, route_pred.detach()).unsqueeze(1)
             best_joint_abs = torch.cat(
                 [best_trajectory.unsqueeze(1), route_pred.detach().unsqueeze(1)],
@@ -3731,42 +3767,48 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 transfuser_lidar_bev=transfuser_lidar_bev,
                 return_intermediates=True,
             )
-            speed_energy_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
+            stage1_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
                 traj_out=shared_eval['traj_out'],
                 route_out=shared_eval['route_out'],
                 speed_out=shared_eval['speed_out'],
                 route_points=shared_eval['route_points'],
                 conditioning=shared_eval['conditioning'],
-                speed_samples=speed_energy_samples,
+                speed_samples=stage1_speed_samples,
             )
-            speed_energy_scores = self._compose_stage1_speed_energy_outputs(speed_energy_scores_raw)
+            stage1_scores = self._compose_stage1_outputs(stage1_scores_raw)
             traj_speed_1s_ref, traj_speed_05s_ref = self._compute_inference_traj_speed_refs(
                 best_trajectory, model_dtype
             )
             head_speed_ref = target_speed_pred if target_speed_pred is not None else center_speed
-            speed_energy_ref_speeds = torch.stack(
+            stage1_speed_ref_speeds = torch.stack(
                 [head_speed_ref, traj_speed_1s_ref, traj_speed_05s_ref], dim=-1
             ).clamp_(0.0, 20.0)
-            speed_energy_ref_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
+            stage1_ref_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
                 traj_out=shared_eval['traj_out'],
                 route_out=shared_eval['route_out'],
                 speed_out=shared_eval['speed_out'],
                 route_points=shared_eval['route_points'],
                 conditioning=shared_eval['conditioning'],
-                speed_samples=speed_energy_ref_speeds,
+                speed_samples=stage1_speed_ref_speeds,
             )
-            speed_energy_ref_scores = self._compose_stage1_speed_energy_outputs(speed_energy_ref_scores_raw)
+            stage1_ref_scores = self._compose_stage1_outputs(stage1_ref_scores_raw)
 
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
             'route_pred': route_pred,                 # (B, 20, 2)
             'all_trajectories': final_traj_abs,       # (B, 1, T, 2)
             'energy_scores': energy_scores,           # dict of (B, 1)
-            'speed_energy_scores': speed_energy_scores,
-            'speed_energy_samples': speed_energy_samples,
-            'speed_energy_query_center': speed_energy_query_center,
-            'speed_energy_ref_speeds': speed_energy_ref_speeds,
-            'speed_energy_ref_scores': speed_energy_ref_scores,
+            'stage1_scores': stage1_scores,
+            'stage1_speed_samples': stage1_speed_samples,
+            'stage1_speed_query_center': stage1_speed_query_center,
+            'stage1_speed_ref_speeds': stage1_speed_ref_speeds,
+            'stage1_ref_scores': stage1_ref_scores,
+            # Backward-compatible aliases for current close-loop debug code.
+            'speed_energy_scores': stage1_scores,
+            'speed_energy_samples': stage1_speed_samples,
+            'speed_energy_query_center': stage1_speed_query_center,
+            'speed_energy_ref_speeds': stage1_speed_ref_speeds,
+            'speed_energy_ref_scores': stage1_ref_scores,
             'traj_branch_condition_probs': traj_branch_condition_probs,
             'traj_window_condition_probs': (
                 traj_branch_condition_details['window_probs']
@@ -3935,12 +3977,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 if key in es:
                     result[f'energy_{key}'] = es[key].detach().float().cpu().numpy()
 
-        if sample_result.get('speed_energy_scores') is not None:
-            ses = sample_result['speed_energy_scores']
-            if sample_result.get('speed_energy_samples') is not None:
-                result['speed_energy_samples'] = sample_result['speed_energy_samples'].detach().float().cpu().numpy()
-            if sample_result.get('speed_energy_query_center') is not None:
-                result['speed_energy_query_center'] = sample_result['speed_energy_query_center'].detach().float().cpu().numpy()
+        if sample_result.get('stage1_scores') is not None:
+            ses = sample_result['stage1_scores']
+            if sample_result.get('stage1_speed_samples') is not None:
+                value_np = sample_result['stage1_speed_samples'].detach().float().cpu().numpy()
+                result['stage1_speed_samples'] = value_np
+                result['speed_energy_samples'] = value_np
+            if sample_result.get('stage1_speed_query_center') is not None:
+                value_np = sample_result['stage1_speed_query_center'].detach().float().cpu().numpy()
+                result['stage1_speed_query_center'] = value_np
+                result['speed_energy_query_center'] = value_np
             for key in (
                 'window_probs',
                 'dir_probs',
@@ -3966,7 +4012,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'selected_go_min_mps',
             ):
                 if key in ses and ses.get(key) is not None:
-                    result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
+                    value_np = ses[key].detach().float().cpu().numpy()
+                    result[f'stage1_{key}'] = value_np
+                    result[f'speed_energy_{key}'] = value_np
             for key in (
                 'window_logits',
                 'dir_logits',
@@ -3986,11 +4034,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'borrow_go_min',
             ):
                 if key in ses and ses.get(key) is not None:
-                    result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
-        if sample_result.get('speed_energy_ref_scores') is not None:
-            ref = sample_result['speed_energy_ref_scores']
-            if sample_result.get('speed_energy_ref_speeds') is not None:
-                result['speed_energy_ref_speeds'] = sample_result['speed_energy_ref_speeds'].detach().float().cpu().numpy()
+                    value_np = ses[key].detach().float().cpu().numpy()
+                    result[f'stage1_{key}'] = value_np
+                    result[f'speed_energy_{key}'] = value_np
+        if sample_result.get('stage1_ref_scores') is not None:
+            ref = sample_result['stage1_ref_scores']
+            if sample_result.get('stage1_speed_ref_speeds') is not None:
+                value_np = sample_result['stage1_speed_ref_speeds'].detach().float().cpu().numpy()
+                result['stage1_speed_ref_speeds'] = value_np
+                result['speed_energy_ref_speeds'] = value_np
             for key in (
                 'window_probs',
                 'dir_probs',
@@ -4016,7 +4068,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'selected_go_min_mps',
             ):
                 if key in ref and ref.get(key) is not None:
-                    result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
+                    value_np = ref[key].detach().float().cpu().numpy()
+                    result[f'stage1_ref_{key}'] = value_np
+                    result[f'speed_energy_ref_{key}'] = value_np
             for key in (
                 'window_logits',
                 'dir_logits',
@@ -4036,6 +4090,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'borrow_go_min',
             ):
                 if key in ref and ref.get(key) is not None:
-                    result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
+                    value_np = ref[key].detach().float().cpu().numpy()
+                    result[f'stage1_ref_{key}'] = value_np
+                    result[f'speed_energy_ref_{key}'] = value_np
 
         return result
