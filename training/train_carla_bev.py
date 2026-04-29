@@ -982,14 +982,21 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     train_retain_bad_routes_for_energy = config.get('dataset', {}).get('train_retain_bad_routes_for_energy', False)
     val_retain_bad_routes_for_energy = config.get('dataset', {}).get('val_retain_bad_routes_for_energy', False)
     use_vqa_anchor = config.get('use_vqa_anchor', False)
+    route_b_cfg = config.get('route_b', {})
     use_lidar_bev_detail = config.get('route_b', {}).get('use_lidar_bev_detail', False)
 
     # Load anchor_centers_abs for semantic behavior labeling
     policy_type = config.get('policy_type', 'anchor')  # 'anchor' (Route A) or 'anchor_free' (Route B)
     semantic_behavior_cfg = config.get('semantic_behavior', {})
     anchor_centers_abs = None
-    # Route B+ automatically enables semantic behavior (energy heads need labels)
-    if policy_type == 'anchor_free' and not semantic_behavior_cfg.get('enabled', False):
+    needs_legacy_anchor_energy = (
+        policy_type == 'anchor_free'
+        and bool(route_b_cfg.get('train_energy', True))
+        and not bool(route_b_cfg.get('use_stage1_speed_energy', True))
+    )
+    # Legacy anchor energy can still use semantic behavior labels. The direct
+    # stage1/tempocc path does not need anchors and should not warn about them.
+    if needs_legacy_anchor_energy and not semantic_behavior_cfg.get('enabled', False):
         anchor_path = config.get('anchor_path', None)
         if anchor_path and os.path.exists(anchor_path):
             semantic_behavior_cfg = {'enabled': True}
@@ -1012,7 +1019,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             semantic_behavior_cfg = {}
 
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
-    route_b_cfg = config.get('route_b', {})
     policy_cfg = config.get('policy', {})
     lidar_history_frames = max(
         int(route_b_cfg.get('lidar_history_frames', policy_cfg.get('ego_status_seq_len', config.get('obs_horizon', 1)))),
@@ -1398,9 +1404,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 )
         else:
             raise ValueError("route_abs_stats_path is required for joint Route B ego diffusion")
-        # Register anchor trajectories for energy head training (before DDP wrapping)
+        # Register anchor trajectories only for the legacy anchor-energy path.
+        # The direct stage1/tempocc path trains from explicit labels and no
+        # longer needs anchor files in the config.
         anchor_path = config.get('anchor_path', None)
-        if anchor_path:
+        if needs_legacy_anchor_energy and anchor_path:
             if anchor_path.endswith('.npy'):
                 anchor_centers = np.load(anchor_path)  # (M, T, 2)
             else:
@@ -1410,7 +1418,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             policy.register_anchor_centers(anchor_centers)
             if rank == 0:
                 print(f"  ✓ Anchor centers registered for energy training: {anchor_centers.shape}")
-        else:
+        elif needs_legacy_anchor_energy:
             if rank == 0:
                 print(f"  ⚠ No anchor_path configured — energy heads will not be trained on anchors")
     else:
