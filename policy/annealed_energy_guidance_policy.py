@@ -204,6 +204,45 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.stage1_boundary_norm_scale = float(
             route_b_cfg.get('stage1_boundary_norm_scale', 30.0)
         )
+        self.use_temporary_occupancy_phase = bool(
+            route_b_cfg.get('use_temporary_occupancy_phase', False)
+        )
+        self.temporary_occupancy_dim = int(route_b_cfg.get('temporary_occupancy_dim', 13))
+        self.temporary_occupancy_loss_weight = float(
+            route_b_cfg.get('temporary_occupancy_loss_weight', 0.25)
+        )
+        self.go_opportunity_loss_weight = float(
+            route_b_cfg.get('go_opportunity_loss_weight', 0.25)
+        )
+        # Independent-state v1 keeps expert phase as the supervision target.
+        # This alpha is reserved for eval/debug ablations and defaults to off.
+        self.temporary_occupancy_phase_alpha = float(
+            route_b_cfg.get('temporary_occupancy_phase_alpha', 0.0)
+        )
+        self.use_conflict_timing_state = bool(
+            route_b_cfg.get('use_conflict_timing_state', False)
+        )
+        self.conflict_area_status_loss_weight = float(
+            route_b_cfg.get('conflict_area_status_loss_weight', 0.25)
+        )
+        self.conflict_timing_loss_weight = float(
+            route_b_cfg.get('conflict_timing_loss_weight', 0.25)
+        )
+        self.conflict_timing_dist_norm_scale = float(
+            route_b_cfg.get('conflict_timing_dist_norm_scale', 30.0)
+        )
+        self.conflict_timing_time_norm_scale = float(
+            route_b_cfg.get('conflict_timing_time_norm_scale', 10.0)
+        )
+        self.use_independent_state_consistency_loss = bool(
+            route_b_cfg.get('use_independent_state_consistency_loss', False)
+        )
+        self.state_consistency_loss_weight = float(
+            route_b_cfg.get('state_consistency_loss_weight', 0.02)
+        )
+        self.state_consistency_prob = float(
+            route_b_cfg.get('state_consistency_prob', 0.25)
+        )
         self.traj_phase_energy_band_offsets = torch.tensor([-2.0, 0.0, 2.0], dtype=torch.float32)
         self.traj_window_condition_names = (
             'none',
@@ -231,12 +270,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'yld_margin',
             'go_margin',
         )
+        self.traj_opportunity_condition_names = (
+            'yld_pressure',
+            'go_opportunity',
+        )
+        self.traj_area_status_condition_names = (
+            'none',
+            'approaching',
+            'inside',
+            'past',
+        )
+        self.traj_timing_condition_names = (
+            'dist_to_entry',
+            'dist_to_exit',
+            'time_to_entry',
+        )
         self.traj_branch_condition_names = (
             *self.traj_window_condition_names,
             *self.traj_dir_condition_names,
             *self.traj_decision_phase_condition_names,
             *self.traj_control_phase_condition_names,
             *self.traj_boundary_condition_names,
+            *self.traj_opportunity_condition_names,
+            *self.traj_area_status_condition_names,
+            *self.traj_timing_condition_names,
             'borrow_time',
         )
 
@@ -473,7 +530,36 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self._resolve_stage1_batch_key(batch, 'borrow_yld_max_speed_valid'),
             self._resolve_stage1_batch_key(batch, 'borrow_go_min_speed_valid'),
         )
-        return not any(key is None for key in required)
+        if any(key is None for key in required):
+            return False
+        if self.use_temporary_occupancy_phase:
+            temp_required = (
+                self._resolve_stage1_batch_key(batch, 'temporary_occupancy_cover_bins'),
+                self._resolve_stage1_batch_key(batch, 'temporary_occupancy_cover_valid'),
+                self._resolve_stage1_batch_key(batch, 'go_opportunity_prob'),
+                self._resolve_stage1_batch_key(batch, 'yld_pressure_prob'),
+                self._resolve_stage1_batch_key(batch, 'go_opportunity_valid'),
+            )
+            if any(key is None for key in temp_required):
+                raise ValueError(
+                    "use_temporary_occupancy_phase=true requires "
+                    "temporary_occupancy_cover_bins/valid, go_opportunity_prob, "
+                    "yld_pressure_prob, and go_opportunity_valid in every batch"
+                )
+        if self.use_conflict_timing_state:
+            timing_required = (
+                self._resolve_stage1_batch_key(batch, 'conflict_area_status'),
+                self._resolve_stage1_batch_key(batch, 'conflict_dist_to_entry_m'),
+                self._resolve_stage1_batch_key(batch, 'conflict_dist_to_exit_m'),
+                self._resolve_stage1_batch_key(batch, 'conflict_time_to_entry_s'),
+            )
+            if any(key is None for key in timing_required):
+                raise ValueError(
+                    "use_conflict_timing_state=true requires conflict_area_status, "
+                    "conflict_dist_to_entry_m, conflict_dist_to_exit_m, "
+                    "and conflict_time_to_entry_s in every batch"
+                )
+        return True
 
     @staticmethod
     def _resolve_stage1_batch_key(batch: Dict[str, torch.Tensor], base_key: str):
@@ -530,6 +616,113 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             return None
         return value.reshape(-1).long()
 
+    def _get_temporary_occupancy_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+        require: bool = False,
+    ):
+        bins = self._get_stage1_batch_tensor(
+            batch, 'temporary_occupancy_cover_bins', device=device, model_dtype=model_dtype
+        )
+        valid = self._get_stage1_batch_tensor(
+            batch, 'temporary_occupancy_cover_valid', device=device, model_dtype=model_dtype
+        )
+        go_prob = self._get_stage1_batch_tensor(
+            batch, 'go_opportunity_prob', device=device, model_dtype=model_dtype
+        )
+        yld_prob = self._get_stage1_batch_tensor(
+            batch, 'yld_pressure_prob', device=device, model_dtype=model_dtype
+        )
+        go_valid = self._get_stage1_batch_tensor(
+            batch, 'go_opportunity_valid', device=device, model_dtype=model_dtype
+        )
+        missing = bins is None or valid is None or go_prob is None or yld_prob is None or go_valid is None
+        if missing:
+            if require:
+                raise ValueError(
+                    "temporary occupancy training requires "
+                    "temporary_occupancy_cover_bins/valid and go/yld opportunity labels"
+                )
+            return None
+
+        B = go_prob.reshape(-1).shape[0]
+        bins = bins.reshape(B, -1)
+        valid = valid.reshape(B, -1)
+        if bins.shape[1] != self.temporary_occupancy_dim or valid.shape[1] != self.temporary_occupancy_dim:
+            raise ValueError(
+                "temporary occupancy labels must have shape "
+                f"(B, {self.temporary_occupancy_dim}), got bins={bins.shape}, valid={valid.shape}"
+            )
+
+        yld_prob = torch.nan_to_num(yld_prob.reshape(-1), nan=0.5, posinf=1.0, neginf=0.0)
+        go_prob = torch.nan_to_num(go_prob.reshape(-1), nan=0.5, posinf=1.0, neginf=0.0)
+        target_probs = torch.stack([yld_prob, go_prob], dim=-1).clamp(0.0, 1.0)
+        prob_sum = target_probs.sum(dim=-1, keepdim=True)
+        target_probs = torch.where(
+            prob_sum > 1e-6,
+            target_probs / prob_sum.clamp(min=1e-6),
+            torch.full_like(target_probs, 0.5),
+        )
+
+        return {
+            'bins': bins.clamp(0.0, 1.0),
+            'valid': valid > 0.5,
+            'go_opportunity_target': target_probs,
+            'go_opportunity_valid': go_valid.reshape(-1) > 0.5,
+        }
+
+    def _get_conflict_timing_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+        family_codes: Optional[torch.Tensor] = None,
+        require: bool = False,
+    ):
+        status = self._get_stage1_long_target(batch, 'conflict_area_status', device=device)
+        dist_entry = self._get_stage1_batch_tensor(
+            batch, 'conflict_dist_to_entry_m', device=device, model_dtype=model_dtype
+        )
+        dist_exit = self._get_stage1_batch_tensor(
+            batch, 'conflict_dist_to_exit_m', device=device, model_dtype=model_dtype
+        )
+        time_entry = self._get_stage1_batch_tensor(
+            batch, 'conflict_time_to_entry_s', device=device, model_dtype=model_dtype
+        )
+        missing = status is None or dist_entry is None or dist_exit is None or time_entry is None
+        if missing:
+            if require:
+                raise ValueError(
+                    "conflict timing training requires conflict_area_status, "
+                    "conflict_dist_to_entry_m, conflict_dist_to_exit_m, conflict_time_to_entry_s"
+                )
+            return None
+
+        status = status.reshape(-1).clamp(min=0, max=3)
+        dist_entry = torch.nan_to_num(dist_entry.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        dist_exit = torch.nan_to_num(dist_exit.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        time_entry = torch.nan_to_num(time_entry.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        values = torch.stack(
+            [
+                dist_entry / max(self.conflict_timing_dist_norm_scale, 1e-6),
+                dist_exit / max(self.conflict_timing_dist_norm_scale, 1e-6),
+                time_entry / max(self.conflict_timing_time_norm_scale, 1e-6),
+            ],
+            dim=-1,
+        ).clamp(-2.0, 2.0)
+        if family_codes is None:
+            valid = status > 0
+        else:
+            valid = family_codes.reshape(-1).to(device=device) > 0
+        finite_valid = torch.isfinite(values).all(dim=-1)
+        return {
+            'status': status,
+            'values': values,
+            'valid': valid & finite_valid,
+        }
+
     @staticmethod
     def _window_target_from_family_codes(family_codes: torch.Tensor) -> torch.Tensor:
         window_target = torch.zeros_like(family_codes)
@@ -547,7 +740,42 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_steps: int,
         device: torch.device,
         model_dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
+    ):
+        offline_mask = self._get_stage1_batch_tensor(
+            batch, 'conflict_area_route_mask', device=device, model_dtype=model_dtype
+        )
+        offline_valid = self._get_stage1_batch_tensor(
+            batch, 'conflict_area_route_mask_valid', device=device, model_dtype=model_dtype
+        )
+
+        B = None
+        fallback_rows = None
+        target = None
+        valid_target_mask = None
+        if offline_mask is not None:
+            B = offline_mask.reshape(offline_mask.shape[0], -1).shape[0]
+            target = offline_mask.reshape(B, -1)
+            if target.shape[1] != route_steps:
+                raise ValueError(
+                    f"conflict_area_route_mask expects {route_steps} route bins, got {target.shape}"
+                )
+            target = target.clamp(0.0, 1.0)
+            if offline_valid is None:
+                valid_target_mask = torch.ones_like(target, dtype=torch.bool)
+                fallback_rows = torch.zeros(B, device=device, dtype=torch.bool)
+            else:
+                valid_raw = offline_valid.reshape(B, -1)
+                if valid_raw.shape[1] == 1:
+                    valid_raw = valid_raw.expand(-1, route_steps)
+                if valid_raw.shape[1] != route_steps:
+                    raise ValueError(
+                        f"conflict_area_route_mask_valid expects 1 or {route_steps} bins, got {valid_raw.shape}"
+                    )
+                fallback_rows = (valid_raw < 0).any(dim=-1)
+                valid_target_mask = valid_raw > 0.5
+            if not fallback_rows.any():
+                return target, valid_target_mask
+
         conflict_active = self._get_stage1_batch_tensor(
             batch, 'conflict_area_active', device=device, model_dtype=model_dtype
         )
@@ -555,42 +783,83 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         end_frames = self._get_stage1_long_target(batch, 'conflict_area_end_frame', device=device)
         frame_ids = batch.get('frame_id')
         if conflict_active is None or start_frames is None or end_frames is None or frame_ids is None:
-            return None
+            if target is not None:
+                return target, valid_target_mask
+            return None, None
         if not isinstance(frame_ids, torch.Tensor):
             frame_ids = torch.as_tensor(frame_ids)
         frame_ids = frame_ids.reshape(-1).to(device=device).long()
-        target = torch.zeros((frame_ids.shape[0], route_steps), device=device, dtype=model_dtype)
+        legacy_target = torch.zeros((frame_ids.shape[0], route_steps), device=device, dtype=model_dtype)
+        legacy_valid_mask = torch.ones_like(legacy_target, dtype=torch.bool)
         valid_mask = (
             (conflict_active.reshape(-1) > 0.5)
             & (start_frames >= 0)
             & (end_frames >= 0)
             & (frame_ids >= 0)
         )
-        if not valid_mask.any():
-            return target
-
-        rel_start = start_frames - frame_ids
-        rel_end = end_frames - frame_ids
-        active_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().tolist()
-        for idx in active_indices:
-            start_idx = int(rel_start[idx].item())
-            end_idx = int(rel_end[idx].item())
-            if end_idx < 0 or start_idx >= route_steps:
-                continue
-            # Keep a small tolerance because route tokens may be offset by one step
-            # relative to frame-based stage1 annotations.
-            start_idx = max(start_idx - 1, 0)
-            end_idx = min(end_idx + 1, route_steps - 1)
-            if start_idx <= end_idx:
-                target[idx, start_idx:end_idx + 1] = 1.0
-        return target
+        if valid_mask.any():
+            rel_start = start_frames - frame_ids
+            rel_end = end_frames - frame_ids
+            active_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().tolist()
+            for idx in active_indices:
+                start_idx = int(rel_start[idx].item())
+                end_idx = int(rel_end[idx].item())
+                if end_idx < 0 or start_idx >= route_steps:
+                    continue
+                # Keep a small tolerance because route tokens may be offset by one step
+                # relative to frame-based stage1 annotations.
+                start_idx = max(start_idx - 1, 0)
+                end_idx = min(end_idx + 1, route_steps - 1)
+                if start_idx <= end_idx:
+                    legacy_target[idx, start_idx:end_idx + 1] = 1.0
+        if target is None:
+            return legacy_target, legacy_valid_mask
+        target = target.clone()
+        valid_target_mask = valid_target_mask.clone()
+        target[fallback_rows] = legacy_target[fallback_rows]
+        valid_target_mask[fallback_rows] = legacy_valid_mask[fallback_rows]
+        return target, valid_target_mask
 
     def _compose_stage1_speed_energy_outputs(self, raw_scores: dict) -> dict:
         window_probs = torch.softmax(raw_scores['window_logits'], dim=-1)
         dir_probs = torch.softmax(raw_scores['dir_logits'], dim=-1)
+        decision_phase_base_logits = raw_scores.get(
+            'decision_phase_logits_base',
+            raw_scores['decision_phase_logits'],
+        )
         decision_phase_probs = torch.softmax(raw_scores['decision_phase_logits'], dim=-1)
+        decision_phase_base_probs = torch.softmax(decision_phase_base_logits, dim=-1)
         control_phase_probs = torch.softmax(raw_scores['control_phase_logits'], dim=-1)
         conflict_area_probs = torch.sigmoid(raw_scores['conflict_area_logits'])
+        if 'temporary_occupancy_logits' in raw_scores:
+            temporary_occupancy_probs = torch.sigmoid(raw_scores['temporary_occupancy_logits'])
+        else:
+            temporary_occupancy_probs = None
+        if 'go_opportunity_logits' in raw_scores:
+            go_opportunity_probs = torch.softmax(raw_scores['go_opportunity_logits'], dim=-1)
+            yld_pressure_probs = go_opportunity_probs[:, 0]
+        else:
+            go_opportunity_probs = None
+            yld_pressure_probs = None
+        if 'conflict_area_status_logits' in raw_scores:
+            conflict_area_status_probs = torch.softmax(raw_scores['conflict_area_status_logits'], dim=-1)
+        else:
+            conflict_area_status_probs = None
+        conflict_timing_values = raw_scores.get('conflict_timing_values')
+        if conflict_timing_values is not None:
+            conflict_dist_to_entry_m = (
+                conflict_timing_values[:, 0] * float(self.conflict_timing_dist_norm_scale)
+            )
+            conflict_dist_to_exit_m = (
+                conflict_timing_values[:, 1] * float(self.conflict_timing_dist_norm_scale)
+            )
+            conflict_time_to_entry_s = (
+                conflict_timing_values[:, 2] * float(self.conflict_timing_time_norm_scale)
+            )
+        else:
+            conflict_dist_to_entry_m = None
+            conflict_dist_to_exit_m = None
+            conflict_time_to_entry_s = None
 
         same_opp = dir_probs[:, 1:3]
         lane_dir_relation_probs = torch.where(
@@ -622,8 +891,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'window_probs': window_probs,
             'dir_probs': dir_probs,
             'decision_phase_probs': decision_phase_probs,
+            'decision_phase_base_probs': decision_phase_base_probs,
             'control_phase_probs': control_phase_probs,
             'conflict_area_probs': conflict_area_probs,
+            'temporary_occupancy_probs': temporary_occupancy_probs,
+            'go_opportunity_probs': go_opportunity_probs,
+            'yld_pressure_probs': yld_pressure_probs,
+            'conflict_area_status_probs': conflict_area_status_probs,
+            'conflict_timing_values': conflict_timing_values,
+            'conflict_dist_to_entry_m': conflict_dist_to_entry_m,
+            'conflict_dist_to_exit_m': conflict_dist_to_exit_m,
+            'conflict_time_to_entry_s': conflict_time_to_entry_s,
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'merge_yld_max_mps': merge_yld_max,
             'merge_go_min_mps': merge_go_min,
@@ -665,7 +943,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         gate_boundary = ((denoise_progress - 0.5) / 0.5).clamp_(0.0, 1.0)
         gate_borrow = ((denoise_progress - 0.7) / 0.3).clamp_(0.0, 1.0)
         return torch.stack(
-            [gate_window, gate_dir, gate_phase, gate_boundary, gate_borrow],
+            [
+                gate_window,
+                gate_dir,
+                gate_phase,
+                gate_boundary,
+                gate_phase,     # go/yld opportunity prior
+                gate_window,    # area status is coarse spatial state
+                gate_boundary,  # dist/time matters more in refinement
+                gate_borrow,
+            ],
             dim=-1,
         )
 
@@ -735,6 +1022,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         borrow_yld_valid: torch.Tensor,
         borrow_go_valid: torch.Tensor,
         center_speed: torch.Tensor,
+        go_opportunity_probs: Optional[torch.Tensor],
+        conflict_area_status_probs: Optional[torch.Tensor],
+        conflict_timing_values: Optional[torch.Tensor],
         borrow_time_s: Optional[torch.Tensor],
         device: torch.device,
         model_dtype: torch.dtype,
@@ -750,6 +1040,36 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         decision_phase_probs = decision_phase_probs.to(device=device, dtype=model_dtype)
         control_phase_probs = control_phase_probs.to(device=device, dtype=model_dtype)
         center_speed = center_speed.to(device=device, dtype=model_dtype).reshape(-1)
+        B = window_probs.shape[0]
+        if go_opportunity_probs is None:
+            go_opportunity_probs = torch.full((B, 2), 0.5, device=device, dtype=model_dtype)
+        else:
+            go_opportunity_probs = self._normalize_prob_rows(
+                go_opportunity_probs.to(device=device, dtype=model_dtype),
+                fallback_index=1,
+            )
+        if conflict_area_status_probs is None:
+            conflict_area_status_probs = torch.zeros((B, 4), device=device, dtype=model_dtype)
+            conflict_area_status_probs[:, 0] = 1.0
+        else:
+            conflict_area_status_probs = self._normalize_prob_rows(
+                conflict_area_status_probs.to(device=device, dtype=model_dtype),
+                fallback_index=0,
+            )
+        if conflict_timing_values is None:
+            conflict_timing_values = torch.zeros((B, 3), device=device, dtype=model_dtype)
+        else:
+            conflict_timing_values = torch.nan_to_num(
+                conflict_timing_values.to(device=device, dtype=model_dtype),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).reshape(B, -1)
+            if conflict_timing_values.shape[-1] != 3:
+                raise ValueError(
+                    f"conflict_timing_values expects 3 dims, got {conflict_timing_values.shape}"
+                )
+            conflict_timing_values = conflict_timing_values.clamp(-2.0, 2.0)
 
         family_probs = window_probs[:, 1:]
         yld_stack = torch.stack(
@@ -833,6 +1153,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 decision_phase_probs,
                 control_phase_probs,
                 boundary_margins,
+                go_opportunity_probs,
+                conflict_area_status_probs,
+                conflict_timing_values,
                 borrow_time_cond.unsqueeze(-1),
             ],
             dim=-1,
@@ -843,6 +1166,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'decision_phase_probs': decision_phase_probs,
             'control_phase_probs': control_phase_probs,
             'boundary_margins': boundary_margins,
+            'go_opportunity_probs': go_opportunity_probs,
+            'conflict_area_status_probs': conflict_area_status_probs,
+            'conflict_timing_values': conflict_timing_values,
             'borrow_time_condition': borrow_time_cond,
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'selected_yld_max_mps': selected_yld_max,
@@ -902,6 +1228,31 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         borrow_go_valid = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed_valid', device=device, model_dtype=model_dtype)
         borrow_time_s = self._get_stage1_borrow_time_target(batch, device=device, model_dtype=model_dtype)
         center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+        temp_targets = self._get_temporary_occupancy_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_temporary_occupancy_phase,
+        )
+        go_opportunity_probs = (
+            temp_targets['go_opportunity_target'] if temp_targets is not None else None
+        )
+        timing_targets = self._get_conflict_timing_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            family_codes=family_codes,
+            require=self.use_conflict_timing_state,
+        )
+        if timing_targets is not None:
+            conflict_area_status_probs = F.one_hot(
+                timing_targets['status'].clamp(min=0, max=3),
+                num_classes=4,
+            ).to(device=device, dtype=model_dtype)
+            conflict_timing_values = timing_targets['values']
+        else:
+            conflict_area_status_probs = None
+            conflict_timing_values = None
 
         return self._compose_stage1_branch_condition(
             window_probs=window_probs,
@@ -921,6 +1272,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             borrow_yld_valid=borrow_yld_valid,
             borrow_go_valid=borrow_go_valid,
             center_speed=center_speed,
+            go_opportunity_probs=go_opportunity_probs,
+            conflict_area_status_probs=conflict_area_status_probs,
+            conflict_timing_values=conflict_timing_values,
             borrow_time_s=borrow_time_s,
             device=device,
             model_dtype=model_dtype,
@@ -975,6 +1329,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             borrow_yld_valid=torch.ones_like(raw_scores['borrow_yld_max'], device=device, dtype=model_dtype),
             borrow_go_valid=torch.ones_like(raw_scores['borrow_go_min'], device=device, dtype=model_dtype),
             center_speed=speed_ref.to(device=device, dtype=model_dtype).reshape(-1),
+            go_opportunity_probs=(
+                torch.softmax(raw_scores['go_opportunity_logits'], dim=-1)
+                if 'go_opportunity_logits' in raw_scores else None
+            ),
+            conflict_area_status_probs=(
+                torch.softmax(raw_scores['conflict_area_status_logits'], dim=-1)
+                if 'conflict_area_status_logits' in raw_scores else None
+            ),
+            conflict_timing_values=raw_scores.get('conflict_timing_values'),
             borrow_time_s=borrow_time_s,
             device=device,
             model_dtype=model_dtype,
@@ -1435,6 +1798,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         junction_go_valid = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
         borrow_yld_valid = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
         borrow_go_valid = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        temp_targets = self._get_temporary_occupancy_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_temporary_occupancy_phase,
+        )
+        timing_targets = self._get_conflict_timing_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            family_codes=family_codes,
+            require=self.use_conflict_timing_state,
+        )
 
         if self.shared_stage1_training_source == 'noisy':
             if noisy_joint is None or noisy_joint_abs is None or diff_timesteps is None:
@@ -1496,7 +1872,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         loss_window = F.cross_entropy(raw_stage1_scores['window_logits'].float(), window_target)
         loss_dir = F.cross_entropy(raw_stage1_scores['dir_logits'].float(), dir_target.clamp(min=0, max=3))
-        conflict_area_target = self._build_conflict_area_route_target(
+        conflict_area_target, conflict_area_valid_mask = self._build_conflict_area_route_target(
             batch=batch,
             route_steps=raw_stage1_scores['conflict_area_logits'].shape[1],
             device=device,
@@ -1509,8 +1885,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 conflict_area_target.float(),
                 reduction='none',
             )
-            pos_mask = conflict_area_target > 0.5
-            neg_mask = ~pos_mask
+            if conflict_area_valid_mask is None:
+                conflict_area_valid_mask = torch.ones_like(conflict_area_target, dtype=torch.bool)
+            pos_mask = (conflict_area_target > 0.5) & conflict_area_valid_mask
+            neg_mask = (conflict_area_target <= 0.5) & conflict_area_valid_mask
             if pos_mask.any() and neg_mask.any():
                 loss_conflict_area = 0.5 * (area_loss_raw[pos_mask].mean() + area_loss_raw[neg_mask].mean())
             elif pos_mask.any():
@@ -1537,12 +1915,194 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
 
         loss_phase = loss_decision_phase + loss_control_phase
+        loss_temporary_occupancy = zero
+        loss_go_opportunity = zero
+        if temp_targets is not None:
+            temp_valid = temp_targets['valid']
+            if temp_valid.any():
+                temp_loss_raw = F.binary_cross_entropy_with_logits(
+                    raw_stage1_scores['temporary_occupancy_logits'].float(),
+                    temp_targets['bins'].float(),
+                    reduction='none',
+                )
+                loss_temporary_occupancy = temp_loss_raw[temp_valid].mean()
+            go_valid = temp_targets['go_opportunity_valid']
+            if go_valid.any():
+                target_probs = temp_targets['go_opportunity_target'][go_valid].float()
+                log_probs = F.log_softmax(
+                    raw_stage1_scores['go_opportunity_logits'][go_valid].float(),
+                    dim=-1,
+                )
+                loss_go_opportunity = -(target_probs * log_probs).sum(dim=-1).mean()
+
+        loss_conflict_area_status = zero
+        loss_conflict_timing = zero
+        if timing_targets is not None:
+            loss_conflict_area_status = F.cross_entropy(
+                raw_stage1_scores['conflict_area_status_logits'].float(),
+                timing_targets['status'].clamp(min=0, max=3),
+            )
+            timing_valid = timing_targets['valid']
+            if timing_valid.any():
+                loss_conflict_timing = F.smooth_l1_loss(
+                    raw_stage1_scores['conflict_timing_values'][timing_valid].float(),
+                    timing_targets['values'][timing_valid].float(),
+                )
+
         loss_merge_active = zero
         loss_junction_active = zero
         loss_borrow_active = zero
         loss_cross_active = zero
         loss_chase = zero
         loss_ped = zero
+        loss_state_consistency = zero
+        loss_state_consistency_window = zero
+        loss_state_consistency_phase = zero
+        loss_state_consistency_timing = zero
+        if (
+            self.use_independent_state_consistency_loss
+            and self.state_consistency_loss_weight > 0
+            and self.state_consistency_prob > 0
+            and noisy_joint is not None
+            and diff_timesteps is not None
+            and torch.rand((), device=device).item() < self.state_consistency_prob
+        ):
+            def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+                if mask is None:
+                    return values.mean()
+                mask = mask.to(device=values.device, dtype=torch.bool)
+                while mask.dim() < values.dim():
+                    mask = mask.unsqueeze(-1)
+                mask = mask.expand_as(values)
+                if not mask.any():
+                    return zero
+                return values[mask].mean()
+
+            def _sym_kl_logits(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                a = a.float()
+                b = b.float()
+                log_a = F.log_softmax(a, dim=-1)
+                log_b = F.log_softmax(b, dim=-1)
+                prob_a = log_a.exp()
+                prob_b = log_b.exp()
+                loss_ab = (prob_a.detach() * (log_a.detach() - log_b)).sum(dim=-1)
+                loss_ba = (prob_b.detach() * (log_b.detach() - log_a)).sum(dim=-1)
+                return _masked_mean(0.5 * (loss_ab + loss_ba), mask)
+
+            def _sym_mse(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                loss = 0.5 * (
+                    F.mse_loss(a.float(), b.detach().float(), reduction='none')
+                    + F.mse_loss(b.float(), a.detach().float(), reduction='none')
+                )
+                return _masked_mean(loss, mask)
+
+            def _sym_smooth_l1(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                loss = 0.5 * (
+                    F.smooth_l1_loss(a.float(), b.detach().float(), reduction='none')
+                    + F.smooth_l1_loss(b.float(), a.detach().float(), reduction='none')
+                )
+                return _masked_mean(loss, mask)
+
+            def _stage1_scores_for_noisy_view(
+                noisy_joint_view: torch.Tensor,
+                timesteps_view: torch.Tensor,
+            ) -> dict:
+                noisy_joint_abs_view = self.joint_norm_to_abs(noisy_joint_view)
+                view_forward = self.model.forward_ego(
+                    x_t=noisy_joint_view,
+                    x_t_abs=noisy_joint_abs_view,
+                    timestep=timesteps_view,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    ego_status=ego_status,
+                    bev_proj_cached=bev_proj,
+                    transfuser_lidar_bev=transfuser_lidar_bev,
+                    return_intermediates=True,
+                )
+                return self.model.compute_shared_stage1_from_ego_outputs(
+                    traj_out=view_forward['traj_out'],
+                    route_out=view_forward['route_out'],
+                    speed_out=view_forward['speed_out'],
+                    route_points=view_forward['route_points'],
+                    conditioning=view_forward['conditioning'],
+                )
+
+            timesteps_view2 = torch.randint(0, self.train_max_timesteps, (gt_abs.shape[0],), device=device).long()
+            noise_view2 = torch.randn_like(gt_joint_normed.squeeze(1), dtype=torch.float32)
+            noisy_view2_flat = self.diffusion_scheduler.add_noise(
+                original_samples=gt_joint_normed.squeeze(1),
+                noise=noise_view2,
+                timesteps=timesteps_view2,
+            )
+            scores_view1 = _stage1_scores_for_noisy_view(noisy_joint.detach(), diff_timesteps.detach())
+            scores_view2 = _stage1_scores_for_noisy_view(noisy_view2_flat.unsqueeze(1), timesteps_view2)
+
+            loss_state_consistency_window = 0.5 * (
+                _sym_kl_logits(scores_view1['window_logits'], scores_view2['window_logits'])
+                + _sym_kl_logits(scores_view1['dir_logits'], scores_view2['dir_logits'])
+            )
+            loss_state_consistency_phase = 0.5 * (
+                _sym_kl_logits(
+                    scores_view1['decision_phase_logits'],
+                    scores_view2['decision_phase_logits'],
+                    decision_phase_valid_mask,
+                )
+                + _sym_kl_logits(
+                    scores_view1['control_phase_logits'],
+                    scores_view2['control_phase_logits'],
+                    control_phase_valid_mask,
+                )
+            )
+            boundary_consistency = (
+                _sym_smooth_l1(scores_view1['merge_yld_max'], scores_view2['merge_yld_max'], merge_yld_valid)
+                + _sym_smooth_l1(scores_view1['merge_go_min'], scores_view2['merge_go_min'], merge_go_valid)
+                + _sym_smooth_l1(scores_view1['junction_yld_max'], scores_view2['junction_yld_max'], junction_yld_valid)
+                + _sym_smooth_l1(scores_view1['junction_go_min'], scores_view2['junction_go_min'], junction_go_valid)
+                + _sym_smooth_l1(scores_view1['borrow_yld_max'], scores_view2['borrow_yld_max'], borrow_yld_valid)
+                + _sym_smooth_l1(scores_view1['borrow_go_min'], scores_view2['borrow_go_min'], borrow_go_valid)
+            ) / 6.0
+            area_consistency = zero
+            if conflict_area_valid_mask is not None:
+                area_consistency = _sym_mse(
+                    scores_view1['conflict_area_logits'],
+                    scores_view2['conflict_area_logits'],
+                    conflict_area_valid_mask,
+                )
+            temp_consistency = zero
+            go_consistency = zero
+            if temp_targets is not None:
+                temp_consistency = _sym_mse(
+                    scores_view1['temporary_occupancy_logits'],
+                    scores_view2['temporary_occupancy_logits'],
+                    temp_targets['valid'],
+                )
+                go_consistency = _sym_kl_logits(
+                    scores_view1['go_opportunity_logits'],
+                    scores_view2['go_opportunity_logits'],
+                    temp_targets['go_opportunity_valid'],
+                )
+            status_consistency = zero
+            timing_consistency = zero
+            if timing_targets is not None:
+                status_consistency = _sym_kl_logits(
+                    scores_view1['conflict_area_status_logits'],
+                    scores_view2['conflict_area_status_logits'],
+                )
+                timing_consistency = _sym_smooth_l1(
+                    scores_view1['conflict_timing_values'],
+                    scores_view2['conflict_timing_values'],
+                    timing_targets['valid'],
+                )
+            loss_state_consistency_timing = status_consistency + timing_consistency
+            loss_state_consistency = (
+                loss_state_consistency_window
+                + loss_state_consistency_phase
+                + boundary_consistency
+                + area_consistency
+                + temp_consistency
+                + go_consistency
+                + loss_state_consistency_timing
+            )
 
         energy_loss = (
             + self.energy_merge_weight * loss_merge
@@ -1552,6 +2112,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.energy_window_weight * loss_window
             + self.energy_phase_weight * loss_phase
             + self.energy_conflict_area_weight * loss_conflict_area
+            + self.temporary_occupancy_loss_weight * loss_temporary_occupancy
+            + self.go_opportunity_loss_weight * loss_go_opportunity
+            + self.conflict_area_status_loss_weight * loss_conflict_area_status
+            + self.conflict_timing_loss_weight * loss_conflict_timing
+            + self.state_consistency_loss_weight * loss_state_consistency
         )
         return {
             'energy_loss': energy_loss,
@@ -1580,6 +2145,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'phase_loss': loss_phase,
             'decision_phase_loss': loss_decision_phase,
             'control_phase_loss': loss_control_phase,
+            'temporary_occupancy_loss': loss_temporary_occupancy,
+            'go_opportunity_loss': loss_go_opportunity,
+            'conflict_area_status_loss': loss_conflict_area_status,
+            'conflict_timing_loss': loss_conflict_timing,
+            'state_consistency_loss': loss_state_consistency,
+            'state_consistency_window_loss': loss_state_consistency_window,
+            'state_consistency_phase_loss': loss_state_consistency_phase,
+            'state_consistency_timing_loss': loss_state_consistency_timing,
             'merge_yld_max_loss': loss_merge_yld,
             'merge_go_min_loss': loss_merge_go,
             'junction_yld_max_loss': loss_junction_yld,
@@ -1843,6 +2416,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'energy_phase_loss': stage1_loss_dict.get('phase_loss', zero_t),
                 'energy_decision_phase_loss': stage1_loss_dict.get('decision_phase_loss', zero_t),
                 'energy_control_phase_loss': stage1_loss_dict.get('control_phase_loss', zero_t),
+                'energy_temporary_occupancy_loss': stage1_loss_dict.get('temporary_occupancy_loss', zero_t),
+                'energy_go_opportunity_loss': stage1_loss_dict.get('go_opportunity_loss', zero_t),
+                'energy_conflict_area_status_loss': stage1_loss_dict.get('conflict_area_status_loss', zero_t),
+                'energy_conflict_timing_loss': stage1_loss_dict.get('conflict_timing_loss', zero_t),
+                'energy_state_consistency_loss': stage1_loss_dict.get('state_consistency_loss', zero_t),
+                'energy_state_consistency_window_loss': stage1_loss_dict.get('state_consistency_window_loss', zero_t),
+                'energy_state_consistency_phase_loss': stage1_loss_dict.get('state_consistency_phase_loss', zero_t),
+                'energy_state_consistency_timing_loss': stage1_loss_dict.get('state_consistency_timing_loss', zero_t),
                 'energy_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),
                 'energy_merge_go_min_loss': stage1_loss_dict.get('merge_go_min_loss', zero_t),
                 'energy_junction_yld_max_loss': stage1_loss_dict.get('junction_yld_max_loss', zero_t),
@@ -3207,6 +3788,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 traj_branch_condition_details['boundary_margins']
                 if traj_branch_condition_details is not None else None
             ),
+            'traj_go_opportunity_condition_probs': (
+                traj_branch_condition_details['go_opportunity_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_conflict_area_status_condition_probs': (
+                traj_branch_condition_details['conflict_area_status_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_conflict_timing_condition': (
+                traj_branch_condition_details['conflict_timing_values']
+                if traj_branch_condition_details is not None else None
+            ),
             'traj_borrow_time_condition': (
                 traj_branch_condition_details['borrow_time_condition']
                 if traj_branch_condition_details is not None else None
@@ -3306,6 +3899,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['traj_boundary_margin_condition'] = (
                 sample_result['traj_boundary_margin_condition'].detach().float().cpu().numpy()
             )
+        if sample_result.get('traj_go_opportunity_condition_probs') is not None:
+            result['traj_go_opportunity_condition_probs'] = (
+                sample_result['traj_go_opportunity_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_conflict_area_status_condition_probs') is not None:
+            result['traj_conflict_area_status_condition_probs'] = (
+                sample_result['traj_conflict_area_status_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_conflict_timing_condition') is not None:
+            result['traj_conflict_timing_condition'] = (
+                sample_result['traj_conflict_timing_condition'].detach().float().cpu().numpy()
+            )
         if sample_result.get('traj_borrow_time_condition') is not None:
             result['traj_borrow_time_condition'] = (
                 sample_result['traj_borrow_time_condition'].detach().float().cpu().numpy()
@@ -3340,8 +3945,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'window_probs',
                 'dir_probs',
                 'decision_phase_probs',
+                'decision_phase_base_probs',
                 'control_phase_probs',
                 'conflict_area_probs',
+                'temporary_occupancy_probs',
+                'go_opportunity_probs',
+                'yld_pressure_probs',
+                'conflict_area_status_probs',
+                'conflict_timing_values',
+                'conflict_dist_to_entry_m',
+                'conflict_dist_to_exit_m',
+                'conflict_time_to_entry_s',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'junction_yld_max_mps',
@@ -3351,13 +3965,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'selected_yld_max_mps',
                 'selected_go_min_mps',
             ):
-                if key in ses:
+                if key in ses and ses.get(key) is not None:
                     result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
             for key in (
                 'window_logits',
                 'dir_logits',
                 'decision_phase_logits',
+                'decision_phase_logits_base',
                 'control_phase_logits',
+                'temporary_occupancy_logits',
+                'go_opportunity_logits',
+                'conflict_area_status_logits',
+                'conflict_timing_values',
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
@@ -3366,7 +3985,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'borrow_yld_max',
                 'borrow_go_min',
             ):
-                if key in ses:
+                if key in ses and ses.get(key) is not None:
                     result[f'speed_energy_{key}'] = ses[key].detach().float().cpu().numpy()
         if sample_result.get('speed_energy_ref_scores') is not None:
             ref = sample_result['speed_energy_ref_scores']
@@ -3376,8 +3995,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'window_probs',
                 'dir_probs',
                 'decision_phase_probs',
+                'decision_phase_base_probs',
                 'control_phase_probs',
                 'conflict_area_probs',
+                'temporary_occupancy_probs',
+                'go_opportunity_probs',
+                'yld_pressure_probs',
+                'conflict_area_status_probs',
+                'conflict_timing_values',
+                'conflict_dist_to_entry_m',
+                'conflict_dist_to_exit_m',
+                'conflict_time_to_entry_s',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'junction_yld_max_mps',
@@ -3387,13 +4015,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'selected_yld_max_mps',
                 'selected_go_min_mps',
             ):
-                if key in ref:
+                if key in ref and ref.get(key) is not None:
                     result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
             for key in (
                 'window_logits',
                 'dir_logits',
                 'decision_phase_logits',
+                'decision_phase_logits_base',
                 'control_phase_logits',
+                'temporary_occupancy_logits',
+                'go_opportunity_logits',
+                'conflict_area_status_logits',
+                'conflict_timing_values',
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
@@ -3402,7 +4035,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'borrow_yld_max',
                 'borrow_go_min',
             ):
-                if key in ref:
+                if key in ref and ref.get(key) is not None:
                     result[f'speed_energy_ref_{key}'] = ref[key].detach().float().cpu().numpy()
 
         return result

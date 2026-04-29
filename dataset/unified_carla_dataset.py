@@ -813,6 +813,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'junction_yld_max_speed_valid',
                 'junction_go_min_speed_valid',
                 'merge_threshold_train_only_negative_tail',
+                'conflict_area_route_mask',
+                'conflict_area_route_mask_valid',
+                'temporary_occupancy_cover_bins',
+                'temporary_occupancy_cover_valid',
+                'go_opportunity_prob',
+                'yld_pressure_prob',
+                'go_opportunity_valid',
+                'conflict_dist_to_entry_m',
+                'conflict_dist_to_exit_m',
+                'conflict_time_to_entry_s',
             }:
                 final_sample[key] = _from_numpy(value, key)
             elif key in {
@@ -823,6 +833,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'conflict_go_frame',
                 'conflict_area_start_frame',
                 'conflict_area_end_frame',
+                'conflict_area_status',
             }:
                 if isinstance(value, np.ndarray):
                     final_sample[key] = torch.from_numpy(value).long()

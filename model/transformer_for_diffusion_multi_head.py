@@ -1756,6 +1756,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.traj_decision_phase_condition_dim = 2
         self.traj_control_phase_condition_dim = 4
         self.traj_boundary_margin_dim = 2
+        self.traj_opportunity_condition_dim = 2
+        self.traj_area_status_condition_dim = 4
+        self.traj_timing_condition_dim = 3
         self.traj_borrow_aux_dim = 1
         self.traj_branch_condition_dim = (
             self.traj_window_condition_dim
@@ -1763,6 +1766,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             + self.traj_decision_phase_condition_dim
             + self.traj_control_phase_condition_dim
             + self.traj_boundary_margin_dim
+            + self.traj_opportunity_condition_dim
+            + self.traj_area_status_condition_dim
+            + self.traj_timing_condition_dim
             + self.traj_borrow_aux_dim
         )
         self.traj_window_condition_proj = nn.Sequential(
@@ -1787,6 +1793,21 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         self.traj_boundary_margin_proj = nn.Sequential(
             nn.Linear(self.traj_boundary_margin_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_opportunity_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_opportunity_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_area_status_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_area_status_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_timing_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_timing_condition_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
@@ -1908,6 +1929,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
             self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
             self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
+            self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.shared_stage1_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
             self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
@@ -2199,11 +2224,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
         semantic_feature = context['semantic_feature']
         conflict_area_input = torch.cat([route_out, context['route_geom_tokens']], dim=-1)
 
+        decision_phase_logits = self.shared_stage1_decision_phase_head(semantic_feature)
         return {
             'window_logits': self.shared_stage1_window_head(semantic_feature),
             'dir_logits': self.shared_stage1_dir_head(semantic_feature),
-            'decision_phase_logits': self.shared_stage1_decision_phase_head(semantic_feature),
+            'decision_phase_logits': decision_phase_logits,
+            'decision_phase_logits_base': decision_phase_logits,
             'control_phase_logits': self.shared_stage1_control_phase_head(semantic_feature),
+            'temporary_occupancy_logits': self.shared_stage1_temporary_occupancy_head(semantic_feature),
+            'go_opportunity_logits': self.shared_stage1_go_opportunity_head(semantic_feature),
+            'conflict_area_status_logits': self.shared_stage1_conflict_area_status_head(semantic_feature),
+            'conflict_timing_values': self.shared_stage1_conflict_timing_head(semantic_feature),
             'merge_yld_max': self.shared_stage1_merge_yld_max_head(semantic_feature).squeeze(-1),
             'merge_go_min': self.shared_stage1_merge_go_min_head(semantic_feature).squeeze(-1),
             'junction_yld_max': self.shared_stage1_junction_yld_max_head(semantic_feature).squeeze(-1),
@@ -2388,13 +2419,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     f"(B, {self.traj_branch_condition_dim}), got {branch_condition.shape}"
                 )
             if branch_condition_schedule is None:
-                branch_condition_schedule = torch.ones(B, 5, device=device, dtype=model_dtype)
+                branch_condition_schedule = torch.ones(B, 8, device=device, dtype=model_dtype)
             else:
                 branch_condition_schedule = branch_condition_schedule.to(device=device, dtype=model_dtype)
-                if branch_condition_schedule.dim() != 2 or branch_condition_schedule.shape[-1] != 5:
+                if branch_condition_schedule.dim() != 2 or branch_condition_schedule.shape[-1] not in (5, 8):
                     raise ValueError(
                         "forward_ego expects branch_condition_schedule as "
-                        f"(B, 5), got {branch_condition_schedule.shape}"
+                        f"(B, 5) or (B, 8), got {branch_condition_schedule.shape}"
                     )
             window_cond = branch_condition[:, :self.traj_window_condition_dim]
             dir_start = self.traj_window_condition_dim
@@ -2409,18 +2440,44 @@ class TransformerForDiffusion(ModuleAttrMixin):
             boundary_start = control_end
             boundary_end = boundary_start + self.traj_boundary_margin_dim
             boundary_cond = branch_condition[:, boundary_start:boundary_end]
-            borrow_aux = branch_condition[:, boundary_end:]
+            opportunity_start = boundary_end
+            opportunity_end = opportunity_start + self.traj_opportunity_condition_dim
+            opportunity_cond = branch_condition[:, opportunity_start:opportunity_end]
+            area_status_start = opportunity_end
+            area_status_end = area_status_start + self.traj_area_status_condition_dim
+            area_status_cond = branch_condition[:, area_status_start:area_status_end]
+            timing_start = area_status_end
+            timing_end = timing_start + self.traj_timing_condition_dim
+            timing_cond = branch_condition[:, timing_start:timing_end]
+            borrow_aux = branch_condition[:, timing_end:]
+            if borrow_aux.shape[-1] != self.traj_borrow_aux_dim:
+                raise ValueError(
+                    "forward_ego expects branch_condition borrow aux dim "
+                    f"{self.traj_borrow_aux_dim}, got {borrow_aux.shape[-1]}"
+                )
             gate_window = branch_condition_schedule[:, 0:1]
             gate_dir = branch_condition_schedule[:, 1:2]
             gate_phase = branch_condition_schedule[:, 2:3]
             gate_boundary = branch_condition_schedule[:, 3:4]
-            gate_borrow = branch_condition_schedule[:, 4:5]
+            if branch_condition_schedule.shape[-1] == 5:
+                gate_opportunity = gate_phase
+                gate_area_status = gate_window
+                gate_timing = gate_boundary
+                gate_borrow = branch_condition_schedule[:, 4:5]
+            else:
+                gate_opportunity = branch_condition_schedule[:, 4:5]
+                gate_area_status = branch_condition_schedule[:, 5:6]
+                gate_timing = branch_condition_schedule[:, 6:7]
+                gate_borrow = branch_condition_schedule[:, 7:8]
             branch_cond_emb = (
                 self.traj_window_condition_proj(window_cond) * gate_window
                 + self.traj_dir_condition_proj(dir_cond) * gate_dir
                 + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
                 + self.traj_control_phase_condition_proj(control_cond) * gate_phase
                 + self.traj_boundary_margin_proj(boundary_cond) * gate_boundary
+                + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
+                + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status
+                + self.traj_timing_condition_proj(timing_cond) * gate_timing
                 + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
             ) * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)

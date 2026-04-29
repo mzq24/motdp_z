@@ -431,6 +431,81 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
             class_names=('coast_yld', 'slow_yld', 'stop_yld', 'go'),
         )
 
+    temp_probs = _to_numpy_array(result.get('speed_energy_temporary_occupancy_probs'))
+    temp_bins = _to_numpy_array(batch.get('temporary_occupancy_cover_bins'))
+    temp_valid = _to_numpy_array(batch.get('temporary_occupancy_cover_valid'))
+    if temp_probs is not None and temp_bins is not None and temp_valid is not None:
+        temp_probs = np.asarray(temp_probs).reshape(-1, np.asarray(temp_probs).shape[-1]).astype(np.float32)
+        temp_bins = np.asarray(temp_bins).reshape(temp_probs.shape[0], -1).astype(np.float32)
+        temp_valid = np.asarray(temp_valid).reshape(temp_probs.shape[0], -1) > 0.5
+        if temp_bins.shape == temp_probs.shape and temp_valid.shape == temp_probs.shape and np.any(temp_valid):
+            clipped = np.clip(temp_probs, 1e-5, 1.0 - 1e-5)
+            bce = -(temp_bins * np.log(clipped) + (1.0 - temp_bins) * np.log(1.0 - clipped))
+            val_metrics['stage1_tempocc_bce'].append(float(np.mean(bce[temp_valid])))
+            val_metrics['stage1_tempocc_count'].append(float(np.sum(temp_valid)))
+
+    go_probs = _to_numpy_array(result.get('speed_energy_go_opportunity_probs'))
+    yld_target = _to_numpy_array(batch.get('yld_pressure_prob'))
+    go_target = _to_numpy_array(batch.get('go_opportunity_prob'))
+    go_valid = _to_numpy_array(batch.get('go_opportunity_valid'))
+    if go_probs is not None and yld_target is not None and go_target is not None and go_valid is not None:
+        go_probs = np.asarray(go_probs).reshape(-1, 2).astype(np.float32)
+        target_probs = np.stack([
+            np.asarray(yld_target).reshape(-1).astype(np.float32),
+            np.asarray(go_target).reshape(-1).astype(np.float32),
+        ], axis=-1)
+        denom = np.sum(target_probs, axis=-1, keepdims=True)
+        target_probs = np.where(denom > 1e-6, target_probs / np.maximum(denom, 1e-6), 0.5)
+        go_valid = np.asarray(go_valid).reshape(-1) > 0.5
+        if go_probs.shape[0] == target_probs.shape[0] and go_valid.shape[0] == go_probs.shape[0]:
+            finite = go_valid & np.isfinite(go_probs).all(axis=-1) & np.isfinite(target_probs).all(axis=-1)
+        else:
+            finite = np.zeros((0,), dtype=bool)
+        if finite.shape[0] == go_probs.shape[0] and np.any(finite):
+            clipped = np.clip(go_probs[finite], 1e-5, 1.0)
+            ce = -np.sum(target_probs[finite] * np.log(clipped), axis=-1)
+            mae = np.abs(go_probs[finite, 1] - target_probs[finite, 1])
+            val_metrics['stage1_go_opportunity_ce'].append(float(np.mean(ce)))
+            val_metrics['stage1_go_opportunity_mae'].append(float(np.mean(mae)))
+            val_metrics['stage1_go_opportunity_count'].append(float(np.sum(finite)))
+
+    if 'speed_energy_conflict_area_status_probs' in result and batch.get('conflict_area_status') is not None:
+        status_target = np.clip(
+            _to_numpy_array(batch['conflict_area_status']).reshape(-1).astype(np.int64),
+            0,
+            3,
+        )
+        _append_classification_val_metrics(
+            val_metrics,
+            'stage1_conflict_area_status',
+            result.get('speed_energy_conflict_area_status_probs'),
+            status_target,
+            class_names=('none', 'approaching', 'inside', 'past'),
+            active_is_nonzero=True,
+        )
+
+    timing_specs = (
+        ('stage1_conflict_dist_to_entry', 'speed_energy_conflict_dist_to_entry_m', 'conflict_dist_to_entry_m'),
+        ('stage1_conflict_dist_to_exit', 'speed_energy_conflict_dist_to_exit_m', 'conflict_dist_to_exit_m'),
+        ('stage1_conflict_time_to_entry', 'speed_energy_conflict_time_to_entry_s', 'conflict_time_to_entry_s'),
+    )
+    timing_valid = None
+    if batch.get('conflict_area_family') is not None:
+        timing_valid = _to_numpy_array(batch['conflict_area_family']).reshape(-1).astype(np.int64) > 0
+    for metric_prefix, pred_key, target_key in timing_specs:
+        pred_np = _to_numpy_array(result.get(pred_key))
+        target_np = _to_numpy_array(batch.get(target_key))
+        if pred_np is None or target_np is None:
+            continue
+        pred_np = np.asarray(pred_np).reshape(-1).astype(np.float32)
+        target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
+        finite = np.isfinite(pred_np) & np.isfinite(target_np)
+        if timing_valid is not None and timing_valid.shape[0] == finite.shape[0]:
+            finite &= timing_valid
+        if pred_np.shape[0] == target_np.shape[0] and np.any(finite):
+            val_metrics[f'{metric_prefix}_mae'].append(float(np.mean(np.abs(pred_np[finite] - target_np[finite]))))
+            val_metrics[f'{metric_prefix}_count'].append(float(np.sum(finite)))
+
     boundary_specs = (
         ('stage1_merge_yld_max', 'speed_energy_merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
         ('stage1_merge_go_min', 'speed_energy_merge_go_min_mps', 'merge_go_min_speed', 'merge_go_min_speed_valid'),
@@ -1894,6 +1969,12 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                            'energy_conflict_area_loss',
                            'energy_window_loss', 'energy_phase_loss',
                            'energy_decision_phase_loss', 'energy_control_phase_loss',
+                           'energy_temporary_occupancy_loss', 'energy_go_opportunity_loss',
+                           'energy_conflict_area_status_loss', 'energy_conflict_timing_loss',
+                           'energy_state_consistency_loss',
+                           'energy_state_consistency_window_loss',
+                           'energy_state_consistency_phase_loss',
+                           'energy_state_consistency_timing_loss',
                            'energy_merge_yld_max_loss', 'energy_merge_go_min_loss',
                            'energy_junction_yld_max_loss', 'energy_junction_go_min_loss',
                            'energy_borrow_yld_max_loss', 'energy_borrow_go_min_loss'):
