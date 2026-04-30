@@ -141,6 +141,11 @@ STUCK_HELPER_TARGET_INSERT_ENABLE = os.environ.get('STUCK_HELPER_TARGET_INSERT_E
 STUCK_HELPER_TARGET_1_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_1_FORWARD_M', '3.63'))
 STUCK_HELPER_TARGET_2_FORWARD_M = float(os.environ.get('STUCK_HELPER_TARGET_2_FORWARD_M', '25.63'))
 STUCK_HELPER_TARGET_LATERAL_M = float(os.environ.get('STUCK_HELPER_TARGET_LATERAL_M', '-3.145'))
+STUCK_HELPER_STARTUP_RECOVERY_MODE = os.environ.get(
+	'STUCK_HELPER_STARTUP_RECOVERY_MODE', 'control'
+).lower()
+STUCK_HELPER_CONTROL_THROTTLE = float(os.environ.get('STUCK_HELPER_CONTROL_THROTTLE', '0.5'))
+STUCK_HELPER_CONTROL_STEER = float(os.environ.get('STUCK_HELPER_CONTROL_STEER', '-1.0'))
 STUCK_HELPER_RELEASE_HEADING_DEG = float(os.environ.get('STUCK_HELPER_RELEASE_HEADING_DEG', '20.0'))
 STUCK_HELPER_STARTUP_DISTANCE_M = float(os.environ.get('STUCK_HELPER_STARTUP_DISTANCE_M', '10.0'))
 STUCK_HELPER_STARTUP_THRESHOLD = int(os.environ.get('STUCK_HELPER_STARTUP_THRESHOLD', '100'))
@@ -853,8 +858,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_apply_events': int(self.semantic_stop_apply_events),
 				'stop_sign_max_apply_events': int(self.semantic_stop_max_apply_events),
 				'stop_sign_arm_speed_ok': False,
-				'stuck_helper_active': bool(self.stuck_helper_active and STUCK_HELPER_TARGET_INSERT_ENABLE),
+				'stuck_helper_active': bool(self.stuck_helper_active),
 				'stuck_helper_mode': self.stuck_helper_mode,
+				'stuck_helper_recovery_mode': STUCK_HELPER_STARTUP_RECOVERY_MODE,
 				'stuck_helper_frames_remaining': int(self.stuck_helper),
 				'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
 				'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
@@ -1011,8 +1017,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'stop_sign_apply_events': int(self.semantic_stop_apply_events),
 			'stop_sign_max_apply_events': int(self.semantic_stop_max_apply_events),
 			'stop_sign_arm_speed_ok': bool(stop_sign_debug.get('arm_speed_ok', False)),
-			'stuck_helper_active': bool(self.stuck_helper_active and STUCK_HELPER_TARGET_INSERT_ENABLE),
+			'stuck_helper_active': bool(self.stuck_helper_active),
 			'stuck_helper_mode': self.stuck_helper_mode,
+			'stuck_helper_recovery_mode': STUCK_HELPER_STARTUP_RECOVERY_MODE,
 			'stuck_helper_frames_remaining': int(self.stuck_helper),
 			'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
 			'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
@@ -2297,6 +2304,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def _get_stuck_helper_target_override(self, ego_xy, yaw):
 		if (
 			not STUCK_HELPER_TARGET_INSERT_ENABLE
+			or STUCK_HELPER_STARTUP_RECOVERY_MODE != 'target'
 			or not self.stuck_helper_active
 			or self.stuck_helper_mode != 'startup'
 		):
@@ -2318,6 +2326,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'next_target_point_ego': helper_ego_points[1].copy(),
 			'target_point_world': helper_world_points[0].copy(),
 			'next_target_point_world': helper_world_points[1].copy(),
+		}
+
+	def _get_stuck_helper_control_override(self):
+		if (
+			STUCK_HELPER_STARTUP_RECOVERY_MODE != 'control'
+			or not self.stuck_helper_active
+			or self.stuck_helper_mode != 'startup'
+		):
+			return None
+		return {
+			'active': True,
+			'frames_remaining': int(self.stuck_helper),
+			'throttle': float(STUCK_HELPER_CONTROL_THROTTLE),
+			'steer': float(STUCK_HELPER_CONTROL_STEER),
+			'brake': 0.0,
 		}
 
 	def _reset_stuck_helper_state(self):
@@ -2732,11 +2755,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		).astype(np.float32)
 
 		stuck_helper_debug = {
-			'active': False,
+			'active': bool(self.stuck_helper_active),
 			'frames_remaining': int(self.stuck_helper),
 			'target_points_ego': None,
 			'target_points_world': None,
+			'control_override': None,
+			'recovery_mode': (
+				STUCK_HELPER_STARTUP_RECOVERY_MODE
+				if self.stuck_helper_mode == 'startup'
+				else None
+			),
 		}
+		ego_target_point = raw_target_point_ego
+		ego_next_target_point = raw_next_target_point_ego
+		target_point_world = raw_target_point_world
+		next_target_point_world = raw_next_target_point_world
 		stuck_helper_override = self._get_stuck_helper_target_override(
 			result['gps'][:2],
 			result['compass'],
@@ -2757,12 +2790,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					stuck_helper_override['target_point_world'].tolist(),
 					stuck_helper_override['next_target_point_world'].tolist(),
 				],
+				'control_override': None,
+				'recovery_mode': 'target',
 			}
-		else:
-			ego_target_point = raw_target_point_ego
-			ego_next_target_point = raw_next_target_point_ego
-			target_point_world = raw_target_point_world
-			next_target_point_world = raw_next_target_point_world
+
+		stuck_helper_control_override = self._get_stuck_helper_control_override()
+		if stuck_helper_control_override is not None:
+			stuck_helper_debug['active'] = True
+			stuck_helper_debug['control_override'] = {
+				'throttle': float(stuck_helper_control_override['throttle']),
+				'steer': float(stuck_helper_control_override['steer']),
+				'brake': float(stuck_helper_control_override['brake']),
+			}
+			stuck_helper_debug['recovery_mode'] = 'control'
 
 		forward_vec_world = np.array([
 			np.cos(result['compass']),
@@ -2807,6 +2847,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result['next_target_point_raw_world'] = raw_next_target_point_world
 		result['stuck_helper_active'] = bool(stuck_helper_debug['active'])
 		result['stuck_helper_mode'] = self.stuck_helper_mode
+		result['stuck_helper_recovery_mode'] = stuck_helper_debug['recovery_mode']
+		result['stuck_helper_control_override'] = stuck_helper_debug['control_override']
 		result['stuck_helper_frames_remaining'] = int(stuck_helper_debug['frames_remaining'])
 		result['stuck_helper_heading_delta_deg'] = float(self.stuck_helper_heading_delta_deg)
 		result['stuck_helper_release_heading_deg'] = float(STUCK_HELPER_RELEASE_HEADING_DEG)
@@ -3402,7 +3444,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				lidar_pil = Image.fromarray(lidar_np, mode='RGB')
 				lidar_pil_list = [lidar_pil]
 
-				if self.stuck_helper_active:
+				if self.stuck_helper_active and STUCK_HELPER_STARTUP_RECOVERY_MODE == 'target':
 					target_point_speed = torch.cat([speed, next_target_point], dim=-1)
 					# print("Get stucked! Trigger the stuck helper!")
 				else:
@@ -3969,8 +4011,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					terminal_route_debug.get('reason') if terminal_route_debug.get('active') else None
 				),
 				)
+			stuck_helper_control_override = tick_data.get('stuck_helper_control_override')
+			if stuck_helper_control_override is not None:
+				steer = float(stuck_helper_control_override.get('steer', steer))
+				throttle = float(stuck_helper_control_override.get('throttle', throttle))
+				brake = float(stuck_helper_control_override.get('brake', 0.0))
 
-			applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
+			if stuck_helper_control_override is not None:
+				applied_steer = float(np.clip(
+					stuck_helper_control_override.get('steer', steer),
+					-1.0,
+					1.0,
+				))
+			else:
+				applied_steer = float(np.clip(STEER_SIGN_SCALE * steer, -1.0, 1.0))
 			control = carla.VehicleControl()
 			control.steer = applied_steer
 			control.throttle = float(throttle)
@@ -3988,6 +4042,23 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'steer': control.steer,
 				'steer_controller': float(steer),
 				'steer_sign_scale': STEER_SIGN_SCALE,
+				'stuck_helper_recovery_mode': tick_data.get('stuck_helper_recovery_mode'),
+				'stuck_helper_control_override_active': bool(stuck_helper_control_override is not None),
+				'stuck_helper_control_steer': (
+					float(stuck_helper_control_override.get('steer'))
+					if stuck_helper_control_override is not None
+					else None
+				),
+				'stuck_helper_control_throttle': (
+					float(stuck_helper_control_override.get('throttle'))
+					if stuck_helper_control_override is not None
+					else None
+				),
+				'stuck_helper_control_brake': (
+					float(stuck_helper_control_override.get('brake'))
+					if stuck_helper_control_override is not None
+					else None
+				),
 				'throttle': control.throttle,
 				'brake': control.brake,
 				'speed': gt_velocity,
@@ -4074,6 +4145,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stuck_helper': int(self.stuck_helper),
 				'stuck_helper_active_state': bool(self.stuck_helper_active),
 				'stuck_helper_mode': self.stuck_helper_mode,
+				'stuck_helper_recovery_mode_state': STUCK_HELPER_STARTUP_RECOVERY_MODE,
 				'stuck_helper_heading_delta_deg': float(self.stuck_helper_heading_delta_deg),
 				'stuck_helper_release_heading_deg': float(STUCK_HELPER_RELEASE_HEADING_DEG),
 				'stuck_helper_in_startup_zone': bool(self.stuck_helper_in_startup_zone),
@@ -4112,6 +4184,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'stop_sign_semantic_arm_speed_ok': bool(semantic_debug.get('stop_sign_arm_speed_ok', False)),
 				'stuck_helper_active': bool(semantic_debug.get('stuck_helper_active', False)),
 				'stuck_helper_mode_tick': semantic_debug.get('stuck_helper_mode'),
+				'stuck_helper_recovery_mode_tick': semantic_debug.get('stuck_helper_recovery_mode'),
 				'stuck_helper_frames_remaining': int(semantic_debug.get('stuck_helper_frames_remaining', 0)),
 				'stuck_helper_in_startup_zone_tick': bool(semantic_debug.get('stuck_helper_in_startup_zone', False)),
 				'stuck_helper_distance_from_start_m_tick': semantic_debug.get('stuck_helper_distance_from_start_m'),
@@ -4180,6 +4253,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'next_target_point_raw_world': tick_data['next_target_point_raw_world'].tolist() if isinstance(tick_data.get('next_target_point_raw_world'), np.ndarray) else tick_data.get('next_target_point_raw_world'),
 				'tick_stuck_helper_active': bool(tick_data.get('stuck_helper_active', False)),
 				'tick_stuck_helper_mode': tick_data.get('stuck_helper_mode'),
+				'tick_stuck_helper_recovery_mode': tick_data.get('stuck_helper_recovery_mode'),
+				'tick_stuck_helper_control_override': tick_data.get('stuck_helper_control_override'),
 				'tick_stuck_helper_frames_remaining': int(tick_data.get('stuck_helper_frames_remaining', 0)),
 				'tick_stuck_helper_heading_delta_deg': float(tick_data.get('stuck_helper_heading_delta_deg', 0.0)),
 				'tick_stuck_helper_release_heading_deg': float(tick_data.get('stuck_helper_release_heading_deg', 0.0)),
