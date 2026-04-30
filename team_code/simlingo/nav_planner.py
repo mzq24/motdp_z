@@ -3,6 +3,7 @@ Some helpful classes for planning and control for the privileged autopilot
 """
 
 import math
+import os
 from copy import deepcopy
 from collections import deque
 import xml.etree.ElementTree as ET
@@ -181,6 +182,10 @@ class RoutePlanner(object):
 
         self.min_distance = min_distance
         self.max_distance = max_distance
+        self.change_lane_pop_multiplier = float(os.environ.get(
+            'ROUTE_PLANNER_CHANGE_LANE_POP_MULTIPLIER',
+            '1.0',
+        ))
         self.is_last = False
 
         # self.mean = np.array([0.0, 0.0, 0.0])
@@ -258,17 +263,20 @@ class RoutePlanner(object):
             distance = (diff[0]**2 + diff[1]**2)**0.5
 
             ### Oscar: this is for teporarily fixing the bug of the route planner ###
-            if (self.route[i][1] == RoadOption.CHANGELANELEFT or\
-                self.route[i][1] == RoadOption.CHANGELANERIGHT) and \
-                self.route_distances[min(i+1, len(self.route_distances))] < self.min_distance:
+            is_change_lane = (
+                self.route[i][1] == RoadOption.CHANGELANELEFT
+                or self.route[i][1] == RoadOption.CHANGELANERIGHT
+            )
+            next_idx = min(i + 1, len(self.route) - 1)
+            next_dist_idx = min(i + 1, len(self.route_distances) - 1)
+            change_lane_pop_distance = self.min_distance * self.change_lane_pop_multiplier
+            if is_change_lane and self.route_distances[next_dist_idx] < self.min_distance:
                 # self.route[i-1][1] == RoadOption.LANEFOLLOW:
-                if farthest_in_range < distance <= self.min_distance * 2:
+                if farthest_in_range < distance <= change_lane_pop_distance:
                     farthest_in_range = distance
                     to_pop = i
-            elif (self.route[i][1] == RoadOption.CHANGELANELEFT or\
-                self.route[i][1] == RoadOption.CHANGELANERIGHT) and \
-                self.route[min(i+1, len(self.route))][1] == RoadOption.LANEFOLLOW:
-                if farthest_in_range < distance <= self.min_distance * 2:
+            elif is_change_lane and self.route[next_idx][1] == RoadOption.LANEFOLLOW:
+                if farthest_in_range < distance <= change_lane_pop_distance:
                     farthest_in_range = distance
                     to_pop = i
             else:

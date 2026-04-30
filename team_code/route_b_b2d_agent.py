@@ -580,6 +580,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		parts = [format(float(v), fmt) for v in arr]
 		return '[' + ', '.join(parts) + ']'
 
+	def _format_debug_curve_slice(self, values, start=0, stop=None, fmt='.2f'):
+		if values is None:
+			return 'NA'
+		if isinstance(values, torch.Tensor):
+			arr = values.detach().cpu().float().reshape(-1).numpy()
+		else:
+			arr = np.asarray(values, dtype=np.float32).reshape(-1)
+		start = int(start)
+		stop = None if stop is None else int(stop)
+		if arr.size <= start:
+			return 'NA'
+		sliced = arr[start:stop]
+		if sliced.size == 0:
+			return '[]'
+		return self._format_debug_curve(sliced, fmt=fmt, max_items=int(sliced.size))
+
 	def _format_debug_first(self, values, fmt='.2f'):
 		if values is None:
 			return 'NA'
@@ -3600,6 +3616,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'traj_boundary_margin_condition',
 				'traj_phase_condition_probs',
 				'traj_phase_energy_summary',
+				'traj_go_opportunity_condition_probs',
+				'traj_conflict_area_status_condition_probs',
+				'traj_conflict_timing_condition',
 				'lane_dir_relation_probs',
 			]:
 				semantic_value = dp_pred_traj.get(semantic_key)
@@ -3681,8 +3700,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'window_probs',
 				'dir_probs',
 				'decision_phase_probs',
+				'decision_phase_base_probs',
 				'control_phase_probs',
 				'conflict_area_probs',
+				'temporary_occupancy_probs',
+				'go_opportunity_probs',
+				'yld_pressure_probs',
+				'conflict_area_status_probs',
+				'conflict_timing_values',
+				'conflict_dist_to_entry_m',
+				'conflict_dist_to_exit_m',
+				'conflict_time_to_entry_s',
 				'merge_yld_max_mps',
 				'merge_go_min_mps',
 				'junction_yld_max_mps',
@@ -4397,11 +4425,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"v: {speed_mps:.2f} m/s",
 			f"src: {self.pid_metadata.get('speed_source', 'N/A')}",
 			f"fus: {self.pid_metadata.get('fusion_regime', 'N/A')}",
+			f"cond: {cond_enabled} sc/dt {cond_scale}/{cond_detach}",
+			f"bm/bt: {cond_boundary_scale}/{cond_borrow_scale}",
 			f"vd0(raw): {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
 			f"vd(cap): {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
 			f"Estg: {self.pid_metadata.get('stage1_energy_control_mode', 'off')}/{int(bool(self.pid_metadata.get('stage1_energy_speed_control_active', False)))}",
 			f"dV(E): {self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')}",
 			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
+			f"Ch dE/S/A: {self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_chase_dedv'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_gradient_chase_score'), '.2f')}/{int(bool(self.pid_metadata.get('stage1_energy_gradient_chase_active', False)))}",
+			f"FR sig/cap: {self._format_debug_value(self.pid_metadata.get('front_route_risk_recent_max_sigmoid'), '.2f')}/{int(bool(self.pid_metadata.get('front_route_risk_speed_cap_active', False)))}/{self._format_debug_value(self.pid_metadata.get('front_route_risk_speed_cap_ms'), '.1f')}",
 			f"v_tgt: {self._format_debug_value(self.pid_metadata.get('stage1_energy_target_speed_ms'), '.1f')} ({self.pid_metadata.get('stage1_energy_target_source', 'NA')})",
 			f"vY/G(q): {self._format_debug_first(self.pid_metadata.get('speed_energy_selected_yld_max_mps'), '.1f')}/{self._format_debug_first(self.pid_metadata.get('speed_energy_selected_go_min_mps'), '.1f')}",
 			f"vY@ref: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_selected_yld_max_mps'), fmt='.1f', max_items=3)}",
@@ -4410,6 +4442,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"steer: {float(self.pid_metadata.get('steer', 0.0)):.3f}",
 			f"thr: {float(self.pid_metadata.get('throttle', 0.0)):.2f}",
 			f"brk: {float(self.pid_metadata.get('brake', 0.0)):.2f}",
+			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
 		]
 
 		mid_status_lines = [
@@ -4420,13 +4453,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"herr: {float(self.pid_metadata.get('steer_heading_error_deg', 0.0)):.1f}",
 			f"sidx: {self.pid_metadata.get('steer_target_idx', 'N/A')}",
 			f"sctl: {float(self.pid_metadata.get('steer_controller', 0.0)):.2f}",
-			f"cond cfg: {cond_enabled} w+d+dp+cp+bm",
-			f"cond sc/dt: {cond_scale}/{cond_detach}",
-			f"bm/bt sc: {cond_boundary_scale}/{cond_borrow_scale}",
-			f"sW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_window_probs'), fmt='.2f', max_items=4)}",
 			f"sP[y/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_decision_phase_probs'), fmt='.2f', max_items=2)}",
-			f"sC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_control_phase_probs'), fmt='.2f', max_items=4)}",
-			f"lidar: {int(bool(self.pid_metadata.get('use_lidar_bev_detail', False)))}/{int(bool(self.pid_metadata.get('lidar_bev_detail_zero_fallback', False)))}",
+			f"sP0[y/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_decision_phase_base_probs'), fmt='.2f', max_items=2)}",
+			f"sGY[y/o]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_go_opportunity_probs'), fmt='.2f', max_items=2)}",
+			f"sT dE/dX/tE: {self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_dist_to_entry_m'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_dist_to_exit_m'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_time_to_entry_s'), '.1f')}",
 		]
 
 		if self.last_target_point is not None:
@@ -4441,15 +4471,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		right_status_lines = [
 			f"pred h/1/.5: {self._format_debug_value(self.pid_metadata.get('speed_head_speed'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_1s'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('traj_speed_05s'), '.1f')} m/s",
 			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=7)}",
+			f"Ec(q): {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.2f', max_items=7)}",
+			f"Ec@ref: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_chase'), fmt='.2f', max_items=3)}",
+			f"sW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_window_probs'), fmt='.2f', max_items=4)}",
 			f"sD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_dir_probs'), fmt='.2f', max_items=4)}",
-			f"sA: {self._format_debug_curve(self.pid_metadata.get('speed_energy_conflict_area_probs'), fmt='.2f', max_items=7)}",
-			f"vY*: {self._format_debug_curve(self.pid_metadata.get('speed_energy_selected_yld_max_mps'), fmt='.1f', max_items=7)}",
-			f"vG*: {self._format_debug_curve(self.pid_metadata.get('speed_energy_selected_go_min_mps'), fmt='.1f', max_items=7)}",
+			f"sC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_control_phase_probs'), fmt='.2f', max_items=4)}",
+			f"sAS[n/b/i/a]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_conflict_area_status_probs'), fmt='.2f', max_items=4)}",
+			f"sA[0:7]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_conflict_area_probs'), 0, 7, fmt='.2f')}",
+			f"sA[7:14]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_conflict_area_probs'), 7, 14, fmt='.2f')}",
+			f"sA[14:20]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_conflict_area_probs'), 14, 20, fmt='.2f')}",
+			f"sOcc[0:7]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_temporary_occupancy_probs'), 0, 7, fmt='.2f')}",
+			f"sOcc[7:13]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_temporary_occupancy_probs'), 7, 13, fmt='.2f')}",
+			f"bcP[y/g]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_decision_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
+			f"bcGY[y/o]: {self._format_debug_curve(self.pid_metadata.get('traj_go_opportunity_condition_probs'), fmt='.2f', max_items=2)}",
+			f"bcT: {self._format_debug_curve(self.pid_metadata.get('traj_conflict_timing_condition'), fmt='.2f', max_items=3)}",
+			f"bm[y/g]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_boundary_margin_condition'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
 			f"bcW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('traj_window_condition_probs'), fmt='.2f', max_items=4)}",
 			f"bcD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('traj_dir_condition_probs'), fmt='.2f', max_items=4)}",
-			f"bcP[y/g]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_decision_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
 			f"bcC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('traj_control_phase_condition_probs'), fmt='.2f', max_items=4)}",
-			f"bm[y/g]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_boundary_margin_condition'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
+			f"bcAS[n/b/i/a]: {self._format_debug_curve(self.pid_metadata.get('traj_conflict_area_status_condition_probs'), fmt='.2f', max_items=4)}",
 		]
 
 		line_gap = 18
