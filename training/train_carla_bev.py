@@ -3,6 +3,7 @@ import os
 import sys
 import torch
 import json
+import csv
 try:
     from torch.amp import autocast as torch_autocast, GradScaler
 
@@ -497,7 +498,21 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         ('stage1_conflict_time_to_entry', 'conflict_time_to_entry_s', 'conflict_time_to_entry_s'),
     )
     timing_valid = None
-    if batch.get('conflict_area_family') is not None:
+    for valid_key in ('conflict_timing_valid', 'conflict_area_timing_valid', 'conflict_area_status_valid'):
+        if batch.get(valid_key) is not None:
+            timing_valid = _to_numpy_array(batch[valid_key]).reshape(-1) > 0.5
+            break
+    if timing_valid is None and all(batch.get(k) is not None for k in (
+        'conflict_dist_to_entry_valid',
+        'conflict_dist_to_exit_valid',
+        'conflict_time_to_entry_valid',
+    )):
+        timing_valid = (
+            (_to_numpy_array(batch['conflict_dist_to_entry_valid']).reshape(-1) > 0.5)
+            & (_to_numpy_array(batch['conflict_dist_to_exit_valid']).reshape(-1) > 0.5)
+            & (_to_numpy_array(batch['conflict_time_to_entry_valid']).reshape(-1) > 0.5)
+        )
+    if timing_valid is None and batch.get('conflict_area_family') is not None:
         timing_valid = _to_numpy_array(batch['conflict_area_family']).reshape(-1).astype(np.int64) > 0
     for metric_prefix, pred_key, target_key in timing_specs:
         pred_np = _to_numpy_array(_get_stage1_result(result, pred_key))
@@ -512,6 +527,44 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         if pred_np.shape[0] == target_np.shape[0] and np.any(finite):
             val_metrics[f'{metric_prefix}_mae'].append(float(np.mean(np.abs(pred_np[finite] - target_np[finite]))))
             val_metrics[f'{metric_prefix}_count'].append(float(np.sum(finite)))
+
+    chase_prob = _to_numpy_array(_get_stage1_result(result, 'chase_has_lead_prob'))
+    chase_target = _to_numpy_array(batch.get('chase_has_lead'))
+    if chase_prob is not None and chase_target is not None:
+        chase_prob = np.asarray(chase_prob).reshape(-1).astype(np.float32)
+        chase_target = np.asarray(chase_target).reshape(-1).astype(np.float32) > 0.5
+        if chase_prob.shape[0] == chase_target.shape[0]:
+            finite = np.isfinite(chase_prob)
+            if np.any(finite):
+                pred_pos = chase_prob[finite] >= 0.5
+                true_pos = chase_target[finite]
+                tp = float(np.sum(pred_pos & true_pos))
+                fp = float(np.sum(pred_pos & ~true_pos))
+                fn = float(np.sum(~pred_pos & true_pos))
+                tn = float(np.sum(~pred_pos & ~true_pos))
+                denom = max(tp + fp + fn + tn, 1.0)
+                precision = tp / max(tp + fp, 1.0)
+                recall = tp / max(tp + fn, 1.0)
+                f1 = 2.0 * precision * recall / max(precision + recall, 1e-6)
+                val_metrics['stage1_chase_has_lead_acc'].append((tp + tn) / denom)
+                val_metrics['stage1_chase_has_lead_precision'].append(precision)
+                val_metrics['stage1_chase_has_lead_recall'].append(recall)
+                val_metrics['stage1_chase_has_lead_f1'].append(f1)
+                val_metrics['stage1_chase_has_lead_count'].append(float(np.sum(finite)))
+
+    chase_speed = _to_numpy_array(_get_stage1_result(result, 'chase_speed_max_mps'))
+    chase_speed_target = _to_numpy_array(batch.get('chase_speed_max'))
+    chase_speed_valid = _to_numpy_array(batch.get('chase_speed_max_valid'))
+    if chase_speed is not None and chase_speed_target is not None and chase_speed_valid is not None:
+        chase_speed = np.asarray(chase_speed).reshape(-1).astype(np.float32)
+        chase_speed_target = np.asarray(chase_speed_target).reshape(-1).astype(np.float32)
+        chase_speed_valid = np.asarray(chase_speed_valid).reshape(-1) > 0.5
+        finite = chase_speed_valid & np.isfinite(chase_speed) & np.isfinite(chase_speed_target)
+        if chase_speed.shape[0] == chase_speed_target.shape[0] and finite.shape[0] == chase_speed.shape[0] and np.any(finite):
+            val_metrics['stage1_chase_speed_max_mae'].append(
+                float(np.mean(np.abs(chase_speed[finite] - chase_speed_target[finite])))
+            )
+            val_metrics['stage1_chase_speed_max_count'].append(float(np.sum(finite)))
 
     boundary_specs = (
         ('stage1_merge_yld_max', 'merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
@@ -660,10 +713,18 @@ def validate_model(
                     'stage1_go_opportunity_loss',
                     'stage1_conflict_area_status_loss',
                     'stage1_conflict_timing_loss',
+                    'stage1_inside_area_go_loss',
+                    'stage1_chase_loss',
+                    'stage1_chase_has_lead_loss',
+                    'stage1_chase_speed_max_loss',
                     'stage1_state_consistency_loss',
                     'stage1_state_consistency_window_loss',
                     'stage1_state_consistency_phase_loss',
                     'stage1_state_consistency_timing_loss',
+                    'stage1_state_consistency_boundary_loss',
+                    'stage1_state_consistency_area_loss',
+                    'stage1_state_consistency_tempocc_loss',
+                    'stage1_state_consistency_opportunity_loss',
                     'stage1_merge_yld_max_loss',
                     'stage1_merge_go_min_loss',
                     'stage1_junction_yld_max_loss',
@@ -688,6 +749,22 @@ def validate_model(
                     'energy_phase_loss',
                     'energy_decision_phase_loss',
                     'energy_control_phase_loss',
+                    'energy_temporary_occupancy_loss',
+                    'energy_go_opportunity_loss',
+                    'energy_conflict_area_status_loss',
+                    'energy_conflict_timing_loss',
+                    'energy_inside_area_go_loss',
+                    'energy_chase_loss',
+                    'energy_chase_has_lead_loss',
+                    'energy_chase_speed_max_loss',
+                    'energy_state_consistency_loss',
+                    'energy_state_consistency_window_loss',
+                    'energy_state_consistency_phase_loss',
+                    'energy_state_consistency_timing_loss',
+                    'energy_state_consistency_boundary_loss',
+                    'energy_state_consistency_area_loss',
+                    'energy_state_consistency_tempocc_loss',
+                    'energy_state_consistency_opportunity_loss',
                     'energy_merge_yld_max_loss',
                     'energy_merge_go_min_loss',
                     'energy_junction_yld_max_loss',
@@ -919,6 +996,65 @@ def _print_validation_metrics(val_metrics, show_speed_metrics=False):
         if (not show_speed_metrics) and key.startswith('val_speed_') and (not key.endswith('_loss')):
             continue
         print(f"  {key}: {value:.4f}")
+
+
+def _json_safe_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _write_validation_metrics_artifacts(checkpoint_dir, epoch, train_loss, val_metrics):
+    """Persist one validation row per checkpoint epoch for offline ckpt selection."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    epoch_1based = int(epoch) + 1
+    metrics_clean = {k: _json_safe_float(v) for k, v in sorted(val_metrics.items())}
+    payload = {
+        'epoch': int(epoch),
+        'epoch_1based': epoch_1based,
+        'checkpoint': f'dit_policy_epoch{epoch_1based}.pt',
+        'train_loss': _json_safe_float(train_loss),
+        'val_metrics': metrics_clean,
+    }
+
+    epoch_json = os.path.join(checkpoint_dir, f'val_metrics_epoch{epoch_1based:04d}.json')
+    latest_json = os.path.join(checkpoint_dir, 'val_metrics_latest.json')
+    for path in (epoch_json, latest_json):
+        with open(path, 'w') as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    csv_path = os.path.join(checkpoint_dir, 'val_metrics_summary.csv')
+    row = {
+        'epoch': int(epoch),
+        'epoch_1based': epoch_1based,
+        'checkpoint': f'dit_policy_epoch{epoch_1based}.pt',
+        'train_loss': _json_safe_float(train_loss),
+    }
+    row.update(metrics_clean)
+
+    rows = []
+    if os.path.exists(csv_path):
+        with open(csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    rows = [r for r in rows if str(r.get('epoch_1based')) != str(epoch_1based)]
+    rows.append(row)
+    rows.sort(key=lambda r: int(float(r.get('epoch_1based', 0) or 0)))
+
+    base_fields = ['epoch', 'epoch_1based', 'checkpoint', 'train_loss']
+    metric_fields = sorted({key for r in rows for key in r.keys()} - set(base_fields))
+    fieldnames = base_fields + metric_fields
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, '') for k in fieldnames})
+
+    return epoch_json, csv_path
 
 @record  # Records error and tracebacks in case of failure
 def train_pdm_policy(config_path, resume_path=None, val_only=False):
@@ -2029,10 +2165,18 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                            'stage1_decision_phase_loss', 'stage1_control_phase_loss',
                            'stage1_temporary_occupancy_loss', 'stage1_go_opportunity_loss',
                            'stage1_conflict_area_status_loss', 'stage1_conflict_timing_loss',
+                           'stage1_inside_area_go_loss',
+                           'stage1_chase_loss',
+                           'stage1_chase_has_lead_loss',
+                           'stage1_chase_speed_max_loss',
                            'stage1_state_consistency_loss',
                            'stage1_state_consistency_window_loss',
                            'stage1_state_consistency_phase_loss',
                            'stage1_state_consistency_timing_loss',
+                           'stage1_state_consistency_boundary_loss',
+                           'stage1_state_consistency_area_loss',
+                           'stage1_state_consistency_tempocc_loss',
+                           'stage1_state_consistency_opportunity_loss',
                            'stage1_merge_yld_max_loss', 'stage1_merge_go_min_loss',
                            'stage1_junction_yld_max_loss', 'stage1_junction_go_min_loss',
                            'stage1_borrow_yld_max_loss', 'stage1_borrow_go_min_loss',
@@ -2049,10 +2193,18 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                            'energy_decision_phase_loss', 'energy_control_phase_loss',
                            'energy_temporary_occupancy_loss', 'energy_go_opportunity_loss',
                            'energy_conflict_area_status_loss', 'energy_conflict_timing_loss',
+                           'energy_inside_area_go_loss',
+                           'energy_chase_loss',
+                           'energy_chase_has_lead_loss',
+                           'energy_chase_speed_max_loss',
                            'energy_state_consistency_loss',
                            'energy_state_consistency_window_loss',
                            'energy_state_consistency_phase_loss',
                            'energy_state_consistency_timing_loss',
+                           'energy_state_consistency_boundary_loss',
+                           'energy_state_consistency_area_loss',
+                           'energy_state_consistency_tempocc_loss',
+                           'energy_state_consistency_opportunity_loss',
                            'energy_merge_yld_max_loss', 'energy_merge_go_min_loss',
                            'energy_junction_yld_max_loss', 'energy_junction_go_min_loss',
                            'energy_borrow_yld_max_loss', 'energy_borrow_go_min_loss'):
@@ -2174,6 +2326,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 safe_wandb_log(log_dict, use_wandb)
 
                 _print_validation_metrics(val_metrics, show_speed_metrics=False)
+                metrics_json_path, metrics_csv_path = _write_validation_metrics_artifacts(
+                    checkpoint_dir, epoch, avg_train_loss, val_metrics
+                )
+                print(f"  Validation metrics saved: {metrics_json_path}")
+                print(f"  Validation summary CSV: {metrics_csv_path}")
 
                 val_loss = val_metrics.get('val_loss', float('inf'))
                 l2_avg = val_metrics.get('val_L2_avg', float('inf'))

@@ -116,6 +116,8 @@ export PYTHONPATH="${B2D_ROOT}/leaderboard:${B2D_ROOT}/scenario_runner:${CARLA_R
 
 mkdir -p "${SAVE_PATH}" "${RESULT_DIR}" "${LOG_DIR}"
 
+BASE_ROUTES_LABEL="$(basename "${BASE_ROUTES}")"
+
 if [[ ${#ROUTES_SUBSET_ARR[@]} -eq 0 ]]; then
   SPLIT_FLAG="${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_${TASK_NUM}tasks_split_done.flag"
   if [[ ! -f "${SPLIT_FLAG}" ]]; then
@@ -132,6 +134,7 @@ echo "  B2D_ROOT:       ${B2D_ROOT}"
 echo "  CARLA_ROOT:     ${CARLA_ROOT}"
 echo "  TEAM_AGENT:     ${TEAM_AGENT}"
 echo "  TEAM_CONFIG:    ${TEAM_CONFIG}"
+echo "  BASE_ROUTES:    ${BASE_ROUTES_LABEL}"
 echo "  RESULT_DIR:     ${RESULT_DIR}"
 echo "  SAVE_PATH:      ${SAVE_PATH}"
 echo "  PLANNER_TYPE:   ${PLANNER_TYPE}"
@@ -167,7 +170,7 @@ for ((i=0; i<${#GPU_RANK_LIST[@]}; i++)); do
   fi
 
   CHECKPOINT_ENDPOINT="${RESULT_DIR}/eval_${ROUTE_TAG}.json"
-  LOG_PATH="${LOG_DIR}/bench2drive220_${ROUTE_TAG}_${ALGO}_${PLANNER_TYPE}.log"
+  LOG_PATH="${LOG_DIR}/${BASE_ROUTES_LABEL}_${ROUTE_TAG}_${ALGO}_${PLANNER_TYPE}.log"
 
   CMD=(
     python leaderboard/leaderboard/leaderboard_evaluator.py

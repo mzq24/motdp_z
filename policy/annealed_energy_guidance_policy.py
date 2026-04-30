@@ -266,6 +266,45 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.state_consistency_prob = float(
             route_b_cfg.get('state_consistency_prob', 0.25)
         )
+        self.state_consistency_window_weight = float(
+            route_b_cfg.get('state_consistency_window_weight', 1.0)
+        )
+        self.state_consistency_phase_weight = float(
+            route_b_cfg.get('state_consistency_phase_weight', 1.0)
+        )
+        self.state_consistency_boundary_weight = float(
+            route_b_cfg.get('state_consistency_boundary_weight', 1.0)
+        )
+        self.state_consistency_area_weight = float(
+            route_b_cfg.get('state_consistency_area_weight', 1.0)
+        )
+        self.state_consistency_tempocc_weight = float(
+            route_b_cfg.get('state_consistency_tempocc_weight', 1.0)
+        )
+        self.state_consistency_opportunity_weight = float(
+            route_b_cfg.get('state_consistency_opportunity_weight', 1.0)
+        )
+        self.state_consistency_timing_weight = float(
+            route_b_cfg.get('state_consistency_timing_weight', 1.0)
+        )
+        self.inside_area_go_loss_weight = float(
+            route_b_cfg.get('inside_area_go_loss_weight', 0.0)
+        )
+        self.use_chase_front_following_state = bool(
+            route_b_cfg.get('use_chase_front_following_state', False)
+        )
+        self.chase_has_lead_loss_weight = float(
+            route_b_cfg.get('chase_has_lead_loss_weight', 0.05)
+        )
+        self.chase_speed_max_loss_weight = float(
+            route_b_cfg.get('chase_speed_max_loss_weight', 0.15)
+        )
+        self.chase_speed_norm_scale = float(
+            route_b_cfg.get('chase_speed_norm_scale', self.stage1_boundary_norm_scale)
+        )
+        self.traj_branch_condition_chase_margin_scale = float(
+            route_b_cfg.get('traj_branch_condition_chase_margin_scale', 5.0)
+        )
         self.traj_phase_energy_band_offsets = torch.tensor([-2.0, 0.0, 2.0], dtype=torch.float32)
         self.traj_window_condition_names = (
             'none',
@@ -308,6 +347,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'dist_to_exit',
             'time_to_entry',
         )
+        self.traj_chase_condition_names = (
+            'chase_has_lead',
+            'chase_speed_margin',
+        )
         self.traj_branch_condition_names = (
             *self.traj_window_condition_names,
             *self.traj_dir_condition_names,
@@ -317,6 +360,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             *self.traj_opportunity_condition_names,
             *self.traj_area_status_condition_names,
             *self.traj_timing_condition_names,
+            *self.traj_chase_condition_names,
             'borrow_time',
         )
 
@@ -586,6 +630,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     "conflict_dist_to_entry_m, conflict_dist_to_exit_m, "
                     "and conflict_time_to_entry_s in every batch"
                 )
+        if self.use_chase_front_following_state:
+            chase_required = (
+                self._resolve_stage1_batch_key(batch, 'chase_has_lead'),
+                self._resolve_stage1_batch_key(batch, 'chase_speed_max'),
+                self._resolve_stage1_batch_key(batch, 'chase_speed_max_valid'),
+            )
+            if any(key is None for key in chase_required):
+                raise ValueError(
+                    "use_chase_front_following_state=true requires chase_has_lead, "
+                    "chase_speed_max, and chase_speed_max_valid in every batch"
+                )
         return True
 
     @staticmethod
@@ -718,6 +773,25 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         time_entry = self._get_stage1_batch_tensor(
             batch, 'conflict_time_to_entry_s', device=device, model_dtype=model_dtype
         )
+        timing_valid_explicit = self._get_stage1_batch_tensor(
+            batch, 'conflict_timing_valid', device=device, model_dtype=model_dtype
+        )
+        if timing_valid_explicit is None:
+            timing_valid_explicit = self._get_stage1_batch_tensor(
+                batch, 'conflict_area_timing_valid', device=device, model_dtype=model_dtype
+            )
+        status_valid_explicit = self._get_stage1_batch_tensor(
+            batch, 'conflict_area_status_valid', device=device, model_dtype=model_dtype
+        )
+        scalar_valids = []
+        for key in (
+            'conflict_dist_to_entry_valid',
+            'conflict_dist_to_exit_valid',
+            'conflict_time_to_entry_valid',
+        ):
+            value = self._get_stage1_batch_tensor(batch, key, device=device, model_dtype=model_dtype)
+            if value is not None:
+                scalar_valids.append(value.reshape(-1) > 0.5)
         missing = status is None or dist_entry is None or dist_exit is None or time_entry is None
         if missing:
             if require:
@@ -731,6 +805,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         dist_entry = torch.nan_to_num(dist_entry.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
         dist_exit = torch.nan_to_num(dist_exit.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
         time_entry = torch.nan_to_num(time_entry.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        B = status.shape[0]
+
+        def _valid_vector(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if value is None:
+                return None
+            value = value.to(device=device).reshape(B, -1)
+            return (value > 0.5).all(dim=-1)
+
+        timing_valid_vec = _valid_vector(timing_valid_explicit)
+        status_valid_vec = _valid_vector(status_valid_explicit)
         values = torch.stack(
             [
                 dist_entry / max(self.conflict_timing_dist_norm_scale, 1e-6),
@@ -739,15 +823,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ],
             dim=-1,
         ).clamp(-2.0, 2.0)
-        if family_codes is None:
+        if timing_valid_vec is not None:
+            valid = timing_valid_vec
+        elif scalar_valids:
+            valid = torch.stack(scalar_valids, dim=-1).all(dim=-1)
+        elif status_valid_vec is not None:
+            valid = status_valid_vec
+        elif family_codes is None:
             valid = status > 0
         else:
             valid = family_codes.reshape(-1).to(device=device) > 0
+        if status_valid_vec is not None:
+            status_valid = status_valid_vec
+        else:
+            status_valid = valid
         finite_valid = torch.isfinite(values).all(dim=-1)
         return {
             'status': status,
             'values': values,
             'valid': valid & finite_valid,
+            'status_valid': status_valid & finite_valid,
         }
 
     @staticmethod
@@ -760,6 +855,46 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
     def _boundary_norm_to_mps(self, value: torch.Tensor) -> torch.Tensor:
         return value.clamp(0.0, 1.0) * float(self.stage1_boundary_norm_scale)
+
+    def _chase_norm_to_mps(self, value: torch.Tensor) -> torch.Tensor:
+        return value.clamp(0.0, 1.0) * float(self.chase_speed_norm_scale)
+
+    def _get_chase_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+        require: bool = False,
+    ):
+        has_lead = self._get_stage1_batch_tensor(
+            batch, 'chase_has_lead', device=device, model_dtype=model_dtype
+        )
+        speed_max = self._get_stage1_batch_tensor(
+            batch, 'chase_speed_max', device=device, model_dtype=model_dtype
+        )
+        speed_valid = self._get_stage1_batch_tensor(
+            batch, 'chase_speed_max_valid', device=device, model_dtype=model_dtype
+        )
+        missing = has_lead is None or speed_max is None or speed_valid is None
+        if missing:
+            if require:
+                raise ValueError(
+                    "chase/front-following training requires chase_has_lead, "
+                    "chase_speed_max, and chase_speed_max_valid"
+                )
+            return None
+        has_lead = torch.nan_to_num(
+            has_lead.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+        speed_max = torch.nan_to_num(
+            speed_max.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(min=0.0)
+        speed_valid = speed_valid.reshape(-1) > 0.5
+        return {
+            'has_lead': has_lead,
+            'speed_max': speed_max,
+            'speed_max_valid': speed_valid,
+        }
 
     def _build_conflict_area_route_target(
         self,
@@ -887,6 +1022,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             conflict_dist_to_entry_m = None
             conflict_dist_to_exit_m = None
             conflict_time_to_entry_s = None
+        if 'chase_has_lead_logit' in raw_scores:
+            chase_has_lead_prob = torch.sigmoid(raw_scores['chase_has_lead_logit'])
+        else:
+            chase_has_lead_prob = None
+        if 'chase_speed_max' in raw_scores:
+            chase_speed_max_mps = self._chase_norm_to_mps(raw_scores['chase_speed_max'])
+        else:
+            chase_speed_max_mps = None
 
         same_opp = dir_probs[:, 1:3]
         lane_dir_relation_probs = torch.where(
@@ -929,6 +1072,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'conflict_dist_to_entry_m': conflict_dist_to_entry_m,
             'conflict_dist_to_exit_m': conflict_dist_to_exit_m,
             'conflict_time_to_entry_s': conflict_time_to_entry_s,
+            'chase_has_lead_prob': chase_has_lead_prob,
+            'chase_speed_max_mps': chase_speed_max_mps,
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'merge_yld_max_mps': merge_yld_max,
             'merge_go_min_mps': merge_go_min,
@@ -1052,6 +1197,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         go_opportunity_probs: Optional[torch.Tensor],
         conflict_area_status_probs: Optional[torch.Tensor],
         conflict_timing_values: Optional[torch.Tensor],
+        chase_has_lead_prob: Optional[torch.Tensor],
+        chase_speed_max_mps: Optional[torch.Tensor],
         borrow_time_s: Optional[torch.Tensor],
         device: torch.device,
         model_dtype: torch.dtype,
@@ -1095,8 +1242,34 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if conflict_timing_values.shape[-1] != 3:
                 raise ValueError(
                     f"conflict_timing_values expects 3 dims, got {conflict_timing_values.shape}"
-                )
+            )
             conflict_timing_values = conflict_timing_values.clamp(-2.0, 2.0)
+        if chase_has_lead_prob is None:
+            chase_has_lead_prob = torch.zeros((B,), device=device, dtype=model_dtype)
+        else:
+            chase_has_lead_prob = torch.nan_to_num(
+                chase_has_lead_prob.to(device=device, dtype=model_dtype).reshape(-1),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+        if chase_speed_max_mps is None:
+            chase_speed_margin = torch.zeros((B,), device=device, dtype=model_dtype)
+        else:
+            chase_speed_max_mps = torch.nan_to_num(
+                chase_speed_max_mps.to(device=device, dtype=model_dtype).reshape(-1),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            chase_speed_margin = (
+                (chase_speed_max_mps - center_speed)
+                / max(self.traj_branch_condition_chase_margin_scale, 1e-6)
+            ).clamp(-1.0, 1.0)
+        chase_condition = torch.stack(
+            [chase_has_lead_prob, chase_speed_margin],
+            dim=-1,
+        )
 
         family_probs = window_probs[:, 1:]
         yld_stack = torch.stack(
@@ -1183,6 +1356,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 go_opportunity_probs,
                 conflict_area_status_probs,
                 conflict_timing_values,
+                chase_condition,
                 borrow_time_cond.unsqueeze(-1),
             ],
             dim=-1,
@@ -1196,6 +1370,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'go_opportunity_probs': go_opportunity_probs,
             'conflict_area_status_probs': conflict_area_status_probs,
             'conflict_timing_values': conflict_timing_values,
+            'chase_has_lead_prob': chase_has_lead_prob,
+            'chase_speed_margin': chase_speed_margin,
+            'chase_speed_max_mps': chase_speed_max_mps,
             'borrow_time_condition': borrow_time_cond,
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'selected_yld_max_mps': selected_yld_max,
@@ -1280,6 +1457,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         else:
             conflict_area_status_probs = None
             conflict_timing_values = None
+        chase_targets = (
+            self._get_chase_targets(
+                batch,
+                device=device,
+                model_dtype=model_dtype,
+                require=True,
+            )
+            if self.use_chase_front_following_state else None
+        )
 
         return self._compose_stage1_branch_condition(
             window_probs=window_probs,
@@ -1302,6 +1488,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             go_opportunity_probs=go_opportunity_probs,
             conflict_area_status_probs=conflict_area_status_probs,
             conflict_timing_values=conflict_timing_values,
+            chase_has_lead_prob=(
+                chase_targets['has_lead'] if chase_targets is not None else None
+            ),
+            chase_speed_max_mps=(
+                chase_targets['speed_max'] if chase_targets is not None else None
+            ),
             borrow_time_s=borrow_time_s,
             device=device,
             model_dtype=model_dtype,
@@ -1365,6 +1557,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 if 'conflict_area_status_logits' in raw_scores else None
             ),
             conflict_timing_values=raw_scores.get('conflict_timing_values'),
+            chase_has_lead_prob=(
+                torch.sigmoid(raw_scores['chase_has_lead_logit'])
+                if self.use_chase_front_following_state and 'chase_has_lead_logit' in raw_scores else None
+            ),
+            chase_speed_max_mps=(
+                self._chase_norm_to_mps(raw_scores['chase_speed_max'])
+                if self.use_chase_front_following_state and 'chase_speed_max' in raw_scores else None
+            ),
             borrow_time_s=borrow_time_s,
             device=device,
             model_dtype=model_dtype,
@@ -1838,6 +2038,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             family_codes=family_codes,
             require=self.use_conflict_timing_state,
         )
+        chase_targets = (
+            self._get_chase_targets(
+                batch,
+                device=device,
+                model_dtype=model_dtype,
+                require=True,
+            )
+            if self.use_chase_front_following_state else None
+        )
 
         if self.shared_stage1_training_source == 'noisy':
             if noisy_joint is None or noisy_joint_abs is None or diff_timesteps is None:
@@ -1964,28 +2173,76 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         loss_conflict_area_status = zero
         loss_conflict_timing = zero
+        loss_inside_area_go = zero
         if timing_targets is not None:
-            loss_conflict_area_status = F.cross_entropy(
-                raw_stage1_scores['conflict_area_status_logits'].float(),
-                timing_targets['status'].clamp(min=0, max=3),
-            )
+            status_valid = timing_targets.get('status_valid', timing_targets['valid'])
+            if status_valid.any():
+                loss_conflict_area_status = F.cross_entropy(
+                    raw_stage1_scores['conflict_area_status_logits'][status_valid].float(),
+                    timing_targets['status'][status_valid].clamp(min=0, max=3),
+                )
             timing_valid = timing_targets['valid']
             if timing_valid.any():
                 loss_conflict_timing = F.smooth_l1_loss(
                     raw_stage1_scores['conflict_timing_values'][timing_valid].float(),
                     timing_targets['values'][timing_valid].float(),
                 )
+            inside_mask = status_valid & (timing_targets['status'] == 2)
+            if inside_mask.any():
+                inside_decision_target = torch.ones(
+                    int(inside_mask.sum().item()), device=device, dtype=torch.long
+                )
+                inside_control_target = torch.full(
+                    (int(inside_mask.sum().item()),),
+                    3,
+                    device=device,
+                    dtype=torch.long,
+                )
+                loss_inside_area_go = (
+                    F.cross_entropy(
+                        raw_stage1_scores['decision_phase_logits'][inside_mask].float(),
+                        inside_decision_target,
+                    )
+                    + F.cross_entropy(
+                        raw_stage1_scores['control_phase_logits'][inside_mask].float(),
+                        inside_control_target,
+                    )
+                )
+
+        loss_chase_has_lead = zero
+        loss_chase_speed_max = zero
+        if self.use_chase_front_following_state and chase_targets is not None:
+            loss_chase_has_lead = F.binary_cross_entropy_with_logits(
+                raw_stage1_scores['chase_has_lead_logit'].float(),
+                chase_targets['has_lead'].float(),
+            )
+            chase_speed_valid = chase_targets['speed_max_valid']
+            if chase_speed_valid.any():
+                chase_speed_target_norm = (
+                    chase_targets['speed_max'] / max(self.chase_speed_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0)
+                loss_chase_speed_max = F.smooth_l1_loss(
+                    raw_stage1_scores['chase_speed_max'][chase_speed_valid].float(),
+                    chase_speed_target_norm[chase_speed_valid].float(),
+                )
 
         loss_merge_active = zero
         loss_junction_active = zero
         loss_borrow_active = zero
         loss_cross_active = zero
-        loss_chase = zero
+        loss_chase = (
+            self.chase_has_lead_loss_weight * loss_chase_has_lead
+            + self.chase_speed_max_loss_weight * loss_chase_speed_max
+        )
         loss_ped = zero
         loss_state_consistency = zero
         loss_state_consistency_window = zero
         loss_state_consistency_phase = zero
         loss_state_consistency_timing = zero
+        loss_state_consistency_boundary = zero
+        loss_state_consistency_area = zero
+        loss_state_consistency_tempocc = zero
+        loss_state_consistency_opportunity = zero
         if (
             self.use_independent_state_consistency_loss
             and self.state_consistency_loss_weight > 0
@@ -2088,6 +2345,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 + _sym_smooth_l1(scores_view1['borrow_yld_max'], scores_view2['borrow_yld_max'], borrow_yld_valid)
                 + _sym_smooth_l1(scores_view1['borrow_go_min'], scores_view2['borrow_go_min'], borrow_go_valid)
             ) / 6.0
+            loss_state_consistency_boundary = boundary_consistency
             area_consistency = zero
             if conflict_area_valid_mask is not None:
                 area_consistency = _sym_mse(
@@ -2095,6 +2353,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     scores_view2['conflict_area_logits'],
                     conflict_area_valid_mask,
                 )
+            loss_state_consistency_area = area_consistency
             temp_consistency = zero
             go_consistency = zero
             if temp_targets is not None:
@@ -2108,12 +2367,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     scores_view2['go_opportunity_logits'],
                     temp_targets['go_opportunity_valid'],
                 )
+            loss_state_consistency_tempocc = temp_consistency
+            loss_state_consistency_opportunity = go_consistency
             status_consistency = zero
             timing_consistency = zero
             if timing_targets is not None:
                 status_consistency = _sym_kl_logits(
                     scores_view1['conflict_area_status_logits'],
                     scores_view2['conflict_area_status_logits'],
+                    timing_targets.get('status_valid', timing_targets['valid']),
                 )
                 timing_consistency = _sym_smooth_l1(
                     scores_view1['conflict_timing_values'],
@@ -2122,13 +2384,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
             loss_state_consistency_timing = status_consistency + timing_consistency
             loss_state_consistency = (
-                loss_state_consistency_window
-                + loss_state_consistency_phase
-                + boundary_consistency
-                + area_consistency
-                + temp_consistency
-                + go_consistency
-                + loss_state_consistency_timing
+                self.state_consistency_window_weight * loss_state_consistency_window
+                + self.state_consistency_phase_weight * loss_state_consistency_phase
+                + self.state_consistency_boundary_weight * loss_state_consistency_boundary
+                + self.state_consistency_area_weight * loss_state_consistency_area
+                + self.state_consistency_tempocc_weight * loss_state_consistency_tempocc
+                + self.state_consistency_opportunity_weight * loss_state_consistency_opportunity
+                + self.state_consistency_timing_weight * loss_state_consistency_timing
             )
 
         stage1_loss = (
@@ -2143,6 +2405,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.go_opportunity_loss_weight * loss_go_opportunity
             + self.conflict_area_status_loss_weight * loss_conflict_area_status
             + self.conflict_timing_loss_weight * loss_conflict_timing
+            + self.energy_chase_weight * loss_chase
+            + self.inside_area_go_loss_weight * loss_inside_area_go
             + self.state_consistency_loss_weight * loss_state_consistency
         )
         return {
@@ -2150,6 +2414,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             # Backward-compatible alias while downstream logs/agents migrate.
             'energy_loss': stage1_loss,
             'chase_loss': loss_chase,
+            'chase_has_lead_loss': loss_chase_has_lead,
+            'chase_speed_max_loss': loss_chase_speed_max,
             'merge_loss': loss_merge,
             'junction_loss': loss_junction,
             'borrow_loss': loss_borrow,
@@ -2178,10 +2444,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'go_opportunity_loss': loss_go_opportunity,
             'conflict_area_status_loss': loss_conflict_area_status,
             'conflict_timing_loss': loss_conflict_timing,
+            'inside_area_go_loss': loss_inside_area_go,
             'state_consistency_loss': loss_state_consistency,
             'state_consistency_window_loss': loss_state_consistency_window,
             'state_consistency_phase_loss': loss_state_consistency_phase,
             'state_consistency_timing_loss': loss_state_consistency_timing,
+            'state_consistency_boundary_loss': loss_state_consistency_boundary,
+            'state_consistency_area_loss': loss_state_consistency_area,
+            'state_consistency_tempocc_loss': loss_state_consistency_tempocc,
+            'state_consistency_opportunity_loss': loss_state_consistency_opportunity,
             'merge_yld_max_loss': loss_merge_yld,
             'merge_go_min_loss': loss_merge_go,
             'junction_yld_max_loss': loss_junction_yld,
@@ -2449,10 +2720,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'stage1_go_opportunity_loss': stage1_loss_dict.get('go_opportunity_loss', zero_t),
                 'stage1_conflict_area_status_loss': stage1_loss_dict.get('conflict_area_status_loss', zero_t),
                 'stage1_conflict_timing_loss': stage1_loss_dict.get('conflict_timing_loss', zero_t),
+                'stage1_inside_area_go_loss': stage1_loss_dict.get('inside_area_go_loss', zero_t),
+                'stage1_chase_loss': stage1_loss_dict.get('chase_loss', zero_t),
+                'stage1_chase_has_lead_loss': stage1_loss_dict.get('chase_has_lead_loss', zero_t),
+                'stage1_chase_speed_max_loss': stage1_loss_dict.get('chase_speed_max_loss', zero_t),
                 'stage1_state_consistency_loss': stage1_loss_dict.get('state_consistency_loss', zero_t),
                 'stage1_state_consistency_window_loss': stage1_loss_dict.get('state_consistency_window_loss', zero_t),
                 'stage1_state_consistency_phase_loss': stage1_loss_dict.get('state_consistency_phase_loss', zero_t),
                 'stage1_state_consistency_timing_loss': stage1_loss_dict.get('state_consistency_timing_loss', zero_t),
+                'stage1_state_consistency_boundary_loss': stage1_loss_dict.get('state_consistency_boundary_loss', zero_t),
+                'stage1_state_consistency_area_loss': stage1_loss_dict.get('state_consistency_area_loss', zero_t),
+                'stage1_state_consistency_tempocc_loss': stage1_loss_dict.get('state_consistency_tempocc_loss', zero_t),
+                'stage1_state_consistency_opportunity_loss': stage1_loss_dict.get('state_consistency_opportunity_loss', zero_t),
                 'stage1_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),
                 'stage1_merge_go_min_loss': stage1_loss_dict.get('merge_go_min_loss', zero_t),
                 'stage1_junction_yld_max_loss': stage1_loss_dict.get('junction_yld_max_loss', zero_t),
@@ -3842,6 +4121,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 traj_branch_condition_details['conflict_timing_values']
                 if traj_branch_condition_details is not None else None
             ),
+            'traj_chase_has_lead_condition': (
+                traj_branch_condition_details['chase_has_lead_prob']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_chase_speed_margin_condition': (
+                traj_branch_condition_details['chase_speed_margin']
+                if traj_branch_condition_details is not None else None
+            ),
             'traj_borrow_time_condition': (
                 traj_branch_condition_details['borrow_time_condition']
                 if traj_branch_condition_details is not None else None
@@ -3953,6 +4240,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['traj_conflict_timing_condition'] = (
                 sample_result['traj_conflict_timing_condition'].detach().float().cpu().numpy()
             )
+        if sample_result.get('traj_chase_has_lead_condition') is not None:
+            result['traj_chase_has_lead_condition'] = (
+                sample_result['traj_chase_has_lead_condition'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_chase_speed_margin_condition') is not None:
+            result['traj_chase_speed_margin_condition'] = (
+                sample_result['traj_chase_speed_margin_condition'].detach().float().cpu().numpy()
+            )
         if sample_result.get('traj_borrow_time_condition') is not None:
             result['traj_borrow_time_condition'] = (
                 sample_result['traj_borrow_time_condition'].detach().float().cpu().numpy()
@@ -4002,6 +4297,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_dist_to_entry_m',
                 'conflict_dist_to_exit_m',
                 'conflict_time_to_entry_s',
+                'chase_has_lead_prob',
+                'chase_speed_max_mps',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'junction_yld_max_mps',
@@ -4025,6 +4322,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'go_opportunity_logits',
                 'conflict_area_status_logits',
                 'conflict_timing_values',
+                'chase_has_lead_logit',
+                'chase_speed_max',
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
@@ -4058,6 +4357,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_dist_to_entry_m',
                 'conflict_dist_to_exit_m',
                 'conflict_time_to_entry_s',
+                'chase_has_lead_prob',
+                'chase_speed_max_mps',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'junction_yld_max_mps',
@@ -4081,6 +4382,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'go_opportunity_logits',
                 'conflict_area_status_logits',
                 'conflict_timing_values',
+                'chase_has_lead_logit',
+                'chase_speed_max',
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',

@@ -1759,6 +1759,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.traj_opportunity_condition_dim = 2
         self.traj_area_status_condition_dim = 4
         self.traj_timing_condition_dim = 3
+        self.traj_chase_condition_dim = 2
         self.traj_borrow_aux_dim = 1
         self.traj_branch_condition_dim = (
             self.traj_window_condition_dim
@@ -1769,6 +1770,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             + self.traj_opportunity_condition_dim
             + self.traj_area_status_condition_dim
             + self.traj_timing_condition_dim
+            + self.traj_chase_condition_dim
             + self.traj_borrow_aux_dim
         )
         self.traj_window_condition_proj = nn.Sequential(
@@ -1808,6 +1810,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         self.traj_timing_condition_proj = nn.Sequential(
             nn.Linear(self.traj_timing_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_chase_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_chase_condition_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
@@ -1933,6 +1940,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
             self.shared_stage1_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
             self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
+            self.shared_stage1_chase_has_lead_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_chase_speed_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
             self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
@@ -2235,6 +2244,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'go_opportunity_logits': self.shared_stage1_go_opportunity_head(semantic_feature),
             'conflict_area_status_logits': self.shared_stage1_conflict_area_status_head(semantic_feature),
             'conflict_timing_values': self.shared_stage1_conflict_timing_head(semantic_feature),
+            'chase_has_lead_logit': self.shared_stage1_chase_has_lead_head(semantic_feature).squeeze(-1),
+            'chase_speed_max': self.shared_stage1_chase_speed_max_head(semantic_feature).squeeze(-1),
             'merge_yld_max': self.shared_stage1_merge_yld_max_head(semantic_feature).squeeze(-1),
             'merge_go_min': self.shared_stage1_merge_go_min_head(semantic_feature).squeeze(-1),
             'junction_yld_max': self.shared_stage1_junction_yld_max_head(semantic_feature).squeeze(-1),
@@ -2449,7 +2460,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             timing_start = area_status_end
             timing_end = timing_start + self.traj_timing_condition_dim
             timing_cond = branch_condition[:, timing_start:timing_end]
-            borrow_aux = branch_condition[:, timing_end:]
+            chase_start = timing_end
+            chase_end = chase_start + self.traj_chase_condition_dim
+            chase_cond = branch_condition[:, chase_start:chase_end]
+            borrow_aux = branch_condition[:, chase_end:]
             if borrow_aux.shape[-1] != self.traj_borrow_aux_dim:
                 raise ValueError(
                     "forward_ego expects branch_condition borrow aux dim "
@@ -2478,6 +2492,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
                 + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status
                 + self.traj_timing_condition_proj(timing_cond) * gate_timing
+                + self.traj_chase_condition_proj(chase_cond) * gate_boundary
                 + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
             ) * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)

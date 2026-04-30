@@ -141,8 +141,21 @@ route_b:
   conflict_timing_dist_norm_scale: 30.0
   conflict_timing_time_norm_scale: 10.0
   use_independent_state_consistency_loss: true
-  state_consistency_loss_weight: 0.02
+  state_consistency_loss_weight: 1.0
   state_consistency_prob: 0.25
+  state_consistency_window_weight: 0.01
+  state_consistency_phase_weight: 0.005
+  state_consistency_boundary_weight: 0.01
+  state_consistency_area_weight: 0.05
+  state_consistency_tempocc_weight: 0.05
+  state_consistency_opportunity_weight: 0.02
+  state_consistency_timing_weight: 0.05
+  inside_area_go_loss_weight: 0.1
+  use_chase_front_following_state: true
+  chase_has_lead_loss_weight: 0.05
+  chase_speed_max_loss_weight: 0.15
+  chase_speed_norm_scale: 30.0
+  traj_branch_condition_chase_margin_scale: 5.0
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
   speed_loss_weight: 0.2
