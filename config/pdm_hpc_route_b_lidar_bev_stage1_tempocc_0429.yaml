@@ -14,25 +14,25 @@ device:
 
 dataloader:
   batch_size: 256
-  num_workers: 8
+  num_workers: 4
   persistent_workers: false
   pin_memory: false
-  prefetch_factor: 2
-  train_num_workers: 8
-  val_num_workers: 2
+  prefetch_factor: 1
+  train_num_workers: 4
+  val_num_workers: 1
   train_persistent_workers: false
   val_persistent_workers: false
-  train_prefetch_factor: 2
+  train_prefetch_factor: 1
   val_prefetch_factor: 1
-  val_batch_size: 256
+  val_batch_size: 128
   shuffle: true
   use_window_weighted_sampler: true
   window_sampler_replacement: true
   window_sampler_weights:
     none: 1.0
     merge: 3.0
-    junction: 3.0
-    borrow: 5.0
+    junction: 4.0
+    borrow: 3.0
 
 obs_horizon: 4
 pred_horizon: 10
@@ -54,7 +54,6 @@ optimizer:
   - 0.999
   eps: 1.0e-08
   lr: 5.0e-05
-  resume_override_lr: 4e-07
   weight_decay: 1.0e-04
 
 shape_meta:
@@ -119,25 +118,25 @@ route_b:
   train_stage1: true
   use_stage1_state: true
   shared_stage1_training_source: clean
-  use_speed_profile_head: true
+  use_speed_profile_head: false
   use_traj_branch_condition: true
   traj_branch_condition_scale: 2.0
   traj_branch_condition_detach: true
   traj_branch_condition_gt_prob_start: 1.0
-  traj_branch_condition_gt_prob_end: 1.0
-  traj_branch_condition_gt_decay_epochs: 0
+  traj_branch_condition_gt_prob_end: 0.7
+  traj_branch_condition_gt_decay_epochs: 80
   traj_branch_condition_affinity_scale: 6.0
   traj_branch_condition_borrow_time_scale: 8.0
   traj_branch_condition_boundary_margin_scale: 5.0
   stage1_boundary_norm_scale: 30.0
   use_temporary_occupancy_phase: true
   temporary_occupancy_dim: 13
-  temporary_occupancy_loss_weight: 0.25
-  go_opportunity_loss_weight: 0.25
+  temporary_occupancy_loss_weight: 0.15
+  go_opportunity_loss_weight: 0.15
   temporary_occupancy_phase_alpha: 0.0
   use_conflict_timing_state: true
-  conflict_area_status_loss_weight: 0.25
-  conflict_timing_loss_weight: 0.25
+  conflict_area_status_loss_weight: 0.15
+  conflict_timing_loss_weight: 0.15
   conflict_timing_dist_norm_scale: 30.0
   conflict_timing_time_norm_scale: 10.0
   use_independent_state_consistency_loss: true
@@ -159,23 +158,23 @@ route_b:
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
   speed_loss_weight: 0.2
-  speed_profile_loss_weight: 0.1
+  speed_profile_loss_weight: 0.0
   speed_profile_dt: 0.5
   stage1_chase_weight: 1.0
   stage1_meet_weight: 1.0
   stage1_ped_weight: 1.0
   stage1_window_weight: 0.25
-  stage1_phase_weight: 0.25
-  stage1_conflict_area_weight: 0.25
+  stage1_phase_weight: 0.15
+  stage1_conflict_area_weight: 0.15
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0
   stage1_noisy_training: false
   alignment_warmup_epochs: 50
   stage1_grad_clip_norm: 1.0
   train_stage1_until_epoch: 70
-  train_stage1_after_update_every: 50
+  train_stage1_after_update_every: 5
   train_speed_head_until_epoch: 70
-  train_speed_head_after_update_every: 50
+  train_speed_head_after_update_every: 5
 
 truncated_diffusion:
   num_train_timesteps: 1000
@@ -188,7 +187,7 @@ truncated_diffusion:
 
 num_modes: 32
 cls_loss_weight: 0.0
-reg_loss_weight: 4.0
+reg_loss_weight: 6.0
 
 dataset:
   use_per_frame: false
@@ -200,20 +199,22 @@ dataset:
   val_retain_bad_routes_for_energy: false
 
 training:
-  num_epochs: 150
+  num_epochs: 80
   max_grad_norm: 1.0
-  warmup_epochs: 10
+  warmup_epochs: 3
   use_lr_scheduler: true
-  scheduler_total_epochs: 100
-  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data
+  resume_rebuild_scheduler: true
+  scheduler_total_epochs: 80
+  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_chase
   image_data_root: /workspace1/z_project/dataset/pdm_lite
   sample_interval: 1
-  lr_final: 1e-8
+  lr_final: 1.0e-07
   validation_freq: 5
   save_freq: 5
   max_keep_ckpts: 20
   early_stopping_patience: 15
-  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_tempocc_0429
+  best_checkpoint_metric: phase_balanced
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_independent_tempocc_0429/checkpoints/route_b_stage1_tempocc_chase_0501
 
 validation:
   enabled: true
@@ -225,15 +226,15 @@ validation:
 logging:
   use_wandb: true
   wandb_project: route_b_lidar_bev
-  run_name: route_b_lidar_bev_stage1_tempocc_0429
-  checkpoint_dir: /workspace1/z_project/code/motdp_z/checkpoints/route_b_lidar_bev_stage1_tempocc_0429
+  run_name: route_b_stage1_tempocc_chase_0501
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_independent_tempocc_0429/checkpoints/route_b_stage1_tempocc_chase_0501
   save_every: 5
   log_freq: 50
 
 augmentation:
   gps_noise:
     enabled: true
-    sigma: 0.15
+    sigma: 0.05
     probability: 1
     apply_to_route: false
 

@@ -4529,6 +4529,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cond_borrow_scale = self._format_debug_value(
 			self.pid_metadata.get('traj_branch_condition_borrow_time_scale'), '.1f'
 		)
+		conflict_area_probs = self.pid_metadata.get('speed_energy_conflict_area_probs')
 
 		left_status_lines = [
 			f"frm: {self.step}",

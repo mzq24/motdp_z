@@ -19,6 +19,9 @@ Key differences from Route A (DiffusionDiTCarlaPolicy):
   - Alignment loss encourages decoder to generate low-energy trajectories
 """
 
+import os
+from collections import deque
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,6 +43,13 @@ def dict_apply(
         else:
             result[key] = func(value)
     return result
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.lower() in ('1', 'true', 'yes', 'on')
 
 
 # =============================================================================
@@ -242,6 +252,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.temporary_occupancy_phase_alpha = float(
             route_b_cfg.get('temporary_occupancy_phase_alpha', 0.0)
         )
+        self.phase_go_smoothing_enable = _env_bool(
+            'PHASE_GO_SMOOTHING_ENABLE',
+            bool(route_b_cfg.get('phase_go_smoothing_enable', False)),
+        )
+        self.phase_go_smoothing_window = max(
+            1,
+            int(os.environ.get(
+                'PHASE_GO_SMOOTHING_WINDOW',
+                route_b_cfg.get('phase_go_smoothing_window', 5),
+            )),
+        )
+        self.phase_go_smoothing_threshold = float(os.environ.get(
+            'PHASE_GO_SMOOTHING_THRESHOLD',
+            route_b_cfg.get('phase_go_smoothing_threshold', 0.8),
+        ))
+        self.phase_go_smoothing_source = str(os.environ.get(
+            'PHASE_GO_SMOOTHING_SOURCE',
+            route_b_cfg.get('phase_go_smoothing_source', 'go_opportunity'),
+        )).lower()
+        self.phase_go_smoothing_history = deque(maxlen=self.phase_go_smoothing_window)
         self.use_conflict_timing_state = bool(
             route_b_cfg.get('use_conflict_timing_state', False)
         )
@@ -590,16 +620,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self._resolve_stage1_batch_key(batch, 'conflict_control_phase'),
             self._resolve_stage1_batch_key(batch, 'merge_yld_max_speed'),
             self._resolve_stage1_batch_key(batch, 'merge_go_min_speed'),
-            self._resolve_stage1_batch_key(batch, 'merge_yld_max_speed_valid'),
-            self._resolve_stage1_batch_key(batch, 'merge_go_min_speed_valid'),
             self._resolve_stage1_batch_key(batch, 'junction_yld_max_speed'),
             self._resolve_stage1_batch_key(batch, 'junction_go_min_speed'),
-            self._resolve_stage1_batch_key(batch, 'junction_yld_max_speed_valid'),
-            self._resolve_stage1_batch_key(batch, 'junction_go_min_speed_valid'),
             self._resolve_stage1_batch_key(batch, 'borrow_yld_max_speed'),
             self._resolve_stage1_batch_key(batch, 'borrow_go_min_speed'),
-            self._resolve_stage1_batch_key(batch, 'borrow_yld_max_speed_valid'),
-            self._resolve_stage1_batch_key(batch, 'borrow_go_min_speed_valid'),
         )
         if any(key is None for key in required):
             return False
@@ -634,12 +658,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             chase_required = (
                 self._resolve_stage1_batch_key(batch, 'chase_has_lead'),
                 self._resolve_stage1_batch_key(batch, 'chase_speed_max'),
-                self._resolve_stage1_batch_key(batch, 'chase_speed_max_valid'),
             )
             if any(key is None for key in chase_required):
                 raise ValueError(
                     "use_chase_front_following_state=true requires chase_has_lead, "
-                    "chase_speed_max, and chase_speed_max_valid in every batch"
+                    "and chase_speed_max in every batch"
                 )
         return True
 
@@ -875,12 +898,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         speed_valid = self._get_stage1_batch_tensor(
             batch, 'chase_speed_max_valid', device=device, model_dtype=model_dtype
         )
-        missing = has_lead is None or speed_max is None or speed_valid is None
+        missing = has_lead is None or speed_max is None
         if missing:
             if require:
                 raise ValueError(
                     "chase/front-following training requires chase_has_lead, "
-                    "chase_speed_max, and chase_speed_max_valid"
+                    "and chase_speed_max"
                 )
             return None
         has_lead = torch.nan_to_num(
@@ -889,7 +912,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         speed_max = torch.nan_to_num(
             speed_max.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0
         ).clamp(min=0.0)
-        speed_valid = speed_valid.reshape(-1) > 0.5
+        if speed_valid is None:
+            speed_valid = torch.ones_like(speed_max, dtype=torch.bool)
+        else:
+            speed_valid = speed_valid.reshape(-1) > 0.5
         return {
             'has_lead': has_lead,
             'speed_max': speed_max,
@@ -906,10 +932,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         offline_mask = self._get_stage1_batch_tensor(
             batch, 'conflict_area_route_mask', device=device, model_dtype=model_dtype
         )
-        offline_valid = self._get_stage1_batch_tensor(
-            batch, 'conflict_area_route_mask_valid', device=device, model_dtype=model_dtype
-        )
-
         B = None
         fallback_rows = None
         target = None
@@ -922,21 +944,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     f"conflict_area_route_mask expects {route_steps} route bins, got {target.shape}"
                 )
             target = target.clamp(0.0, 1.0)
-            if offline_valid is None:
-                valid_target_mask = torch.ones_like(target, dtype=torch.bool)
-                fallback_rows = torch.zeros(B, device=device, dtype=torch.bool)
-            else:
-                valid_raw = offline_valid.reshape(B, -1)
-                if valid_raw.shape[1] == 1:
-                    valid_raw = valid_raw.expand(-1, route_steps)
-                if valid_raw.shape[1] != route_steps:
-                    raise ValueError(
-                        f"conflict_area_route_mask_valid expects 1 or {route_steps} bins, got {valid_raw.shape}"
-                    )
-                fallback_rows = (valid_raw < 0).any(dim=-1)
-                valid_target_mask = valid_raw > 0.5
-            if not fallback_rows.any():
-                return target, valid_target_mask
+            valid_target_mask = torch.ones_like(target, dtype=torch.bool)
+            fallback_rows = torch.zeros(B, device=device, dtype=torch.bool)
+            return target, valid_target_mask
 
         conflict_active = self._get_stage1_batch_tensor(
             batch, 'conflict_area_active', device=device, model_dtype=model_dtype
@@ -1380,6 +1390,77 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         }
         return branch_condition, details
 
+    def _apply_phase_go_smoothing_override(
+        self,
+        branch_condition: Optional[torch.Tensor],
+        details: Optional[Dict[str, torch.Tensor]],
+        *,
+        update_history: bool,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ):
+        debug = {
+            'enabled': float(self.phase_go_smoothing_enable),
+            'applied': 0.0,
+            'raw_go_prob': float('nan'),
+            'smoothed_go_prob': float('nan'),
+            'history_len': float(len(self.phase_go_smoothing_history)),
+            'threshold': float(self.phase_go_smoothing_threshold),
+        }
+        if not self.phase_go_smoothing_enable or branch_condition is None or details is None:
+            return branch_condition, details, debug, False
+
+        decision_phase_probs = details.get('decision_phase_probs')
+        if decision_phase_probs is None or decision_phase_probs.shape[-1] < 2:
+            return branch_condition, details, debug, False
+
+        source = self.phase_go_smoothing_source
+        go_prob_tensor = None
+        if source in ('decision', 'decision_phase', 'phase'):
+            go_prob_tensor = decision_phase_probs[:, 1]
+        else:
+            go_opportunity_probs = details.get('go_opportunity_probs')
+            if go_opportunity_probs is not None and go_opportunity_probs.shape[-1] >= 2:
+                go_prob_tensor = go_opportunity_probs[:, 1]
+            else:
+                go_prob_tensor = decision_phase_probs[:, 1]
+
+        raw_go_prob = float(go_prob_tensor.detach().float().reshape(-1)[0].item())
+        if update_history:
+            self.phase_go_smoothing_history.append(raw_go_prob)
+        if len(self.phase_go_smoothing_history) > 0:
+            smoothed_go_prob = float(
+                sum(self.phase_go_smoothing_history) / len(self.phase_go_smoothing_history)
+            )
+        else:
+            smoothed_go_prob = raw_go_prob
+
+        applied = smoothed_go_prob > self.phase_go_smoothing_threshold
+        debug.update({
+            'applied': float(applied),
+            'raw_go_prob': raw_go_prob,
+            'smoothed_go_prob': smoothed_go_prob,
+            'history_len': float(len(self.phase_go_smoothing_history)),
+        })
+        if not applied:
+            return branch_condition, details, debug, update_history
+
+        decision_start = len(self.traj_window_condition_names) + len(self.traj_dir_condition_names)
+        decision_end = decision_start + len(self.traj_decision_phase_condition_names)
+        decision_override = torch.zeros_like(decision_phase_probs)
+        decision_override[:, 1] = 1.0
+
+        new_details = dict(details)
+        new_details['decision_phase_probs_before_go_smoothing'] = decision_phase_probs
+        new_details['decision_phase_probs'] = decision_override
+
+        new_branch_condition = branch_condition.clone()
+        new_branch_condition[:, decision_start:decision_end] = decision_override.to(
+            device=device,
+            dtype=model_dtype,
+        )
+        return new_branch_condition, new_details, debug, update_history
+
     def _build_stage1_branch_condition_gt(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1424,12 +1505,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         junction_go_min = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed', device=device, model_dtype=model_dtype)
         borrow_yld_max = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed', device=device, model_dtype=model_dtype)
         borrow_go_min = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed', device=device, model_dtype=model_dtype)
-        merge_yld_valid = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed_valid', device=device, model_dtype=model_dtype)
-        merge_go_valid = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed_valid', device=device, model_dtype=model_dtype)
-        junction_yld_valid = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed_valid', device=device, model_dtype=model_dtype)
-        junction_go_valid = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed_valid', device=device, model_dtype=model_dtype)
-        borrow_yld_valid = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed_valid', device=device, model_dtype=model_dtype)
-        borrow_go_valid = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed_valid', device=device, model_dtype=model_dtype)
+        boundary_targets = (
+            merge_yld_max,
+            merge_go_min,
+            junction_yld_max,
+            junction_go_min,
+            borrow_yld_max,
+            borrow_go_min,
+        )
+        if any(target is None for target in boundary_targets):
+            return None, None
+        merge_yld_valid = torch.ones_like(merge_yld_max, device=device, dtype=model_dtype)
+        merge_go_valid = torch.ones_like(merge_go_min, device=device, dtype=model_dtype)
+        junction_yld_valid = torch.ones_like(junction_yld_max, device=device, dtype=model_dtype)
+        junction_go_valid = torch.ones_like(junction_go_min, device=device, dtype=model_dtype)
+        borrow_yld_valid = torch.ones_like(borrow_yld_max, device=device, dtype=model_dtype)
+        borrow_go_valid = torch.ones_like(borrow_go_min, device=device, dtype=model_dtype)
         borrow_time_s = self._get_stage1_borrow_time_target(batch, device=device, model_dtype=model_dtype)
         center_speed = ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
         temp_targets = self._get_temporary_occupancy_targets(
@@ -2019,12 +2110,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         junction_go_target = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed', device=device, model_dtype=model_dtype)
         borrow_yld_target = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed', device=device, model_dtype=model_dtype)
         borrow_go_target = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed', device=device, model_dtype=model_dtype)
-        merge_yld_valid = self._get_stage1_batch_tensor(batch, 'merge_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        merge_go_valid = self._get_stage1_batch_tensor(batch, 'merge_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        junction_yld_valid = self._get_stage1_batch_tensor(batch, 'junction_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        junction_go_valid = self._get_stage1_batch_tensor(batch, 'junction_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        borrow_yld_valid = self._get_stage1_batch_tensor(batch, 'borrow_yld_max_speed_valid', device=device, model_dtype=model_dtype) > 0.5
-        borrow_go_valid = self._get_stage1_batch_tensor(batch, 'borrow_go_min_speed_valid', device=device, model_dtype=model_dtype) > 0.5
+        boundary_targets = (
+            merge_yld_target,
+            merge_go_target,
+            junction_yld_target,
+            junction_go_target,
+            borrow_yld_target,
+            borrow_go_target,
+        )
+        if any(target is None for target in boundary_targets):
+            raise ValueError("shared stage1 training requires all boundary speed labels")
+        merge_yld_valid = torch.ones_like(merge_yld_target, device=device, dtype=torch.bool)
+        merge_go_valid = torch.ones_like(merge_go_target, device=device, dtype=torch.bool)
+        junction_yld_valid = torch.ones_like(junction_yld_target, device=device, dtype=torch.bool)
+        junction_go_valid = torch.ones_like(junction_go_target, device=device, dtype=torch.bool)
+        borrow_yld_valid = torch.ones_like(borrow_yld_target, device=device, dtype=torch.bool)
+        borrow_go_valid = torch.ones_like(borrow_go_target, device=device, dtype=torch.bool)
         temp_targets = self._get_temporary_occupancy_targets(
             batch,
             device=device,
@@ -2088,19 +2189,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         zero = gt_abs.new_tensor(0.0)
 
-        def _masked_boundary_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-            valid_mask = valid_mask.to(dtype=torch.bool)
-            if valid_mask.sum() <= 0:
-                return zero
-            target_norm = (target_mps / max(self.stage1_boundary_norm_scale, 1e-6)).clamp(0.0, 1.0)
-            return F.smooth_l1_loss(pred_norm[valid_mask], target_norm[valid_mask])
+        def _boundary_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor) -> torch.Tensor:
+            target_norm = torch.nan_to_num(
+                target_mps,
+                nan=0.0,
+                posinf=float(self.stage1_boundary_norm_scale),
+                neginf=0.0,
+            )
+            target_norm = (target_norm / max(self.stage1_boundary_norm_scale, 1e-6)).clamp(0.0, 1.0)
+            return F.smooth_l1_loss(pred_norm.float(), target_norm.float())
 
-        loss_merge_yld = _masked_boundary_loss(raw_stage1_scores['merge_yld_max'], merge_yld_target, merge_yld_valid)
-        loss_merge_go = _masked_boundary_loss(raw_stage1_scores['merge_go_min'], merge_go_target, merge_go_valid)
-        loss_junction_yld = _masked_boundary_loss(raw_stage1_scores['junction_yld_max'], junction_yld_target, junction_yld_valid)
-        loss_junction_go = _masked_boundary_loss(raw_stage1_scores['junction_go_min'], junction_go_target, junction_go_valid)
-        loss_borrow_yld = _masked_boundary_loss(raw_stage1_scores['borrow_yld_max'], borrow_yld_target, borrow_yld_valid)
-        loss_borrow_go = _masked_boundary_loss(raw_stage1_scores['borrow_go_min'], borrow_go_target, borrow_go_valid)
+        loss_merge_yld = _boundary_loss(raw_stage1_scores['merge_yld_max'], merge_yld_target)
+        loss_merge_go = _boundary_loss(raw_stage1_scores['merge_go_min'], merge_go_target)
+        loss_junction_yld = _boundary_loss(raw_stage1_scores['junction_yld_max'], junction_yld_target)
+        loss_junction_go = _boundary_loss(raw_stage1_scores['junction_go_min'], junction_go_target)
+        loss_borrow_yld = _boundary_loss(raw_stage1_scores['borrow_yld_max'], borrow_yld_target)
+        loss_borrow_go = _boundary_loss(raw_stage1_scores['borrow_go_min'], borrow_go_target)
         loss_merge = 0.5 * (loss_merge_yld + loss_merge_go)
         loss_junction = 0.5 * (loss_junction_yld + loss_junction_go)
         loss_borrow = 0.5 * (loss_borrow_yld + loss_borrow_go)
@@ -2175,19 +2279,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_conflict_timing = zero
         loss_inside_area_go = zero
         if timing_targets is not None:
-            status_valid = timing_targets.get('status_valid', timing_targets['valid'])
-            if status_valid.any():
-                loss_conflict_area_status = F.cross_entropy(
-                    raw_stage1_scores['conflict_area_status_logits'][status_valid].float(),
-                    timing_targets['status'][status_valid].clamp(min=0, max=3),
-                )
+            status_target = timing_targets['status'].clamp(min=0, max=3)
+            loss_conflict_area_status = F.cross_entropy(
+                raw_stage1_scores['conflict_area_status_logits'].float(),
+                status_target,
+            )
             timing_valid = timing_targets['valid']
             if timing_valid.any():
                 loss_conflict_timing = F.smooth_l1_loss(
                     raw_stage1_scores['conflict_timing_values'][timing_valid].float(),
                     timing_targets['values'][timing_valid].float(),
                 )
-            inside_mask = status_valid & (timing_targets['status'] == 2)
+            inside_mask = timing_targets['status'] == 2
             if inside_mask.any():
                 inside_decision_target = torch.ones(
                     int(inside_mask.sum().item()), device=device, dtype=torch.long
@@ -2216,15 +2319,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 raw_stage1_scores['chase_has_lead_logit'].float(),
                 chase_targets['has_lead'].float(),
             )
-            chase_speed_valid = chase_targets['speed_max_valid']
-            if chase_speed_valid.any():
-                chase_speed_target_norm = (
-                    chase_targets['speed_max'] / max(self.chase_speed_norm_scale, 1e-6)
-                ).clamp(0.0, 1.0)
-                loss_chase_speed_max = F.smooth_l1_loss(
-                    raw_stage1_scores['chase_speed_max'][chase_speed_valid].float(),
-                    chase_speed_target_norm[chase_speed_valid].float(),
-                )
+            chase_speed_target_norm = (
+                chase_targets['speed_max'] / max(self.chase_speed_norm_scale, 1e-6)
+            ).clamp(0.0, 1.0)
+            loss_chase_speed_max = F.smooth_l1_loss(
+                raw_stage1_scores['chase_speed_max'].float(),
+                chase_speed_target_norm.float(),
+            )
 
         loss_merge_active = zero
         loss_junction_active = zero
@@ -2375,7 +2476,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 status_consistency = _sym_kl_logits(
                     scores_view1['conflict_area_status_logits'],
                     scores_view2['conflict_area_status_logits'],
-                    timing_targets.get('status_valid', timing_targets['valid']),
+                    None,
                 )
                 timing_consistency = _sym_smooth_l1(
                     scores_view1['conflict_timing_values'],
@@ -3745,6 +3846,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         traj_branch_condition_probs = None
         traj_branch_condition_details = None
         pass1_trajectory = None
+        phase_go_smoothing_debug = None
+        phase_go_smoothing_history_updated = False
 
         for step_i, k in enumerate(roll_timesteps):
             t_cur = k.item()
@@ -3820,6 +3923,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                             prev_relation_probs=prev_relation_probs,
                             device=device,
                             model_dtype=model_dtype,
+                        )
+                        (
+                            traj_branch_condition_probs,
+                            traj_branch_condition_details,
+                            phase_go_smoothing_debug,
+                            phase_go_smoothing_history_just_updated,
+                        ) = self._apply_phase_go_smoothing_override(
+                            traj_branch_condition_probs,
+                            traj_branch_condition_details,
+                            update_history=not phase_go_smoothing_history_updated,
+                            device=device,
+                            model_dtype=model_dtype,
+                        )
+                        phase_go_smoothing_history_updated = (
+                            phase_go_smoothing_history_updated
+                            or phase_go_smoothing_history_just_updated
                         )
                         branch_schedule = self._build_traj_condition_schedule(
                             t_tensor, device=device, model_dtype=model_dtype
@@ -3974,6 +4093,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                             device=device,
                             model_dtype=model_dtype,
                         )
+                        (
+                            traj_branch_condition_probs,
+                            traj_branch_condition_details,
+                            phase_go_smoothing_debug,
+                            phase_go_smoothing_history_just_updated,
+                        ) = self._apply_phase_go_smoothing_override(
+                            traj_branch_condition_probs,
+                            traj_branch_condition_details,
+                            update_history=not phase_go_smoothing_history_updated,
+                            device=device,
+                            model_dtype=model_dtype,
+                        )
+                        phase_go_smoothing_history_updated = (
+                            phase_go_smoothing_history_updated
+                            or phase_go_smoothing_history_just_updated
+                        )
                         branch_schedule = self._build_traj_condition_schedule(
                             t_tensor, device=device, model_dtype=model_dtype
                         )
@@ -4072,6 +4207,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
             stage1_ref_scores = self._compose_stage1_outputs(stage1_ref_scores_raw)
 
+        if phase_go_smoothing_debug is None:
+            phase_go_smoothing_debug = {
+                'enabled': float(self.phase_go_smoothing_enable),
+                'applied': 0.0,
+                'raw_go_prob': float('nan'),
+                'smoothed_go_prob': float('nan'),
+                'history_len': float(len(self.phase_go_smoothing_history)),
+                'threshold': float(self.phase_go_smoothing_threshold),
+            }
+        phase_go_smoothing_tensors = {
+            key: torch.tensor([value], device=device, dtype=model_dtype)
+            for key, value in phase_go_smoothing_debug.items()
+        }
+
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
             'route_pred': route_pred,                 # (B, 20, 2)
@@ -4137,6 +4286,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 traj_branch_condition_details['lane_dir_relation_probs']
                 if traj_branch_condition_details is not None else None
             ),
+            'traj_phase_go_smoothing_enabled': phase_go_smoothing_tensors['enabled'],
+            'traj_phase_go_smoothing_applied': phase_go_smoothing_tensors['applied'],
+            'traj_phase_go_smoothing_raw_go_prob': phase_go_smoothing_tensors['raw_go_prob'],
+            'traj_phase_go_smoothing_smoothed_go_prob': phase_go_smoothing_tensors['smoothed_go_prob'],
+            'traj_phase_go_smoothing_history_len': phase_go_smoothing_tensors['history_len'],
+            'traj_phase_go_smoothing_threshold': phase_go_smoothing_tensors['threshold'],
             'pass1_trajectory': pass1_trajectory,
             'pass2_trajectory': best_trajectory,
             'poses_cls': poses_cls,                   # (B, 1)
@@ -4256,6 +4411,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['lane_dir_relation_probs'] = (
                 sample_result['lane_dir_relation_probs'].detach().float().cpu().numpy()
             )
+        for key in (
+            'traj_phase_go_smoothing_enabled',
+            'traj_phase_go_smoothing_applied',
+            'traj_phase_go_smoothing_raw_go_prob',
+            'traj_phase_go_smoothing_smoothed_go_prob',
+            'traj_phase_go_smoothing_history_len',
+            'traj_phase_go_smoothing_threshold',
+        ):
+            if sample_result.get(key) is not None:
+                result[key] = sample_result[key].detach().float().cpu().numpy()
         if sample_result.get('pass1_trajectory') is not None:
             result['pass1_trajectory'] = (
                 sample_result['pass1_trajectory'].detach().float().cpu().numpy()

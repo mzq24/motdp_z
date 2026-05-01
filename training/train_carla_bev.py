@@ -354,20 +354,18 @@ def _append_classification_val_metrics(
                 )
 
 
-def _append_boundary_val_metric(val_metrics, prefix, pred, target, valid):
+def _append_boundary_val_metric(val_metrics, prefix, pred, target, valid=None):
     pred_np = _to_numpy_array(pred)
     target_np = _to_numpy_array(target)
-    valid_np = _to_numpy_array(valid)
-    if pred_np is None or target_np is None or valid_np is None:
+    if pred_np is None or target_np is None:
         return
 
     pred_np = np.asarray(pred_np).reshape(-1).astype(np.float32)
     target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
-    valid_np = np.asarray(valid_np).reshape(-1) > 0.5
-    if pred_np.shape[0] != target_np.shape[0] or pred_np.shape[0] != valid_np.shape[0]:
+    if pred_np.shape[0] != target_np.shape[0]:
         return
 
-    finite_mask = valid_np & np.isfinite(pred_np) & np.isfinite(target_np)
+    finite_mask = np.isfinite(pred_np) & np.isfinite(target_np)
     if not np.any(finite_mask):
         return
     mae = np.abs(pred_np[finite_mask] - target_np[finite_mask])
@@ -554,45 +552,40 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
 
     chase_speed = _to_numpy_array(_get_stage1_result(result, 'chase_speed_max_mps'))
     chase_speed_target = _to_numpy_array(batch.get('chase_speed_max'))
-    chase_speed_valid = _to_numpy_array(batch.get('chase_speed_max_valid'))
-    if chase_speed is not None and chase_speed_target is not None and chase_speed_valid is not None:
+    if chase_speed is not None and chase_speed_target is not None:
         chase_speed = np.asarray(chase_speed).reshape(-1).astype(np.float32)
         chase_speed_target = np.asarray(chase_speed_target).reshape(-1).astype(np.float32)
-        chase_speed_valid = np.asarray(chase_speed_valid).reshape(-1) > 0.5
-        finite = chase_speed_valid & np.isfinite(chase_speed) & np.isfinite(chase_speed_target)
-        if chase_speed.shape[0] == chase_speed_target.shape[0] and finite.shape[0] == chase_speed.shape[0] and np.any(finite):
+        finite = np.isfinite(chase_speed) & np.isfinite(chase_speed_target)
+        if chase_speed.shape[0] == chase_speed_target.shape[0] and np.any(finite):
             val_metrics['stage1_chase_speed_max_mae'].append(
                 float(np.mean(np.abs(chase_speed[finite] - chase_speed_target[finite])))
             )
             val_metrics['stage1_chase_speed_max_count'].append(float(np.sum(finite)))
 
     boundary_specs = (
-        ('stage1_merge_yld_max', 'merge_yld_max_mps', 'merge_yld_max_speed', 'merge_yld_max_speed_valid'),
-        ('stage1_merge_go_min', 'merge_go_min_mps', 'merge_go_min_speed', 'merge_go_min_speed_valid'),
-        ('stage1_junction_yld_max', 'junction_yld_max_mps', 'junction_yld_max_speed', 'junction_yld_max_speed_valid'),
-        ('stage1_junction_go_min', 'junction_go_min_mps', 'junction_go_min_speed', 'junction_go_min_speed_valid'),
-        ('stage1_borrow_yld_max', 'borrow_yld_max_mps', 'borrow_yld_max_speed', 'borrow_yld_max_speed_valid'),
-        ('stage1_borrow_go_min', 'borrow_go_min_mps', 'borrow_go_min_speed', 'borrow_go_min_speed_valid'),
+        ('stage1_merge_yld_max', 'merge_yld_max_mps', 'merge_yld_max_speed'),
+        ('stage1_merge_go_min', 'merge_go_min_mps', 'merge_go_min_speed'),
+        ('stage1_junction_yld_max', 'junction_yld_max_mps', 'junction_yld_max_speed'),
+        ('stage1_junction_go_min', 'junction_go_min_mps', 'junction_go_min_speed'),
+        ('stage1_borrow_yld_max', 'borrow_yld_max_mps', 'borrow_yld_max_speed'),
+        ('stage1_borrow_go_min', 'borrow_go_min_mps', 'borrow_go_min_speed'),
     )
     all_abs_errors = []
     all_valid_counts = []
-    for metric_prefix, pred_key, target_key, valid_key in boundary_specs:
+    for metric_prefix, pred_key, target_key in boundary_specs:
         _append_boundary_val_metric(
             val_metrics,
             metric_prefix,
             _get_stage1_result(result, pred_key),
             batch.get(target_key),
-            batch.get(valid_key),
         )
         pred_np = _to_numpy_array(_get_stage1_result(result, pred_key))
         target_np = _to_numpy_array(batch.get(target_key))
-        valid_np = _to_numpy_array(batch.get(valid_key))
-        if pred_np is None or target_np is None or valid_np is None:
+        if pred_np is None or target_np is None:
             continue
         pred_np = np.asarray(pred_np).reshape(-1).astype(np.float32)
         target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
-        valid_np = np.asarray(valid_np).reshape(-1) > 0.5
-        finite_mask = valid_np & np.isfinite(pred_np) & np.isfinite(target_np)
+        finite_mask = np.isfinite(pred_np) & np.isfinite(target_np)
         if np.any(finite_mask):
             all_abs_errors.append(np.abs(pred_np[finite_mask] - target_np[finite_mask]))
             all_valid_counts.append(float(np.sum(finite_mask)))
