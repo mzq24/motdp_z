@@ -154,10 +154,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.shared_stage1_training_source = str(
             route_b_cfg.get('shared_stage1_training_source', 'clean')
         ).lower()
-        if self.shared_stage1_training_source not in ('clean', 'noisy'):
+        if self.shared_stage1_training_source not in ('clean', 'noisy', 'clean_then_noisy'):
             raise ValueError(
                 f"Unsupported shared_stage1_training_source={self.shared_stage1_training_source}"
             )
+        self.shared_stage1_training_source_switch_epoch = int(
+            route_b_cfg.get('shared_stage1_training_source_switch_epoch', 30)
+        )
         self.use_speed_profile_head = route_b_cfg.get('use_speed_profile_head', False)
         self._current_epoch = 0
         self._current_batch_idx = 0
@@ -2149,7 +2152,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if self.use_chase_front_following_state else None
         )
 
-        if self.shared_stage1_training_source == 'noisy':
+        stage1_training_source = self.shared_stage1_training_source
+        if stage1_training_source == 'clean_then_noisy':
+            stage1_training_source = (
+                'noisy'
+                if self._current_epoch >= self.shared_stage1_training_source_switch_epoch
+                else 'clean'
+            )
+
+        if stage1_training_source == 'noisy':
             if noisy_joint is None or noisy_joint_abs is None or diff_timesteps is None:
                 raise ValueError("shared_stage1_training_source='noisy' requires noisy_joint inputs")
             shared_forward = self.model.forward_ego(
