@@ -165,6 +165,10 @@ EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M = float(os.environ.get('EARLY_TARGET_PROM
 EARLY_TARGET_PROMOTE_CUR_ANGLE_MIN_DEG = float(os.environ.get('EARLY_TARGET_PROMOTE_CUR_ANGLE_MIN_DEG', '45.0'))
 EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M = float(os.environ.get('EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M', '20.0'))
 EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG = float(os.environ.get('EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG', '30.0'))
+EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX = max(
+    2,
+    int(os.environ.get('EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX', '8')),
+)
 SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
     '1', 'true', 'yes', 'on'
 )
@@ -2699,31 +2703,62 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				cur_forward <= EARLY_TARGET_PROMOTE_CUR_FORWARD_MAX_M
 				and abs(cur_lateral) >= EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M
 				and cur_angle_deg >= EARLY_TARGET_PROMOTE_CUR_ANGLE_MIN_DEG
-				and next_forward >= EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M
-				and next_angle_deg <= EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG
 			):
-				early_target_promote_active = True
-				early_target_promote_reason = (
-					f"cur_fwd={cur_forward:.2f},cur_lat={cur_lateral:.2f},"
-					f"cur_ang={cur_angle_deg:.1f},next_fwd={next_forward:.2f},"
-					f"next_ang={next_angle_deg:.1f}"
+				promote_candidate_idx = None
+				promote_candidate_forward = None
+				promote_candidate_angle_deg = None
+				max_route_idx = min(
+					len(waypoint_route) - 1,
+					EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX,
 				)
-				target_point, far_command = waypoint_route[2]
-				if len(waypoint_route) > 3:
-					next_target_point, next_far_command = waypoint_route[3]
-				else:
-					promoted_target_world = np.asarray(target_point[:2], dtype=np.float32)
-					promoted_direction = promoted_target_world - prepromote_next_target_point_world
-					promoted_dist = float(np.linalg.norm(promoted_direction))
-					if promoted_dist > 1e-3:
-						promoted_direction = promoted_direction / promoted_dist
+				for candidate_idx in range(2, max_route_idx + 1):
+					candidate_point, _ = waypoint_route[candidate_idx]
+					candidate_world = np.asarray(candidate_point[:2], dtype=np.float32)
+					candidate_ego = t_u.inverse_conversion_2d(
+						candidate_world, result['gps'], result['compass']
+					).astype(np.float32)
+					candidate_forward = float(candidate_ego[0])
+					candidate_lateral = float(candidate_ego[1])
+					candidate_angle_deg = float(np.rad2deg(np.arctan2(
+						abs(candidate_lateral),
+						max(candidate_forward, 1e-6),
+					)))
+					if (
+						candidate_forward >= EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M
+						and candidate_angle_deg <= EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG
+					):
+						promote_candidate_idx = candidate_idx
+						promote_candidate_forward = candidate_forward
+						promote_candidate_angle_deg = candidate_angle_deg
+						break
+
+				if promote_candidate_idx is not None:
+					early_target_promote_active = True
+					early_target_promote_reason = (
+						f"cur_fwd={cur_forward:.2f},cur_lat={cur_lateral:.2f},"
+						f"cur_ang={cur_angle_deg:.1f},next_fwd={next_forward:.2f},"
+						f"next_ang={next_angle_deg:.1f},idx={promote_candidate_idx},"
+						f"cand_fwd={promote_candidate_forward:.2f},"
+						f"cand_ang={promote_candidate_angle_deg:.1f}"
+					)
+					target_point, far_command = waypoint_route[promote_candidate_idx]
+					if len(waypoint_route) > promote_candidate_idx + 1:
+						next_target_point, next_far_command = waypoint_route[promote_candidate_idx + 1]
 					else:
-						promoted_direction = np.array(
-							[np.cos(result['compass']), np.sin(result['compass'])],
-							dtype=np.float32,
-						)
-					next_target_point = promoted_target_world + promoted_direction * 50.0
-					next_far_command = far_command
+						promoted_target_world = np.asarray(target_point[:2], dtype=np.float32)
+						prev_idx = max(0, promote_candidate_idx - 1)
+						prev_world = np.asarray(waypoint_route[prev_idx][0][:2], dtype=np.float32)
+						promoted_direction = promoted_target_world - prev_world
+						promoted_dist = float(np.linalg.norm(promoted_direction))
+						if promoted_dist > 1e-3:
+							promoted_direction = promoted_direction / promoted_dist
+						else:
+							promoted_direction = np.array(
+								[np.cos(result['compass']), np.sin(result['compass'])],
+								dtype=np.float32,
+							)
+						next_target_point = promoted_target_world + promoted_direction * 50.0
+						next_far_command = far_command
 
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp
