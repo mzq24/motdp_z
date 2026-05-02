@@ -150,24 +150,67 @@ STUCK_HELPER_RELEASE_HEADING_DEG = float(os.environ.get('STUCK_HELPER_RELEASE_HE
 STUCK_HELPER_STARTUP_DISTANCE_M = float(os.environ.get('STUCK_HELPER_STARTUP_DISTANCE_M', '10.0'))
 STUCK_HELPER_STARTUP_THRESHOLD = int(os.environ.get('STUCK_HELPER_STARTUP_THRESHOLD', '100'))
 STUCK_HELPER_POSTSTART_THRESHOLD = int(os.environ.get('STUCK_HELPER_POSTSTART_THRESHOLD', '300'))
-JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE = os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE', '1').lower() in (
+WINDOW_SOFT_SPEED_CAP_ENABLE = os.environ.get(
+    'WINDOW_SOFT_SPEED_CAP_ENABLE',
+    os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE', '1'),
+).lower() in ('1', 'true', 'yes', 'on')
+WINDOW_SOFT_SPEED_CAP_MERGE_MS = float(os.environ.get('WINDOW_SOFT_SPEED_CAP_MERGE_MS', '12.0'))
+WINDOW_SOFT_SPEED_CAP_JUNCTION_MS = float(os.environ.get('WINDOW_SOFT_SPEED_CAP_JUNCTION_MS', '20.0'))
+WINDOW_SOFT_SPEED_CAP_BORROW_MS = float(os.environ.get('WINDOW_SOFT_SPEED_CAP_BORROW_MS', '20.0'))
+WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD = float(os.environ.get(
+    'WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD',
+    os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD', '0.2'),
+))
+WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD = float(os.environ.get(
+    'WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD',
+    os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD', '0.1'),
+))
+WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES = max(1, int(os.environ.get(
+    'WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES',
+    os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES', '3'),
+)))
+WINDOW_SOFT_SPEED_CAP_BY_NAME = {
+    'merge': WINDOW_SOFT_SPEED_CAP_MERGE_MS,
+    'junction': WINDOW_SOFT_SPEED_CAP_JUNCTION_MS,
+    'borrow': WINDOW_SOFT_SPEED_CAP_BORROW_MS,
+}
+CHASE_SPEED_CAP_ENABLE = os.environ.get('CHASE_SPEED_CAP_ENABLE', '1').lower() in (
     '1', 'true', 'yes', 'on'
 )
-JUNCTION_WINDOW_SOFT_SPEED_CAP_MS = float(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_MS', '20.0'))
-JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD = float(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD', '0.2'))
-JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD = float(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD', '0.1'))
-JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES = max(1, int(os.environ.get('JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES', '3')))
+CHASE_SPEED_CAP_HAS_LEAD_THRESHOLD = float(os.environ.get('CHASE_SPEED_CAP_HAS_LEAD_THRESHOLD', '0.5'))
 EARLY_TARGET_PROMOTE_ENABLE = os.environ.get('EARLY_TARGET_PROMOTE_ENABLE', '1').lower() in (
     '1', 'true', 'yes', 'on'
 )
+EARLY_TARGET_STRICT_PROMOTE_ENABLE = os.environ.get(
+    'EARLY_TARGET_STRICT_PROMOTE_ENABLE', '1'
+).lower() in ('1', 'true', 'yes', 'on')
+EARLY_TARGET_STRICT_PROMOTE_HEADING_GATE_ENABLE = os.environ.get(
+    'EARLY_TARGET_STRICT_PROMOTE_HEADING_GATE_ENABLE', '1'
+).lower() in ('1', 'true', 'yes', 'on')
+EARLY_TARGET_STRICT_PROMOTE_HEADING_DELTA_DEG = float(
+    os.environ.get('EARLY_TARGET_STRICT_PROMOTE_HEADING_DELTA_DEG', '45.0')
+)
 EARLY_TARGET_PROMOTE_CUR_FORWARD_MAX_M = float(os.environ.get('EARLY_TARGET_PROMOTE_CUR_FORWARD_MAX_M', '4.0'))
-EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M = float(os.environ.get('EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M', '8.0'))
+EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M = float(os.environ.get('EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M', '5.0'))
 EARLY_TARGET_PROMOTE_CUR_ANGLE_MIN_DEG = float(os.environ.get('EARLY_TARGET_PROMOTE_CUR_ANGLE_MIN_DEG', '45.0'))
 EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M = float(os.environ.get('EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M', '20.0'))
 EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG = float(os.environ.get('EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG', '30.0'))
 EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX = max(
     2,
     int(os.environ.get('EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX', '8')),
+)
+EARLY_TARGET_PROMOTE_CONSUME_SKIPPED_POINTS = os.environ.get(
+    'EARLY_TARGET_PROMOTE_CONSUME_SKIPPED_POINTS', '1'
+).lower() in ('1', 'true', 'yes', 'on')
+EARLY_TARGET_PROMOTE_HOLD_ENABLE = os.environ.get(
+    'EARLY_TARGET_PROMOTE_HOLD_ENABLE', '1'
+).lower() in ('1', 'true', 'yes', 'on')
+EARLY_TARGET_PROMOTE_HOLD_FRAMES = max(
+    0,
+    int(os.environ.get('EARLY_TARGET_PROMOTE_HOLD_FRAMES', '100')),
+)
+EARLY_TARGET_PROMOTE_HOLD_RELEASE_FORWARD_M = float(
+    os.environ.get('EARLY_TARGET_PROMOTE_HOLD_RELEASE_FORWARD_M', '0.0')
 )
 SAVE_TRANSFUSER_BEV_DEBUG = os.environ.get('SAVE_TRANSFUSER_BEV_DEBUG', '0').lower() in (
     '1', 'true', 'yes', 'on'
@@ -1401,18 +1444,32 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"[front_route_risk_debug] failed: {exc}")
 			return None
 
-	def _get_junction_window_soft_speed_cap(self):
+	def _reset_window_soft_cap_streaks(self):
+		self.junction_window_soft_cap_streak = 0
+		self.window_soft_cap_streaks = {
+			'merge': 0,
+			'junction': 0,
+			'borrow': 0,
+		}
+
+	def _get_window_soft_speed_cap(self):
 		debug = {
 			'active': False,
 			'reason': None,
 			'speed_cap_ms': None,
+			'window_name': None,
+			'window_index': None,
+			'window_probs': None,
+			'merge_prob': None,
 			'junction_prob': None,
-			'streak_frames': int(self.junction_window_soft_cap_streak),
+			'borrow_prob': None,
+			'streak_frames': 0,
+			'streaks': dict(self.window_soft_cap_streaks),
 			'source': None,
 		}
 
-		if not JUNCTION_WINDOW_SOFT_SPEED_CAP_ENABLE:
-			self.junction_window_soft_cap_streak = 0
+		if not WINDOW_SOFT_SPEED_CAP_ENABLE:
+			self._reset_window_soft_cap_streaks()
 			return debug
 
 		window_probs = self.last_branch_condition_debug.get('traj_window_condition_probs')
@@ -1421,41 +1478,119 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			window_probs = self.last_branch_condition_debug.get('speed_energy_window_probs')
 			source = 'speed_energy_window_probs'
 		if window_probs is None:
-			self.junction_window_soft_cap_streak = 0
+			self._reset_window_soft_cap_streaks()
 			return debug
 
 		window_probs = np.asarray(window_probs, dtype=np.float32).reshape(-1)
-		if window_probs.size < 3:
-			self.junction_window_soft_cap_streak = 0
+		if window_probs.size < 4:
+			self._reset_window_soft_cap_streaks()
 			return debug
 
-		junction_prob = float(window_probs[2])
-		if junction_prob > JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD:
-			self.junction_window_soft_cap_streak += 1
-		else:
-			self.junction_window_soft_cap_streak = 0
+		candidates = []
+		window_items = [
+			('merge', 1, float(window_probs[1])),
+			('junction', 2, float(window_probs[2])),
+			('borrow', 3, float(window_probs[3])),
+		]
+		for window_name, window_index, window_prob in window_items:
+			if window_prob > WINDOW_SOFT_SPEED_CAP_CONSEC_THRESHOLD:
+				self.window_soft_cap_streaks[window_name] += 1
+			else:
+				self.window_soft_cap_streaks[window_name] = 0
+
+			single_active = window_prob > WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD
+			streak_active = (
+				self.window_soft_cap_streaks[window_name] >= WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES
+			)
+			if single_active or streak_active:
+				candidates.append({
+					'window_name': window_name,
+					'window_index': int(window_index),
+					'prob': float(window_prob),
+					'reason': (
+						f'{window_name}_window_single_high'
+						if single_active else f'{window_name}_window_streak'
+					),
+					'speed_cap_ms': float(WINDOW_SOFT_SPEED_CAP_BY_NAME[window_name]),
+					'streak_frames': int(self.window_soft_cap_streaks[window_name]),
+				})
+
+		self.junction_window_soft_cap_streak = int(self.window_soft_cap_streaks.get('junction', 0))
 
 		debug.update({
-			'junction_prob': junction_prob,
+			'window_probs': window_probs.astype(np.float32).tolist(),
+			'merge_prob': float(window_probs[1]),
+			'junction_prob': float(window_probs[2]),
+			'borrow_prob': float(window_probs[3]),
 			'streak_frames': int(self.junction_window_soft_cap_streak),
+			'streaks': dict(self.window_soft_cap_streaks),
 			'source': source,
 		})
 
-		if junction_prob > JUNCTION_WINDOW_SOFT_SPEED_CAP_SINGLE_THRESHOLD:
+		if candidates:
+			best_candidate = max(candidates, key=lambda item: item['prob'])
 			debug.update({
 				'active': True,
-				'reason': 'junction_window_single_high',
-				'speed_cap_ms': float(JUNCTION_WINDOW_SOFT_SPEED_CAP_MS),
+				'reason': best_candidate['reason'],
+				'speed_cap_ms': best_candidate['speed_cap_ms'],
+				'window_name': best_candidate['window_name'],
+				'window_index': best_candidate['window_index'],
+				'streak_frames': best_candidate['streak_frames'],
 			})
+
+		return debug
+
+	def _get_junction_window_soft_speed_cap(self):
+		return self._get_window_soft_speed_cap()
+
+	def _get_first_branch_debug_float(self, key):
+		value = self.last_branch_condition_debug.get(key)
+		if value is None:
+			return None
+		try:
+			array = np.asarray(value, dtype=np.float32).reshape(-1)
+		except (TypeError, ValueError):
+			return None
+		if array.size == 0:
+			return None
+		result = float(array[0])
+		if not np.isfinite(result):
+			return None
+		return result
+
+	def _get_chase_speed_cap(self):
+		debug = {
+			'active': False,
+			'reason': None,
+			'speed_cap_ms': None,
+			'has_lead_prob': None,
+			'speed_max_mps': None,
+			'threshold': float(CHASE_SPEED_CAP_HAS_LEAD_THRESHOLD),
+		}
+		if not CHASE_SPEED_CAP_ENABLE:
 			return debug
 
-		if self.junction_window_soft_cap_streak >= JUNCTION_WINDOW_SOFT_SPEED_CAP_CONSEC_FRAMES:
-			debug.update({
-				'active': True,
-				'reason': 'junction_window_streak',
-				'speed_cap_ms': float(JUNCTION_WINDOW_SOFT_SPEED_CAP_MS),
-			})
+		has_lead_prob = self._get_first_branch_debug_float('speed_energy_chase_has_lead_prob')
+		speed_max_mps = self._get_first_branch_debug_float('speed_energy_chase_speed_max_mps')
+		debug.update({
+			'has_lead_prob': has_lead_prob,
+			'speed_max_mps': speed_max_mps,
+		})
+		if has_lead_prob is None or speed_max_mps is None:
+			debug['reason'] = 'missing_chase_state'
+			return debug
+		if has_lead_prob < CHASE_SPEED_CAP_HAS_LEAD_THRESHOLD:
+			debug['reason'] = 'has_lead_low'
+			return debug
+		if speed_max_mps <= 0.0:
+			debug['reason'] = 'invalid_speed_max'
+			return debug
 
+		debug.update({
+			'active': True,
+			'reason': 'has_lead',
+			'speed_cap_ms': float(speed_max_mps),
+		})
 		return debug
 
 	def _get_stage1_energy_speed_cap(self, tick_data, ego_speed):
@@ -2042,7 +2177,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_stage1_energy_cap_debug = {}
 		self.last_terminal_route_debug = {}
 		self.last_junction_window_soft_cap_debug = {}
+		self.last_window_soft_cap_debug = {}
 		self.junction_window_soft_cap_streak = 0
+		self.window_soft_cap_streaks = {
+			'merge': 0,
+			'junction': 0,
+			'borrow': 0,
+		}
+		self.early_target_promote_hold_target_world = None
+		self.early_target_promote_hold_next_target_world = None
+		self.early_target_promote_hold_command = None
+		self.early_target_promote_hold_next_command = None
+		self.early_target_promote_hold_frames = 0
+		self.early_target_strict_promote_reference_heading = None
 		self.prev_debug_planner_xy = None
 		self.prev_debug_filtered_xy = None
 		self.prev_debug_raw_xy = None
@@ -2093,7 +2240,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.lat_ref, self.lon_ref = 0.0, 0.0
 		
 
-		self.route_planner_min_distance = float(os.environ.get('ROUTE_PLANNER_MIN_DISTANCE', '7.5'))
+		self.route_planner_min_distance = float(os.environ.get('ROUTE_PLANNER_MIN_DISTANCE', '5.0'))
 		self.route_planner_max_distance = float(os.environ.get('ROUTE_PLANNER_MAX_DISTANCE', '50.0'))
 		self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
 										   self.lat_ref, self.lon_ref)
@@ -2688,9 +2835,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		).astype(np.float32)
 		early_target_promote_active = False
 		early_target_promote_reason = None
+		early_target_promote_candidate_idx = None
+		early_target_promote_mode = None
+		early_target_promote_trigger = None
+		early_target_promote_route_pop_count = 0
+		early_target_promote_hold_active = False
+		early_target_promote_hold_frames_remaining = int(self.early_target_promote_hold_frames)
+		early_target_promote_hold_release_reason = None
+		early_target_promote_heading_reference_deg = None
+		early_target_promote_heading_delta_deg = None
+		early_target_promote_heading_gate_ready = False
 
 		if (
 			EARLY_TARGET_PROMOTE_ENABLE
+			and EARLY_TARGET_STRICT_PROMOTE_ENABLE
 			and len(waypoint_route) > 2
 		):
 			cur_forward = float(prepromote_target_point_ego[0])
@@ -2699,48 +2857,77 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			next_lateral = float(prepromote_next_target_point_ego[1])
 			cur_angle_deg = float(np.rad2deg(np.arctan2(abs(cur_lateral), max(cur_forward, 1e-6))))
 			next_angle_deg = float(np.rad2deg(np.arctan2(abs(next_lateral), max(next_forward, 1e-6))))
-			if (
+			cur_target_lateral_bad = (
 				cur_forward <= EARLY_TARGET_PROMOTE_CUR_FORWARD_MAX_M
 				and abs(cur_lateral) >= EARLY_TARGET_PROMOTE_CUR_LATERAL_MIN_M
 				and cur_angle_deg >= EARLY_TARGET_PROMOTE_CUR_ANGLE_MIN_DEG
-			):
+			)
+			if cur_target_lateral_bad:
+				if self.early_target_strict_promote_reference_heading is None:
+					self.early_target_strict_promote_reference_heading = float(result['compass'])
+				heading_delta_deg = float(np.rad2deg(abs(t_u.normalize_angle(
+					float(result['compass']) - float(self.early_target_strict_promote_reference_heading)
+				))))
+				early_target_promote_heading_reference_deg = float(np.rad2deg(
+					self.early_target_strict_promote_reference_heading
+				))
+				early_target_promote_heading_delta_deg = heading_delta_deg
+				early_target_promote_heading_gate_ready = (
+					(not EARLY_TARGET_STRICT_PROMOTE_HEADING_GATE_ENABLE)
+					or heading_delta_deg >= EARLY_TARGET_STRICT_PROMOTE_HEADING_DELTA_DEG
+				)
 				promote_candidate_idx = None
 				promote_candidate_forward = None
 				promote_candidate_angle_deg = None
-				max_route_idx = min(
-					len(waypoint_route) - 1,
-					EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX,
-				)
-				for candidate_idx in range(2, max_route_idx + 1):
-					candidate_point, _ = waypoint_route[candidate_idx]
-					candidate_world = np.asarray(candidate_point[:2], dtype=np.float32)
-					candidate_ego = t_u.inverse_conversion_2d(
-						candidate_world, result['gps'], result['compass']
-					).astype(np.float32)
-					candidate_forward = float(candidate_ego[0])
-					candidate_lateral = float(candidate_ego[1])
-					candidate_angle_deg = float(np.rad2deg(np.arctan2(
-						abs(candidate_lateral),
-						max(candidate_forward, 1e-6),
-					)))
-					if (
-						candidate_forward >= EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M
-						and candidate_angle_deg <= EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG
-					):
-						promote_candidate_idx = candidate_idx
-						promote_candidate_forward = candidate_forward
-						promote_candidate_angle_deg = candidate_angle_deg
-						break
+				promote_candidate_mode = None
+				if early_target_promote_heading_gate_ready:
+					max_route_idx = min(
+						len(waypoint_route) - 1,
+						EARLY_TARGET_PROMOTE_SEARCH_MAX_ROUTE_INDEX,
+					)
+					for candidate_idx in range(2, max_route_idx + 1):
+						candidate_point, _ = waypoint_route[candidate_idx]
+						candidate_world = np.asarray(candidate_point[:2], dtype=np.float32)
+						candidate_ego = t_u.inverse_conversion_2d(
+							candidate_world, result['gps'], result['compass']
+						).astype(np.float32)
+						candidate_forward = float(candidate_ego[0])
+						candidate_lateral = float(candidate_ego[1])
+						candidate_angle_deg = float(np.rad2deg(np.arctan2(
+							abs(candidate_lateral),
+							max(candidate_forward, 1e-6),
+						)))
+						if (
+							candidate_forward >= EARLY_TARGET_PROMOTE_NEXT_FORWARD_MIN_M
+							and candidate_angle_deg <= EARLY_TARGET_PROMOTE_NEXT_ANGLE_MAX_DEG
+						):
+							promote_candidate_idx = candidate_idx
+							promote_candidate_forward = candidate_forward
+							promote_candidate_angle_deg = candidate_angle_deg
+							promote_candidate_mode = 'strict_heading_gate'
+							break
+				else:
+					early_target_promote_reason = (
+						f"heading_wait,cur_fwd={cur_forward:.2f},cur_lat={cur_lateral:.2f},"
+						f"cur_ang={cur_angle_deg:.1f},heading_delta={heading_delta_deg:.1f}<"
+						f"{EARLY_TARGET_STRICT_PROMOTE_HEADING_DELTA_DEG:.1f}"
+					)
 
 				if promote_candidate_idx is not None:
 					early_target_promote_active = True
+					early_target_promote_candidate_idx = int(promote_candidate_idx)
+					early_target_promote_mode = promote_candidate_mode
+					early_target_promote_trigger = 'lateral'
 					early_target_promote_reason = (
 						f"cur_fwd={cur_forward:.2f},cur_lat={cur_lateral:.2f},"
 						f"cur_ang={cur_angle_deg:.1f},next_fwd={next_forward:.2f},"
 						f"next_ang={next_angle_deg:.1f},idx={promote_candidate_idx},"
+						f"mode={promote_candidate_mode},trigger=lateral,"
+						f"heading_delta={heading_delta_deg:.1f},"
 						f"cand_fwd={promote_candidate_forward:.2f},"
 						f"cand_ang={promote_candidate_angle_deg:.1f}"
 					)
+					self.early_target_strict_promote_reference_heading = None
 					target_point, far_command = waypoint_route[promote_candidate_idx]
 					if len(waypoint_route) > promote_candidate_idx + 1:
 						next_target_point, next_far_command = waypoint_route[promote_candidate_idx + 1]
@@ -2756,9 +2943,83 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 							promoted_direction = np.array(
 								[np.cos(result['compass']), np.sin(result['compass'])],
 								dtype=np.float32,
-							)
+						)
 						next_target_point = promoted_target_world + promoted_direction * 50.0
 						next_far_command = far_command
+					if EARLY_TARGET_PROMOTE_HOLD_ENABLE and EARLY_TARGET_PROMOTE_HOLD_FRAMES > 0:
+						self.early_target_promote_hold_target_world = np.asarray(
+							target_point[:2],
+							dtype=np.float32,
+						).copy()
+						self.early_target_promote_hold_next_target_world = np.asarray(
+							next_target_point[:2],
+							dtype=np.float32,
+						).copy()
+						self.early_target_promote_hold_command = far_command
+						self.early_target_promote_hold_next_command = next_far_command
+						self.early_target_promote_hold_frames = int(EARLY_TARGET_PROMOTE_HOLD_FRAMES)
+						early_target_promote_hold_active = True
+						early_target_promote_hold_frames_remaining = int(
+							self.early_target_promote_hold_frames
+						)
+					if (
+						EARLY_TARGET_PROMOTE_CONSUME_SKIPPED_POINTS
+						and promote_candidate_idx > 1
+						and hasattr(self._route_planner, 'skip_until_target_index')
+					):
+						early_target_promote_route_pop_count = int(
+							self._route_planner.skip_until_target_index(promote_candidate_idx)
+						)
+						waypoint_route = self._route_planner.route
+			else:
+				self.early_target_strict_promote_reference_heading = None
+
+		if (
+			not early_target_promote_active
+			and EARLY_TARGET_PROMOTE_HOLD_ENABLE
+			and self.early_target_promote_hold_frames > 0
+			and self.early_target_promote_hold_target_world is not None
+		):
+			hold_target_ego = t_u.inverse_conversion_2d(
+				self.early_target_promote_hold_target_world,
+				result['gps'],
+				result['compass'],
+			).astype(np.float32)
+			if float(hold_target_ego[0]) <= EARLY_TARGET_PROMOTE_HOLD_RELEASE_FORWARD_M:
+				early_target_promote_hold_release_reason = (
+					f"hold_target_forward={float(hold_target_ego[0]):.2f}"
+				)
+				self.early_target_promote_hold_target_world = None
+				self.early_target_promote_hold_next_target_world = None
+				self.early_target_promote_hold_command = None
+				self.early_target_promote_hold_next_command = None
+				self.early_target_promote_hold_frames = 0
+			else:
+				target_point = self.early_target_promote_hold_target_world.copy()
+				if self.early_target_promote_hold_next_target_world is not None:
+					next_target_point = self.early_target_promote_hold_next_target_world.copy()
+				if self.early_target_promote_hold_command is not None:
+					far_command = self.early_target_promote_hold_command
+				if self.early_target_promote_hold_next_command is not None:
+					next_far_command = self.early_target_promote_hold_next_command
+				self.early_target_promote_hold_frames -= 1
+				early_target_promote_hold_active = True
+				early_target_promote_hold_frames_remaining = int(
+					self.early_target_promote_hold_frames
+				)
+
+		if (
+			EARLY_TARGET_PROMOTE_HOLD_ENABLE
+			and self.early_target_promote_hold_frames == 0
+			and self.early_target_promote_hold_target_world is not None
+		):
+			early_target_promote_hold_release_reason = (
+				early_target_promote_hold_release_reason or 'hold_timeout'
+			)
+			self.early_target_promote_hold_target_world = None
+			self.early_target_promote_hold_next_target_world = None
+			self.early_target_promote_hold_command = None
+			self.early_target_promote_hold_next_command = None
 
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp
@@ -2876,6 +3137,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result['next_target_point_prepromote_world'] = prepromote_next_target_point_world
 		result['early_target_promote_active'] = bool(early_target_promote_active)
 		result['early_target_promote_reason'] = early_target_promote_reason
+		result['early_target_promote_candidate_idx'] = early_target_promote_candidate_idx
+		result['early_target_promote_mode'] = early_target_promote_mode
+		result['early_target_promote_trigger'] = early_target_promote_trigger
+		result['early_target_promote_route_pop_count'] = int(early_target_promote_route_pop_count)
+		result['early_target_promote_hold_active'] = bool(early_target_promote_hold_active)
+		result['early_target_promote_hold_frames_remaining'] = int(
+			early_target_promote_hold_frames_remaining
+		)
+		result['early_target_promote_hold_release_reason'] = early_target_promote_hold_release_reason
+		result['early_target_promote_heading_reference_deg'] = early_target_promote_heading_reference_deg
+		result['early_target_promote_heading_delta_deg'] = early_target_promote_heading_delta_deg
+		result['early_target_promote_heading_gate_ready'] = bool(early_target_promote_heading_gate_ready)
 		result['target_point_raw_ego'] = raw_target_point_ego
 		result['next_target_point_raw_ego'] = raw_next_target_point_ego
 		result['target_point_raw_world'] = raw_target_point_world
@@ -3083,7 +3356,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		velocity,
 		speed_waypoints,
 		target_point=None,
-		junction_window_soft_cap_ms=None,
+		window_soft_cap_ms=None,
+		chase_speed_cap_ms=None,
 		terminal_speed_cap_ms=None,
 		front_route_risk_cap_ms=None,
 		stage1_energy_cap_ms=None,
@@ -3197,20 +3471,29 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			desired_speed = traj_speed
 
 		desired_speed_raw = float(desired_speed)
+		base_soft_speed_limit_ms = float(SOFT_SPEED_LIMIT_MS) if SOFT_SPEED_LIMIT_MS > 0.0 else None
+		window_soft_cap_active = window_soft_cap_ms is not None and float(window_soft_cap_ms) > 0.0
+		effective_soft_speed_limit_ms = (
+			float(window_soft_cap_ms)
+			if window_soft_cap_active
+			else base_soft_speed_limit_ms
+		)
 		desired_speed_after_soft_cap = float(desired_speed)
-		if SOFT_SPEED_LIMIT_MS > 0.0:
-			desired_speed_after_soft_cap = min(desired_speed_after_soft_cap, SOFT_SPEED_LIMIT_MS)
-		desired_speed_after_junction_window_soft_cap = float(desired_speed_after_soft_cap)
-		junction_window_soft_cap_applied = False
-		if junction_window_soft_cap_ms is not None and junction_window_soft_cap_ms > 0.0:
-			junction_window_soft_cap_applied = (
-				desired_speed_after_junction_window_soft_cap > float(junction_window_soft_cap_ms)
+		soft_speed_cap_applied = False
+		if effective_soft_speed_limit_ms is not None and effective_soft_speed_limit_ms > 0.0:
+			soft_speed_cap_applied = desired_speed_after_soft_cap > float(effective_soft_speed_limit_ms)
+			desired_speed_after_soft_cap = min(
+				desired_speed_after_soft_cap,
+				float(effective_soft_speed_limit_ms),
 			)
-			desired_speed_after_junction_window_soft_cap = min(
-				desired_speed_after_junction_window_soft_cap,
-				junction_window_soft_cap_ms,
-			)
-		desired_speed_after_terminal_cap = float(desired_speed_after_junction_window_soft_cap)
+		desired_speed_after_window_soft_cap = float(desired_speed_after_soft_cap)
+		window_soft_cap_applied = bool(window_soft_cap_active and soft_speed_cap_applied)
+		desired_speed_after_chase_cap = float(desired_speed_after_window_soft_cap)
+		chase_speed_cap_applied = False
+		if chase_speed_cap_ms is not None and chase_speed_cap_ms > 0.0:
+			chase_speed_cap_applied = desired_speed_after_chase_cap > float(chase_speed_cap_ms)
+			desired_speed_after_chase_cap = min(desired_speed_after_chase_cap, chase_speed_cap_ms)
+		desired_speed_after_terminal_cap = float(desired_speed_after_chase_cap)
 		terminal_speed_cap_applied = False
 		if terminal_speed_cap_ms is not None and terminal_speed_cap_ms > 0.0:
 			terminal_speed_cap_applied = desired_speed_after_terminal_cap > float(terminal_speed_cap_ms)
@@ -3258,9 +3541,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			'desired_speed_raw': desired_speed_raw,
 			'desired_speed_capped': float(desired_speed),
 			'desired_speed_after_soft_cap': float(desired_speed_after_soft_cap),
-			'desired_speed_after_junction_window_soft_cap': float(desired_speed_after_junction_window_soft_cap),
-			'junction_window_soft_cap_ms': float(junction_window_soft_cap_ms) if junction_window_soft_cap_ms is not None else None,
-			'junction_window_soft_cap_applied': bool(junction_window_soft_cap_applied),
+			'desired_speed_after_junction_window_soft_cap': float(desired_speed_after_window_soft_cap),
+			'desired_speed_after_window_soft_cap': float(desired_speed_after_window_soft_cap),
+			'junction_window_soft_cap_ms': float(window_soft_cap_ms) if window_soft_cap_ms is not None else None,
+			'junction_window_soft_cap_applied': bool(window_soft_cap_applied),
+			'window_soft_cap_ms': float(window_soft_cap_ms) if window_soft_cap_ms is not None else None,
+			'window_soft_cap_applied': bool(window_soft_cap_applied),
+			'desired_speed_after_chase_cap': float(desired_speed_after_chase_cap),
+			'chase_speed_cap_ms': float(chase_speed_cap_ms) if chase_speed_cap_ms is not None else None,
+			'chase_speed_cap_applied': bool(chase_speed_cap_applied),
+			'effective_soft_speed_limit_ms': (
+				float(effective_soft_speed_limit_ms)
+				if effective_soft_speed_limit_ms is not None else None
+			),
+			'base_soft_speed_limit_ms': (
+				float(base_soft_speed_limit_ms)
+				if base_soft_speed_limit_ms is not None else None
+			),
+			'soft_speed_cap_applied': bool(soft_speed_cap_applied),
 			'desired_speed_after_terminal_cap': float(desired_speed_after_terminal_cap),
 			'desired_speed_after_front_route_risk_cap': float(desired_speed_after_front_route_risk_cap),
 			'desired_speed_after_stage1_energy_adjust': float(desired_speed_after_stage1_energy_adjust),
@@ -3659,6 +3957,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'traj_branch_condition_boundary_margin_scale': float(
 					getattr(self.net, 'traj_branch_condition_boundary_margin_scale', 0.0) or 0.0
 				),
+				'phase_go_smoothing_enable': bool(
+					getattr(self.net, 'phase_go_smoothing_enable', False)
+				),
+				'phase_go_smoothing_window': int(
+					getattr(self.net, 'phase_go_smoothing_window', 0) or 0
+				),
+				'phase_go_smoothing_threshold': float(
+					getattr(self.net, 'phase_go_smoothing_threshold', 0.0) or 0.0
+				),
+				'phase_go_smoothing_source': str(
+					getattr(self.net, 'phase_go_smoothing_source', 'go_opportunity')
+				),
 				'stage1_boundary_norm_scale': float(
 					getattr(self.net, 'stage1_boundary_norm_scale', 0.0) or 0.0
 				),
@@ -3696,7 +4006,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'traj_go_opportunity_condition_probs',
 				'traj_conflict_area_status_condition_probs',
 				'traj_conflict_timing_condition',
+				'traj_chase_has_lead_condition',
+				'traj_chase_speed_margin_condition',
 				'lane_dir_relation_probs',
+				'traj_phase_go_smoothing_enabled',
+				'traj_phase_go_smoothing_applied',
+				'traj_phase_go_smoothing_raw_go_prob',
+				'traj_phase_go_smoothing_smoothed_go_prob',
+				'traj_phase_go_smoothing_history_len',
+				'traj_phase_go_smoothing_threshold',
 			]:
 				semantic_value = dp_pred_traj.get(semantic_key)
 				if semantic_value is None:
@@ -3788,6 +4106,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'conflict_dist_to_entry_m',
 				'conflict_dist_to_exit_m',
 				'conflict_time_to_entry_s',
+				'chase_has_lead_prob',
+				'chase_speed_max_mps',
 				'merge_yld_max_mps',
 				'merge_go_min_mps',
 				'junction_yld_max_mps',
@@ -4002,8 +4322,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			terminal_route_debug = self._get_terminal_route_speed_cap(tick_data)
 			self.last_terminal_route_debug = terminal_route_debug
-			junction_window_soft_cap_debug = self._get_junction_window_soft_speed_cap()
+			junction_window_soft_cap_debug = self._get_window_soft_speed_cap()
 			self.last_junction_window_soft_cap_debug = junction_window_soft_cap_debug
+			self.last_window_soft_cap_debug = junction_window_soft_cap_debug
+			chase_speed_cap_debug = self._get_chase_speed_cap()
 			front_route_risk_cap_debug = self._get_front_route_risk_speed_cap(
 				tick_data,
 				gt_velocity,
@@ -4023,9 +4345,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				gt_velocity,
 				speed_waypoints,
 				target_point=target_point,
-				junction_window_soft_cap_ms=(
+				window_soft_cap_ms=(
 					junction_window_soft_cap_debug.get('speed_cap_ms')
 					if junction_window_soft_cap_debug.get('active')
+					else None
+				),
+				chase_speed_cap_ms=(
+					chase_speed_cap_debug.get('speed_cap_ms')
+					if chase_speed_cap_debug.get('active')
 					else None
 				),
 				terminal_speed_cap_ms=terminal_route_debug.get('speed_cap_ms'),
@@ -4107,6 +4434,28 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'desired_speed_raw': self.last_speed_debug.get('desired_speed_raw'),
 				'desired_speed_capped': self.last_speed_debug.get('desired_speed_capped'),
 				'soft_speed_limit_ms': self.last_speed_debug.get('soft_speed_limit_ms'),
+				'effective_soft_speed_limit_ms': self.last_speed_debug.get('effective_soft_speed_limit_ms'),
+				'base_soft_speed_limit_ms': self.last_speed_debug.get('base_soft_speed_limit_ms'),
+				'soft_speed_cap_applied': bool(self.last_speed_debug.get('soft_speed_cap_applied', False)),
+				'window_soft_cap_active': bool(junction_window_soft_cap_debug.get('active', False)),
+				'window_soft_cap_reason': junction_window_soft_cap_debug.get('reason'),
+				'window_soft_cap_ms': self.last_speed_debug.get('window_soft_cap_ms'),
+				'window_soft_cap_applied': bool(self.last_speed_debug.get('window_soft_cap_applied', False)),
+				'window_soft_cap_name': junction_window_soft_cap_debug.get('window_name'),
+				'window_soft_cap_index': junction_window_soft_cap_debug.get('window_index'),
+				'window_soft_cap_probs': junction_window_soft_cap_debug.get('window_probs'),
+				'window_soft_cap_merge_prob': junction_window_soft_cap_debug.get('merge_prob'),
+				'window_soft_cap_junction_prob': junction_window_soft_cap_debug.get('junction_prob'),
+				'window_soft_cap_borrow_prob': junction_window_soft_cap_debug.get('borrow_prob'),
+				'window_soft_cap_streaks': junction_window_soft_cap_debug.get('streaks'),
+				'chase_speed_cap_active': bool(chase_speed_cap_debug.get('active', False)),
+				'chase_speed_cap_reason': chase_speed_cap_debug.get('reason'),
+				'chase_speed_cap_ms': self.last_speed_debug.get('chase_speed_cap_ms'),
+				'chase_speed_cap_applied': bool(self.last_speed_debug.get('chase_speed_cap_applied', False)),
+				'desired_speed_after_chase_cap': self.last_speed_debug.get('desired_speed_after_chase_cap'),
+				'chase_speed_cap_has_lead_prob': chase_speed_cap_debug.get('has_lead_prob'),
+				'chase_speed_cap_speed_max_mps': chase_speed_cap_debug.get('speed_max_mps'),
+				'chase_speed_cap_threshold': chase_speed_cap_debug.get('threshold'),
 				'junction_window_soft_cap_active': bool(junction_window_soft_cap_debug.get('active', False)),
 				'junction_window_soft_cap_reason': junction_window_soft_cap_debug.get('reason'),
 				'junction_window_soft_cap_ms': self.last_speed_debug.get('junction_window_soft_cap_ms'),
@@ -4282,6 +4631,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'next_target_point_prepromote_world': tick_data['next_target_point_prepromote_world'].tolist() if isinstance(tick_data.get('next_target_point_prepromote_world'), np.ndarray) else tick_data.get('next_target_point_prepromote_world'),
 				'early_target_promote_active': bool(tick_data.get('early_target_promote_active', False)),
 				'early_target_promote_reason': tick_data.get('early_target_promote_reason'),
+				'early_target_promote_candidate_idx': tick_data.get('early_target_promote_candidate_idx'),
+				'early_target_promote_mode': tick_data.get('early_target_promote_mode'),
+				'early_target_promote_trigger': tick_data.get('early_target_promote_trigger'),
+				'early_target_promote_route_pop_count': int(tick_data.get('early_target_promote_route_pop_count', 0)),
+				'early_target_promote_hold_active': bool(tick_data.get('early_target_promote_hold_active', False)),
+				'early_target_promote_hold_frames_remaining': int(tick_data.get('early_target_promote_hold_frames_remaining', 0)),
+				'early_target_promote_hold_release_reason': tick_data.get('early_target_promote_hold_release_reason'),
+				'early_target_promote_heading_reference_deg': tick_data.get('early_target_promote_heading_reference_deg'),
+				'early_target_promote_heading_delta_deg': tick_data.get('early_target_promote_heading_delta_deg'),
+				'early_target_promote_heading_gate_ready': bool(tick_data.get('early_target_promote_heading_gate_ready', False)),
 				'target_point_raw_ego': tick_data['target_point_raw_ego'].tolist() if isinstance(tick_data.get('target_point_raw_ego'), np.ndarray) else tick_data.get('target_point_raw_ego'),
 				'next_target_point_raw_ego': tick_data['next_target_point_raw_ego'].tolist() if isinstance(tick_data.get('next_target_point_raw_ego'), np.ndarray) else tick_data.get('next_target_point_raw_ego'),
 				'target_point_raw_world': tick_data['target_point_raw_world'].tolist() if isinstance(tick_data.get('target_point_raw_world'), np.ndarray) else tick_data.get('target_point_raw_world'),
@@ -4540,6 +4899,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"bm/bt: {cond_boundary_scale}/{cond_borrow_scale}",
 			f"vd0(raw): {self._format_debug_value(self.pid_metadata.get('desired_speed_raw'), '.2f')}",
 			f"vd(cap): {self._format_debug_value(self.pid_metadata.get('desired_speed_capped'), '.2f')}",
+			f"wCap {self.pid_metadata.get('window_soft_cap_name', 'none')}: {int(bool(self.pid_metadata.get('window_soft_cap_active', False)))}/{self._format_debug_value(self.pid_metadata.get('effective_soft_speed_limit_ms'), '.1f')}",
+			f"cCap H/v: {self._format_debug_value(self.pid_metadata.get('chase_speed_cap_has_lead_prob'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('chase_speed_cap_ms'), '.1f')}",
 			f"Estg: {self.pid_metadata.get('stage1_energy_control_mode', 'off')}/{int(bool(self.pid_metadata.get('stage1_energy_speed_control_active', False)))}",
 			f"dV(E): {self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_adjust_ms'), '.2f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_speed_cap_ms'), '.1f')}",
 			f"Et c/t/p: {self._format_debug_value(self.pid_metadata.get('stage1_energy_current_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_target_score'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('stage1_energy_local_peak_score'), '.1f')}",
@@ -4567,6 +4928,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"sP[y/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_decision_phase_probs'), fmt='.2f', max_items=2)}",
 			f"sP0[y/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_decision_phase_base_probs'), fmt='.2f', max_items=2)}",
 			f"sGY[y/o]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_go_opportunity_probs'), fmt='.2f', max_items=2)}",
+			f"gSm a/r/s: {self._format_debug_first(self.pid_metadata.get('traj_phase_go_smoothing_applied'), '.0f')}/{self._format_debug_first(self.pid_metadata.get('traj_phase_go_smoothing_raw_go_prob'), '.2f')}/{self._format_debug_first(self.pid_metadata.get('traj_phase_go_smoothing_smoothed_go_prob'), '.2f')}",
+			f"dEnt/tEnt: {self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_dist_to_entry_m'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_time_to_entry_s'), '.1f')}",
 			f"sT dE/dX/tE: {self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_dist_to_entry_m'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_dist_to_exit_m'), '.1f')}/{self._format_debug_value(self.pid_metadata.get('speed_energy_conflict_time_to_entry_s'), '.1f')}",
 		]
 
@@ -4584,6 +4947,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"vs m/s: {self._format_debug_curve(self.pid_metadata.get('speed_energy_samples'), fmt='.1f', max_items=7)}",
 			f"Ec(q): {self._format_debug_curve(self.pid_metadata.get('speed_energy_chase'), fmt='.2f', max_items=7)}",
 			f"Ec@ref: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_chase'), fmt='.2f', max_items=3)}",
+			f"Ch H/v(q): {self._format_debug_first(self.pid_metadata.get('speed_energy_chase_has_lead_prob'), '.2f')}/{self._format_debug_first(self.pid_metadata.get('speed_energy_chase_speed_max_mps'), '.1f')}",
+			f"Ch H/v@r: {self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_chase_has_lead_prob'), fmt='.2f', max_items=3)}/{self._format_debug_curve(self.pid_metadata.get('speed_energy_ref_chase_speed_max_mps'), fmt='.1f', max_items=3)}",
 			f"sW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_window_probs'), fmt='.2f', max_items=4)}",
 			f"sD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_dir_probs'), fmt='.2f', max_items=4)}",
 			f"sC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('speed_energy_control_phase_probs'), fmt='.2f', max_items=4)}",
@@ -4596,6 +4961,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"bcP[y/g]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_decision_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
 			f"bcGY[y/o]: {self._format_debug_curve(self.pid_metadata.get('traj_go_opportunity_condition_probs'), fmt='.2f', max_items=2)}",
 			f"bcT: {self._format_debug_curve(self.pid_metadata.get('traj_conflict_timing_condition'), fmt='.2f', max_items=3)}",
+			f"bcCh H/m: {self._format_debug_first(self.pid_metadata.get('traj_chase_has_lead_condition'), '.2f')}/{self._format_debug_first(self.pid_metadata.get('traj_chase_speed_margin_condition'), '.2f')}",
 			f"bm[y/g]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_boundary_margin_condition'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
 			f"bcW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('traj_window_condition_probs'), fmt='.2f', max_items=4)}",
 			f"bcD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('traj_dir_condition_probs'), fmt='.2f', max_items=4)}",

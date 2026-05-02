@@ -291,6 +291,28 @@ class RoutePlanner(object):
 
         return self.route
 
+    def skip_until_target_index(self, target_index):
+        """
+        Promote a later route point to become the next target point.
+
+        The agent consumes route[1] as target. If we choose old route[k] as a
+        better target, pop k-1 entries so old route[k] becomes new route[1].
+        """
+        target_index = int(target_index)
+        if target_index <= 1:
+            return 0
+
+        to_pop = min(target_index - 1, max(0, len(self.route) - 2))
+        popped = 0
+        for _ in range(to_pop):
+            if len(self.route) > 2:
+                self.route.popleft()
+                if len(self.route_distances) > 0:
+                    self.route_distances.popleft()
+                popped += 1
+
+        return popped
+
     def save(self):
         # because self.route saves objects of traffic lights and traffic signs a deep copy is not possible
         self.saved_route = [] # deepcopy(self.route)
