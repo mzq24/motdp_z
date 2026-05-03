@@ -1569,6 +1569,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		}
 		if not CHASE_SPEED_CAP_ENABLE:
 			return debug
+		if not bool(getattr(self.net, 'use_chase_front_following_state', False)):
+			debug['reason'] = 'chase_state_disabled'
+			return debug
 
 		has_lead_prob = self._get_first_branch_debug_float('speed_energy_chase_has_lead_prob')
 		speed_max_mps = self._get_first_branch_debug_float('speed_energy_chase_speed_max_mps')

@@ -1684,6 +1684,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         use_lidar_bev_detail: bool = False,
         lidar_bev_history_frames: int = 1,
         use_condition_group_dropout: bool = False,
+        use_chase_front_following_state: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1706,6 +1707,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.use_lidar_bev_detail = use_lidar_bev_detail
         self.lidar_bev_history_frames = max(int(lidar_bev_history_frames), 1)
         self.use_condition_group_dropout = use_condition_group_dropout
+        self.use_chase_front_following_state = bool(use_chase_front_following_state)
         
         # ========== Anchor Embedding ==========
         # Encode full noisy trajectory shape per mode (not just mean point) to preserve
@@ -2492,9 +2494,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
                 + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status
                 + self.traj_timing_condition_proj(timing_cond) * gate_timing
-                + self.traj_chase_condition_proj(chase_cond) * gate_boundary
                 + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
-            ) * float(branch_condition_scale)
+            )
+            if self.use_chase_front_following_state:
+                branch_cond_emb = (
+                    branch_cond_emb
+                    + self.traj_chase_condition_proj(chase_cond) * gate_boundary
+                )
+            branch_cond_emb = branch_cond_emb * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)
         traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
 

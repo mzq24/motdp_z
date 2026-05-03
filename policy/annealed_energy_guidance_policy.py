@@ -323,8 +323,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.inside_area_go_loss_weight = float(
             route_b_cfg.get('inside_area_go_loss_weight', 0.0)
         )
-        self.use_chase_front_following_state = bool(
-            route_b_cfg.get('use_chase_front_following_state', False)
+        self.use_chase_front_following_state = _env_bool(
+            'USE_CHASE_FRONT_FOLLOWING_STATE',
+            bool(route_b_cfg.get('use_chase_front_following_state', False)),
         )
         self.chase_has_lead_loss_weight = float(
             route_b_cfg.get('chase_has_lead_loss_weight', 0.05)
@@ -431,6 +432,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             use_lidar_bev_detail=self.use_lidar_bev_detail,
             lidar_bev_history_frames=self.lidar_history_frames,
             use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
+            use_chase_front_following_state=self.use_chase_front_following_state,
         )
         self.model = model
 
@@ -1035,11 +1037,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             conflict_dist_to_entry_m = None
             conflict_dist_to_exit_m = None
             conflict_time_to_entry_s = None
-        if 'chase_has_lead_logit' in raw_scores:
+        if self.use_chase_front_following_state and 'chase_has_lead_logit' in raw_scores:
             chase_has_lead_prob = torch.sigmoid(raw_scores['chase_has_lead_logit'])
         else:
             chase_has_lead_prob = None
-        if 'chase_speed_max' in raw_scores:
+        if self.use_chase_front_following_state and 'chase_speed_max' in raw_scores:
             chase_speed_max_mps = self._chase_norm_to_mps(raw_scores['chase_speed_max'])
         else:
             chase_speed_max_mps = None

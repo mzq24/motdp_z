@@ -117,7 +117,8 @@ route_b:
   lidar_history_frames: 4
   train_stage1: true
   use_stage1_state: true
-  shared_stage1_training_source: clean
+  shared_stage1_training_source: clean_then_noisy
+  shared_stage1_training_source_switch_epoch: 30
   use_speed_profile_head: false
   use_traj_branch_condition: true
   traj_branch_condition_scale: 2.0
