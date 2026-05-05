@@ -1,22 +1,10 @@
 """
-Route B+: Compositional Energy-Guided Diffusion Policy
+Route B semantic-state diffusion policy.
 
-Pure diffusion from N(0,I) with DDIM and compositional energy guidance.
-Energy gradients are injected at each denoising step with time-scale scheduling:
-  - High noise (t=100->70): Navigation energy pulls trajectories to macro direction
-  - Medium noise (t=70->30): Collision energy applies repulsion
-  - Low noise (t=30->0): Offroad energy + smoothness for lane-level polish
-
-Dual-optimizer training (GAN-style D/G isolation):
-  - Phase 1 (optimizer_energy): Train energy heads on anchor trajectories + GT augmentation
-  - Phase 2 (optimizer_diff): Train diffusion decoder (L_diffusion + L_alignment)
-
-Key differences from Route A (DiffusionDiTCarlaPolicy):
-  - No anchor centers — start from pure Gaussian noise
-  - Model predicts absolute trajectory (no residual from anchor)
-  - 10-step DDIM inference with energy gradient guidance
-  - Energy heads trained on diverse anchor trajectories (positive + negative)
-  - Alignment loss encourages decoder to generate low-energy trajectories
+This branch keeps the Route B anchor-free traj/route/speed path plus independent
+and transition semantic-state heads. Legacy Route-A anchors and anchor-energy
+training/guidance have been removed; some ``energy_*`` log aliases remain only
+for backward-compatible dashboards.
 """
 
 import os
@@ -50,36 +38,6 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return bool(default)
     return value.lower() in ('1', 'true', 'yes', 'on')
-
-
-# =============================================================================
-# Time-scale Energy Weight Scheduling
-# =============================================================================
-
-def get_energy_weights(t: int, T: int = 100):
-    """
-    Annealed energy weights: different energies activate at different noise levels.
-
-    Schedule (hardcoded; LLM Router can override per-head weights at runtime):
-      t=T→0.7T  (high noise):   E_route activates (macro navigation direction)
-      t=0.7T→0.3T (mid noise):  E_vehicle (front/left/right) + E_pedestrian activate
-      t=0.3T→0    (low noise):  E_offroad activates (lane-level polish)
-
-    Args:
-        t: current timestep (higher = more noise)
-        T: total timesteps
-
-    Returns:
-        (w_route, w_veh, w_off) weight tuple
-        w_veh applies to all 4 collision heads (front/left/right/pedestrian)
-    """
-    progress = 1.0 - t / T  # 0 -> 1 as denoising progresses
-
-    w_route = 1.0                                      # always active (navigation)
-    w_veh   = max(0.0, (progress - 0.3) / 0.4)        # activates after t < 0.7*T
-    w_off   = max(0.0, (progress - 0.7) / 0.3)        # activates after t < 0.3*T
-
-    return w_route, w_veh, w_off
 
 
 # =============================================================================
@@ -121,30 +79,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_b_cfg = config.get('route_b', {})
         self.route_b_cfg = route_b_cfg
         self.num_samples = route_b_cfg.get('num_samples', 1)  # diffusion denoising: single mode
-        self.num_energy_modes = route_b_cfg.get('num_energy_modes', 32)  # energy training: multi-anchor
         self.num_inference_steps = route_b_cfg.get('num_inference_steps', 10)
-        self.guidance_scale = route_b_cfg.get('guidance_scale', 1.0)  # global energy guidance multiplier
+        self.guidance_scale = route_b_cfg.get('guidance_scale', 0.0)
         self.use_split_forward = route_b_cfg.get('use_split_forward', True)
-        # Per-head energy weights (used in alignment loss and guidance)
-        self.energy_front_weight      = route_b_cfg.get('energy_front_weight', 1.0)
-        self.energy_left_weight       = route_b_cfg.get('energy_left_weight', 1.0)
-        self.energy_right_weight      = route_b_cfg.get('energy_right_weight', 1.0)
-        self.energy_pedestrian_weight = route_b_cfg.get('energy_pedestrian_weight', 1.0)
-        self.energy_offroad_weight    = route_b_cfg.get('energy_offroad_weight', 1.0)
-        self.energy_route_weight      = route_b_cfg.get('energy_route_weight', 1.0)
-        # Route target params
-        self.route_energy_margin = route_b_cfg.get('route_energy_margin', 1.0)   # corridor half-width (m)
-        self.route_energy_norm   = route_b_cfg.get('route_energy_norm', 5.0)     # normalization factor (m)
 
-        # Route B+ config
-        self.energy_grad_clip_norm = route_b_cfg.get('stage1_grad_clip_norm', route_b_cfg.get('energy_grad_clip_norm', 1.0))
-        self.alignment_loss_weight = route_b_cfg.get('alignment_loss_weight', 0.1)
-        self.num_gt_augmentations = route_b_cfg.get('num_gt_augmentations', 4)
-        self.use_safe_anchors = route_b_cfg.get('use_safe_anchors', False)
-        self.energy_noisy_training = route_b_cfg.get('stage1_noisy_training', route_b_cfg.get('energy_noisy_training', False))
-        self.alignment_warmup_epochs = route_b_cfg.get('alignment_warmup_epochs', 0)
         self.train_energy = route_b_cfg.get('train_stage1', route_b_cfg.get('train_energy', True))
-        self.use_front_route_risk_energy = route_b_cfg.get('use_front_route_risk_energy', False)
         self.use_stage1_state = route_b_cfg.get(
             'use_stage1_state',
             route_b_cfg.get('use_stage1_speed_energy', True),
@@ -424,7 +363,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.num_waypoints = num_waypoints
         n_emb = policy_cfg.get('n_emb', 512)
 
-        # Build model with anchor_free=True and energy_heads=True
+        # Build the Route B semantic-state model.
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
             output_dim=policy_cfg.get('output_dim', 2),
@@ -444,10 +383,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             transfuser_bev_dim=self.bev_feature_dim,
             transfuser_bev_upsample_dim=self.bev_feature_upsample_dim,
             num_waypoints=num_waypoints,
-            num_modes=self.num_energy_modes,
+            num_modes=1,
             traj_can_attend_route=policy_cfg.get('traj_can_attend_route', True),
             anchor_free=True,
-            energy_heads=True,
+            energy_heads=False,
             ego_detail_activation_t=policy_cfg.get('ego_detail_activation_t', 400),
             use_lidar_bev_detail=self.use_lidar_bev_detail,
             lidar_bev_history_frames=self.lidar_history_frames,
@@ -511,19 +450,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             torch.tensor(speed_profile_weights, dtype=torch.float32),
         )
 
-        # Anchor buffer (registered externally before DDP wrapping)
-        self.register_buffer('anchor_centers_abs', None)
-
-    # ========== Anchor Registration ==========
-    def register_anchor_centers(self, anchor_centers_abs):
-        """Register anchor trajectories for energy head training.
-        Must be called before DDP wrapping.
-        """
-        if isinstance(anchor_centers_abs, np.ndarray):
-            anchor_centers_abs = torch.from_numpy(anchor_centers_abs).float()
-        device = next(self.parameters()).device
-        self.register_buffer('anchor_centers_abs', anchor_centers_abs.to(device))
-
     def _get_transfuser_lidar_bev(
         self,
         tensor_dict: Dict[str, torch.Tensor],
@@ -536,49 +462,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if transfuser_lidar_bev is None:
             return None
         return transfuser_lidar_bev.to(device=device, dtype=model_dtype)
-
-    def _slice_energy_anchor_inputs(
-        self,
-        device: torch.device,
-        model_dtype: torch.dtype,
-        behavior_labels: Optional[torch.Tensor] = None,
-        allowed_flags: Optional[torch.Tensor] = None,
-        energy_targets: Optional[torch.Tensor] = None,
-        energy_active_mask: Optional[torch.Tensor] = None,
-    ):
-        """Take the first num_energy_modes anchors and aligned supervision tensors."""
-        if self.anchor_centers_abs is None:
-            raise ValueError("anchor_centers_abs is not registered")
-
-        requested = int(self.num_energy_modes)
-        available = int(self.anchor_centers_abs.shape[0])
-        if requested > available:
-            raise ValueError(
-                f"num_energy_modes={requested} exceeds available anchors={available}"
-            )
-
-        def _slice_optional(name: str, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if tensor is None:
-                return None
-            if tensor.shape[1] < requested:
-                raise ValueError(
-                    f"{name} provides only {tensor.shape[1]} modes, expected at least {requested}"
-                )
-            return tensor[:, :requested]
-
-        anchor_subset = self.anchor_centers_abs[:requested].to(device=device, dtype=model_dtype)
-        behavior_subset = _slice_optional("behavior_labels", behavior_labels)
-        allowed_subset = _slice_optional("allowed_flags", allowed_flags)
-        energy_targets_subset = _slice_optional("energy_targets", energy_targets)
-        energy_active_mask_subset = _slice_optional("energy_active_mask", energy_active_mask)
-        return (
-            requested,
-            anchor_subset,
-            behavior_subset,
-            allowed_subset,
-            energy_targets_subset,
-            energy_active_mask_subset,
-        )
 
     # ========== Speed Target Computation ==========
     def _compute_speed_target(self, trajectory, device, batch: Optional[Dict[str, torch.Tensor]] = None):
@@ -2192,80 +2075,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         focal_weight = alpha * (1 - p_t) ** gamma
         return (focal_weight * bce).mean()
 
-    def _get_front_route_energy_targets(
-        self,
-        batch: Dict[str, torch.Tensor],
-        device: torch.device,
-        model_dtype: torch.dtype,
-    ):
-        """Scene-level front risk supervision from precomputed route-constrained labels.
-
-        The new front/block/risk labels are scene-level, not anchor-level. We therefore
-        train the front energy head on the GT slot only instead of forcing the same target
-        onto every anchor sample.
-        """
-        hazard_bin = batch.get('front_route_hazard_bin', None)
-        if hazard_bin is not None:
-            target = hazard_bin.to(device=device, dtype=model_dtype).clamp(min=0.0, max=4.0) / 4.0
-        else:
-            risk = batch.get('front_route_risk', None)
-            if risk is None:
-                return None, None
-            target = risk.to(device=device, dtype=model_dtype).clamp(0.0, 1.0)
-            block_risk = batch.get('front_route_block_risk', None)
-            if block_risk is not None:
-                target = torch.maximum(
-                    target,
-                    block_risk.to(device=device, dtype=model_dtype).clamp(0.0, 1.0),
-                )
-
-        actor_weight = batch.get('front_route_actor_weight', None)
-        if actor_weight is None:
-            sample_weight = torch.ones_like(target)
-        else:
-            actor_weight = actor_weight.to(device=device, dtype=model_dtype)
-            positive_weight = actor_weight.clamp(min=1.0)
-            sample_weight = torch.where(
-                target > 0,
-                positive_weight,
-                torch.ones_like(target),
-            )
-        return target, sample_weight
-
-    def _compute_front_route_energy_loss(
-        self,
-        front_logits: torch.Tensor,
-        batch: Dict[str, torch.Tensor],
-        device: torch.device,
-        model_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        targets, sample_weight = self._get_front_route_energy_targets(
-            batch=batch,
-            device=device,
-            model_dtype=model_dtype,
-        )
-        if targets is None:
-            return torch.tensor(0.0, device=device, dtype=model_dtype)
-        loss = F.binary_cross_entropy_with_logits(
-            front_logits.float(),
-            targets.float(),
-            reduction='none',
-        )
-        weighted = loss * sample_weight.float()
-        return weighted.sum() / sample_weight.float().sum().clamp(min=1.0)
-
-    # ========== Energy Head Eval with Detached Weights ==========
-    @staticmethod
-    def _eval_energy_head_detached(head: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate an energy head using detached weights.
-        Gradients flow back to input x, but NOT to head parameters.
-        head: nn.Sequential(Linear, SiLU, Linear)
-        """
-        x = F.linear(x, head[0].weight.detach(), head[0].bias.detach())
-        x = F.silu(x)
-        x = F.linear(x, head[2].weight.detach(), head[2].bias.detach())
-        return x
-
     def _compute_shared_stage1_loss(
         self,
         batch: Dict[str, torch.Tensor],
@@ -3069,20 +2878,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor],
                 return_loss_dict: bool = False,
                 phase: str = 'unified'):
-        """
-        DDP-compatible forward.
-          - 'unified': Single forward pass for both energy + diffusion training (default)
-          - 'energy': Phase 1 only — train energy heads (legacy, for ablation)
-          - 'diffusion': Phase 2 only — train decoder (legacy, for ablation)
-        """
-        if phase == 'split' or (phase == 'unified' and self.use_split_forward):
-            loss_dict = self.compute_split_loss(batch)
-        elif phase == 'unified':
-            loss_dict = self.compute_unified_loss(batch)
-        elif phase == 'energy':
-            loss_dict = self.compute_energy_loss(batch)
-        else:
-            loss_dict = self.compute_diffusion_loss(batch)
+        """DDP-compatible Route B semantic-state forward."""
+        loss_dict = self.compute_split_loss(batch)
 
         if return_loss_dict:
             return loss_dict
@@ -3095,15 +2892,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         Split-forward Route B training.
 
         1. Ego path: waypoint-token denoising for pred_x0 + route prediction
-        2. Energy path: anchor/GT trajectory-level scoring
-        3. Alignment path: evaluate pred_x0 as a single trajectory with detached energy heads
+        2. Shared stage1 semantic-state heads on clean/noisy Route B context
         """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
 
         trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
         B, T, D = trajectory.shape
-        M_anchor = self.num_energy_modes
         good_route_mask = self._get_good_route_mask(batch, device)
 
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
@@ -3117,14 +2912,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         else:
             raise KeyError("Joint Route B ego diffusion requires 'route' in the training batch")
 
-        behavior_labels = batch.get('behavior_labels', None)
-        allowed_flags = batch.get('allowed_flags', None)
-        energy_targets = batch.get('energy_targets', None)
-        energy_active_mask = batch.get('energy_active_mask', None)
         has_stage1_labels = self._has_stage1_labels(batch)
-        has_energy = (self.anchor_centers_abs is not None
-                      and behavior_labels is not None
-                      and allowed_flags is not None)
         train_speed_head_active = self._train_branch_enabled_with_schedule(
             self.train_speed_head_until_epoch,
             self.train_speed_head_after_update_every,
@@ -3328,202 +3116,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 for key, value in stage1_extra_losses.items()
                 if key.startswith('stage1_')
             })
-        elif has_energy and self.train_energy and (not self.use_stage1_speed_energy):
-            (
-                M_anchor,
-                anchor_subset,
-                behavior_labels_subset,
-                allowed_flags_subset,
-                energy_targets_subset,
-                energy_active_mask_subset,
-            ) = self._slice_energy_anchor_inputs(
-                device=device,
-                model_dtype=model_dtype,
-                behavior_labels=behavior_labels,
-                allowed_flags=allowed_flags,
-                energy_targets=energy_targets,
-                energy_active_mask=energy_active_mask,
-            )
-            anchor_abs = anchor_subset.unsqueeze(0).expand(B, -1, -1, -1)
-            behavior_labels_dev = behavior_labels_subset.to(device=device)
-            allowed_flags_dev = allowed_flags_subset.to(device=device, dtype=model_dtype)
-            energy_targets_dev = None
-            energy_active_mask_dev = None
-            if energy_targets_subset is not None:
-                energy_targets_dev = energy_targets_subset.to(device=device, dtype=model_dtype)
-            if energy_active_mask_subset is not None:
-                energy_active_mask_dev = energy_active_mask_subset.to(device=device, dtype=torch.bool)
-
-            K = min(self.num_gt_augmentations, M_anchor)
-            if K > 0:
-                anchor_abs = anchor_abs.clone()
-                behavior_labels_dev = behavior_labels_dev.clone()
-                allowed_flags_dev = allowed_flags_dev.clone()
-                if energy_targets_dev is not None:
-                    energy_targets_dev = energy_targets_dev.clone()
-                if energy_active_mask_dev is not None:
-                    energy_active_mask_dev = energy_active_mask_dev.clone()
-                gt_aug = self._augment_gt(trajectory, K)
-                anchor_abs[:, :K] = gt_aug
-                behavior_labels_dev[:, :K] = 0
-                allowed_flags_dev[:, :K] = 1.0
-                if energy_targets_dev is not None:
-                    energy_targets_dev[:, :K] = 0.0
-                if energy_active_mask_dev is not None:
-                    energy_active_mask_dev[:, :K] = True
-
-            gt_abs = trajectory.unsqueeze(1)
-            energy_abs = torch.cat([anchor_abs, gt_abs], dim=1)  # (B, 33, T, 2)
-            energy_normed = self.abs_to_norm(energy_abs)
-
-            gt_behavior = torch.zeros(B, 1, device=device, dtype=behavior_labels_dev.dtype)
-            behavior_all = torch.cat([behavior_labels_dev, gt_behavior], dim=1)
-            allowed_all = torch.cat([
-                allowed_flags_dev,
-                torch.ones(B, 1, device=device, dtype=model_dtype),
-            ], dim=1)
-
-            energy_scores, _ = self.model.forward_energy(
-                x_t=energy_normed,
-                x_t_abs=energy_abs,
-                timestep=torch.zeros(B, device=device, dtype=torch.long),
-                transfuser_bev_feature=transfuser_bev_feature,
-                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                ego_status=ego_status,
-                traj_for_energy=energy_abs,
-                behavior_labels=behavior_all,
-                allowed_flags=allowed_all,
-                bev_proj_cached=bev_proj,
-                route_points=route_gt,
-                transfuser_lidar_bev=transfuser_lidar_bev,
-            )
-
-            if energy_targets_dev is not None:
-                gt_targets = torch.zeros(B, 1, energy_targets_dev.shape[-1], device=device, dtype=model_dtype)
-                energy_targets_all = torch.cat([energy_targets_dev, gt_targets], dim=1)
-                front_target = energy_targets_all[..., 0]
-                left_target = energy_targets_all[..., 1]
-                right_target = energy_targets_all[..., 2]
-                ped_target = energy_targets_all[..., 3]
-                offroad_target = energy_targets_all[..., 4]
-            else:
-                front_target = (behavior_all == 1).float()
-                left_target = (behavior_all == 2).float()
-                right_target = (behavior_all == 3).float()
-                ped_target = (behavior_all == 4).float()
-                offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
-
-            def _sl1e(pred, tgt, mask=None):
-                return F.smooth_l1_loss(pred[mask], tgt[mask]) if mask is not None else F.smooth_l1_loss(pred, tgt)
-
-            if not self.use_safe_anchors:
-                if energy_active_mask_dev is not None:
-                    gt_active = torch.ones(B, 1, device=device, dtype=torch.bool)
-                    active_mask = torch.cat([energy_active_mask_dev, gt_active], dim=1)
-                else:
-                    active_mask = torch.ones(B, M_anchor + 1, device=device, dtype=torch.bool)
-                    active_mask[:, K:M_anchor] = (allowed_all[:, K:M_anchor] < 0.5)
-                    active_mask[:, M_anchor] = True
-                n_active = active_mask.sum()
-                if n_active > 0:
-                    if self.use_front_route_risk_energy:
-                        loss_front = zero_t
-                    else:
-                        loss_front = _sl1e(energy_scores['front'], front_target, active_mask)
-                    loss_left = _sl1e(energy_scores['left'], left_target, active_mask)
-                    loss_right = _sl1e(energy_scores['right'], right_target, active_mask)
-                    loss_ped = _sl1e(energy_scores['pedestrian'], ped_target, active_mask)
-                    loss_off = _sl1e(energy_scores['offroad'], offroad_target, active_mask)
-            else:
-                if self.use_front_route_risk_energy:
-                    loss_front = zero_t
-                else:
-                    loss_front = _sl1e(energy_scores['front'], front_target)
-                loss_left = _sl1e(energy_scores['left'], left_target)
-                loss_right = _sl1e(energy_scores['right'], right_target)
-                loss_ped = _sl1e(energy_scores['pedestrian'], ped_target)
-                loss_off = _sl1e(energy_scores['offroad'], offroad_target)
-
-            energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
-
-        if (not has_stage1_labels) and self.use_front_route_risk_energy:
-            gt_abs = trajectory.unsqueeze(1)
-            gt_normed = self.abs_to_norm(gt_abs)
-            front_route_logits, _ = self.model.forward_front_route_risk(
-                x_t=gt_normed,
-                x_t_abs=gt_abs,
-                timestep=torch.zeros(B, device=device, dtype=torch.long),
-                transfuser_bev_feature=transfuser_bev_feature,
-                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                ego_status=ego_status,
-                traj_for_energy=gt_abs,
-                bev_proj_cached=bev_proj,
-                route_points=route_gt,
-                transfuser_lidar_bev=transfuser_lidar_bev,
-            )
-            loss_front = self._compute_front_route_energy_loss(
-                front_route_logits[:, -1],
-                batch,
-                device,
-                model_dtype,
-            )
-            energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off
-
-        # ===== Forward 3: Alignment / guidance eval on pred_x0 =====
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and alignment_active and not has_stage1_labels:
-            if self.use_front_route_risk_energy:
-                _, mode_out_front = self.model.forward_front_route_risk_eval(
-                    x_t=poses_reg,
-                    x_t_abs=poses_reg_abs,
-                    transfuser_bev_feature=transfuser_bev_feature,
-                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                    ego_status=ego_status,
-                    traj_for_energy=poses_reg_abs,
-                    bev_proj_cached=bev_proj,
-                    route_points=route_gt,
-                    transfuser_lidar_bev=transfuser_lidar_bev,
-                )
-                front_align_input = torch.cat([poses_reg_abs.flatten(-2), mode_out_front], dim=-1)
-                a_front = self._eval_energy_head_detached(
-                    self.model.front_route_risk_head,
-                    front_align_input,
-                ).squeeze(-1)
-                alignment_loss = alignment_loss + self.energy_front_weight * torch.sigmoid(a_front).mean()
-
-            if has_energy and self.train_energy:
-                _, mode_out_clean = self.model.forward_energy_eval(
-                    x_t=poses_reg,
-                    x_t_abs=poses_reg_abs,
-                    transfuser_bev_feature=transfuser_bev_feature,
-                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                    ego_status=ego_status,
-                    traj_for_energy=poses_reg_abs,
-                    bev_proj_cached=bev_proj,
-                    route_points=route_gt,
-                    transfuser_lidar_bev=transfuser_lidar_bev,
-                )
-                align_input = torch.cat([poses_reg_abs.flatten(-2), mode_out_clean], dim=-1)
-                if not self.use_front_route_risk_energy:
-                    a_front = self._eval_energy_head_detached(self.model.energy_front_head, align_input).squeeze(-1)
-                    alignment_loss = alignment_loss + self.energy_front_weight * torch.sigmoid(a_front).mean()
-                a_left = self._eval_energy_head_detached(self.model.energy_left_head, align_input).squeeze(-1)
-                a_right = self._eval_energy_head_detached(self.model.energy_right_head, align_input).squeeze(-1)
-                a_ped = self._eval_energy_head_detached(self.model.energy_pedestrian_head, align_input).squeeze(-1)
-                a_off = self._eval_energy_head_detached(self.model.energy_offroad_head, align_input).squeeze(-1)
-                alignment_loss = alignment_loss + (
-                    self.energy_left_weight * torch.sigmoid(a_left).mean()
-                    + self.energy_right_weight * torch.sigmoid(a_right).mean()
-                    + self.energy_pedestrian_weight * torch.sigmoid(a_ped).mean()
-                    + self.energy_offroad_weight * torch.sigmoid(a_off).mean()
-                )
 
         total_loss = (
             self.energy_loss_weight * energy_loss
             + self.reg_loss_weight * loss_reg
             + self.route_loss_weight * route_loss
-            + self.alignment_loss_weight * alignment_loss
             + self.speed_loss_weight * speed_loss
             + self.speed_profile_loss_weight * speed_profile_loss
         )
@@ -3556,636 +3154,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_dict.update(stage1_extra_losses)
         return loss_dict
 
-    # ========== Unified Training: Single Forward Pass ==========
-    def compute_unified_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Unified single-forward training for both energy heads and diffusion decoder.
-
-        Constructs M_total = M_anchor + 1 (GT) + 1 (x_t) modes in one forward pass:
-          - Slots [0, M_anchor): anchor trajectories (with behavior labels from dataset)
-          - Slot [M_anchor]: GT trajectory (clean, labeled safe)
-          - Slot [M_anchor+1]: noisy GT trajectory (x_t for diffusion denoising)
-
-        Mode queries:
-          - Slots [0, M_anchor+1): use mode_queries (anchor + GT share anchor query space)
-          - Slot [M_anchor+1]: uses diff_mode_query (dedicated diffusion query)
-
-        Energy head evaluates original anchor/GT coords via traj_for_energy (not model output).
-        Diffusion loss computed only on the last slot's poses_reg.
-
-        Anchor isolation in decoder self-attention ensures no information leak between modes.
-        """
-        device = next(self.parameters()).device
-        model_dtype = next(self.parameters()).dtype
-
-        trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
-        B, T, D = trajectory.shape
-        M_anchor = self.num_energy_modes  # 32
-
-        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        transfuser_lidar_bev = self._get_transfuser_lidar_bev(batch, device, model_dtype)
-        ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
-
-        route_gt = batch.get('route', None)
-        if route_gt is not None:
-            route_gt = route_gt.to(device=device, dtype=model_dtype)
-
-        behavior_labels = batch.get('behavior_labels', None)  # (B, M_anchor) or None
-        allowed_flags = batch.get('allowed_flags', None)      # (B, M_anchor) or None
-
-        has_energy = (self.train_energy
-                      and self.anchor_centers_abs is not None
-                      and behavior_labels is not None
-                      and allowed_flags is not None)
-
-        # ========== Build anchor slots ==========
-
-        # ========== Build GT slot (1) ==========
-        gt_abs = trajectory.unsqueeze(1)  # (B, 1, T, 2)
-
-        # ========== Build x_t slot (1): noisy GT for diffusion ==========
-        traj_normed = self.abs_to_norm(trajectory)  # (B, T, 2)
-        diff_timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
-
-        noise = torch.randn(B, T, D, dtype=torch.float32, device=device)
-        noisy_flat = self.diffusion_scheduler.add_noise(
-            original_samples=traj_normed,
-            noise=noise,
-            timesteps=diff_timesteps,
-        )
-        noisy_traj = noisy_flat.unsqueeze(1)  # (B, 1, T, D)
-
-        # ========== Concatenate all slots into unified input ==========
-        # IMPORTANT: x_t (diffusion) is at position 0 to match M=1 inference (predict_action).
-        # Order: [x_t(0), anchors(1-32), GT(33)]
-        if has_energy:
-            (
-                M_anchor,
-                anchor_subset,
-                behavior_labels_subset,
-                allowed_flags_subset,
-                _,
-                _,
-            ) = self._slice_energy_anchor_inputs(
-                device=device,
-                model_dtype=model_dtype,
-                behavior_labels=behavior_labels,
-                allowed_flags=allowed_flags,
-            )
-            anchor_abs = anchor_subset.unsqueeze(0).expand(B, -1, -1, -1).clone()
-            behavior_labels_dev = behavior_labels_subset.to(device=device).clone()
-            allowed_flags_dev = allowed_flags_subset.to(device=device, dtype=model_dtype).clone()
-            K = min(self.num_gt_augmentations, M_anchor)
-            if K > 0:
-                gt_aug = self._augment_gt(trajectory, K)
-                anchor_abs[:, :K] = gt_aug
-                behavior_labels_dev[:, :K] = 0
-                allowed_flags_dev[:, :K] = 1.0
-
-            # Energy anchor input: normalize anchors
-            anchor_normed = self.abs_to_norm(anchor_abs)  # (B, M_anchor, T, 2)
-            gt_normed = self.abs_to_norm(gt_abs)           # (B, 1, T, 2)
-
-            # Unified: [x_t (1), anchors (32), GT (1)] = 34 modes
-            x_t_unified = torch.cat([noisy_traj, anchor_normed, gt_normed], dim=1)  # (B, 34, T, 2)
-
-            # Abs coords for BEV grid_sample
-            noisy_traj_abs = self.norm_to_abs(noisy_traj)
-            x_t_abs_unified = torch.cat([noisy_traj_abs, anchor_abs, gt_abs], dim=1)  # (B, 34, T, 2)
-
-            # traj_for_energy: original anchor/GT abs coords for energy head (slots 1-33)
-            # Energy evaluates spatial properties (collision/offroad/target) — abs space is natural.
-            # Slot 0 (x_t) uses GT abs as placeholder (energy loss is NOT computed on this slot,
-            # alignment loss is computed separately below with the actual diffusion prediction).
-            energy_traj_padded = torch.cat([
-                gt_abs,       # (B, 1, T, 2) placeholder for x_t slot (not used for energy_loss)
-                anchor_abs,   # (B, 32, T, 2) abs
-                gt_abs,       # (B, 1, T, 2) abs
-            ], dim=1)  # (B, 34, T, 2) abs coords
-        else:
-            # No anchors: just x_t + GT (2 modes), no energy training
-            gt_normed = self.abs_to_norm(gt_abs)
-            x_t_unified = torch.cat([noisy_traj, gt_normed], dim=1)  # (B, 2, T, 2)
-            noisy_traj_abs = self.norm_to_abs(noisy_traj)
-            x_t_abs_unified = torch.cat([noisy_traj_abs, gt_abs], dim=1)
-            energy_traj_padded = None
-
-        # ========== Single forward pass ==========
-        poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
-            x_t=x_t_unified,
-            x_t_abs=x_t_abs_unified,
-            timestep=diff_timesteps,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=energy_traj_padded,
-        )
-
-        # ========== Split outputs ==========
-        # Layout: [x_t(0), anchors(1..M_anchor), GT(M_anchor+1)]
-        if has_energy:
-            M_energy = M_anchor + 1  # anchors + GT = 33 energy slots
-
-            # Energy scores for slots 1-33 (anchors + GT), skip slot 0 (x_t)
-            energy_scores_energy = {k: v[:, 1:1+M_energy] for k, v in energy_scores.items()}
-
-            # Diffusion output from first slot (position 0)
-            poses_reg_diff = poses_reg[:, :1, :, :]  # (B, 1, T, 2)
-        else:
-            M_energy = 0
-            energy_scores_energy = None
-            poses_reg_diff = poses_reg[:, :1, :, :]
-
-        # ========== Energy Loss (on slots 1-33: anchors + GT) ==========
-        zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
-        energy_loss = zero_t
-        loss_front = loss_left = loss_right = loss_ped = loss_off = loss_route = zero_t
-
-        if has_energy and energy_scores_energy is not None:
-            # Build targets: anchors (32) + GT (1)
-            # GT slot is safe (all collision/offroad = 0)
-            gt_behavior = torch.zeros(B, 1, device=device, dtype=behavior_labels_dev.dtype)
-            behavior_all = torch.cat([behavior_labels_dev, gt_behavior], dim=1)  # (B, 33)
-
-            front_target  = (behavior_all == 1).float()
-            left_target   = (behavior_all == 2).float()
-            right_target  = (behavior_all == 3).float()
-            ped_target    = (behavior_all == 4).float()
-            offroad_target = ((behavior_all >= 5) & (behavior_all <= 6)).float()
-
-            # Route deviation target for anchors+GT: (B, 33)
-            # anchor_abs_for_energy contains anchors+GT in abs coords
-            if route_gt is not None:
-                # Reconstruct abs traj for energy slots from x_t_abs_unified slots 1-34
-                anchor_abs_energy = x_t_abs_unified[:, 1:1+M_energy, :, :]  # (B, 33, T, 2)
-                route_target_all = self.compute_route_target(
-                    anchor_abs_energy, route_gt, trajectory)   # (B, 33)
-            else:
-                route_target_all = torch.zeros(B, M_energy, device=device, dtype=model_dtype)
-
-            def _sl1e(pred, tgt, mask=None):
-                return F.smooth_l1_loss(pred[mask], tgt[mask]) if mask is not None else F.smooth_l1_loss(pred, tgt)
-
-            if not self.use_safe_anchors:
-                active_mask = torch.ones(B, M_energy, device=device, dtype=torch.bool)
-                allowed_flags_original = torch.cat([
-                    allowed_flags_dev,
-                    torch.ones(B, 1, device=device),  # GT always active
-                ], dim=1)
-                K = min(self.num_gt_augmentations, M_anchor)
-                active_mask[:, K:M_anchor] = (allowed_flags_original[:, K:M_anchor] < 0.5)
-                active_mask[:, M_anchor] = True  # GT slot always active
-
-                n_active = active_mask.sum()
-                if n_active > 0:
-                    if self.use_front_route_risk_energy:
-                        loss_front = self._compute_front_route_energy_loss(
-                            energy_scores_energy['front'][:, -1],
-                            batch,
-                            device,
-                            model_dtype,
-                        )
-                    else:
-                        loss_front = _sl1e(energy_scores_energy['front'],  front_target,  active_mask)
-                    loss_left  = _sl1e(energy_scores_energy['left'],   left_target,   active_mask)
-                    loss_right = _sl1e(energy_scores_energy['right'],  right_target,  active_mask)
-                    loss_ped   = _sl1e(energy_scores_energy['pedestrian'], ped_target, active_mask)
-                    loss_off   = _sl1e(energy_scores_energy['offroad'], offroad_target, active_mask)
-                # Route loss on ALL slots (continuous metric)
-                loss_route = _sl1e(energy_scores_energy['route'], route_target_all)
-            else:
-                if self.use_front_route_risk_energy:
-                    loss_front = self._compute_front_route_energy_loss(
-                        energy_scores_energy['front'][:, -1],
-                        batch,
-                        device,
-                        model_dtype,
-                    )
-                else:
-                    loss_front = _sl1e(energy_scores_energy['front'],  front_target)
-                loss_left  = _sl1e(energy_scores_energy['left'],   left_target)
-                loss_right = _sl1e(energy_scores_energy['right'],  right_target)
-                loss_ped   = _sl1e(energy_scores_energy['pedestrian'], ped_target)
-                loss_off   = _sl1e(energy_scores_energy['offroad'], offroad_target)
-                loss_route = _sl1e(energy_scores_energy['route'], route_target_all)
-
-            energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off + loss_route
-
-        # ========== Diffusion Loss (on slot 0: x_t) ==========
-        poses_reg_diff_abs = self.norm_to_abs(poses_reg_diff)  # (B, 1, T, 2)
-        traj_target = trajectory.unsqueeze(1)  # (B, 1, T, 2)
-        loss_reg = F.l1_loss(poses_reg_diff_abs, traj_target, reduction='mean')
-
-        # Route loss
-        route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        if route_gt is not None and route_pred is not None:
-            route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
-            route_loss = route_loss + self.route_final_loss_weight * F.l1_loss(
-                route_pred[:, -1],
-                route_gt[:, -1],
-                reduction='mean',
-            )
-
-        # Alignment loss: evaluate diffusion prediction with FROZEN energy heads
-        # Goal: push diffusion decoder to generate trajectories that energy heads rate as safe.
-        # - Use actual prediction (poses_reg_diff_abs), not noisy input or zero placeholder
-        # - Gradient flows back to decoder (poses_reg_diff_abs, mode_out are NOT detached)
-        # - Energy head weights are detached via _eval_energy_head_detached, so
-        #   optimizer_energy sees NO alignment gradient — only energy_loss trains the heads
-        # - Sigmoid bounds binary scores to [0,1]; route score left unbounded (already ≥ 0)
-        alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and has_energy and alignment_active:
-            diff_mode_out = mode_out[:, :1, :]           # (B, 1, n_emb) — slot 0 is diffusion
-            diff_traj_flat = poses_reg_diff_abs.flatten(-2)  # (B, 1, T*2)
-            align_input = torch.cat([diff_traj_flat, diff_mode_out], dim=-1)
-
-            # Detached-weight evaluation: grad → decoder, NOT → energy heads
-            a_front = self._eval_energy_head_detached(self.model.energy_front_head,      align_input).squeeze(-1)
-            a_left  = self._eval_energy_head_detached(self.model.energy_left_head,       align_input).squeeze(-1)
-            a_right = self._eval_energy_head_detached(self.model.energy_right_head,      align_input).squeeze(-1)
-            a_ped   = self._eval_energy_head_detached(self.model.energy_pedestrian_head, align_input).squeeze(-1)
-            a_off   = self._eval_energy_head_detached(self.model.energy_offroad_head,    align_input).squeeze(-1)
-            a_rte   = self._eval_energy_head_detached(self.model.energy_route_head,      align_input).squeeze(-1)
-
-            alignment_loss = (
-                self.energy_front_weight      * torch.sigmoid(a_front).mean()
-                + self.energy_left_weight     * torch.sigmoid(a_left).mean()
-                + self.energy_right_weight    * torch.sigmoid(a_right).mean()
-                + self.energy_pedestrian_weight * torch.sigmoid(a_ped).mean()
-                + self.energy_offroad_weight  * torch.sigmoid(a_off).mean()
-                + self.energy_route_weight    * a_rte.mean()  # already ≥ 0, no sigmoid needed
-            )
-
-        # ========== Total Loss ==========
-        total_loss = (
-            self.energy_loss_weight * energy_loss
-            + self.reg_loss_weight * loss_reg
-            + self.route_loss_weight * route_loss
-            + self.alignment_loss_weight * alignment_loss
-        )
-
-        return {
-            'total_loss': total_loss,
-            'energy_loss': energy_loss,
-            'energy_front_loss': loss_front,
-            'energy_left_loss':  loss_left,
-            'energy_right_loss': loss_right,
-            'energy_ped_loss':   loss_ped,
-            'energy_off_loss':   loss_off,
-            'energy_route_loss': loss_route,
-            'reg_loss': loss_reg,
-            'cls_loss': torch.tensor(0.0, device=device),
-            'route_loss': route_loss,
-            'alignment_loss': alignment_loss,
-        }
-
-    # ========== Route Energy Target ==========
-    @staticmethod
-    def _point_to_polyline_dist(pts: torch.Tensor, seg_a: torch.Tensor, seg_b: torch.Tensor) -> torch.Tensor:
-        """
-        Compute mean-over-T minimum distance from trajectory points to a polyline.
-
-        Args:
-            pts:   (B, M, T, 2) — trajectory points to evaluate
-            seg_a: (B, N, 2)    — polyline segment start points
-            seg_b: (B, N, 2)    — polyline segment end points
-
-        Returns:
-            (B, M) — mean over T of min-over-N distance to polyline
-        """
-        # (B, M, T, 1, 2) vs (B, 1, 1, N, 2)
-        pts_e = pts.unsqueeze(3)
-        a_e = seg_a.unsqueeze(1).unsqueeze(2)
-        b_e = seg_b.unsqueeze(1).unsqueeze(2)
-        ab = b_e - a_e                                  # (B, 1, 1, N, 2)
-        ap = pts_e - a_e                                # (B, M, T, N, 2)
-        t = (ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-8)
-        t = t.clamp(0.0, 1.0)                           # project onto segment
-        closest = a_e + t.unsqueeze(-1) * ab            # (B, M, T, N, 2)
-        dist = (pts_e - closest).norm(dim=-1)           # (B, M, T, N)
-        return dist.min(dim=-1).values.mean(dim=-1)     # (B, M)
-
-    def compute_route_target(
-        self,
-        anchor_abs: torch.Tensor,
-        route: torch.Tensor,
-        gt_traj: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute continuous route-deviation target for energy heads.
-
-        Defines a "corridor" as the union of the route polyline and the GT traj polyline.
-        Trajectories within `route_energy_margin` meters of the corridor get target=0.
-        Outside the corridor: target = (dist - margin) / norm, clipped to [0, 2].
-
-        GT trajectory is inside its own corridor by construction → gt_route_target ≈ 0.
-
-        Args:
-            anchor_abs: (B, M, T, 2) — anchor/pred trajectories in abs ego-frame coords
-            route:      (B, 20, 2)   — route waypoints (ego frame)
-            gt_traj:    (B, T, 2)    — GT trajectory (abs ego-frame, used as corridor reference)
-
-        Returns:
-            (B, M) route deviation target ≥ 0
-        """
-        # Route polyline segments: (B, 19, 2)
-        route_seg_a = route[:, :-1, :]
-        route_seg_b = route[:, 1:, :]
-
-        # GT polyline segments: (B, T-1, 2)
-        gt_seg_a = gt_traj[:, :-1, :]
-        gt_seg_b = gt_traj[:, 1:, :]
-
-        # Corridor = route + GT polyline (B, 19+T-1, 2)
-        corridor_a = torch.cat([route_seg_a, gt_seg_a], dim=1)
-        corridor_b = torch.cat([route_seg_b, gt_seg_b], dim=1)
-
-        dist = self._point_to_polyline_dist(anchor_abs, corridor_a, corridor_b)  # (B, M)
-        target = F.relu(dist - self.route_energy_margin) / self.route_energy_norm
-        return target.clamp(max=2.0)
-
-    # ========== Phase 1: Energy Head Training (legacy) ==========
-    def compute_energy_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Train energy heads on anchor trajectories + GT augmentation.
-        Provides diverse positive (safe) and negative (forbidden) samples.
-
-        Input composition (M slots):
-          - First K slots: GT augmentation (speed-scaled, labeled safe)
-          - Remaining M-K slots: anchor trajectories (with behavior_labels from dataset)
-        """
-        device = next(self.parameters()).device
-        model_dtype = next(self.parameters()).dtype
-
-        trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
-        B, T, D = trajectory.shape
-        M = self.num_energy_modes  # use full anchor count for energy training
-
-        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
-
-        behavior_labels = batch.get('behavior_labels', None)  # (B, M) or None
-        allowed_flags = batch.get('allowed_flags', None)      # (B, M) or None
-
-        # Fallback: if no anchors or labels, return zero loss (with grad for backward compatibility)
-        if self.anchor_centers_abs is None or behavior_labels is None or allowed_flags is None:
-            zero = torch.tensor(0.0, device=device, dtype=model_dtype, requires_grad=True)
-            return {
-                'total_loss': zero,
-                'energy_loss': zero.detach(),
-                'energy_front_loss': zero.detach(),
-                'energy_left_loss': zero.detach(),
-                'energy_right_loss': zero.detach(),
-                'energy_ped_loss': zero.detach(),
-                'energy_off_loss': zero.detach(),
-                'energy_route_loss': zero.detach(),
-            }
-
-        # --- Build mixed input: GT augmentation + anchors ---
-        (
-            M,
-            anchor_subset,
-            behavior_labels_subset,
-            allowed_flags_subset,
-            _,
-            _,
-        ) = self._slice_energy_anchor_inputs(
-            device=device,
-            model_dtype=model_dtype,
-            behavior_labels=behavior_labels,
-            allowed_flags=allowed_flags,
-        )
-        anchor_abs = anchor_subset.unsqueeze(0).expand(B, -1, -1, -1).clone()  # (B, M, T, 2)
-        behavior_labels_dev = behavior_labels_subset.to(device=device).clone()
-        allowed_flags_dev = allowed_flags_subset.to(device=device, dtype=model_dtype).clone()
-
-        # Replace first K slots with GT augmentation (reliable positive samples)
-        K = min(self.num_gt_augmentations, M)
-        if K > 0:
-            gt_aug = self._augment_gt(trajectory, K)  # (B, K, T, 2)
-            anchor_abs[:, :K] = gt_aug
-            behavior_labels_dev[:, :K] = 0   # safe: follow_road
-            allowed_flags_dev[:, :K] = 1.0   # allowed
-
-        # --- Timestep: clean (t=0) or noisy (random t) ---
-        if self.energy_noisy_training:
-            timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
-            anchor_normed = self.abs_to_norm(anchor_abs)  # (B, M, T, 2) z-scored delta
-            anchor_flat = anchor_normed.contiguous().view(B * M, T, D)
-            t_expanded = timesteps.unsqueeze(1).expand(-1, M).reshape(B * M)
-            noise = torch.randn_like(anchor_flat)
-            noisy_anchor = self.diffusion_scheduler.add_noise(anchor_flat, noise, t_expanded)
-            noisy_anchor = noisy_anchor.view(B, M, T, D)
-            anchor_input = noisy_anchor
-            anchor_abs_input = self.norm_to_abs(anchor_input)
-        else:
-            timesteps = torch.zeros(B, device=device, dtype=torch.long)
-            anchor_input = self.abs_to_norm(anchor_abs)
-            anchor_abs_input = anchor_abs
-
-        # --- Forward pass WITH gradients ---
-        # Pass original anchor abs coords as traj_for_energy so energy head evaluates
-        # spatial properties (collision/offroad) in abs space, consistent with inference.
-        _, _, _, _, energy_scores = self.model(
-            x_t=anchor_input,
-            x_t_abs=anchor_abs_input,
-            timestep=timesteps,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=anchor_abs_input,
-        )
-
-        # --- Build supervision targets (derived from single-label behavior_labels) ---
-        # Vehicle collision direction (mutually exclusive per label priority)
-        front_target = (behavior_labels_dev == 1).float()
-        left_target  = (behavior_labels_dev == 2).float()
-        right_target = (behavior_labels_dev == 3).float()
-        ped_target   = (behavior_labels_dev == 4).float()
-        offroad_target = ((behavior_labels_dev >= 5) & (behavior_labels_dev <= 6)).float()
-
-        # Route deviation target: continuous distance to route+GT corridor
-        route = batch.get('route', None)
-        if route is not None:
-            route_dev = route.to(device=device, dtype=model_dtype)  # (B, 20, 2)
-            trajectory_dev = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
-            route_target = self.compute_route_target(anchor_abs_input, route_dev, trajectory_dev)  # (B, M)
-        else:
-            route_target = torch.zeros(B, M, device=device, dtype=model_dtype)
-
-        # --- Compute energy loss with optional masking ---
-        def _sl1(pred, tgt, mask=None):
-            if mask is not None:
-                return F.smooth_l1_loss(pred[mask], tgt[mask])
-            return F.smooth_l1_loss(pred, tgt)
-
-        zero = torch.tensor(0.0, device=device, dtype=model_dtype)
-
-        if not self.use_safe_anchors:
-            # Binary heads: GT augmentation (first K, always safe) + forbidden anchors only
-            active_mask = torch.ones(B, M, device=device, dtype=torch.bool)
-            active_mask[:, K:] = (allowed_flags_dev[:, K:] < 0.5)
-
-            n_active = active_mask.sum()
-            if n_active > 0:
-                if self.use_front_route_risk_energy:
-                    gt_like_front = energy_scores['front'].mean(dim=1)
-                    loss_front = self._compute_front_route_energy_loss(
-                        gt_like_front,
-                        batch,
-                        device,
-                        model_dtype,
-                    )
-                else:
-                    loss_front = _sl1(energy_scores['front'], front_target, active_mask)
-                loss_left  = _sl1(energy_scores['left'],  left_target,  active_mask)
-                loss_right = _sl1(energy_scores['right'], right_target, active_mask)
-                loss_ped   = _sl1(energy_scores['pedestrian'], ped_target, active_mask)
-                loss_off   = _sl1(energy_scores['offroad'], offroad_target, active_mask)
-            else:
-                loss_front = loss_left = loss_right = loss_ped = loss_off = zero
-            # Route loss on ALL anchors (continuous metric, not safety-based masking)
-            loss_route = _sl1(energy_scores['route'], route_target)
-        else:
-            if self.use_front_route_risk_energy:
-                gt_like_front = energy_scores['front'].mean(dim=1)
-                loss_front = self._compute_front_route_energy_loss(
-                    gt_like_front,
-                    batch,
-                    device,
-                    model_dtype,
-                )
-            else:
-                loss_front = _sl1(energy_scores['front'], front_target)
-            loss_left  = _sl1(energy_scores['left'],  left_target)
-            loss_right = _sl1(energy_scores['right'], right_target)
-            loss_ped   = _sl1(energy_scores['pedestrian'], ped_target)
-            loss_off   = _sl1(energy_scores['offroad'], offroad_target)
-            loss_route = _sl1(energy_scores['route'], route_target)
-
-        energy_loss = loss_front + loss_left + loss_right + loss_ped + loss_off + loss_route
-
-        return {
-            'total_loss': self.energy_loss_weight * energy_loss,
-            'energy_loss': energy_loss,
-            'energy_front_loss': loss_front,
-            'energy_left_loss': loss_left,
-            'energy_right_loss': loss_right,
-            'energy_ped_loss': loss_ped,
-            'energy_off_loss': loss_off,
-            'energy_route_loss': loss_route,
-        }
-
-    # ========== Phase 2: Diffusion Training + Alignment (legacy) ==========
-    def compute_diffusion_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Single-mode diffusion training + alignment loss.
-
-        Training procedure:
-        1. GT trajectory as single mode (M=1), no replication needed
-        2. Sample random timestep, add noise to GT
-        3. Model predicts clean x_0 from noisy input
-        4. Losses: regression (L1), route (L1), alignment (energy)
-        """
-        device = next(self.parameters()).device
-        model_dtype = next(self.parameters()).dtype
-
-        trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
-        B, T, D = trajectory.shape
-
-        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        transfuser_lidar_bev = self._get_transfuser_lidar_bev(batch, device, model_dtype)
-        ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
-
-        route_gt = batch.get('route', None)
-        if route_gt is not None:
-            route_gt = route_gt.to(device=device, dtype=model_dtype)
-
-        # ========== Prepare noisy trajectory (M=1) ==========
-        traj_normed = self.abs_to_norm(trajectory)  # (B, T, 2) z-scored delta
-        traj_normed = traj_normed.unsqueeze(1)      # (B, 1, T, 2)
-
-        timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
-
-        noise = torch.randn(B, 1, T, D, dtype=torch.float32, device=device)
-        traj_flat = traj_normed.view(B, T, D)
-        noisy_flat = self.diffusion_scheduler.add_noise(
-            original_samples=traj_flat,
-            noise=noise.view(B, T, D),
-            timesteps=timesteps,
-        )
-        noisy_traj = noisy_flat.view(B, 1, T, D)
-
-        # ========== Forward pass ==========
-        noisy_traj_abs = self.norm_to_abs(noisy_traj)
-
-        poses_reg, poses_cls, route_pred, mode_out, energy_scores = self.model(
-            x_t=noisy_traj,
-            x_t_abs=noisy_traj_abs,
-            timestep=timesteps,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-        )
-
-        # Denorm predictions to absolute space: z-normed delta -> delta -> abs
-        poses_reg_abs = self.norm_to_abs(poses_reg)  # (B, 1, T, 2)
-
-        # ========== Regression Loss ==========
-        traj_target = trajectory.unsqueeze(1)  # (B, 1, T, 2)
-        loss_reg = F.l1_loss(poses_reg_abs, traj_target, reduction='mean')
-
-        # ========== Route Loss ==========
-        route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        if route_gt is not None and route_pred is not None:
-            route_loss = F.l1_loss(route_pred, route_gt, reduction='mean')
-            # FDE: extra weight on final route point
-            route_loss = route_loss + self.route_final_loss_weight * F.l1_loss(
-                route_pred[:, -1],
-                route_gt[:, -1],
-                reduction='mean',
-            )
-
-        # ========== Alignment Loss ==========
-        alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
-        alignment_active = (self._current_epoch >= self.alignment_warmup_epochs)
-        if self.alignment_loss_weight > 0 and energy_scores is not None and alignment_active:
-            alignment_loss = (
-                self.energy_front_weight      * torch.sigmoid(energy_scores['front']).mean()
-                + self.energy_left_weight     * torch.sigmoid(energy_scores['left']).mean()
-                + self.energy_right_weight    * torch.sigmoid(energy_scores['right']).mean()
-                + self.energy_pedestrian_weight * torch.sigmoid(energy_scores['pedestrian']).mean()
-                + self.energy_offroad_weight  * torch.sigmoid(energy_scores['offroad']).mean()
-                + self.energy_route_weight    * energy_scores['route'].mean()
-            )
-
-        # ========== Total Loss ==========
-        total_loss = (
-            self.reg_loss_weight * loss_reg
-            + self.route_loss_weight * route_loss
-            + self.alignment_loss_weight * alignment_loss
-        )
-
-        loss_dict = {
-            'total_loss': total_loss,
-            'reg_loss': loss_reg,
-            'cls_loss': torch.tensor(0.0, device=device),
-            'route_loss': route_loss,
-            'speed_loss': torch.tensor(0.0, device=device),
-            'alignment_loss': alignment_loss,
-        }
-        if self.use_speed_profile_head:
-            loss_dict['speed_profile_loss'] = torch.tensor(0.0, device=device)
-        return loss_dict
-
     # ========== Legacy compute_loss (backward compatible) ==========
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Backward compatible: calls compute_diffusion_loss."""
-        return self.compute_diffusion_loss(batch)
+        """Backward compatible: Route B semantic-state split loss."""
+        return self.compute_split_loss(batch)
 
     # ========== Checkpoint Loading ==========
     @classmethod
@@ -4209,17 +3181,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             policy.register_route_abs_stats(rdata['route_abs_mean'], rdata['route_abs_std'])
         else:
             raise ValueError("route_abs_stats_path is required for joint Route B ego diffusion")
-
-        # Register anchor centers
-        anchor_path = config.get('anchor_path')
-        if anchor_path:
-            if anchor_path.endswith('.npy'):
-                ac = np.load(anchor_path)
-            else:
-                import pickle
-                with open(anchor_path, 'rb') as f:
-                    ac = pickle.load(f)['centers']
-            policy.register_anchor_centers(ac)
 
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -4300,15 +3261,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             raise NotImplementedError(f"Joint Route B ego diffusion currently expects num_samples=1, got {M}")
         self._require_route_abs_stats()
 
-        # Dynamic weight override (LLM Router interface — runtime per-head weight control)
-        def _w(key, default):
-            return energy_weights.get(key, default) if energy_weights else default
-        w_front_cfg = _w('front',      self.energy_front_weight)
-        w_left_cfg  = _w('left',       self.energy_left_weight)
-        w_right_cfg = _w('right',      self.energy_right_weight)
-        w_ped_cfg   = _w('pedestrian', self.energy_pedestrian_weight)
-        w_off_cfg   = _w('offroad',    self.energy_offroad_weight)
-
         # Start from pure Gaussian noise in joint normalized traj+route space
         x_t = torch.randn(B, M, joint_T, 2, device=device, dtype=torch.float32)
         bev_proj = self.model.decoder.compute_bev_proj(
@@ -4337,283 +3289,109 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             t_next = roll_timesteps[step_i + 1].item() if step_i + 1 < len(roll_timesteps) else 0
 
             # Get annealed energy weights for current noise level
-            _, w_veh, w_off = get_energy_weights(t_cur, T=self.train_max_timesteps)
-
             # ========== Forward pass 1: denoise x_t → pred_x0 ==========
             x_input = x_t.to(dtype=model_dtype)
             x_t_abs = self.joint_norm_to_abs(x_input)
 
             t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
 
-            use_guidance = self.guidance_scale > 0 and (w_veh + w_off) > 0
-
-            if use_guidance:
-                # Pass 1: get pred_x0 from denoising (no energy eval yet)
-                with torch.no_grad():
-                    pass1_shared = None
-                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
-                        pass1_shared = self.model.forward_ego(
-                            x_t=x_input,
-                            x_t_abs=x_t_abs,
-                            timestep=t_tensor,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            bev_proj_cached=bev_proj,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
-                            return_intermediates=True,
-                        )
-                        poses_reg = pass1_shared['poses_reg']
-                        route_pred = pass1_shared['route_pred']
-                        speed_pred = pass1_shared['speed_pred']
-                        speed_profile_pred = pass1_shared['speed_profile_pred']
-                    else:
-                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-                            x_t=x_input,
-                            x_t_abs=x_t_abs,
-                            timestep=t_tensor,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            bev_proj_cached=bev_proj,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
-                        )
-                    pass1_trajectory = self.norm_to_abs(poses_reg.detach())
-                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
-                        route_pred_abs = self.route_norm_to_abs(route_pred.detach())
-                        branch_speed_ref = (
-                            self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
-                            if speed_pred is not None else
-                            ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
-                        )
-                        stage1_raw_scores = None
-                        if pass1_shared is not None:
-                            stage1_speed_samples = self._build_local_phase_energy_samples(
-                                branch_speed_ref.detach(), device, model_dtype
-                            )
-                            stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
-                                traj_out=pass1_shared['traj_out'],
-                                route_out=pass1_shared['route_out'],
-                                speed_out=pass1_shared['speed_out'],
-                                route_points=pass1_shared['route_points'],
-                                conditioning=pass1_shared['conditioning'],
-                                speed_samples=stage1_speed_samples,
-                            )
-                        traj_branch_condition_probs, traj_branch_condition_details = self._infer_traj_branch_condition(
-                            stage1_raw_scores=stage1_raw_scores,
-                            speed_ref=branch_speed_ref.detach(),
-                            borrow_time_s=borrow_time_s,
-                            prev_relation_probs=prev_relation_probs,
-                            device=device,
-                            model_dtype=model_dtype,
-                        )
-                        (
-                            traj_branch_condition_probs,
-                            traj_branch_condition_details,
-                            phase_go_smoothing_debug,
-                            phase_go_smoothing_history_just_updated,
-                        ) = self._apply_phase_go_smoothing_override(
-                            traj_branch_condition_probs,
-                            traj_branch_condition_details,
-                            update_history=not phase_go_smoothing_history_updated,
-                            device=device,
-                            model_dtype=model_dtype,
-                        )
-                        phase_go_smoothing_history_updated = (
-                            phase_go_smoothing_history_updated
-                            or phase_go_smoothing_history_just_updated
-                        )
-                        branch_schedule = self._build_traj_condition_schedule(
-                            t_tensor, device=device, model_dtype=model_dtype
-                        )
-                        branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
-                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-                            x_t=x_input,
-                            x_t_abs=x_t_abs,
-                            timestep=t_tensor,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            bev_proj_cached=bev_proj,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
-                            branch_condition=branch_input,
-                            branch_condition_scale=self.traj_branch_condition_scale,
-                            branch_condition_schedule=branch_schedule,
-                        )
-                    pred_x0 = poses_reg.detach()  # (B, M, T, 2)
-                    route_context = route_for_guidance if route_for_guidance is not None else self.route_norm_to_abs(route_pred.detach())
-                    route_pred_norm = route_pred.detach().unsqueeze(1)  # (B, 1, T_route, 2)
-
-                # Pass 2: re-embed pred_x0 as a trajectory-level energy-eval sample.
-                pred_x0_for_grad = pred_x0.clone().requires_grad_(True)
-
-                with torch.enable_grad():
-                    pred_x0_abs = self.norm_to_abs(pred_x0_for_grad)  # differentiable: z-denorm + cumsum
-                    front_route_scores = None
-                    needs_legacy_energy = (
-                        (not self.use_front_route_risk_energy and w_front_cfg != 0)
-                        or w_left_cfg != 0
-                        or w_right_cfg != 0
-                        or w_ped_cfg != 0
-                        or (w_off_cfg != 0 and w_off > 0)
+            # Legacy anchor-energy guidance was removed in this Route B-only cleanup.
+            with torch.no_grad():
+                pass1_shared = None
+                if self.use_traj_branch_condition and self.use_stage1_speed_energy:
+                    pass1_shared = self.model.forward_ego(
+                        x_t=x_input,
+                        x_t_abs=x_t_abs,
+                        timestep=t_tensor,
+                        transfuser_bev_feature=transfuser_bev_feature,
+                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                        ego_status=ego_status,
+                        bev_proj_cached=bev_proj,
+                        transfuser_lidar_bev=transfuser_lidar_bev,
+                        return_intermediates=True,
                     )
-                    if needs_legacy_energy:
-                        energy_scores, _ = self.model.forward_energy_eval(
-                            x_t=pred_x0_for_grad,
-                            x_t_abs=pred_x0_abs,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            traj_for_energy=pred_x0_abs,  # abs space for spatial energy evaluation
-                            bev_proj_cached=bev_proj,
-                            route_points=route_context,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
+                    poses_reg = pass1_shared['poses_reg']
+                    route_pred = pass1_shared['route_pred']
+                    speed_pred = pass1_shared['speed_pred']
+                    speed_profile_pred = pass1_shared['speed_profile_pred']
+                else:
+                    poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                        x_t=x_input,
+                        x_t_abs=x_t_abs,
+                        timestep=t_tensor,
+                        transfuser_bev_feature=transfuser_bev_feature,
+                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                        ego_status=ego_status,
+                        bev_proj_cached=bev_proj,
+                        transfuser_lidar_bev=transfuser_lidar_bev,
+                    )
+                pass1_trajectory = self.norm_to_abs(poses_reg.detach())
+                if self.use_traj_branch_condition and self.use_stage1_speed_energy:
+                    route_pred_abs = self.route_norm_to_abs(route_pred.detach())
+                    branch_speed_ref = (
+                        self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
+                        if speed_pred is not None else
+                        ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+                    )
+                    stage1_raw_scores = None
+                    if pass1_shared is not None:
+                        stage1_speed_samples = self._build_local_phase_energy_samples(
+                            branch_speed_ref.detach(), device, model_dtype
                         )
-                    else:
-                        energy_scores = None
-                    if self.use_front_route_risk_energy and w_front_cfg != 0:
-                        front_route_scores, _ = self.model.forward_front_route_risk_eval(
-                            x_t=pred_x0_for_grad,
-                            x_t_abs=pred_x0_abs,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            traj_for_energy=pred_x0_abs,
-                            bev_proj_cached=bev_proj,
-                            route_points=route_context,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
+                        stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
+                            traj_out=pass1_shared['traj_out'],
+                            route_out=pass1_shared['route_out'],
+                            speed_out=pass1_shared['speed_out'],
+                            route_points=pass1_shared['route_points'],
+                            conditioning=pass1_shared['conditioning'],
+                            speed_samples=stage1_speed_samples,
                         )
-
-                    # Compute total energy
-                    total_energy = torch.zeros(1, device=device)
-                    if energy_scores is not None:
-                        total_energy = (
-                            w_veh * (
-                                ((0.0 if self.use_front_route_risk_energy else w_front_cfg) * energy_scores['front'].sum())
-                                + w_left_cfg  * energy_scores['left'].sum()
-                                + w_right_cfg * energy_scores['right'].sum()
-                                + w_ped_cfg   * energy_scores['pedestrian'].sum()
-                            )
-                            + w_off_cfg * w_off * energy_scores['offroad'].sum()
-                        )
-                    if front_route_scores is not None:
-                        total_energy = total_energy + w_veh * w_front_cfg * front_route_scores.sum()
-
-                    # Gradient w.r.t. pred_x0 with clipping
-                    if total_energy.requires_grad and pred_x0_for_grad.requires_grad:
-                        grad = torch.autograd.grad(total_energy, pred_x0_for_grad, allow_unused=True)[0]
-                        if grad is None:
-                            grad = torch.zeros_like(pred_x0_for_grad)
-                        grad = grad.detach().to(dtype=torch.float32)
-                        grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                        max_norm = self.energy_grad_clip_norm
-                        grad = grad * torch.clamp(max_norm / grad_norm, max=1.0)
-                    else:
-                        grad = torch.zeros_like(pred_x0_for_grad)
-
-                # Correct pred_x0, then DDIM step
-                pred_x0_corrected = torch.cat([
-                    pred_x0.float() - self.guidance_scale * grad,
-                    route_pred_norm.float(),
-                ], dim=2)
-                poses_cls = None
-            else:
-                with torch.no_grad():
-                    pass1_shared = None
-                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
-                        pass1_shared = self.model.forward_ego(
-                            x_t=x_input,
-                            x_t_abs=x_t_abs,
-                            timestep=t_tensor,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            bev_proj_cached=bev_proj,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
-                            return_intermediates=True,
-                        )
-                        poses_reg = pass1_shared['poses_reg']
-                        route_pred = pass1_shared['route_pred']
-                        speed_pred = pass1_shared['speed_pred']
-                        speed_profile_pred = pass1_shared['speed_profile_pred']
-                    else:
-                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-                            x_t=x_input,
-                            x_t_abs=x_t_abs,
-                            timestep=t_tensor,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            bev_proj_cached=bev_proj,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
-                        )
-                    pass1_trajectory = self.norm_to_abs(poses_reg.detach())
-                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
-                        route_pred_abs = self.route_norm_to_abs(route_pred.detach())
-                        branch_speed_ref = (
-                            self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
-                            if speed_pred is not None else
-                            ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
-                        )
-                        stage1_raw_scores = None
-                        if pass1_shared is not None:
-                            stage1_speed_samples = self._build_local_phase_energy_samples(
-                                branch_speed_ref.detach(), device, model_dtype
-                            )
-                            stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
-                                traj_out=pass1_shared['traj_out'],
-                                route_out=pass1_shared['route_out'],
-                                speed_out=pass1_shared['speed_out'],
-                                route_points=pass1_shared['route_points'],
-                                conditioning=pass1_shared['conditioning'],
-                                speed_samples=stage1_speed_samples,
-                            )
-                        traj_branch_condition_probs, traj_branch_condition_details = self._infer_traj_branch_condition(
-                            stage1_raw_scores=stage1_raw_scores,
-                            speed_ref=branch_speed_ref.detach(),
-                            borrow_time_s=borrow_time_s,
-                            prev_relation_probs=prev_relation_probs,
-                            device=device,
-                            model_dtype=model_dtype,
-                        )
-                        (
-                            traj_branch_condition_probs,
-                            traj_branch_condition_details,
-                            phase_go_smoothing_debug,
-                            phase_go_smoothing_history_just_updated,
-                        ) = self._apply_phase_go_smoothing_override(
-                            traj_branch_condition_probs,
-                            traj_branch_condition_details,
-                            update_history=not phase_go_smoothing_history_updated,
-                            device=device,
-                            model_dtype=model_dtype,
-                        )
-                        phase_go_smoothing_history_updated = (
-                            phase_go_smoothing_history_updated
-                            or phase_go_smoothing_history_just_updated
-                        )
-                        branch_schedule = self._build_traj_condition_schedule(
-                            t_tensor, device=device, model_dtype=model_dtype
-                        )
-                        branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
-                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-                            x_t=x_input,
-                            x_t_abs=x_t_abs,
-                            timestep=t_tensor,
-                            transfuser_bev_feature=transfuser_bev_feature,
-                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                            ego_status=ego_status,
-                            bev_proj_cached=bev_proj,
-                            transfuser_lidar_bev=transfuser_lidar_bev,
-                            branch_condition=branch_input,
-                            branch_condition_scale=self.traj_branch_condition_scale,
-                            branch_condition_schedule=branch_schedule,
-                        )
-                energy_scores = None
-                pred_x0_corrected = torch.cat([
-                    poses_reg.float(),
-                    route_pred.unsqueeze(1).float(),
-                ], dim=2)
+                    traj_branch_condition_probs, traj_branch_condition_details = self._infer_traj_branch_condition(
+                        stage1_raw_scores=stage1_raw_scores,
+                        speed_ref=branch_speed_ref.detach(),
+                        borrow_time_s=borrow_time_s,
+                        prev_relation_probs=prev_relation_probs,
+                        device=device,
+                        model_dtype=model_dtype,
+                    )
+                    (
+                        traj_branch_condition_probs,
+                        traj_branch_condition_details,
+                        phase_go_smoothing_debug,
+                        phase_go_smoothing_history_just_updated,
+                    ) = self._apply_phase_go_smoothing_override(
+                        traj_branch_condition_probs,
+                        traj_branch_condition_details,
+                        update_history=not phase_go_smoothing_history_updated,
+                        device=device,
+                        model_dtype=model_dtype,
+                    )
+                    phase_go_smoothing_history_updated = (
+                        phase_go_smoothing_history_updated
+                        or phase_go_smoothing_history_just_updated
+                    )
+                    branch_schedule = self._build_traj_condition_schedule(
+                        t_tensor, device=device, model_dtype=model_dtype
+                    )
+                    branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
+                    poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                        x_t=x_input,
+                        x_t_abs=x_t_abs,
+                        timestep=t_tensor,
+                        transfuser_bev_feature=transfuser_bev_feature,
+                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                        ego_status=ego_status,
+                        bev_proj_cached=bev_proj,
+                        transfuser_lidar_bev=transfuser_lidar_bev,
+                        branch_condition=branch_input,
+                        branch_condition_scale=self.traj_branch_condition_scale,
+                        branch_condition_schedule=branch_schedule,
+                    )
+            energy_scores = None
+            pred_x0_corrected = torch.cat([
+                poses_reg.float(),
+                route_pred.unsqueeze(1).float(),
+            ], dim=2)
 
             # ========== DDIM Step with corrected pred_x0 ==========
             alpha_t = alphas_cumprod[t_cur]

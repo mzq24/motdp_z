@@ -1689,7 +1689,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
         super().__init__()
 
         self.anchor_free = anchor_free
-        self.energy_heads_enabled = energy_heads
 
         if n_obs_steps is None:
             n_obs_steps = horizon
@@ -1709,16 +1708,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.use_condition_group_dropout = use_condition_group_dropout
         self.use_chase_front_following_state = bool(use_chase_front_following_state)
         
-        # ========== Anchor Embedding ==========
-        # Encode full noisy trajectory shape per mode (not just mean point) to preserve
-        # mode identity under multi-step denoising.
+        # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
-        self.anchor_embed_dim = horizon * self.anchor_pos_hidden_dim
-        self.anchor_emb = nn.Sequential(
-            nn.Linear(self.anchor_embed_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
         self.wp_emb = nn.Sequential(
             nn.Linear(self.anchor_pos_hidden_dim, n_emb),
             nn.SiLU(),
@@ -1730,21 +1721,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(n_emb, n_emb),
         )
 
-        # Learnable mode queries for each anchor (energy training uses all num_modes)
-        self.mode_queries = nn.Parameter(torch.randn(1, num_modes, n_emb))
         # Dedicated diffusion mode query (single-mode denoising in Route B)
         self.diff_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
         self.route_diff_query = nn.Parameter(torch.randn(1, 1, n_emb))
-        # Dedicated GT mode query (unified training: GT slot in energy evaluation)
-        self.gt_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
-        # Extra learnable query for VLM anchor (33rd mode), used when use_vqa_anchor=True
-        self.vqa_mode_query = nn.Parameter(torch.randn(1, 1, n_emb))
-
-        # Semantic behavior conditioning (optional)
-        self.num_behaviors = num_behaviors
-        if num_behaviors > 0:
-            self.behavior_emb = nn.Embedding(num_behaviors, n_emb)
-            self.allowed_emb = nn.Embedding(2, n_emb)  # 0=forbidden, 1=allowed
 
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
@@ -1868,173 +1847,145 @@ class TransformerForDiffusion(ModuleAttrMixin):
             num_heads=n_head,
         )
 
-        # Classification head: (B, num_modes, n_emb) -> (B, num_modes)
-        self.cls_head = nn.Sequential(
-            nn.Linear(n_emb, n_emb // 2),
+        self.shared_stage1_route_geom_proj = nn.Sequential(
+            nn.Linear(self.num_waypoints * self.output_dim, n_emb),
             nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.shared_stage1_pool_attn = nn.MultiheadAttention(
+            embed_dim=n_emb,
+            num_heads=n_head,
+            batch_first=True,
+        )
+        self.shared_stage1_pool_norm = nn.LayerNorm(n_emb)
+        self.shared_stage1_traj_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
+        self.shared_stage1_route_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
+        self.shared_stage1_neck = nn.Sequential(
+            nn.Linear(5 * n_emb, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+            nn.LayerNorm(n_emb),
+        )
+        self.shared_stage1_speed_query_proj = nn.Sequential(
+            nn.Linear(1, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.shared_stage1_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
+        self.shared_stage1_query_attn = nn.MultiheadAttention(
+            embed_dim=n_emb,
+            num_heads=n_head,
+            batch_first=True,
+        )
+        self.shared_stage1_query_norm = nn.LayerNorm(n_emb)
+
+        def _make_shared_stage1_scalar_head(out_dim: int = 1):
+            return nn.Sequential(
+                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, out_dim),
+            )
+
+        self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+        self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.shared_stage1_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
+        self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+        self.shared_stage1_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
+        self.shared_stage1_chase_has_lead_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_chase_speed_max_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_junction_go_min_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_borrow_yld_max_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_borrow_go_min_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_conflict_area_head = nn.Sequential(
+            nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
             nn.Linear(n_emb // 2, 1),
         )
 
-        # Energy evaluator heads (Route B: evaluate pred_x0 + scene context)
-        # Input: concat(pred_x0_flat, mode_out) = (B, M, horizon*output_dim + n_emb)
-        #   - pred_x0_flat: trajectory being evaluated (gradient flows back for guidance)
-        #   - mode_out: scene context from BEV attention + ego status (provides scene understanding)
-        # 6 heads: front/left/right (vehicle collision by direction), pedestrian, offroad, route
-        if energy_heads:
-            energy_in_dim = self.horizon * self.output_dim + n_emb  # T*2 + n_emb
-            def _make_energy_head():
-                return nn.Sequential(
-                    nn.Linear(energy_in_dim, n_emb // 2), nn.SiLU(),
-                    nn.Linear(n_emb // 2, 1),
-                )
-            self.energy_front_head      = _make_energy_head()  # vehicle collision front (label 1)
-            self.energy_left_head       = _make_energy_head()  # vehicle collision left  (label 2)
-            self.energy_right_head      = _make_energy_head()  # vehicle collision right (label 3)
-            self.energy_pedestrian_head = _make_energy_head()  # pedestrian collision    (label 4)
-            self.energy_offroad_head    = _make_energy_head()  # off_road/sidewalk       (label 5-6)
-            self.energy_route_head      = _make_energy_head()  # route deviation (continuous, computed in policy)
-            self.front_route_risk_head  = _make_energy_head()  # route-conditioned front risk (GT/pred_x0 path)
-
-            self.shared_stage1_route_geom_proj = nn.Sequential(
-                nn.Linear(self.num_waypoints * self.output_dim, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            # Shared main-path semantic neck (shared path v1)
-            self.shared_stage1_pool_attn = nn.MultiheadAttention(
-                embed_dim=n_emb,
-                num_heads=n_head,
-                batch_first=True,
-            )
-            self.shared_stage1_pool_norm = nn.LayerNorm(n_emb)
-            self.shared_stage1_traj_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
-            self.shared_stage1_route_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
-            self.shared_stage1_neck = nn.Sequential(
-                nn.Linear(5 * n_emb, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-                nn.LayerNorm(n_emb),
-            )
-            self.shared_stage1_speed_query_proj = nn.Sequential(
-                nn.Linear(1, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.shared_stage1_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
-            self.shared_stage1_query_attn = nn.MultiheadAttention(
-                embed_dim=n_emb,
-                num_heads=n_head,
-                batch_first=True,
-            )
-            self.shared_stage1_query_norm = nn.LayerNorm(n_emb)
-
-            def _make_shared_stage1_scalar_head(out_dim: int = 1):
-                return nn.Sequential(
-                    nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
-                    nn.Linear(n_emb // 2, out_dim),
-                )
-
-            self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
-            self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.shared_stage1_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
-            self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
-            self.shared_stage1_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
-            self.shared_stage1_chase_has_lead_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_chase_speed_max_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_junction_go_min_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_borrow_yld_max_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_borrow_go_min_head = _make_shared_stage1_scalar_head()
-            self.shared_stage1_conflict_area_head = nn.Sequential(
-                nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1),
-            )
-
-            # Semantic-state transition head: offline previous semantic tokens
-            # plus current decoder context predict the current semantic state.
-            self.semantic_transition_num_slots = 8
-            self.semantic_transition_slot_embed = nn.Parameter(
-                torch.randn(1, self.semantic_transition_num_slots, n_emb)
-            )
-            self.semantic_transition_prev_valid_proj = nn.Sequential(
-                nn.Linear(1, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.semantic_transition_family_embed = nn.Embedding(4, n_emb)
-            self.semantic_transition_dir_embed = nn.Embedding(4, n_emb)
-            self.semantic_transition_status_embed = nn.Embedding(4, n_emb)
-            self.semantic_transition_decision_embed = nn.Embedding(3, n_emb)
-            self.semantic_transition_control_embed = nn.Embedding(5, n_emb)
-            self.semantic_transition_area_proj = nn.Sequential(
-                nn.Linear(self.num_waypoints, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.semantic_transition_tempocc_proj = nn.Sequential(
-                nn.Linear(2 * 13, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.semantic_transition_opportunity_proj = nn.Sequential(
-                nn.Linear(3, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.semantic_transition_timing_proj = nn.Sequential(
-                nn.Linear(4, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.semantic_transition_boundary_proj = nn.Sequential(
-                nn.Linear(6, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            self.semantic_transition_chase_proj = nn.Sequential(
-                nn.Linear(2, n_emb),
-                nn.SiLU(),
-                nn.Linear(n_emb, n_emb),
-            )
-            transition_layer = nn.TransformerEncoderLayer(
-                d_model=n_emb,
-                nhead=n_head,
-                dim_feedforward=4 * n_emb,
-                dropout=p_drop_emb,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True,
-            )
-            self.semantic_transition_encoder = nn.TransformerEncoder(
-                transition_layer,
-                num_layers=1,
-            )
-            self.semantic_transition_norm = nn.LayerNorm(n_emb)
-            self.semantic_transition_window_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.semantic_transition_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.semantic_transition_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
-            self.semantic_transition_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.semantic_transition_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
-            self.semantic_transition_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
-            self.semantic_transition_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
-            self.semantic_transition_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
-            self.semantic_transition_chase_has_lead_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_chase_speed_max_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_merge_yld_max_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_merge_go_min_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_junction_yld_max_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_junction_go_min_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_borrow_yld_max_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_borrow_go_min_head = _make_shared_stage1_scalar_head()
-            self.semantic_transition_conflict_area_head = nn.Sequential(
-                nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, 1),
-            )
+        # Semantic-state transition head: offline previous semantic tokens
+        # plus current decoder context predict the current semantic state.
+        self.semantic_transition_num_slots = 8
+        self.semantic_transition_slot_embed = nn.Parameter(
+            torch.randn(1, self.semantic_transition_num_slots, n_emb)
+        )
+        self.semantic_transition_prev_valid_proj = nn.Sequential(
+            nn.Linear(1, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_transition_family_embed = nn.Embedding(4, n_emb)
+        self.semantic_transition_dir_embed = nn.Embedding(4, n_emb)
+        self.semantic_transition_status_embed = nn.Embedding(4, n_emb)
+        self.semantic_transition_decision_embed = nn.Embedding(3, n_emb)
+        self.semantic_transition_control_embed = nn.Embedding(5, n_emb)
+        self.semantic_transition_area_proj = nn.Sequential(
+            nn.Linear(self.num_waypoints, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_transition_tempocc_proj = nn.Sequential(
+            nn.Linear(2 * 13, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_transition_opportunity_proj = nn.Sequential(
+            nn.Linear(3, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_transition_timing_proj = nn.Sequential(
+            nn.Linear(4, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_transition_boundary_proj = nn.Sequential(
+            nn.Linear(6, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_transition_chase_proj = nn.Sequential(
+            nn.Linear(2, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        transition_layer = nn.TransformerEncoderLayer(
+            d_model=n_emb,
+            nhead=n_head,
+            dim_feedforward=4 * n_emb,
+            dropout=p_drop_emb,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.semantic_transition_encoder = nn.TransformerEncoder(
+            transition_layer,
+            num_layers=1,
+        )
+        self.semantic_transition_norm = nn.LayerNorm(n_emb)
+        self.semantic_transition_window_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.semantic_transition_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.semantic_transition_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+        self.semantic_transition_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.semantic_transition_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
+        self.semantic_transition_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+        self.semantic_transition_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
+        self.semantic_transition_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
+        self.semantic_transition_chase_has_lead_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_chase_speed_max_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_merge_yld_max_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_merge_go_min_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_junction_yld_max_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_junction_go_min_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_borrow_yld_max_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_borrow_go_min_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_conflict_area_head = nn.Sequential(
+            nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
+            nn.Linear(n_emb // 2, 1),
+        )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -2113,7 +2064,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         for name in param_dict:
             if 'pos_emb' in name or '_dummy_variable' in name or 'segment_emb' in name:
                 no_decay.add(name)
-            elif 'route_queries' in name or 'pool_query' in name or 'mode_queries' in name or 'route_diff_query' in name or 'speed_query' in name:
+            elif 'route_queries' in name or 'pool_query' in name or 'route_diff_query' in name or 'speed_query' in name:
                 no_decay.add(name)
             elif 'gating_factor' in name:
                 no_decay.add(name)
@@ -2206,14 +2157,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         return dropped
 
-    def _embed_trajectory(self, traj_abs: torch.Tensor) -> torch.Tensor:
-        """Trajectory-level embedding: (B, M, T, 2) -> (B, M, n_emb)."""
-        anchor_pos_embed = gen_sineembed_for_position(
-            traj_abs, hidden_dim=self.anchor_pos_hidden_dim
-        )
-        anchor_pos_embed = anchor_pos_embed.flatten(-2)
-        return self.anchor_emb(anchor_pos_embed)
-
     def _embed_waypoint_tokens(self, traj_abs: torch.Tensor) -> torch.Tensor:
         """Waypoint-level embedding for ego path: (B, T, 2) -> (B, T, n_emb)."""
         wp_pos_embed = gen_sineembed_for_position(
@@ -2227,18 +2170,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_abs, hidden_dim=self.anchor_pos_hidden_dim
         )
         return self.route_wp_emb(route_pos_embed)
-
-    def _compute_energy_scores(self, energy_input: torch.Tensor, include_route: bool = True) -> dict:
-        energy_scores = {
-            'front': self.energy_front_head(energy_input).squeeze(-1),
-            'left': self.energy_left_head(energy_input).squeeze(-1),
-            'right': self.energy_right_head(energy_input).squeeze(-1),
-            'pedestrian': self.energy_pedestrian_head(energy_input).squeeze(-1),
-            'offroad': self.energy_offroad_head(energy_input).squeeze(-1),
-        }
-        if include_route and hasattr(self, 'energy_route_head'):
-            energy_scores['route'] = self.energy_route_head(energy_input).squeeze(-1)
-        return energy_scores
 
     def _attn_pool_stage1_tokens(
         self,
@@ -2524,95 +2455,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             prev_state=prev_state,
         )
 
-    def _forward_traj_energy_context(
-        self,
-        x_t: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        behavior_labels: Optional[torch.Tensor] = None,
-        allowed_flags: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Shared trajectory-context builder for energy-style heads."""
-        model_dtype = next(self.parameters()).dtype
-        device = next(self.parameters()).device
-
-        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
-        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
-        ego_status = ego_status.to(device=device, dtype=model_dtype)
-        if route_points is not None:
-            route_points = route_points.contiguous().to(device=device, dtype=model_dtype)
-        if transfuser_lidar_bev is not None:
-            transfuser_lidar_bev = transfuser_lidar_bev.contiguous().to(device=device, dtype=model_dtype)
-        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
-
-        B, M, _, _ = bev_traj_points.shape
-        conditioning, _, route_conditioning = self._compute_conditioning(
-            timestep, ego_status, device, model_dtype
-        )
-
-        traj_emb = self._embed_trajectory(bev_traj_points)
-        if M == 1:
-            mode_queries = self.diff_mode_query.expand(B, -1, -1)
-        elif M <= self.mode_queries.shape[1]:
-            mode_queries = self.mode_queries[:, :M, :].expand(B, -1, -1)
-        elif M == self.mode_queries.shape[1] + 1:
-            anchor_queries = self.mode_queries.expand(B, -1, -1)
-            gt_queries = self.gt_mode_query.expand(B, -1, -1)
-            mode_queries = torch.cat([anchor_queries, gt_queries], dim=1)
-        else:
-            raise ValueError(f"Unsupported energy mode count M={M}, expected <= {self.mode_queries.shape[1] + 1}")
-
-        mode_emb = traj_emb + mode_queries + conditioning.unsqueeze(1)
-        if self.num_behaviors > 0 and behavior_labels is not None and allowed_flags is not None:
-            behavior_emb = self.behavior_emb(behavior_labels.to(device))
-            allowed_emb = self.allowed_emb(allowed_flags.long().to(device))
-            mode_emb = mode_emb + behavior_emb + allowed_emb
-
-        mode_emb = self.pre_decoder_norm(self.drop(mode_emb))
-        route_emb = None
-        if route_points is not None:
-            if route_points.dim() != 3:
-                raise ValueError(
-                    f"_forward_traj_energy_context expects route_points as (B, T_route, 2), got {route_points.shape}"
-                )
-            if route_points.shape[1] != self.num_waypoints:
-                raise ValueError(
-                    f"_forward_traj_energy_context expects T_route={self.num_waypoints}, got {route_points.shape[1]}"
-                )
-            route_wp_emb = self._embed_route_waypoint_tokens(route_points)
-            route_diff_query = self.route_diff_query.expand(B, route_points.shape[1], -1)
-            route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
-            route_emb = self.pre_decoder_norm(self.drop(route_emb))
-
-        mode_out, route_out, _ = self.decoder(
-            traj_emb=mode_emb,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            conditioning=conditioning,
-            traj_points=bev_traj_points,
-            route_emb=route_emb,
-            route_points=route_points,
-            timesteps=timestep,
-            route_conditioning=route_conditioning,
-            bev_proj_cached=bev_proj_cached,
-            route_pos_offset=M,
-            spatial_mode="anchor",
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
-
-        eval_traj = traj_for_energy if traj_for_energy is not None else bev_traj_points
-        eval_traj_flat = eval_traj.flatten(-2)
-        energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)
-        return energy_input, mode_out, route_out
-
     def forward_ego(
         self,
         x_t: torch.Tensor,
@@ -2829,290 +2671,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             return result
 
         return poses_reg, route_pred, traj_out, conditioning, speed_pred, speed_profile_pred
-
-    def forward_energy(
-        self,
-        x_t: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        behavior_labels: Optional[torch.Tensor] = None,
-        allowed_flags: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[dict, torch.Tensor]:
-        """
-        Trajectory-level energy path. Anchors/GT remain 1 token per trajectory.
-        Route is context only; route-token energies are not produced here.
-        """
-        energy_input, mode_out, _ = self._forward_traj_energy_context(
-            x_t=x_t,
-            x_t_abs=x_t_abs,
-            timestep=timestep,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=traj_for_energy,
-            behavior_labels=behavior_labels,
-            allowed_flags=allowed_flags,
-            bev_proj_cached=bev_proj_cached,
-            route_points=route_points,
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
-        return self._compute_energy_scores(energy_input, include_route=False), mode_out
-
-    def forward_front_route_risk(
-        self,
-        x_t: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Independent route-conditioned front-risk path for GT/pred_x0 evaluation."""
-        energy_input, mode_out, _ = self._forward_traj_energy_context(
-            x_t=x_t,
-            x_t_abs=x_t_abs,
-            timestep=timestep,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=traj_for_energy,
-            bev_proj_cached=bev_proj_cached,
-            route_points=route_points,
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
-        return self.front_route_risk_head(energy_input).squeeze(-1), mode_out
-
-    def forward_energy_eval(
-        self,
-        x_t: torch.Tensor,
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[dict, torch.Tensor]:
-        """
-        Guidance/alignment energy evaluation on a single predicted trajectory.
-        """
-        B = x_t.shape[0]
-        timestep = torch.zeros(B, dtype=torch.long, device=x_t.device)
-        return self.forward_energy(
-            x_t=x_t,
-            x_t_abs=x_t_abs,
-            timestep=timestep,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=traj_for_energy,
-            bev_proj_cached=bev_proj_cached,
-            route_points=route_points,
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
-
-    def forward_front_route_risk_eval(
-        self,
-        x_t: torch.Tensor,
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        bev_proj_cached: Optional[torch.Tensor] = None,
-        route_points: Optional[torch.Tensor] = None,
-        transfuser_lidar_bev: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Guidance/alignment evaluation for the independent front-route-risk head."""
-        B = x_t.shape[0]
-        timestep = torch.zeros(B, dtype=torch.long, device=x_t.device)
-        return self.forward_front_route_risk(
-            x_t=x_t,
-            x_t_abs=x_t_abs,
-            timestep=timestep,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            ego_status=ego_status,
-            traj_for_energy=traj_for_energy,
-            bev_proj_cached=bev_proj_cached,
-            route_points=route_points,
-            transfuser_lidar_bev=transfuser_lidar_bev,
-        )
-    
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
-        transfuser_bev_feature: torch.Tensor,
-        transfuser_bev_feature_upsample: torch.Tensor,
-        ego_status: torch.Tensor,
-        x_t_abs: Optional[torch.Tensor] = None,
-        behavior_labels: torch.Tensor = None,
-        allowed_flags: torch.Tensor = None,
-        traj_for_energy: Optional[torch.Tensor] = None,
-        **kwargs
-    ):
-        """
-        Multimodal forward pass for trajectory prediction.
-
-        Args:
-            x_t: (B, num_modes, anchor_num_points, 2) - current denoising trajectory in normalized space
-            timestep: diffusion timestep (for conditioning, can be 0 at inference)
-            transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature from transfuser
-            transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upsampled BEV for spatial attention
-            ego_status: (B, T_obs, status_dim) - ego status history
-            x_t_abs: (B, num_modes, anchor_num_points, 2) - current denoising trajectory in absolute coords for BEV grid_sample.
-                     If None, uses `x_t` directly (backward compatible).
-            traj_for_energy: (B, M, T, 2) optional - trajectory for energy head evaluation.
-                     Training: original anchor coords (labels match these, not model output).
-                     Inference: pred_x0 from first forward pass (gradient flows back for guidance).
-                     If None, uses poses_reg (model output).
-
-        Returns:
-            poses_reg: (B, num_modes, horizon, 2) - trajectory predictions for each mode.
-                      Output space follows residual base:
-                      - absolute space if x_t_abs is provided
-                      - normalized space otherwise (backward compatibility)
-            poses_cls: (B, num_modes) - classification logits for mode selection
-            route_pred: (B, num_waypoints, 2) - route prediction
-        """
-        model_dtype = next(self.parameters()).dtype
-        device = next(self.parameters()).device
-
-        x_t = x_t.contiguous().to(device=device, dtype=model_dtype)
-        transfuser_bev_feature = transfuser_bev_feature.contiguous().to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(device=device, dtype=model_dtype)
-        ego_status = ego_status.to(device=device, dtype=model_dtype)
-
-        # BEV sampling uses absolute coords; fallback to x_t for backward compat
-        bev_traj_points = x_t_abs.contiguous().to(device=device, dtype=model_dtype) if x_t_abs is not None else x_t
-
-        B = x_t.shape[0]
-        num_modes = x_t.shape[1]
-        anchor_num_points = x_t.shape[2]
-        
-        # ========== Timestep handling ==========
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], dtype=torch.long, device=device)
-        elif len(timestep.shape) == 0:
-            timestep = timestep[None].to(device)
-        timesteps = timestep.expand(B)
-        
-        # ========== Conditioning ==========
-        conditioning, current_status, route_conditioning = self._compute_conditioning(
-            timestep, ego_status, device, model_dtype
-        )
-        
-        # ========== Anchor Embedding ==========
-        # Encode full trajectory geometry for each mode:
-        # (B, M, T, 2) -> sine embed (B, M, T, 64) -> flatten (B, M, T*64) -> (B, M, n_emb)
-        anchor_pos_embed = gen_sineembed_for_position(
-            bev_traj_points, hidden_dim=self.anchor_pos_hidden_dim
-        )
-        anchor_pos_embed = anchor_pos_embed.flatten(-2)  # (B, M, T * 64)
-        anchor_emb = self.anchor_emb(anchor_pos_embed.to(dtype=model_dtype))
-
-        # Add learnable mode queries (select based on input M)
-        M = anchor_emb.shape[1]
-        M_anchor = self.mode_queries.shape[1]  # num_energy_modes (e.g. 32)
-        if M == 1 and self.anchor_free:
-            # Single-mode diffusion denoising: use dedicated diff_mode_query
-            mode_queries = self.diff_mode_query.expand(B, -1, -1)
-        elif self.anchor_free and M == M_anchor + 2:
-            # Unified training: M = 1 (x_t) + M_anchor (32) + 1 (GT) = 34
-            # Build each block separately to preserve native parameter strides for DDP.
-            diff_queries = self.diff_mode_query.expand(B, -1, -1)
-            anchor_queries = self.mode_queries.expand(B, -1, -1)
-            gt_queries = self.gt_mode_query.expand(B, -1, -1)
-            mode_queries = torch.cat([diff_queries, anchor_queries, gt_queries], dim=1)
-        elif M > M_anchor:
-            if M != M_anchor + 1:
-                raise ValueError(f"Unsupported mode count M={M}, expected <= {M_anchor + 2}")
-            # VLM anchor added: concatenate vqa_mode_query for the extra mode.
-            anchor_queries = self.mode_queries.expand(B, -1, -1)
-            vqa_queries = self.vqa_mode_query.expand(B, -1, -1)
-            mode_queries = torch.cat([anchor_queries, vqa_queries], dim=1)
-        else:
-            mode_queries = self.mode_queries[:, :M, :].expand(B, -1, -1)
-
-        # Combine: anchor embedding + mode queries + conditioning
-        mode_emb = anchor_emb + mode_queries + conditioning.unsqueeze(1)  # (B, num_modes, n_emb)
-
-        # Add semantic behavior conditioning (if available)
-        if self.num_behaviors > 0 and behavior_labels is not None:
-            behavior_emb = self.behavior_emb(behavior_labels.to(device))  # (B, num_modes, n_emb)
-            allowed_emb = self.allowed_emb(allowed_flags.long().to(device))  # (B, num_modes, n_emb)
-            mode_emb = mode_emb + behavior_emb + allowed_emb
-
-        mode_emb = self.drop(mode_emb)
-        mode_emb = self.pre_decoder_norm(mode_emb)
-
-        # ========== UnifiedDecoderOnlyTransformer ==========
-        # traj_emb = mode_emb (B, num_modes, n_emb) - each mode is one "trajectory query"
-        # traj_points = bev_traj_points (B, num_modes, horizon, 2) - each mode samples BEV at its waypoints
-        # The decoder internally builds route_queries and returns (mode_out, route_out)
-        mode_out, route_out = self.decoder(
-            traj_emb=mode_emb,
-            transfuser_bev_feature=transfuser_bev_feature,
-            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            conditioning=conditioning,
-            traj_points=bev_traj_points,  # (B, num_modes, horizon, 2) absolute coords for grid_sample
-            route_conditioning=route_conditioning,
-        )
-        # mode_out: (B, num_modes, n_emb), route_out: (B, num_waypoints, n_emb)
-        
-        # ========== Output Heads ==========
-        # 1. Trajectory regression: (B, num_modes, n_emb) -> (B, num_modes, horizon * 2)
-        traj_flat = self.trajectory_head(mode_out, conditioning, route_features=route_out)  # (B, num_modes, horizon * output_dim)
-        poses_reg = traj_flat.view(B, num_modes, self.horizon, self.output_dim)  # (B, num_modes, horizon, 2)
-        
-        assert anchor_num_points == self.horizon, \
-            f"anchor_num_points ({anchor_num_points}) must equal horizon ({self.horizon})."
-
-        # Add anchor as residual (skip in anchor-free mode where model predicts absolute)
-        if not self.anchor_free:
-            residual_base = bev_traj_points
-            poses_reg = poses_reg + residual_base
-        
-        # 2. Classification: (B, num_modes, n_emb) -> (B, num_modes, 1) -> (B, num_modes)
-        poses_cls = self.cls_head(mode_out).squeeze(-1)  # (B, num_modes)
-
-        # 3. Route prediction from unified decoder output
-        route_pred = self.route_head(route_out, conditioning, current_status)  # (B, num_waypoints, 2)
-
-        # 4. Energy scores (Route B: evaluate trajectory + scene context)
-        #    traj_for_energy: the trajectory to evaluate (anchor coords for training, pred_x0 for inference)
-        #    mode_out: scene context from BEV attention (computed from the evaluated trajectory's path)
-        #    At inference, gradient of energy w.r.t. traj_for_energy flows back for guidance.
-        if self.energy_heads_enabled:
-            # Use external trajectory if provided (training: original anchors), else model output (inference)
-            eval_traj = traj_for_energy if traj_for_energy is not None else poses_reg
-            eval_traj_flat = eval_traj.flatten(-2)  # (B, M, horizon * 2)
-            energy_input = torch.cat([eval_traj_flat, mode_out], dim=-1)  # (B, M, T*2 + n_emb)
-            energy_scores = {
-                'front':      self.energy_front_head(energy_input).squeeze(-1),      # (B, M) vehicle front
-                'left':       self.energy_left_head(energy_input).squeeze(-1),       # (B, M) vehicle left
-                'right':      self.energy_right_head(energy_input).squeeze(-1),      # (B, M) vehicle right
-                'pedestrian': self.energy_pedestrian_head(energy_input).squeeze(-1), # (B, M) pedestrian
-                'offroad':    self.energy_offroad_head(energy_input).squeeze(-1),    # (B, M) offroad
-                'route':      self.energy_route_head(energy_input).squeeze(-1),      # (B, M) route deviation
-            }
-            return poses_reg, poses_cls, route_pred, mode_out, energy_scores
-
-        return poses_reg, poses_cls, route_pred, mode_out
-
 
 # =============================================================================
 # Test

@@ -1,6 +1,6 @@
 from training.train_carla_bev import validate_model, create_carla_config
 from dataset.generate_pdm_dataset import CARLAImageDataset
-from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
+from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
 from torch.utils.data import DataLoader
 import torch
 import os
@@ -34,7 +34,7 @@ action_stats = {
     'mean': torch.tensor([2.3079, 0.0188]),
     'std': torch.tensor([3.7443, 0.6994]),
 }
-policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats)
+policy = AnnealedEnergyGuidancePolicy(config)
 
 
 from time import time

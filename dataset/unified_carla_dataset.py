@@ -170,11 +170,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  dataset_path: str,
                  image_data_root: str,
                  mode: str = 'train',        # train or val
-                 anchor_centers_abs: np.ndarray = None,  # (num_modes, num_points, 2)
-                 semantic_behavior_cfg: dict = None,      # semantic behavior config
                  skip_memmap: bool = False,   # True for val: skip memmap, use inject_ram_features() later
                  use_per_frame: bool = False, # True for local SSD: load individual .pt files directly (no pack/memmap)
-                 use_vqa_anchor: bool = False, # True to load VLM-predicted anchor from dp_vl_feature/*.pt
                  cache_dir: str = None,       # Override memmap cache dir (e.g. /tmp/tmp_data for tmpfs)
                  feature_suffix: str = '',    # Suffix for feature files (e.g. 'ensemble' → bev_features_fp16_ensemble.bin)
                  gps_noise_cfg: dict = None,  # GPS noise augmentation config
@@ -198,7 +195,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._route_pack_cache_maxsize = 32
         self._ram_features = None    # dict: abs_idx -> (feat_tensor, ups_tensor), set by preload_to_ram()
         self._use_per_frame = use_per_frame  # Local SSD mode: read individual .pt files
-        self._use_vqa_anchor = use_vqa_anchor  # Load VLM anchor from dp_vl_feature
         self._load_transfuser_lidar_bev = load_transfuser_lidar_bev
         self._lidar_history_frames = max(int(lidar_history_frames), 1)
         self._filter_bad_routes = bool(filter_bad_routes)
@@ -209,15 +205,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
         self._route_speed_cache = {}
         self._route_speed_cache_maxsize = 64
-
-        # Semantic behavior labeling
-        self.anchor_centers_abs = anchor_centers_abs
-        self.semantic_behavior_enabled = (
-            anchor_centers_abs is not None
-            and semantic_behavior_cfg is not None
-            and semantic_behavior_cfg.get('enabled', False)
-        )
-        self.semantic_behavior_cfg = semantic_behavior_cfg or {}
 
         # GPS noise augmentation (train only)
         gps_cfg = gps_noise_cfg or {}
@@ -435,27 +422,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 print(f"[Rank {rank}] WARNING: LiDAR BEV memmap not found. "
                       f"Falling back to per-frame .npy loading. "
                       f"Run: python scripts/data_tools/build_lidar_bev_cache.py")
-
-        # ===== Pre-load VQA anchors into RAM (tiny: ~48 bytes each) =====
-        self._vqa_anchor_cache = {}  # sample_idx -> tensor (6, 2)
-        if self._use_vqa_anchor:
-            loaded = 0
-            for i, s in enumerate(tqdm(self._sample_cache, desc="Loading VQA anchors", disable=(rank != 0))):
-                feat_rel = s.get('transfuser_bev_feature', '')
-                if not feat_rel:
-                    continue
-                base_dir = os.path.dirname(os.path.dirname(feat_rel))
-                frame_str = os.path.basename(feat_rel).replace('_feature.pt', '')
-                vqa_path = os.path.join(image_data_root, base_dir, 'dp_vl_feature', f'{frame_str}.pt')
-                if os.path.exists(vqa_path):
-                    vf = torch.load(vqa_path, weights_only=True)
-                    if 'pred_traj' in vf:
-                        anchor = vf['pred_traj']
-                        if anchor.dim() == 3:
-                            anchor = anchor.squeeze(0)
-                        self._vqa_anchor_cache[i] = anchor[:6].float()
-                        loaded += 1
-            print(f"[Rank {rank}] Pre-loaded {loaded}/{len(self._sample_cache)} VQA anchors into RAM.")
 
     def get_route_batch_sampler(self, batch_size, shuffle=True, drop_last=False):
         """Return a RouteBatchSampler for this dataset."""
@@ -720,11 +686,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                         f"(n_frames={n_frames}) for {packed_path}",
                         stacklevel=2)
         
-        # Load VQA anchor from pre-loaded RAM cache (zero IO)
-        vqa_anchor_cached = None
-        if self._use_vqa_anchor:
-            vqa_anchor_cached = self._vqa_anchor_cache.get(idx)  # (6, 2) or None
-
         # Convert sample data
         final_sample = dict()
         next_speed_target_mps = sample.get('next_speed_target_mps')
@@ -749,8 +710,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 ego_waypoints = _from_numpy(sample['ego_waypoints'][1:], 'agent_pos')
                 final_sample['agent_pos'] = ego_waypoints
             elif key == 'vqa':
-                if self._use_vqa_anchor and vqa_anchor_cached is not None:
-                    final_sample['vqa_anchor'] = vqa_anchor_cached.clone()
                 continue
             elif key == 'route':
                 # Load route waypoints (expected shape: (20, 2))
@@ -769,14 +728,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample['target_point_next_hist'] = _from_numpy(value, 'target_point_next_hist')
             elif key == 'ego_status':
                 final_sample['ego_status'] = _from_numpy(value, 'ego_status')
-            elif key == 'energy_targets':
-                final_sample['energy_targets'] = _from_numpy(value, 'energy_targets')
-            elif key == 'energy_active_mask':
-                final_sample['energy_active_mask'] = _from_numpy(
-                    value.astype(np.bool_) if isinstance(value, np.ndarray) else value,
-                    'energy_active_mask',
-                    dtype=None,
-                ).bool()
+            elif key in ('energy_targets', 'energy_active_mask', 'behavior_labels', 'allowed_flags', 'scene_buckets'):
+                # Legacy anchor-energy / Route-A semantic behavior payloads are no longer consumed.
+                continue
             elif key == 'speed_sample_valid_mask':
                 final_sample['speed_sample_valid_mask'] = _from_numpy(value, 'speed_sample_valid_mask')
             elif key == 'speed_sample_exp_index':
@@ -915,13 +869,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if 'target_point_next_hist' not in final_sample:
             final_sample['target_point_next_hist'] = final_sample['target_point_hist'].clone()
 
-        # Set vqa_anchor from RAM cache (or fallback to zeros)
-        if self._use_vqa_anchor:
-            if vqa_anchor_cached is not None:
-                final_sample['vqa_anchor'] = vqa_anchor_cached.clone()
-            elif 'vqa_anchor' not in final_sample:
-                final_sample['vqa_anchor'] = torch.zeros(6, 2)
-
         _apply_stage1_near_zero_speed_snap(final_sample)
         _ensure_stage1_legacy_curve_defaults(final_sample)
 
@@ -953,118 +900,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         else:
             final_sample['transfuser_lidar_bev'] = torch.zeros(
                 self._lidar_history_frames, 2, 256, 256, dtype=torch.float16)
-
-        # ========== Semantic Behavior Labeling ==========
-        if self.semantic_behavior_enabled:
-            # Fast path: use pre-computed labels from samples_packed.pkl
-            if 'behavior_labels' in sample and 'allowed_flags' in sample:
-                bl = sample['behavior_labels']
-                af = sample['allowed_flags']
-                final_sample['behavior_labels'] = torch.from_numpy(bl).long() if isinstance(bl, np.ndarray) else torch.tensor(bl).long()
-                final_sample['allowed_flags'] = torch.from_numpy(af).float() if isinstance(af, np.ndarray) else torch.tensor(af).float()
-                if 'scene_buckets' in sample:
-                    sb = sample['scene_buckets']
-                    final_sample['scene_buckets'] = torch.from_numpy(sb).float() if isinstance(sb, np.ndarray) else torch.tensor(sb).float()
-                else:
-                    from tools.anchor_semantic_labeler import NUM_BUCKET_CATEGORIES
-                    final_sample['scene_buckets'] = torch.zeros(NUM_BUCKET_CATEGORIES, dtype=torch.float32)
-            else:
-                # Slow path: on-the-fly computation (fallback if not pre-computed)
-                from tools.anchor_semantic_labeler import label_anchors_semantic, classify_scene_buckets
-                import json, gzip
-
-                feature_rel = sample.get('transfuser_bev_feature', '')
-                base_dir = os.path.dirname(os.path.dirname(feature_rel))
-                frame_str = os.path.basename(feature_rel).replace('_feature.pt', '')
-
-                bev_rel = feature_rel.replace('transfuser_feature/', 'bev_semantics/').replace('_feature.pt', '.png')
-                bev_path = os.path.join(self.image_data_root, bev_rel)
-
-                if os.path.exists(bev_path):
-                    bev_semantic = np.array(Image.open(bev_path))
-
-                    boxes = None
-                    boxes_rel = feature_rel.replace('transfuser_feature/', 'boxes/').replace('_feature.pt', '.json.gz')
-                    boxes_path = os.path.join(self.image_data_root, boxes_rel)
-                    if os.path.exists(boxes_path):
-                        try:
-                            with gzip.open(boxes_path, 'rt') as bf:
-                                boxes = json.load(bf)
-                        except Exception:
-                            boxes = None
-
-                    measurements = None
-                    meas_rel = feature_rel.replace('transfuser_feature/', 'measurements/').replace('_feature.pt', '.json.gz')
-                    meas_path = os.path.join(self.image_data_root, meas_rel)
-                    if os.path.exists(meas_path):
-                        try:
-                            with gzip.open(meas_path, 'rt') as mf:
-                                measurements = json.load(mf)
-                        except Exception:
-                            measurements = None
-
-                    ego_matrix_current = None
-                    future_frames_data = None
-                    if measurements is not None:
-                        ego_matrix_current = measurements.get('ego_matrix', None)
-
-                    if ego_matrix_current is not None:
-                        frame_id = int(frame_str)
-                        num_points = self.anchor_centers_abs.shape[1]
-                        future_frames_data = []
-                        for k in range(1, num_points + 1):
-                            future_frame_str = f"{frame_id + k:04d}"
-                            fut_boxes_path = os.path.join(
-                                self.image_data_root, base_dir,
-                                'boxes', f'{future_frame_str}.json.gz')
-                            fut_meas_path = os.path.join(
-                                self.image_data_root, base_dir,
-                                'measurements', f'{future_frame_str}.json.gz')
-                            if os.path.exists(fut_boxes_path) and os.path.exists(fut_meas_path):
-                                try:
-                                    with gzip.open(fut_boxes_path, 'rt') as bf:
-                                        fut_boxes = json.load(bf)
-                                    with gzip.open(fut_meas_path, 'rt') as mf:
-                                        fut_meas = json.load(mf)
-                                    fut_ego_matrix = fut_meas.get('ego_matrix', None)
-                                    if fut_ego_matrix is not None:
-                                        future_frames_data.append((fut_boxes, fut_ego_matrix))
-                                    else:
-                                        future_frames_data.append(None)
-                                except Exception:
-                                    future_frames_data.append(None)
-                            else:
-                                future_frames_data.append(None)
-
-                    gt_traj = sample.get('ego_waypoints', None)
-                    if gt_traj is not None:
-                        gt_traj = gt_traj[1:]
-
-                    behavior_labels, allowed_flags, _ = label_anchors_semantic(
-                        self.anchor_centers_abs, bev_semantic,
-                        ppm=self.semantic_behavior_cfg.get('bev_ppm', 2.0),
-                        bev_size=self.semantic_behavior_cfg.get('bev_size', 256),
-                        boxes=boxes,
-                        measurements=measurements,
-                        ego_matrix_current=ego_matrix_current,
-                        future_frames_data=future_frames_data,
-                        gt_trajectory=gt_traj,
-                    )
-                    final_sample['behavior_labels'] = torch.from_numpy(behavior_labels).long()
-                    final_sample['allowed_flags'] = torch.from_numpy(allowed_flags.astype(np.float32))
-
-                    bucket_flags = classify_scene_buckets(
-                        measurements=measurements,
-                        boxes=boxes,
-                        ego_waypoints=gt_traj,
-                    )
-                    final_sample['scene_buckets'] = torch.from_numpy(bucket_flags.astype(np.float32))
-                else:
-                    n_modes = self.anchor_centers_abs.shape[0]
-                    final_sample['behavior_labels'] = torch.zeros(n_modes, dtype=torch.long)
-                    final_sample['allowed_flags'] = torch.ones(n_modes, dtype=torch.float32)
-                    from tools.anchor_semantic_labeler import NUM_BUCKET_CATEGORIES
-                    final_sample['scene_buckets'] = torch.zeros(NUM_BUCKET_CATEGORIES, dtype=torch.float32)
 
         # ========== GPS Noise Augmentation ==========
         gps_noise_applied = False

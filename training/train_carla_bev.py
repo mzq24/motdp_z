@@ -23,7 +23,6 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from collections import defaultdict
 import argparse
-import pickle
 import datetime
 from torch.distributed.elastic.multiprocessing.errors import record
 from diffusers.training_utils import EMAModel
@@ -32,7 +31,6 @@ from diffusers.training_utils import EMAModel
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
-from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
 
 
@@ -637,15 +635,7 @@ def validate_model(
                     batch[key] = batch[key].to(device, non_blocking=True)
 
             with autocast_cuda(use_amp, amp_dtype):
-                # Route B can explicitly choose unified or split-forward validation.
-                # Do not gate this on anchors: current stage1/tempocc runs are
-                # anchor-free, while the legacy compute_loss path still expects the
-                # old decoder return contract.
-                if hasattr(model_for_inference, 'compute_unified_loss') and \
-                   hasattr(model_for_inference, 'compute_split_loss'):
-                    loss_dict = model_for_inference(batch, return_loss_dict=True, phase=route_b_phase)
-                else:
-                    loss_dict = model_for_inference.compute_loss(batch)
+                loss_dict = model_for_inference(batch, return_loss_dict=True, phase=route_b_phase)
                 loss = loss_dict['total_loss']
             if rank == 0:
                 val_metrics['loss'].append(loss.item())
@@ -771,8 +761,7 @@ def validate_model(
                     if key.startswith('speed_profile_step') and key.endswith('_loss'):
                         val_metrics[key].append(value.item() if isinstance(value, torch.Tensor) else value)
                 
-                # Multimodal model: only needs bev_feature, bev_feature_upsample, ego_status
-                # No more reasoning_query_tokens or anchor needed (anchor is loaded from wp_tokens.pkl)
+                # Route B model only needs BEV/detail features plus ego status.
                 obs_dict = {
                     'transfuser_bev_feature': batch['transfuser_bev_feature'],
                     'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
@@ -781,8 +770,6 @@ def validate_model(
                 }
                 if 'borrow_cross_active_time_s' in batch:
                     obs_dict['borrow_cross_active_time_s'] = batch['borrow_cross_active_time_s']
-                if getattr(model_for_inference, 'use_vqa_anchor', False) and 'vqa_anchor' in batch:
-                    obs_dict['vqa_anchor'] = batch['vqa_anchor']
                 target_actions = batch['agent_pos']
                 
                 try:
@@ -1156,35 +1143,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     val_filter_bad_routes = config.get('dataset', {}).get('val_filter_bad_routes', True)
     train_retain_bad_routes_for_energy = config.get('dataset', {}).get('train_retain_bad_routes_for_energy', False)
     val_retain_bad_routes_for_energy = config.get('dataset', {}).get('val_retain_bad_routes_for_energy', False)
-    use_vqa_anchor = config.get('use_vqa_anchor', False)
     use_lidar_bev_detail = config.get('route_b', {}).get('use_lidar_bev_detail', False)
 
-    # Load anchor_centers_abs for semantic behavior labeling
-    policy_type = config.get('policy_type', 'anchor')  # 'anchor' (Route A) or 'anchor_free' (Route B)
-    semantic_behavior_cfg = config.get('semantic_behavior', {})
-    anchor_centers_abs = None
-    # Route B+ automatically enables semantic behavior (energy heads need labels)
-    if policy_type == 'anchor_free' and not semantic_behavior_cfg.get('enabled', False):
-        anchor_path = config.get('anchor_path', None)
-        if anchor_path and os.path.exists(anchor_path):
-            semantic_behavior_cfg = {'enabled': True}
-            if rank == 0:
-                print(f"[Route B+] Auto-enabling semantic behavior for energy head training")
-    if semantic_behavior_cfg.get('enabled', False):
-        anchor_path = config.get('anchor_path', None)
-        if anchor_path and os.path.exists(anchor_path):
-            if anchor_path.endswith('.npy'):
-                anchor_centers_abs = np.load(anchor_path)  # (M, T, 2)
-            else:
-                with open(anchor_path, 'rb') as f:
-                    anchor_data = pickle.load(f)
-                anchor_centers_abs = anchor_data['centers']  # (M, T, 2)
-            if rank == 0:
-                print(f"[Semantic Behavior] Loaded anchor centers: {anchor_centers_abs.shape}")
-        else:
-            if rank == 0:
-                print(f"[Semantic Behavior] WARNING: anchor file not found: {anchor_path}, disabling")
-            semantic_behavior_cfg = {}
+    policy_type = config.get('policy_type', 'anchor_free')
+    if policy_type != 'anchor_free':
+        raise ValueError(
+            f"This training entry is Route B-only after cleanup; expected policy_type='anchor_free', "
+            f"got {policy_type!r}."
+        )
 
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
     route_b_cfg = config.get('route_b', {})
@@ -1204,8 +1170,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     train_dataset = CARLAImageDataset(
         dataset_path=train_dataset_path, image_data_root=image_data_root,
         mode='train',
-        use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
-        anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+        use_per_frame=use_per_frame,
         cache_dir=cache_dir, feature_suffix=feature_suffix,
         gps_noise_cfg=gps_noise_cfg,
         load_transfuser_lidar_bev=use_lidar_bev_detail,
@@ -1220,8 +1185,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             dataset_path=val_dataset_path, image_data_root=image_data_root,
             mode='val',
             skip_memmap=not validation_use_memmap,
-            use_per_frame=use_per_frame, use_vqa_anchor=use_vqa_anchor,
-            anchor_centers_abs=anchor_centers_abs, semantic_behavior_cfg=semantic_behavior_cfg,
+            use_per_frame=use_per_frame,
             cache_dir=cache_dir, feature_suffix=feature_suffix,
             load_transfuser_lidar_bev=use_lidar_bev_detail,
             lidar_history_frames=lidar_history_frames,
@@ -1537,61 +1501,46 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
     if rank == 0:
         print("Initializing policy model...")
-    policy_type = config.get('policy_type', 'anchor')  # 'anchor' (Route A) or 'anchor_free' (Route B)
-    if policy_type == 'anchor_free':
-        policy = AnnealedEnergyGuidancePolicy(config).to(device)
-        if rank == 0:
-            print(f"  Policy: AnnealedEnergyGuidancePolicy (Route B+ - anchor-free)")
-        # Register normalization stats (before DDP wrapping).
-        # Route B uses strict config selection: exactly one normalization family
-        # must be specified, and checkpoint loading must not silently override it.
-        norm_mode = policy.register_norm_stats_from_config(config)
-        route_abs_stats_path = config.get('route_abs_stats_path', None)
-        if rank == 0:
-            if norm_mode == 'global_abs':
-                print(
-                    "  ✓ Global abs stats registered: "
-                    f"mean={tuple(policy.global_abs_mean.shape)}, std={tuple(policy.global_abs_std.shape)}"
-                )
-            elif norm_mode == 'abs':
-                print(
-                    "  ✓ Per-step abs stats registered: "
-                    f"mean={tuple(policy.abs_mean.shape)}, std={tuple(policy.abs_std.shape)}"
-                )
-            else:
-                print(
-                    "  ✓ Delta stats registered (legacy): "
-                    f"mean={tuple(policy.delta_mean.shape)}, std={tuple(policy.delta_std.shape)}"
-                )
-        if route_abs_stats_path:
-            route_data = np.load(route_abs_stats_path)
-            policy.register_route_abs_stats(route_data['route_abs_mean'], route_data['route_abs_std'])
-            if rank == 0:
-                print(
-                    f"  ✓ Route abs stats registered: mean={route_data['route_abs_mean'].shape}, "
-                    f"std={route_data['route_abs_std'].shape}"
-                )
+    policy_type = config.get('policy_type', 'anchor_free')
+    if policy_type != 'anchor_free':
+        raise ValueError(
+            f"This training entry is Route B-only after cleanup; expected policy_type='anchor_free', "
+            f"got {policy_type!r}."
+        )
+    policy = AnnealedEnergyGuidancePolicy(config).to(device)
+    if rank == 0:
+        print("  Policy: AnnealedEnergyGuidancePolicy (Route B semantic-state)")
+    # Register normalization stats (before DDP wrapping).
+    # Route B uses strict config selection: exactly one normalization family
+    # must be specified, and checkpoint loading must not silently override it.
+    norm_mode = policy.register_norm_stats_from_config(config)
+    route_abs_stats_path = config.get('route_abs_stats_path', None)
+    if rank == 0:
+        if norm_mode == 'global_abs':
+            print(
+                "  ✓ Global abs stats registered: "
+                f"mean={tuple(policy.global_abs_mean.shape)}, std={tuple(policy.global_abs_std.shape)}"
+            )
+        elif norm_mode == 'abs':
+            print(
+                "  ✓ Per-step abs stats registered: "
+                f"mean={tuple(policy.abs_mean.shape)}, std={tuple(policy.abs_std.shape)}"
+            )
         else:
-            raise ValueError("route_abs_stats_path is required for joint Route B ego diffusion")
-        # Register anchor trajectories for energy head training (before DDP wrapping)
-        anchor_path = config.get('anchor_path', None)
-        if anchor_path:
-            if anchor_path.endswith('.npy'):
-                anchor_centers = np.load(anchor_path)  # (M, T, 2)
-            else:
-                with open(anchor_path, 'rb') as f:
-                    anchor_data = pickle.load(f)
-                anchor_centers = anchor_data['centers']  # (M, T, 2)
-            policy.register_anchor_centers(anchor_centers)
-            if rank == 0:
-                print(f"  ✓ Anchor centers registered for energy training: {anchor_centers.shape}")
-        else:
-            if rank == 0:
-                print(f"  ⚠ No anchor_path configured — energy heads will not be trained on anchors")
+            print(
+                "  ✓ Delta stats registered (legacy): "
+                f"mean={tuple(policy.delta_mean.shape)}, std={tuple(policy.delta_std.shape)}"
+            )
+    if route_abs_stats_path:
+        route_data = np.load(route_abs_stats_path)
+        policy.register_route_abs_stats(route_data['route_abs_mean'], route_data['route_abs_std'])
+        if rank == 0:
+            print(
+                f"  ✓ Route abs stats registered: mean={route_data['route_abs_mean'].shape}, "
+                f"std={route_data['route_abs_std'].shape}"
+            )
     else:
-        policy = DiffusionDiTCarlaPolicy(config).to(device)
-        if rank == 0:
-            print(f"  Policy: DiffusionDiTCarlaPolicy (Route A - anchor-based)")
+        raise ValueError("route_abs_stats_path is required for Route B ego diffusion")
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -1674,40 +1623,12 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         lr = lr_scaled
     
     # ========== Optimizer Setup ==========
-    # Route B+: dual optimizers (GAN-style D/G isolation)
-    # Route A: single optimizer (unchanged)
-    optimizer_energy = None
     policy_for_params = policy.module if world_size > 1 else policy
     route_b_cfg = config.get('route_b', {})
     route_b_phase = 'split' if route_b_cfg.get('use_split_forward', False) else 'unified'
-
-    if policy_type == 'anchor_free':
-        # Separate stage1/state head params from decoder params.
-        energy_param_ids = set()
-        energy_params = []
-        energy_param_prefixes = (
-            'energy_front_head.',
-            'energy_left_head.',
-            'energy_right_head.',
-            'energy_pedestrian_head.',
-            'energy_offroad_head.',
-            'energy_route_head.',
-            'front_route_risk_head.',
-            'speed_energy_',
-        )
-        for param_name, p in policy_for_params.model.named_parameters():
-            if any(param_name.startswith(prefix) for prefix in energy_param_prefixes):
-                energy_param_ids.add(id(p))
-                energy_params.append(p)
-
-        diff_params = [p for p in policy_for_params.parameters() if id(p) not in energy_param_ids]
-
-        optimizer = torch.optim.AdamW(diff_params, lr=lr, weight_decay=weight_decay)
-        optimizer_energy = torch.optim.AdamW(energy_params, lr=lr, weight_decay=weight_decay)
-        if rank == 0:
-            print(f"✓ Dual optimizers: decoder ({len(diff_params)} param groups) + stage1 ({len(energy_params)} param groups)")
-    else:
-        optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    if rank == 0:
+        print("✓ Single optimizer: Route B semantic-state model")
 
     # Learning rate scheduler with warmup for multi-GPU training stability
     warmup_epochs = int(config.get('training', {}).get('warmup_epochs', 5))
@@ -1751,33 +1672,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 milestones=[warmup_epochs]
             )
 
-        # Stage1 optimizer also gets a scheduler (Route B+)
-        scheduler_energy = None
-        if optimizer_energy is not None:
-            warmup_energy = LinearLR(optimizer_energy, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
-            cosine_energy = CosineAnnealingLR(
-                optimizer_energy,
-                T_max=scheduler_total_epochs - warmup_epochs,
-                eta_min=lr_final,
-            )
-            if scheduler_total_epochs < total_epochs:
-                hold_energy = ConstantLR(
-                    optimizer_energy,
-                    factor=1.0,
-                    total_iters=total_epochs - scheduler_total_epochs,
-                )
-                scheduler_energy = SequentialLR(
-                    optimizer_energy,
-                    schedulers=[warmup_energy, cosine_energy, hold_energy],
-                    milestones=[warmup_epochs, scheduler_total_epochs],
-                )
-            else:
-                scheduler_energy = SequentialLR(
-                    optimizer_energy,
-                    schedulers=[warmup_energy, cosine_energy],
-                    milestones=[warmup_epochs],
-                )
-
         if rank == 0:
             print(
                 f"✓ Learning rate scheduler: {warmup_epochs} epochs warmup + "
@@ -1786,7 +1680,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             )
     else:
         scheduler = None
-        scheduler_energy = None
         if rank == 0:
             print("✓ No learning rate scheduler used")
 
@@ -1851,19 +1744,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             except Exception:
                 if rank == 0:
                     print("  ⚠ Could not restore optimizer state (param groups changed)")
-        stage1_optim_key = (
-            'optimizer_stage1_state_dict'
-            if 'optimizer_stage1_state_dict' in checkpoint
-            else 'optimizer_energy_state_dict'
-        )
-        if optimizer_energy is not None and stage1_optim_key in checkpoint:
-            try:
-                optimizer_energy.load_state_dict(checkpoint[stage1_optim_key])
-                if rank == 0:
-                    print("  ✓ Stage1 optimizer state restored")
-            except Exception:
-                if rank == 0:
-                    print("  ⚠ Could not restore stage1 optimizer state")
         if scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
             if resume_rebuild_scheduler:
                 if rank == 0:
@@ -1876,26 +1756,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 except Exception:
                     if rank == 0:
                         print("  ⚠ Could not restore scheduler state")
-        stage1_sched_key = (
-            'scheduler_stage1_state_dict'
-            if 'scheduler_stage1_state_dict' in checkpoint
-            else 'scheduler_energy_state_dict'
-        )
-        if scheduler_energy is not None and stage1_sched_key in checkpoint and checkpoint[stage1_sched_key] is not None:
-            if resume_rebuild_scheduler:
-                if rank == 0:
-                    print("  ↺ Skipping stage1 scheduler state restore (resume_rebuild_scheduler=true)")
-            else:
-                try:
-                    scheduler_energy.load_state_dict(checkpoint[stage1_sched_key])
-                    if rank == 0:
-                        print("  ✓ Stage1 scheduler state restored")
-                except Exception:
-                    if rank == 0:
-                        print("  ⚠ Could not restore stage1 scheduler state")
 
         resume_override_lr = config.get('optimizer', {}).get('resume_override_lr', None)
-        resume_override_lr_energy = config.get('optimizer', {}).get('resume_override_lr_energy', resume_override_lr)
 
         if resume_override_lr is not None:
             resume_override_lr = float(resume_override_lr)
@@ -1906,15 +1768,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             if rank == 0:
                 print(f"  ✓ Resume override decoder lr -> {resume_override_lr:.2e}")
 
-        if optimizer_energy is not None and resume_override_lr_energy is not None:
-            resume_override_lr_energy = float(resume_override_lr_energy)
-            if scale_lr and world_size > 1:
-                resume_override_lr_energy *= world_size
-            _set_optimizer_lr(optimizer_energy, resume_override_lr_energy)
-            _set_scheduler_base_lrs(scheduler_energy, resume_override_lr_energy)
-            if rank == 0:
-                print(f"  ✓ Resume override stage1 lr -> {resume_override_lr_energy:.2e}")
-
         if resume_rebuild_scheduler:
             if scheduler is not None:
                 _fast_forward_scheduler(scheduler, start_epoch)
@@ -1923,14 +1776,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         "  ✓ Rebuilt decoder scheduler from config and "
                         f"fast-forwarded to start_epoch={start_epoch} "
                         f"(lr={optimizer.param_groups[0]['lr']:.2e})"
-                    )
-            if scheduler_energy is not None:
-                _fast_forward_scheduler(scheduler_energy, start_epoch)
-                if rank == 0:
-                    print(
-                        "  ✓ Rebuilt energy scheduler from config and "
-                        f"fast-forwarded to start_epoch={start_epoch} "
-                        f"(lr={optimizer_energy.param_groups[0]['lr']:.2e})"
                     )
 
     # 设置 checkpoint 目录
@@ -2016,80 +1861,36 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
 
             max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
 
-            if policy_type == 'anchor_free' and optimizer_energy is not None:
-                # ===== Route B+: Explicit unified/split training path =====
-                # Split-forward is the default for the MOA refactor branch.
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_cuda(use_amp, amp_dtype):
+                loss_dict = policy(batch, return_loss_dict=True, phase=route_b_phase)
+                loss = loss_dict['total_loss']
 
-                optimizer_energy.zero_grad(set_to_none=True)
-                optimizer.zero_grad(set_to_none=True)
+            if torch.isnan(loss) or torch.isinf(loss):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf loss at batch {batch_idx}, skipping")
+                    if nonfinite_debug_budget > 0:
+                        print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
+                        nonfinite_debug_budget -= 1
+                continue
 
-                with autocast_cuda(use_amp, amp_dtype):
-                    loss_dict = policy(batch, return_loss_dict=True, phase=route_b_phase)
-                    total_loss = loss_dict['total_loss']
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            params = policy.module.parameters() if world_size > 1 else policy.parameters()
+            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
 
-                if torch.isnan(total_loss) or torch.isinf(total_loss):
-                    if rank == 0:
-                        print(f"Warning: NaN/Inf total_loss at batch {batch_idx}, skipping")
-                        if nonfinite_debug_budget > 0:
-                            print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
-                            nonfinite_debug_budget -= 1
-                    continue
-
-                scaler.scale(total_loss).backward()
-
-                scaler.unscale_(optimizer_energy)
-                scaler.unscale_(optimizer)
-                energy_grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(energy_params, max_norm=max_grad_norm)
-                diff_params_for_clip = [p for p in (policy.module if world_size > 1 else policy).parameters()
-                                        if id(p) not in energy_param_ids]
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(diff_params_for_clip, max_norm=max_grad_norm)
-
-                energy_grad_nonfinite = torch.isnan(energy_grad_norm_before_clip) or torch.isinf(energy_grad_norm_before_clip)
-                diff_grad_nonfinite = torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip)
-                if energy_grad_nonfinite or diff_grad_nonfinite:
-                    if rank == 0:
-                        print(
-                            f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping "
-                            f"(stage1_grad={energy_grad_norm_before_clip}, diff_grad={grad_norm_before_clip})"
-                        )
-                        if nonfinite_debug_budget > 0:
-                            print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
-                            nonfinite_debug_budget -= 1
-                    optimizer.zero_grad()
-                    optimizer_energy.zero_grad()
-                    scaler.update()
-                    continue
-
-                scaler.step(optimizer_energy)
-                scaler.step(optimizer)
+            if torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping")
+                    if nonfinite_debug_budget > 0:
+                        print_nonfinite_loss_debug(loss_dict, batch, batch_idx, rank)
+                        nonfinite_debug_budget -= 1
+                optimizer.zero_grad()
                 scaler.update()
+                continue
 
-                loss = total_loss
-            else:
-                # ===== Route A: Single-phase training (unchanged) =====
-                optimizer.zero_grad(set_to_none=True)
-                with autocast_cuda(use_amp, amp_dtype):
-                    loss_dict = policy(batch, return_loss_dict=True)
-                    loss = loss_dict['total_loss']
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    if rank == 0:
-                        print(f"Warning: NaN/Inf loss at batch {batch_idx}, skipping")
-                    continue
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                params = policy.module.parameters() if world_size > 1 else policy.parameters()
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
-
-                if torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip):
-                    if rank == 0:
-                        print(f"Warning: NaN/Inf gradient at batch {batch_idx}, skipping")
-                    optimizer.zero_grad()
-                    continue
-
-                scaler.step(optimizer)
-                scaler.update()
+            scaler.step(optimizer)
+            scaler.update()
 
             # Update EMA every N steps
             if batch_idx % ema_update_interval == 0:
@@ -2215,10 +2016,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 if 'behavior_loss' in loss_dict:
                     log_data["train/behavior_loss"] = loss_dict['behavior_loss'].item()
                     log_data["train/allowed_loss"] = loss_dict['allowed_loss'].item()
-                # Stage1 optimizer LR (Route B+)
-                if optimizer_energy is not None:
-                    log_data["train/lr_stage1"] = optimizer_energy.param_groups[0]['lr']
-                    log_data["train/lr_energy"] = optimizer_energy.param_groups[0]['lr']
                 safe_wandb_log(log_data, use_wandb)
         
         if rank == 0:
@@ -2233,12 +2030,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             scheduler.step()
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f"  Learning rate (decoder): {current_lr:.2e}")
-        if scheduler_energy is not None:
-            scheduler_energy.step()
-            if rank == 0:
-                current_lr_e = optimizer_energy.param_groups[0]['lr']
-                print(f"  Learning rate (stage1): {current_lr_e:.2e}")
+                print(f"  Learning rate: {current_lr:.2e}")
         
         # Get model state dict (handle DDP wrapper)
         model_to_save = policy.module if world_size > 1 else policy
@@ -2260,12 +2052,6 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         'train_loss': avg_train_loss,
                         'val_metrics': val_metrics,
                         }
-            if optimizer_energy is not None:
-                ckpt_data['optimizer_stage1_state_dict'] = optimizer_energy.state_dict()
-                ckpt_data['scheduler_stage1_state_dict'] = scheduler_energy.state_dict() if scheduler_energy is not None else None
-                # Backward-compatible aliases for old resume scripts.
-                ckpt_data['optimizer_energy_state_dict'] = optimizer_energy.state_dict()
-                ckpt_data['scheduler_energy_state_dict'] = scheduler_energy.state_dict() if scheduler_energy is not None else None
             torch.save(ckpt_data, ckpt_path)
             print(f"  Checkpoint saved: {ckpt_path}")
 
