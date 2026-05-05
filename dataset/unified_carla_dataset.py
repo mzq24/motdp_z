@@ -836,6 +836,25 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'chase_dist_valid',
                 'chase_ttc_s',
                 'chase_ttc_valid',
+                'prev_semantic_state_valid',
+                'prev_conflict_area_route_mask',
+                'prev_temporary_occupancy_cover_bins',
+                'prev_temporary_occupancy_cover_valid',
+                'prev_go_opportunity_prob',
+                'prev_yld_pressure_prob',
+                'prev_go_opportunity_valid',
+                'prev_conflict_dist_to_entry_m',
+                'prev_conflict_dist_to_exit_m',
+                'prev_conflict_time_to_entry_s',
+                'prev_conflict_timing_valid',
+                'prev_merge_yld_max_speed',
+                'prev_merge_go_min_speed',
+                'prev_junction_yld_max_speed',
+                'prev_junction_go_min_speed',
+                'prev_borrow_yld_max_speed',
+                'prev_borrow_go_min_speed',
+                'prev_chase_has_lead',
+                'prev_chase_speed_max',
             }:
                 final_sample[key] = _from_numpy(value, key)
             elif key in {
@@ -848,6 +867,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'conflict_area_end_frame',
                 'conflict_area_status',
                 'chase_status',
+                'prev_conflict_area_family',
+                'prev_conflict_area_dir',
+                'prev_conflict_area_status',
+                'prev_conflict_decision_phase',
+                'prev_conflict_control_phase',
             }:
                 if isinstance(value, np.ndarray):
                     final_sample[key] = torch.from_numpy(value).long()

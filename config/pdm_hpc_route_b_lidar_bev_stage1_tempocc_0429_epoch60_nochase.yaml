@@ -156,6 +156,11 @@ route_b:
   chase_speed_max_loss_weight: 0.15
   chase_speed_norm_scale: 30.0
   traj_branch_condition_chase_margin_scale: 5.0
+  use_semantic_state_transition: false
+  semantic_transition_prev_source: offline_gt
+  semantic_transition_loss_weight: 1.0
+  semantic_direct_aux_loss_weight: 0.25
+  semantic_transition_consistency_weight: 0.05
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
   speed_loss_weight: 0.2

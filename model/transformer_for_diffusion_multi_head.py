@@ -1955,6 +1955,87 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 nn.Linear(n_emb // 2, 1),
             )
 
+            # Semantic-state transition head: offline previous semantic tokens
+            # plus current decoder context predict the current semantic state.
+            self.semantic_transition_num_slots = 8
+            self.semantic_transition_slot_embed = nn.Parameter(
+                torch.randn(1, self.semantic_transition_num_slots, n_emb)
+            )
+            self.semantic_transition_prev_valid_proj = nn.Sequential(
+                nn.Linear(1, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_family_embed = nn.Embedding(4, n_emb)
+            self.semantic_transition_dir_embed = nn.Embedding(4, n_emb)
+            self.semantic_transition_status_embed = nn.Embedding(4, n_emb)
+            self.semantic_transition_decision_embed = nn.Embedding(3, n_emb)
+            self.semantic_transition_control_embed = nn.Embedding(5, n_emb)
+            self.semantic_transition_area_proj = nn.Sequential(
+                nn.Linear(self.num_waypoints, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_tempocc_proj = nn.Sequential(
+                nn.Linear(2 * 13, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_opportunity_proj = nn.Sequential(
+                nn.Linear(3, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_timing_proj = nn.Sequential(
+                nn.Linear(4, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_boundary_proj = nn.Sequential(
+                nn.Linear(6, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_chase_proj = nn.Sequential(
+                nn.Linear(2, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            transition_layer = nn.TransformerEncoderLayer(
+                d_model=n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * n_emb,
+                dropout=p_drop_emb,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.semantic_transition_encoder = nn.TransformerEncoder(
+                transition_layer,
+                num_layers=1,
+            )
+            self.semantic_transition_norm = nn.LayerNorm(n_emb)
+            self.semantic_transition_window_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.semantic_transition_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
+            self.semantic_transition_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.semantic_transition_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
+            self.semantic_transition_chase_has_lead_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_chase_speed_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_merge_yld_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_merge_go_min_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_junction_yld_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_junction_go_min_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_borrow_yld_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_borrow_go_min_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_conflict_area_head = nn.Sequential(
+                nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, 1),
+            )
+
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
         self.route_head = RouteMLPHead(
@@ -2257,6 +2338,156 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
         }
 
+    def _encode_prev_semantic_state(self, prev_state: dict, context: dict) -> torch.Tensor:
+        semantic_feature = context['semantic_feature']
+        B = semantic_feature.shape[0]
+        device = semantic_feature.device
+        dtype = semantic_feature.dtype
+
+        def _cat(name: str, max_value: int) -> torch.Tensor:
+            value = prev_state.get(name)
+            if value is None:
+                return torch.zeros(B, device=device, dtype=torch.long)
+            return value.to(device=device).reshape(B).long().clamp(min=0, max=max_value)
+
+        def _float(name: str, width: int, default: float = 0.0) -> torch.Tensor:
+            value = prev_state.get(name)
+            if value is None:
+                return torch.full((B, width), default, device=device, dtype=dtype)
+            value = value.to(device=device, dtype=dtype).reshape(B, -1)
+            if value.shape[1] != width:
+                raise ValueError(
+                    f"prev semantic field {name} expects width={width}, got {value.shape}"
+                )
+            return torch.nan_to_num(value, nan=default, posinf=default, neginf=default)
+
+        valid = _float('valid', 1, default=0.0).clamp(0.0, 1.0)
+        content_gate = valid
+        valid_embed = self.semantic_transition_prev_valid_proj(valid)
+
+        family_token = self.semantic_transition_family_embed(_cat('family', 3))
+        dir_token = self.semantic_transition_dir_embed(_cat('dir', 3))
+        phase_token = (
+            self.semantic_transition_decision_embed(_cat('decision_phase', 2))
+            + self.semantic_transition_control_embed(_cat('control_phase', 4))
+        )
+        area_token = self.semantic_transition_area_proj(
+            _float('conflict_area_route_mask', self.num_waypoints)
+        )
+        tempocc_token = self.semantic_transition_tempocc_proj(
+            torch.cat(
+                [
+                    _float('temporary_occupancy_cover_bins', 13),
+                    _float('temporary_occupancy_cover_valid', 13),
+                ],
+                dim=-1,
+            )
+        )
+        opportunity_token = self.semantic_transition_opportunity_proj(
+            torch.cat(
+                [
+                    _float('yld_pressure_prob', 1, default=0.5),
+                    _float('go_opportunity_prob', 1, default=0.5),
+                    _float('go_opportunity_valid', 1, default=0.0),
+                ],
+                dim=-1,
+            )
+        )
+        timing_token = (
+            self.semantic_transition_status_embed(_cat('status', 3))
+            + self.semantic_transition_timing_proj(
+                torch.cat(
+                    [
+                        _float('conflict_timing_values', 3),
+                        _float('conflict_timing_valid', 1, default=0.0),
+                    ],
+                    dim=-1,
+                )
+            )
+        )
+        boundary_token = self.semantic_transition_boundary_proj(
+            _float('boundary_values', 6)
+        )
+        chase_token = self.semantic_transition_chase_proj(
+            _float('chase_values', 2)
+        )
+
+        tokens = torch.stack(
+            [
+                family_token,
+                dir_token,
+                phase_token,
+                area_token,
+                tempocc_token + opportunity_token,
+                timing_token,
+                boundary_token,
+                chase_token,
+            ],
+            dim=1,
+        )
+        tokens = tokens * content_gate.unsqueeze(-1)
+        tokens = (
+            tokens
+            + self.semantic_transition_slot_embed.to(device=device, dtype=dtype)
+            + semantic_feature.unsqueeze(1)
+            + valid_embed.unsqueeze(1)
+        )
+        return tokens
+
+    def _compute_shared_stage1_transition_scores(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        prev_state: dict,
+    ) -> dict:
+        context = self._build_shared_stage1_context(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+        )
+        tokens = self._encode_prev_semantic_state(prev_state, context)
+        tokens = self.semantic_transition_norm(self.semantic_transition_encoder(tokens))
+        window_token = tokens[:, 0]
+        dir_token = tokens[:, 1]
+        phase_token = tokens[:, 2]
+        area_token = tokens[:, 3]
+        tempocc_token = tokens[:, 4]
+        timing_token = tokens[:, 5]
+        boundary_token = tokens[:, 6]
+        chase_token = tokens[:, 7]
+
+        area_token_seq = area_token.unsqueeze(1).expand(-1, route_out.shape[1], -1)
+        conflict_area_input = torch.cat(
+            [route_out, context['route_geom_tokens'], area_token_seq],
+            dim=-1,
+        )
+        decision_phase_logits = self.semantic_transition_decision_phase_head(phase_token)
+        return {
+            'window_logits': self.semantic_transition_window_head(window_token),
+            'dir_logits': self.semantic_transition_dir_head(dir_token),
+            'decision_phase_logits': decision_phase_logits,
+            'decision_phase_logits_base': decision_phase_logits,
+            'control_phase_logits': self.semantic_transition_control_phase_head(phase_token),
+            'temporary_occupancy_logits': self.semantic_transition_temporary_occupancy_head(tempocc_token),
+            'go_opportunity_logits': self.semantic_transition_go_opportunity_head(tempocc_token),
+            'conflict_area_status_logits': self.semantic_transition_conflict_area_status_head(timing_token),
+            'conflict_timing_values': self.semantic_transition_conflict_timing_head(timing_token),
+            'chase_has_lead_logit': self.semantic_transition_chase_has_lead_head(chase_token).squeeze(-1),
+            'chase_speed_max': self.semantic_transition_chase_speed_max_head(chase_token).squeeze(-1),
+            'merge_yld_max': self.semantic_transition_merge_yld_max_head(boundary_token).squeeze(-1),
+            'merge_go_min': self.semantic_transition_merge_go_min_head(boundary_token).squeeze(-1),
+            'junction_yld_max': self.semantic_transition_junction_yld_max_head(boundary_token).squeeze(-1),
+            'junction_go_min': self.semantic_transition_junction_go_min_head(boundary_token).squeeze(-1),
+            'borrow_yld_max': self.semantic_transition_borrow_yld_max_head(boundary_token).squeeze(-1),
+            'borrow_go_min': self.semantic_transition_borrow_go_min_head(boundary_token).squeeze(-1),
+            'conflict_area_logits': self.semantic_transition_conflict_area_head(conflict_area_input).squeeze(-1),
+        }
+
     def compute_shared_stage1_from_ego_outputs(
         self,
         traj_out: torch.Tensor,
@@ -2273,6 +2504,24 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_points=route_points,
             conditioning=conditioning,
             speed_samples=speed_samples,
+        )
+
+    def compute_shared_stage1_transition_from_ego_outputs(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        prev_state: dict,
+    ) -> dict:
+        return self._compute_shared_stage1_transition_scores(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+            prev_state=prev_state,
         )
 
     def _forward_traj_energy_context(

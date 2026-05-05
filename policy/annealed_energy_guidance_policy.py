@@ -339,6 +339,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.traj_branch_condition_chase_margin_scale = float(
             route_b_cfg.get('traj_branch_condition_chase_margin_scale', 5.0)
         )
+        self.use_semantic_state_transition = bool(
+            route_b_cfg.get('use_semantic_state_transition', False)
+        )
+        self.semantic_transition_prev_source = str(
+            route_b_cfg.get('semantic_transition_prev_source', 'offline_gt')
+        ).lower()
+        if self.semantic_transition_prev_source != 'offline_gt':
+            raise ValueError(
+                "V1 semantic state transition only supports "
+                "semantic_transition_prev_source='offline_gt'"
+            )
+        self.semantic_transition_loss_weight = float(
+            route_b_cfg.get('semantic_transition_loss_weight', 1.0)
+        )
+        self.semantic_direct_aux_loss_weight = float(
+            route_b_cfg.get('semantic_direct_aux_loss_weight', 0.25)
+        )
+        self.semantic_transition_consistency_weight = float(
+            route_b_cfg.get('semantic_transition_consistency_weight', 0.05)
+        )
         self.traj_phase_energy_band_offsets = torch.tensor([-2.0, 0.0, 2.0], dtype=torch.float32)
         self.traj_window_condition_names = (
             'none',
@@ -669,6 +689,39 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     "use_chase_front_following_state=true requires chase_has_lead, "
                     "and chase_speed_max in every batch"
                 )
+        if self.use_semantic_state_transition:
+            prev_required = (
+                self._resolve_stage1_batch_key(batch, 'prev_semantic_state_valid'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_area_family'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_area_dir'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_area_status'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_decision_phase'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_control_phase'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_area_route_mask'),
+                self._resolve_stage1_batch_key(batch, 'prev_temporary_occupancy_cover_bins'),
+                self._resolve_stage1_batch_key(batch, 'prev_temporary_occupancy_cover_valid'),
+                self._resolve_stage1_batch_key(batch, 'prev_go_opportunity_prob'),
+                self._resolve_stage1_batch_key(batch, 'prev_yld_pressure_prob'),
+                self._resolve_stage1_batch_key(batch, 'prev_go_opportunity_valid'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_dist_to_entry_m'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_dist_to_exit_m'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_time_to_entry_s'),
+                self._resolve_stage1_batch_key(batch, 'prev_conflict_timing_valid'),
+                self._resolve_stage1_batch_key(batch, 'prev_merge_yld_max_speed'),
+                self._resolve_stage1_batch_key(batch, 'prev_merge_go_min_speed'),
+                self._resolve_stage1_batch_key(batch, 'prev_junction_yld_max_speed'),
+                self._resolve_stage1_batch_key(batch, 'prev_junction_go_min_speed'),
+                self._resolve_stage1_batch_key(batch, 'prev_borrow_yld_max_speed'),
+                self._resolve_stage1_batch_key(batch, 'prev_borrow_go_min_speed'),
+                self._resolve_stage1_batch_key(batch, 'prev_chase_has_lead'),
+                self._resolve_stage1_batch_key(batch, 'prev_chase_speed_max'),
+            )
+            if any(key is None for key in prev_required):
+                raise ValueError(
+                    "use_semantic_state_transition=true requires offline prev_* "
+                    "semantic state fields. Run postprocess_semantic_prev_state.py "
+                    "on train/val packed files after split."
+                )
         return True
 
     @staticmethod
@@ -926,6 +979,139 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_max': speed_max,
             'speed_max_valid': speed_valid,
         }
+
+    def _get_semantic_transition_prev_state(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+        route_steps: int,
+        require: bool = False,
+    ) -> Optional[dict]:
+        valid = self._get_stage1_batch_tensor(
+            batch, 'prev_semantic_state_valid', device=device, model_dtype=model_dtype
+        )
+        categorical = {}
+        for out_key, batch_key in (
+            ('family', 'prev_conflict_area_family'),
+            ('dir', 'prev_conflict_area_dir'),
+            ('status', 'prev_conflict_area_status'),
+            ('decision_phase', 'prev_conflict_decision_phase'),
+            ('control_phase', 'prev_conflict_control_phase'),
+        ):
+            value = self._get_stage1_long_target(batch, batch_key, device=device)
+            if value is None:
+                if require:
+                    raise ValueError(f"semantic transition requires {batch_key}")
+                return None
+            categorical[out_key] = value.reshape(-1)
+
+        if valid is None:
+            if require:
+                raise ValueError("semantic transition requires prev_semantic_state_valid")
+            return None
+        valid = torch.nan_to_num(valid.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        B = valid.shape[0]
+
+        def _float_field(key: str, *, width: int = 1, default: float = 0.0) -> Optional[torch.Tensor]:
+            value = self._get_stage1_batch_tensor(batch, key, device=device, model_dtype=model_dtype)
+            if value is None:
+                if require:
+                    raise ValueError(f"semantic transition requires {key}")
+                return None
+            value = value.reshape(B, -1)
+            if value.shape[1] != width:
+                raise ValueError(f"{key} expects width={width}, got {value.shape}")
+            return torch.nan_to_num(value, nan=default, posinf=default, neginf=default)
+
+        area_mask = _float_field('prev_conflict_area_route_mask', width=route_steps)
+        temp_bins = _float_field('prev_temporary_occupancy_cover_bins', width=self.temporary_occupancy_dim)
+        temp_valid = _float_field('prev_temporary_occupancy_cover_valid', width=self.temporary_occupancy_dim)
+        go_prob = _float_field('prev_go_opportunity_prob', default=0.5)
+        yld_prob = _float_field('prev_yld_pressure_prob', default=0.5)
+        go_valid = _float_field('prev_go_opportunity_valid')
+        dist_entry = _float_field('prev_conflict_dist_to_entry_m')
+        dist_exit = _float_field('prev_conflict_dist_to_exit_m')
+        time_entry = _float_field('prev_conflict_time_to_entry_s')
+        timing_valid = _float_field('prev_conflict_timing_valid')
+        boundary_values = []
+        for key in (
+            'prev_merge_yld_max_speed',
+            'prev_merge_go_min_speed',
+            'prev_junction_yld_max_speed',
+            'prev_junction_go_min_speed',
+            'prev_borrow_yld_max_speed',
+            'prev_borrow_go_min_speed',
+        ):
+            value = _float_field(key)
+            if value is None:
+                return None
+            boundary_values.append(value.reshape(B))
+        chase_has_lead = _float_field('prev_chase_has_lead')
+        chase_speed = _float_field('prev_chase_speed_max')
+        if any(
+            value is None
+            for value in (
+                area_mask,
+                temp_bins,
+                temp_valid,
+                go_prob,
+                yld_prob,
+                go_valid,
+                dist_entry,
+                dist_exit,
+                time_entry,
+                timing_valid,
+                chase_has_lead,
+                chase_speed,
+            )
+        ):
+            return None
+
+        timing_values = torch.cat(
+            [
+                dist_entry / max(self.conflict_timing_dist_norm_scale, 1e-6),
+                dist_exit / max(self.conflict_timing_dist_norm_scale, 1e-6),
+                time_entry / max(self.conflict_timing_time_norm_scale, 1e-6),
+            ],
+            dim=-1,
+        ).clamp(-2.0, 2.0)
+        boundary = (
+            torch.stack(boundary_values, dim=-1)
+            / max(self.stage1_boundary_norm_scale, 1e-6)
+        ).clamp(0.0, 1.0)
+        chase_values = torch.cat(
+            [
+                chase_has_lead.clamp(0.0, 1.0),
+                (chase_speed / max(self.chase_speed_norm_scale, 1e-6)).clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
+        prev_state = {
+            **categorical,
+            'valid': valid,
+            'conflict_area_route_mask': area_mask.clamp(0.0, 1.0),
+            'temporary_occupancy_cover_bins': temp_bins.clamp(0.0, 1.0),
+            'temporary_occupancy_cover_valid': temp_valid.clamp(0.0, 1.0),
+            'go_opportunity_prob': go_prob.clamp(0.0, 1.0),
+            'yld_pressure_prob': yld_prob.clamp(0.0, 1.0),
+            'go_opportunity_valid': go_valid.clamp(0.0, 1.0),
+            'conflict_timing_values': timing_values,
+            'conflict_timing_valid': timing_valid.clamp(0.0, 1.0),
+            'boundary_values': boundary,
+            'chase_values': chase_values,
+        }
+        # Invalid prev samples are true sequence starts; hide semantic content but
+        # keep the validity bit so the transition branch can learn the reset case.
+        for key, value in list(prev_state.items()):
+            if key in ('valid',):
+                continue
+            if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
+                gate = valid
+                while gate.dim() < value.dim():
+                    gate = gate.unsqueeze(-1)
+                prev_state[key] = value * gate
+        return prev_state
 
     def _build_conflict_area_route_target(
         self,
@@ -2199,6 +2385,23 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_points=shared_forward['route_points'],
             conditioning=shared_forward['conditioning'],
         )
+        transition_stage1_scores = None
+        if self.use_semantic_state_transition:
+            prev_state = self._get_semantic_transition_prev_state(
+                batch=batch,
+                device=device,
+                model_dtype=model_dtype,
+                route_steps=raw_stage1_scores['conflict_area_logits'].shape[1],
+                require=True,
+            )
+            transition_stage1_scores = self.model.compute_shared_stage1_transition_from_ego_outputs(
+                traj_out=shared_forward['traj_out'],
+                route_out=shared_forward['route_out'],
+                speed_out=shared_forward['speed_out'],
+                route_points=shared_forward['route_points'],
+                conditioning=shared_forward['conditioning'],
+                prev_state=prev_state,
+            )
 
         zero = gt_abs.new_tensor(0.0)
 
@@ -2507,7 +2710,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 + self.state_consistency_timing_weight * loss_state_consistency_timing
             )
 
-        stage1_loss = (
+        direct_stage1_base_loss = (
             + self.energy_merge_weight * loss_merge
             + self.energy_junction_weight * loss_junction
             + self.energy_borrow_weight * loss_borrow
@@ -2521,8 +2724,269 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.conflict_timing_loss_weight * loss_conflict_timing
             + self.energy_chase_weight * loss_chase
             + self.inside_area_go_loss_weight * loss_inside_area_go
-            + self.state_consistency_loss_weight * loss_state_consistency
         )
+        semantic_transition_loss = zero
+        semantic_transition_consistency_loss = zero
+        if transition_stage1_scores is not None:
+            def _transition_boundary_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor) -> torch.Tensor:
+                return _boundary_loss(pred_norm, target_mps)
+
+            transition_loss_merge = 0.5 * (
+                _transition_boundary_loss(transition_stage1_scores['merge_yld_max'], merge_yld_target)
+                + _transition_boundary_loss(transition_stage1_scores['merge_go_min'], merge_go_target)
+            )
+            transition_loss_junction = 0.5 * (
+                _transition_boundary_loss(transition_stage1_scores['junction_yld_max'], junction_yld_target)
+                + _transition_boundary_loss(transition_stage1_scores['junction_go_min'], junction_go_target)
+            )
+            transition_loss_borrow = 0.5 * (
+                _transition_boundary_loss(transition_stage1_scores['borrow_yld_max'], borrow_yld_target)
+                + _transition_boundary_loss(transition_stage1_scores['borrow_go_min'], borrow_go_target)
+            )
+            transition_loss_window = F.cross_entropy(
+                transition_stage1_scores['window_logits'].float(),
+                window_target,
+            )
+            transition_loss_dir = F.cross_entropy(
+                transition_stage1_scores['dir_logits'].float(),
+                dir_target.clamp(min=0, max=3),
+            )
+            transition_loss_conflict_area = zero
+            if conflict_area_target is not None:
+                transition_area_raw = F.binary_cross_entropy_with_logits(
+                    transition_stage1_scores['conflict_area_logits'].float(),
+                    conflict_area_target.float(),
+                    reduction='none',
+                )
+                transition_valid = conflict_area_valid_mask
+                if transition_valid is None:
+                    transition_valid = torch.ones_like(conflict_area_target, dtype=torch.bool)
+                transition_pos = (conflict_area_target > 0.5) & transition_valid
+                transition_neg = (conflict_area_target <= 0.5) & transition_valid
+                if transition_pos.any() and transition_neg.any():
+                    transition_loss_conflict_area = 0.5 * (
+                        transition_area_raw[transition_pos].mean()
+                        + transition_area_raw[transition_neg].mean()
+                    )
+                elif transition_pos.any():
+                    transition_loss_conflict_area = transition_area_raw[transition_pos].mean()
+                elif transition_neg.any():
+                    transition_loss_conflict_area = transition_area_raw[transition_neg].mean()
+
+            transition_loss_decision_phase = zero
+            if decision_phase_valid_mask.any():
+                transition_loss_decision_phase = F.cross_entropy(
+                    transition_stage1_scores['decision_phase_logits'][decision_phase_valid_mask].float(),
+                    decision_phase_target[decision_phase_valid_mask],
+                )
+            transition_loss_control_phase = zero
+            if control_phase_valid_mask.any():
+                transition_loss_control_phase = F.cross_entropy(
+                    transition_stage1_scores['control_phase_logits'][control_phase_valid_mask].float(),
+                    control_phase_target[control_phase_valid_mask],
+                )
+            transition_loss_phase = transition_loss_decision_phase + transition_loss_control_phase
+
+            transition_loss_tempocc = zero
+            transition_loss_go_opp = zero
+            if temp_targets is not None:
+                transition_temp_valid = temp_targets['valid']
+                if transition_temp_valid.any():
+                    transition_temp_raw = F.binary_cross_entropy_with_logits(
+                        transition_stage1_scores['temporary_occupancy_logits'].float(),
+                        temp_targets['bins'].float(),
+                        reduction='none',
+                    )
+                    transition_loss_tempocc = transition_temp_raw[transition_temp_valid].mean()
+                transition_go_valid = temp_targets['go_opportunity_valid']
+                if transition_go_valid.any():
+                    transition_target_probs = temp_targets['go_opportunity_target'][transition_go_valid].float()
+                    transition_log_probs = F.log_softmax(
+                        transition_stage1_scores['go_opportunity_logits'][transition_go_valid].float(),
+                        dim=-1,
+                    )
+                    transition_loss_go_opp = -(
+                        transition_target_probs * transition_log_probs
+                    ).sum(dim=-1).mean()
+
+            transition_loss_status = zero
+            transition_loss_timing = zero
+            transition_loss_inside_go = zero
+            if timing_targets is not None:
+                transition_loss_status = F.cross_entropy(
+                    transition_stage1_scores['conflict_area_status_logits'].float(),
+                    timing_targets['status'].clamp(min=0, max=3),
+                )
+                if timing_targets['valid'].any():
+                    transition_loss_timing = F.smooth_l1_loss(
+                        transition_stage1_scores['conflict_timing_values'][timing_targets['valid']].float(),
+                        timing_targets['values'][timing_targets['valid']].float(),
+                    )
+                transition_inside_mask = timing_targets['status'] == 2
+                if transition_inside_mask.any():
+                    transition_inside_decision_target = torch.ones(
+                        int(transition_inside_mask.sum().item()), device=device, dtype=torch.long
+                    )
+                    transition_inside_control_target = torch.full(
+                        (int(transition_inside_mask.sum().item()),),
+                        3,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    transition_loss_inside_go = (
+                        F.cross_entropy(
+                            transition_stage1_scores['decision_phase_logits'][transition_inside_mask].float(),
+                            transition_inside_decision_target,
+                        )
+                        + F.cross_entropy(
+                            transition_stage1_scores['control_phase_logits'][transition_inside_mask].float(),
+                            transition_inside_control_target,
+                        )
+                    )
+
+            transition_loss_chase = zero
+            if self.use_chase_front_following_state and chase_targets is not None:
+                transition_chase_has_lead = F.binary_cross_entropy_with_logits(
+                    transition_stage1_scores['chase_has_lead_logit'].float(),
+                    chase_targets['has_lead'].float(),
+                )
+                transition_chase_speed_target = (
+                    chase_targets['speed_max'] / max(self.chase_speed_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0)
+                transition_chase_speed = F.smooth_l1_loss(
+                    transition_stage1_scores['chase_speed_max'].float(),
+                    transition_chase_speed_target.float(),
+                )
+                transition_loss_chase = (
+                    self.chase_has_lead_loss_weight * transition_chase_has_lead
+                    + self.chase_speed_max_loss_weight * transition_chase_speed
+                )
+
+            semantic_transition_loss = (
+                + self.energy_merge_weight * transition_loss_merge
+                + self.energy_junction_weight * transition_loss_junction
+                + self.energy_borrow_weight * transition_loss_borrow
+                + self.energy_relation_weight * transition_loss_dir
+                + self.energy_window_weight * transition_loss_window
+                + self.energy_phase_weight * transition_loss_phase
+                + self.energy_conflict_area_weight * transition_loss_conflict_area
+                + self.temporary_occupancy_loss_weight * transition_loss_tempocc
+                + self.go_opportunity_loss_weight * transition_loss_go_opp
+                + self.conflict_area_status_loss_weight * transition_loss_status
+                + self.conflict_timing_loss_weight * transition_loss_timing
+                + self.energy_chase_weight * transition_loss_chase
+                + self.inside_area_go_loss_weight * transition_loss_inside_go
+            )
+
+            def _transition_masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+                if mask is None:
+                    return values.mean()
+                mask = mask.to(device=values.device, dtype=torch.bool)
+                while mask.dim() < values.dim():
+                    mask = mask.unsqueeze(-1)
+                mask = mask.expand_as(values)
+                if not mask.any():
+                    return zero
+                return values[mask].mean()
+
+            def _transition_sym_kl(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                a = a.float()
+                b = b.float()
+                log_a = F.log_softmax(a, dim=-1)
+                log_b = F.log_softmax(b, dim=-1)
+                prob_a = log_a.exp()
+                prob_b = log_b.exp()
+                loss_ab = (prob_a.detach() * (log_a.detach() - log_b)).sum(dim=-1)
+                loss_ba = (prob_b.detach() * (log_b.detach() - log_a)).sum(dim=-1)
+                return _transition_masked_mean(0.5 * (loss_ab + loss_ba), mask)
+
+            def _transition_sym_mse(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                loss = 0.5 * (
+                    F.mse_loss(a.float(), b.detach().float(), reduction='none')
+                    + F.mse_loss(b.float(), a.detach().float(), reduction='none')
+                )
+                return _transition_masked_mean(loss, mask)
+
+            transition_consistency_terms = [
+                _transition_sym_kl(raw_stage1_scores['window_logits'], transition_stage1_scores['window_logits']),
+                _transition_sym_kl(raw_stage1_scores['dir_logits'], transition_stage1_scores['dir_logits']),
+                _transition_sym_kl(
+                    raw_stage1_scores['decision_phase_logits'],
+                    transition_stage1_scores['decision_phase_logits'],
+                    decision_phase_valid_mask,
+                ),
+                _transition_sym_kl(
+                    raw_stage1_scores['control_phase_logits'],
+                    transition_stage1_scores['control_phase_logits'],
+                    control_phase_valid_mask,
+                ),
+                _transition_sym_mse(
+                    raw_stage1_scores['conflict_area_logits'],
+                    transition_stage1_scores['conflict_area_logits'],
+                    conflict_area_valid_mask,
+                ),
+            ]
+            if temp_targets is not None:
+                transition_consistency_terms.extend([
+                    _transition_sym_mse(
+                        raw_stage1_scores['temporary_occupancy_logits'],
+                        transition_stage1_scores['temporary_occupancy_logits'],
+                        temp_targets['valid'],
+                    ),
+                    _transition_sym_kl(
+                        raw_stage1_scores['go_opportunity_logits'],
+                        transition_stage1_scores['go_opportunity_logits'],
+                        temp_targets['go_opportunity_valid'],
+                    ),
+                ])
+            if timing_targets is not None:
+                transition_consistency_terms.extend([
+                    _transition_sym_kl(
+                        raw_stage1_scores['conflict_area_status_logits'],
+                        transition_stage1_scores['conflict_area_status_logits'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['conflict_timing_values'],
+                        transition_stage1_scores['conflict_timing_values'],
+                        timing_targets['valid'],
+                    ),
+                ])
+            for key in (
+                'merge_yld_max',
+                'merge_go_min',
+                'junction_yld_max',
+                'junction_go_min',
+                'borrow_yld_max',
+                'borrow_go_min',
+            ):
+                transition_consistency_terms.append(
+                    _transition_sym_mse(raw_stage1_scores[key], transition_stage1_scores[key])
+                )
+            if self.use_chase_front_following_state and chase_targets is not None:
+                transition_consistency_terms.extend([
+                    _transition_sym_mse(
+                        raw_stage1_scores['chase_has_lead_logit'],
+                        transition_stage1_scores['chase_has_lead_logit'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['chase_speed_max'],
+                        transition_stage1_scores['chase_speed_max'],
+                    ),
+                ])
+            semantic_transition_consistency_loss = torch.stack(transition_consistency_terms).mean()
+
+        if transition_stage1_scores is not None:
+            stage1_loss = (
+                self.semantic_direct_aux_loss_weight * direct_stage1_base_loss
+                + self.semantic_transition_loss_weight * semantic_transition_loss
+                + self.semantic_transition_consistency_weight * semantic_transition_consistency_loss
+                + self.state_consistency_loss_weight * loss_state_consistency
+            )
+        else:
+            stage1_loss = (
+                direct_stage1_base_loss
+                + self.state_consistency_loss_weight * loss_state_consistency
+            )
         return {
             'stage1_loss': stage1_loss,
             # Backward-compatible alias while downstream logs/agents migrate.
@@ -2567,6 +3031,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'state_consistency_area_loss': loss_state_consistency_area,
             'state_consistency_tempocc_loss': loss_state_consistency_tempocc,
             'state_consistency_opportunity_loss': loss_state_consistency_opportunity,
+            'semantic_direct_aux_loss': direct_stage1_base_loss,
+            'semantic_transition_loss': semantic_transition_loss,
+            'semantic_transition_consistency_loss': semantic_transition_consistency_loss,
             'merge_yld_max_loss': loss_merge_yld,
             'merge_go_min_loss': loss_merge_go,
             'junction_yld_max_loss': loss_junction_yld,
@@ -2846,6 +3313,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'stage1_state_consistency_area_loss': stage1_loss_dict.get('state_consistency_area_loss', zero_t),
                 'stage1_state_consistency_tempocc_loss': stage1_loss_dict.get('state_consistency_tempocc_loss', zero_t),
                 'stage1_state_consistency_opportunity_loss': stage1_loss_dict.get('state_consistency_opportunity_loss', zero_t),
+                'stage1_semantic_direct_aux_loss': stage1_loss_dict.get('semantic_direct_aux_loss', zero_t),
+                'stage1_semantic_transition_loss': stage1_loss_dict.get('semantic_transition_loss', zero_t),
+                'stage1_semantic_transition_consistency_loss': stage1_loss_dict.get('semantic_transition_consistency_loss', zero_t),
                 'stage1_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),
                 'stage1_merge_go_min_loss': stage1_loss_dict.get('merge_go_min_loss', zero_t),
                 'stage1_junction_yld_max_loss': stage1_loss_dict.get('junction_yld_max_loss', zero_t),
