@@ -61,6 +61,12 @@ CONFLICT_CONTROL_PHASE_NAMES = {
     3: "stop_yld",
     4: "go",
 }
+CONFLICT_AREA_STATUS_NAMES = {
+    0: "none",
+    1: "before",
+    2: "inside",
+    3: "after",
+}
 
 
 def _resolve_packed_path(dataset_path=None, packed_path=None):
@@ -532,6 +538,30 @@ def _draw_route_progress_marker(canvas, route_xy, progress_m, color, label, x_ra
     _draw_local_point_marker(canvas, pt, color, label, x_range, y_range)
 
 
+def _draw_conflict_area_route_mask_tokens(canvas, sample, x_range, y_range):
+    route_pts = np.asarray(sample.get("route", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+    mask = np.asarray(sample.get("conflict_area_route_mask", []), dtype=np.float32).reshape(-1)
+    valid = np.asarray(sample.get("conflict_area_route_mask_valid", []), dtype=np.float32).reshape(-1)
+    if route_pts.ndim != 2 or route_pts.shape[1] != 2 or mask.size == 0 or valid.size == 0:
+        return
+    n = int(min(route_pts.shape[0], mask.size, valid.size, 20))
+    if n <= 0:
+        return
+    pts_px = _local_to_canvas(route_pts[:n, :2], canvas.shape[1], canvas.shape[0], x_range, y_range)
+    if pts_px.shape[0] != n:
+        return
+    for idx in range(n):
+        if float(valid[idx]) <= 0.5:
+            continue
+        px = tuple(pts_px[idx])
+        active = float(mask[idx]) > 0.5
+        fill_color = (0, 165, 255) if active else (230, 230, 230)
+        ring_color = (0, 96, 220) if active else (180, 180, 180)
+        radius = 7 if active else 4
+        cv2.circle(canvas, px, radius, fill_color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, px, radius + 1, ring_color, 1, cv2.LINE_AA)
+
+
 def _draw_panel_header(panel, title, subtitle=None, bg_color=(28, 38, 54), fg_color=(245, 245, 245)):
     cv2.rectangle(panel, (0, 0), (panel.shape[1], 40), bg_color, -1, cv2.LINE_AA)
     cv2.putText(panel, str(title), (14, 26), cv2.FONT_HERSHEY_DUPLEX, 0.70, fg_color, 1, cv2.LINE_AA)
@@ -671,22 +701,50 @@ def _threshold_panel_line(family_name, phase, sample, merge_threshold_debug, bor
         extra = "issue=none"
 
     value = sample.get(speed_field, np.nan) if speed_field else np.nan
-    valid = int(float(sample.get(valid_field, 0.0)) > 0.5) if valid_field else 0
+    raw_valid = int(float(sample.get(valid_field, 0.0)) > 0.5) if valid_field else 0
+    scalar_loss_valid = int(float(sample.get("conflict_phase_boundary_scalar_loss_valid", 1.0)) > 0.5)
+    valid = int(raw_valid > 0 and scalar_loss_valid > 0)
+    extra = f"valid={valid} raw={raw_valid} sloss={scalar_loss_valid} {extra}"
     if phase == "yld":
-        return f"{prefix} yld={_fmt_float(value)} valid={valid} {extra}"
-    return f"{prefix} go={_fmt_float(value)} valid={valid} {extra}"
+        return f"{prefix} yld={_fmt_float(value)} {extra}"
+    return f"{prefix} go={_fmt_float(value)} {extra}"
 
 
-def _chase_panel_line(sample, chase_threshold_debug):
-    debug = chase_threshold_debug or {}
-    chase_max = sample.get("chase_max_speed", np.nan)
-    valid = int(float(sample.get("chase_max_speed_valid", 0.0)) > 0.5)
-    return (
-        f"chase : max={_fmt_float(chase_max)} valid={valid} "
-        f"gap={_fmt_float(debug.get('gap_m', np.nan))} "
-        f"safe={_fmt_float(debug.get('safe_gap_cur_m', np.nan))} "
-        f"lead={_fmt_float(debug.get('lead_speed_mps', np.nan))}"
-    )
+def _chase_panel_lines(sample, chase_threshold_debug):
+    debug = ((sample.get("stage1_speed_debug") or {}).get("chase_front_following") or {})
+    if not debug:
+        debug = chase_threshold_debug or {}
+    has_lead = int(float(sample.get("chase_has_lead", debug.get("active", 0.0))) > 0.5)
+    status = _fmt_int(sample.get("chase_status", debug.get("status", -1)))
+    chase_max = sample.get("chase_speed_max", debug.get("speed_max_mps", np.nan))
+    valid = int(float(sample.get("chase_speed_max_valid", debug.get("speed_max_valid", 0.0))) > 0.5)
+    dist_m = sample.get("chase_dist_m", debug.get("distance_m", debug.get("gap_m", np.nan)))
+    ttc_s = sample.get("chase_ttc_s", debug.get("ttc_s", np.nan))
+    return [
+        f"chase : lead={has_lead} stat={status} vmax={_fmt_float(chase_max)} valid={valid}",
+        f"chase : dist={_fmt_float(dist_m)} ttc={_fmt_float(ttc_s)}",
+    ]
+
+
+def _merge_vbmin_panel_lines(sample):
+    debug = ((sample.get("stage1_speed_debug") or {}).get("merge_follow_through_vbmin") or {})
+    valid = int(float(sample.get("merge_follow_through_vbmin_valid", 0.0)) > 0.5)
+    actor_valid = int(float(sample.get("merge_follow_through_vbmin_actor_valid", 0.0)) > 0.5)
+    return [
+        f"merge vbmin={_fmt_float(sample.get('merge_follow_through_vbmin', np.nan))} "
+        f"valid={valid} actor={_fmt_int(sample.get('merge_follow_through_vbmin_actor_id', -1))}/{actor_valid}",
+        f"merge vbmin src={debug.get('source', 'none')} issue={debug.get('issue_reason', 'none')}",
+    ]
+
+
+def _boundary_consistency_panel_lines(sample):
+    debug = ((sample.get("stage1_speed_debug") or {}).get("boundary_speed_consistency") or {})
+    valid = int(float(sample.get("boundary_speed_consistency_valid", 0.0)) > 0.5)
+    flag = int(float(sample.get("boundary_speed_consistency_issue_flag", 0.0)) > 0.5)
+    return [
+        f"consist valid={valid} flag={flag} issue={debug.get('issue_name', _fmt_int(sample.get('boundary_speed_consistency_issue', 0)))} req={debug.get('required_action_name', _fmt_int(sample.get('boundary_speed_consistency_required_action', 0)))}",
+        f"consist v={_fmt_float(debug.get('current_speed_mps', np.nan))} dv={_fmt_float(sample.get('boundary_speed_consistency_speed_delta_mps', np.nan))} upper={_fmt_float(debug.get('effective_speed_max_mps', debug.get('chase_speed_max_mps', np.nan)))} lower={_fmt_float(debug.get('effective_go_min_mps', np.nan))} gap={_fmt_float(debug.get('bound_gap_mps', np.nan))}",
+    ]
 
 
 def _temporary_occupancy_cover_panel_lines(sample):
@@ -700,11 +758,28 @@ def _temporary_occupancy_cover_panel_lines(sample):
         f"tempocc bins={_fmt_bit_vector(bins, expected_len=13)}",
         f"tempocc valid={_fmt_bit_vector(valid, expected_len=13)}",
         f"tempocc go={_fmt_float(go_prob)} yld={_fmt_float(yld_prob)} valid={go_valid} cyc={_fmt_int(tempocc_debug.get('cycle_id', -1))} acc={_fmt_int(tempocc_debug.get('accepted_cycle', 0))}",
-        f"tempocc ref rs exp={_fmt_int(tempocc_debug.get('reference_run_start_expert', -1))} geom={_fmt_int(tempocc_debug.get('reference_run_start_geom', -1))} fin={_fmt_int(tempocc_debug.get('reference_run_start_final', -1))}",
-        f"tempocc ref len={_fmt_int(tempocc_debug.get('reference_run_len', -1))} raw={_fmt_int(tempocc_debug.get('raw_reference_pass_time_bins', -1))} areaf={_fmt_int(tempocc_debug.get('area_start_frame', -1))}",
-        f"tempocc cur rs={_fmt_int(tempocc_debug.get('current_run_start', -1))} len={_fmt_int(tempocc_debug.get('current_run_len', -1))} rem={_fmt_int(tempocc_debug.get('current_remaining_run_len', -1))} adjrs={_fmt_int(tempocc_debug.get('adjusted_run_start_bins', -1))} goable={_fmt_int(tempocc_debug.get('goable', 0))}",
-        f"tempocc distA={_fmt_float(tempocc_debug.get('distance_to_area_start_m', np.nan))} extra={_fmt_int(tempocc_debug.get('distance_adjustment_bins', -1))} src={tempocc_debug.get('area_start_source', 'none')}",
-        f"tempocc issue={tempocc_debug.get('issue_reason', 'none')}",
+        f"tempocc run ref={_fmt_int(tempocc_debug.get('reference_run_start_final', -1))}+{_fmt_int(tempocc_debug.get('reference_run_len', -1))} cur={_fmt_int(tempocc_debug.get('current_run_start', -1))}+{_fmt_int(tempocc_debug.get('current_run_len', -1))} goable={_fmt_int(tempocc_debug.get('goable', 0))}",
+    ]
+
+
+def _phase_object_binding_panel_lines(sample):
+    debug = ((sample.get("stage1_speed_debug") or {}).get("phase_object_binding") or {})
+    current = debug.get("current_candidate") or {}
+    future = debug.get("future_candidate") or {}
+    boundary = debug.get("boundary_ref") or {}
+    ref_valid = int(float(sample.get("conflict_phase_ref_actor_valid", 0.0)) > 0.5)
+    boundary_valid = int(float(sample.get("conflict_phase_boundary_ref_valid", 0.0)) > 0.5)
+    boundary_state_valid = int(float(sample.get("conflict_phase_boundary_state_valid", 0.0)) > 0.5)
+    object_missing = int(float(sample.get("conflict_phase_boundary_object_missing", 0.0)) > 0.5)
+    scalar_loss_valid = int(float(sample.get("conflict_phase_boundary_scalar_loss_valid", 0.0)) > 0.5)
+    match = int(float(sample.get("conflict_phase_boundary_actor_match", 0.0)) > 0.5)
+    open_unbounded = int(float(sample.get("conflict_phase_open_unbounded", 0.0)) > 0.5)
+    return [
+        f"obj ref role={_fmt_int(sample.get('conflict_phase_ref_role', -1))} actor={_fmt_int(sample.get('conflict_phase_ref_actor_id', -1))}/{ref_valid} open={open_unbounded} match={match}",
+        f"obj cur={_fmt_int(current.get('role', -1))}/{_fmt_int(current.get('actor_id', -1))} fut={_fmt_int(future.get('role', -1))}/{_fmt_int(future.get('actor_id', -1))} gate={_fmt_int(future.get('gate_passed', 0))} d={_fmt_float(future.get('distance_m', np.nan))}",
+        f"obj bnd role={_fmt_int(sample.get('conflict_phase_boundary_ref_role', -1))} mode={boundary.get('mode_name', _fmt_int(sample.get('conflict_phase_boundary_mode', -1)))} state={boundary_state_valid} miss={object_missing} sloss={scalar_loss_valid}",
+        f"obj bnd actor={_fmt_int(sample.get('conflict_phase_boundary_ref_actor_id', -1))}/{boundary_valid} case={boundary.get('cover_case', 'none')} srcf={_fmt_int(boundary.get('source_frame', -1))}",
+        f"obj bnd issue={boundary.get('issue_reason', 'none')}",
     ]
 
 
@@ -754,6 +829,7 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
                 cv2.circle(canvas, tuple(pt), 1, (214, 214, 214), -1, cv2.LINE_AA)
         route_px = _local_to_canvas(route_xy, canvas.shape[1], canvas.shape[0], x_range, y_range)
         cv2.polylines(canvas, [route_px], isClosed=False, color=(30, 30, 30), thickness=3, lineType=cv2.LINE_AA)
+    _draw_conflict_area_route_mask_tokens(canvas, sample, x_range, y_range)
 
     for box in current_boxes or []:
         cls = str(box.get("class", "")).lower()
@@ -889,7 +965,7 @@ def _build_bev_panel(sample, current_boxes, current_meas, x_range, y_range, futu
 
 
 def _build_text_panel(sample, current_meas):
-    panel = np.full((600, 960, 3), 248, dtype=np.uint8)
+    panel = np.full((720, 960, 3), 248, dtype=np.uint8)
     stage1_debug = sample.get("stage1_speed_debug") or {}
     current_cover = stage1_debug.get("current_cover") or {}
     future_cover = stage1_debug.get("future_cover") or {}
@@ -912,6 +988,8 @@ def _build_text_panel(sample, current_meas):
     family_code = int(sample.get("conflict_area_family", 0))
     family_name = CONFLICT_FAMILY_NAMES.get(family_code, str(family_code))
     dir_code = int(sample.get("conflict_area_dir", 0))
+    area_status_code = int(sample.get("conflict_area_status", 0))
+    area_status_name = CONFLICT_AREA_STATUS_NAMES.get(area_status_code, str(area_status_code))
     control_phase_code = int(sample.get("conflict_control_phase", 0))
     control_phase = CONFLICT_CONTROL_PHASE_NAMES.get(
         control_phase_code,
@@ -925,6 +1003,10 @@ def _build_text_panel(sample, current_meas):
             issue_line += f" [{issue_families}]"
     else:
         issue_line = "issue=none"
+    route_mask = np.asarray(sample.get("conflict_area_route_mask", []), dtype=np.float32).reshape(-1)
+    route_mask_valid = np.asarray(sample.get("conflict_area_route_mask_valid", []), dtype=np.float32).reshape(-1)
+    route_mask_positive_count = int(np.sum(route_mask > 0.5)) if route_mask.size > 0 else int(conflict_area.get("route_mask_positive_count", 0))
+    route_mask_valid_count = int(np.sum(route_mask_valid > 0.5)) if route_mask_valid.size > 0 else int(conflict_area.get("route_mask_valid_count", 0))
     _draw_panel_header(panel, f"{event_name} | frame {int(sample.get('frame_id', -1)):04d}", route_name)
     col_gap = 18
     col_x0 = 10
@@ -950,9 +1032,12 @@ def _build_text_panel(sample, current_meas):
         col_w,
         "Conflict",
         [
-            f"family={family_name} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))} active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)}",
+            f"family={family_name} dir={CONFLICT_DIR_NAMES.get(dir_code, str(dir_code))}",
+            f"active={int(float(sample.get('conflict_area_active', 0.0)) > 0.5)} status={area_status_name}",
             f"frame start={_fmt_int(sample.get('conflict_area_start_frame', -1))} end={_fmt_int(sample.get('conflict_area_end_frame', -1))} role={conflict_area.get('frame_role', 'none')}",
             f"win s={_fmt_float(conflict_area.get('window_start_s_m', np.nan))} area s={_fmt_float(conflict_area.get('area_start_s_m', np.nan))} e={_fmt_float(conflict_area.get('area_end_s_m', np.nan))}",
+            f"d_ent={_fmt_float(sample.get('conflict_dist_to_entry_m', np.nan))} d_exit={_fmt_float(sample.get('conflict_dist_to_exit_m', np.nan))}",
+            f"t_ent={_fmt_float(sample.get('conflict_time_to_entry_s', np.nan))}",
             f"borrow prog s={_fmt_float(conflict_area.get('borrow_conflict_start_progress_m', np.nan))} e={_fmt_float(conflict_area.get('borrow_conflict_end_progress_m', np.nan))}",
             f"src={conflict_area.get('source', 'none')} type={conflict_area.get('area_type', 'none')}",
             f"reason={conflict_area.get('selection_reason', 'none')}",
@@ -984,6 +1069,8 @@ def _build_text_panel(sample, current_meas):
         [
             f"issue_count={issue_count} issue_families={issue_families}",
             f"dir src={conflict_area.get('dir_source', 'none')} frame={_fmt_int(conflict_area.get('dir_frame_id', -1))}",
+            f"dist src={conflict_area.get('distance_source', 'none')}",
+            f"area pts={route_mask_positive_count}/{route_mask_valid_count}",
             f"cover={conflict_area.get('dir_cover_key', 'none')}",
             f"angle={_fmt_float(conflict_area.get('dir_angle_deg', np.nan))} route={_fmt_float(conflict_area.get('route_heading_deg', np.nan))} actor={_fmt_float(conflict_area.get('actor_heading_deg', np.nan))}",
         ],
@@ -998,7 +1085,7 @@ def _build_text_panel(sample, current_meas):
         [
             f"current: name={_cover_name(current_cover)} subtype={_cover_subtype(current_cover)} actor={_fmt_int(current_cover.get('actor_id', -1))}",
             f"current: dist={_fmt_float(current_cover.get('distance', np.nan))} route_d={_fmt_float(current_cover.get('route_distance_m', np.nan))} cp_s={_fmt_float(current_cover.get('scene_route_conflict_s_m', np.nan))}",
-            _chase_panel_line(sample, chase_threshold_debug),
+            *_chase_panel_lines(sample, chase_threshold_debug),
             f"future : name={_cover_name(future_cover)} subtype={_cover_subtype(future_cover)} actor={_fmt_int(future_cover.get('actor_id', -1))}",
             f"future : dE={_fmt_float(future_cover.get('d_ego', np.nan))} dB={_fmt_float(future_cover.get('d_bg', np.nan))} route_d={_fmt_float(future_cover.get('route_distance_m', np.nan))}",
             f"future : conflict_s={_fmt_float(future_cover.get('scene_route_conflict_s_m', np.nan))}",
@@ -1012,11 +1099,7 @@ def _build_text_panel(sample, current_meas):
         col_w,
         "Debug",
         [
-            f"xyz area={len(conflict_area.get('area_start_world_xyz', []))}/{len(conflict_area.get('area_end_world_xyz', []))}/{len(conflict_area.get('area_segment_world_xyz', []))} borrow={len(conflict_area.get('borrow_start_world_xyz', []))}/{len(conflict_area.get('borrow_end_world_xyz', []))}",
-            f"collision xyz={len(conflict_area.get('collision_point_world_xyz', []))} radius={_fmt_float(conflict_area.get('area_radius_m', np.nan))}",
-            f"yld f={_fmt_int(conflict_phase.get('yld_frame_count', 0))} low={_fmt_int(conflict_phase.get('yld_low_speed_frame_count', 0))} stop={_fmt_int(conflict_phase.get('yld_stop_frame_count', 0))}",
-            f"v0={_fmt_float(conflict_phase.get('yld_start_speed_mps', np.nan))} vmin={_fmt_float(conflict_phase.get('window_min_speed_mps', np.nan))}@{_fmt_int(conflict_phase.get('window_min_speed_frame', -1))}/{conflict_phase.get('window_min_speed_phase', 'none')} vgo={_fmt_float(conflict_phase.get('yld_go_speed_mps', np.nan))}",
-            f"drop={_fmt_float(conflict_phase.get('yld_speed_drop_from_start_mps', np.nan))} ratio={_fmt_float(conflict_phase.get('yld_speed_drop_ratio', np.nan))} prog={_fmt_float(conflict_phase.get('yld_progress_span_m', np.nan))}",
+            *_phase_object_binding_panel_lines(sample),
             *_temporary_occupancy_cover_panel_lines(sample),
             _threshold_panel_line(
                 family_name,
@@ -1034,6 +1117,8 @@ def _build_text_panel(sample, current_meas):
                 borrow_threshold_debug,
                 junction_threshold_debug,
             ),
+            *_merge_vbmin_panel_lines(sample),
+            *_boundary_consistency_panel_lines(sample),
         ],
         (86, 86, 86),
     )

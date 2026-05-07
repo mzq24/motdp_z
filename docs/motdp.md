@@ -43,6 +43,35 @@
 
 ## 当前重点方向
 
+### 0. 2026-04-29 Direction Turn: Independent 0423 Is The Close-Loop Baseline
+
+Latest training analysis produced an important direction change:
+
+- `independent 0423 best` was trained only to epoch 25, but currently appears
+  to be the strongest close-loop candidate.
+- Later joint/state/temp-occ models can improve selected offline metrics,
+  especially 10-step `L2_1s` and junction recall.
+- They still fail to match the independent model's `decision_go_recall` and
+  `control_go_recall`, which seem more important for closed-loop decisiveness.
+- Current conclusion: do not assume semantic state should be jointly diffused
+  with trajectory. Treat independent state / phase prediction as a strong
+  baseline and likely main direction.
+
+Detailed metrics and reasoning are recorded in:
+
+- `./tmp/independent_0423_close_loop_turning_point_20260429.md`
+
+### 0.1 2026-05-01 Area / Window Decoupling Handoff
+
+Window and global area/status heads should both be treated as always-defined
+global classifications. `valid` masks should remain only for route-bin heatmaps,
+timing/distance scalars, temporary occupancy bins, go-opportunity targets, and
+boundary-speed labels whose supervision can be genuinely undefined.
+
+Detailed model-session handoff:
+
+- `./tmp/area_window_decoupled_valid_handoff_20260501.md`
+
 ### 1. Route B 主线
 
 - 关键思路：
@@ -238,8 +267,147 @@
       - 当前先记录 issue
       - 不在这层直接 hard crash
     - 这层是骨架，不是最终 conflict-area 语义：
-      - `borrow conflict area` 后面还要从 corridor 里再提纯
-      - `merge / junction direction` 后面还要改成 area-based approach direction
+    - `borrow conflict area` 后面还要从 corridor 里再提纯
+    - `merge / junction direction` 后面还要改成 area-based approach direction
+  - `2026-04-27` 的 conflict-area route-mask 同步记录：
+    - `scripts/data_tools/precompute_semantic_labels.py` 现在会离线写出
+      `conflict_area_route_mask` / `conflict_area_route_mask_valid`
+    - mask 是 route-token aligned，默认 20 点，对应当前 stage1 route tokens
+    - 这不是 frame-window 里的 `start_frame:end_frame` 全段置 1
+    - 它由当前 family 的 conflict-area local interval 投影到 route token
+      arclength 后得到
+    - `borrow / merge / junction` 都走同一套 route-mask 写法
+    - 所以 borrow 也不再默认 20 个点全写成 area
+    - `dataset/unified_carla_dataset.py` 已透传这两个字段
+    - 老 packed 如果没有该字段，dataset 会给
+      `conflict_area_route_mask_valid = -1`
+    - policy 看到 valid 为未知时才 fallback 到旧 frame-window target
+    - main worktree 与 `MoT-DP-joint-state-speed` worktree 的
+      `precompute_semantic_labels.py` / `unified_carla_dataset.py`
+      已同步
+    - 后续 labeling session 若重跑 label，应优先检查：
+      - merge / junction 的 route-mask positive count 不应大面积 20/20
+      - borrow 也应由 corridor/area interval 决定 mask span
+      - video/debug 里应能区分 `window` 长度和真正 `conflict_area_route_mask`
+  - `2026-05-05` 新增 phase-object binding 后处理：
+    - `scripts/data_tools/postprocess_stage1_phase_object_binding.py`
+    - 目标是把 area/ego-based `conflict_decision_phase` 对齐到当前 phase
+      对应的 object / opening
+    - `current_cover` 在 active conflict window 内通常视作
+      `current_area_actor`；但 merge 会额外检查 current cover 是否仍在
+      merge area 内，已经离开 area 的 front/chase cover 不再绑定 role3
+    - `future_cover` 只有在 `frame_index <= 6` 且距离 gate `<=20m`
+      时才绑定成 next actor；否则 `phase=go` 可写成
+      `open_unbounded`
+    - 这里的 `role` 是 ego phase 和 object/opening 的 relation 属性，
+      不是 actor 的静态类别；更接近 GNN edge attribute
+    - boundary binding 也写 relation role/mode：
+      - `future_actor_boundary`: old future-cover yld/go speed boundary
+      - `current_clear_transition`: future actor 已变 current cover，旧
+        go-before boundary 不再成立，但 relation 仍绑定 current actor
+      - `open_unbounded`: 无 future cover，speed boundary 无约束且无 actor
+    - boundary relation 保留旧 threshold scalar 的真实来源，不再为了
+      match 而强行改写成 `phase_ref`
+    - 若 actor-conditioned scalar boundary 和 post-hoc `phase_ref` 不一致，
+      `actor_match=0` 且 `scalar_loss_valid=0`
+    - 主要字段：
+      `conflict_phase_ref_role`,
+      `conflict_phase_ref_actor_id`,
+      `conflict_phase_boundary_ref_role`,
+      `conflict_phase_boundary_mode`,
+      `conflict_phase_boundary_state_valid`,
+      `conflict_phase_boundary_object_missing`,
+      `conflict_phase_boundary_scalar_loss_valid`,
+      `conflict_phase_boundary_ref_actor_id`,
+      `conflict_phase_boundary_actor_match`
+    - `object_missing=1` 表示 phase 仍 active，但没有 bbox reference 可构建
+      actor-conditioned boundary；这种样本不要用 fallback 的
+      `yld=30/go_min=0` 当 hard scalar supervision
+    - `scalar_loss_valid=0` 用于 mask 掉 missing-object/open-unbounded 的
+      boundary scalar loss
+    - 重要语义边界：
+      - 原始 `conflict_decision_phase` 仍然主要是 ego-state / area-state
+        label，不是原生 object-anchored phase
+      - `phase_ref` 是后处理根据 current/future cover 对 phase 做出的
+        relation 解释
+      - 因此 `phase_ref=current_area_actor` 不代表原始 phase 生成时已经
+        绑定该 actor
+      - `open_unbounded` / unconstrained boundary 常对应 raw fallback
+        `yld=30/go_min=0`，只能 debug，不能监督 scalar loss
+      - 真正危险的是 actor-conditioned scalar boundary 与 post-hoc
+        phase_ref 不一致；这类现在通过
+        `actor_match=0` 和 `scalar_loss_valid=0` mask 掉
+      - merge mixed state 的例外：
+        当 current cover 仍在 merge area 内、且 gated future cover 已出现，
+        phase-object binding 优先绑定到 future cover，因为 yld/go scalar
+        boundary 本来就是 future actor-conditioned
+      - 该 mixed state 中，`phase=yld` 绑定 role1
+        `yld_target_actor`，`phase=go` 绑定 role2
+        `go_before_next_actor`
+      - 一类预期正常 mismatch：
+        `merge + phase=yld + phase_ref=none + boundary_ref=open_unbounded`
+        且 `current_cover_outside_area + no_future_cover`
+      - 同类还有：
+        `junction + phase=yld + phase_ref=none + boundary_ref=open_unbounded`
+        且 `missing_current_cover + no_future_cover`
+      - 这表示 current cover 已离开 merge area，next future cover 尚不可用，
+        或 junction 当前帧没有可见/可 gate 的 current/future actor
+      - 这两类本质都是 object-free / open-unbounded boundary：
+        没有 actor-conditioned `yld/go` boundary，raw fallback 是全范围
+        `go_min=0/yld_max=30`
+      - 此时 speed 解释应回到独立 speed constraints：
+        `vchase` 和 `merge_follow_through_vbmin`
+      - 这种情况下的 `phase=yld` 可能只是 ego-state 减速标签，
+        原因可能是 `vchase`，不一定是 yield-next-actor
+      - consistency audit 里，`Town12_Rep0_1105_0... frame 59` 这类
+        单帧 `go_under_min_no_accel`，以及类似的单帧
+        `junction_go_over_max_no_decel`，当前归为危险但不算 label bug
+      - route-level issue 需要连续至少 2 帧；单帧只保留 debug
+      - `yld_over_max_no_decel` 若满足 merge/future actor 对齐且速度主要
+        贴近 `vchase`，归为 `candidate_chase_limited_go`，不是
+        yld-boundary 错误
+      - shard01 的 borrow/merge consistency 复查增加两类 benign cause：
+        `candidate_yield_after_actor_no_decel_needed` 和
+        borrow `yld_over_max_no_decel` local blip
+      - `candidate_yield_after_actor_no_decel_needed` 代表：
+        `phase=go` 但 `go_min > 20m/s` 等明显说明不应该抢前，
+        ego 更可能是在 actor 后方通过；此时 `yld_max` 往往更贴近当前
+        车流速度
+      - borrow `yld_over_max_no_decel` 若处于长期减速到 0 的趋势中，
+        连续 2 帧局部减速幅度不足也先归为 debug-only，不当 label bug
+      - full-dataset / new_hpc issue review 的顺序：
+        先 skip collision，再识别 phase-cause/relation-cause，再过滤单帧
+        与 borrow slowdown blip，最后只看 remaining non-chase consecutive
+        issue；`chase_over_max_no_decel` 单独成桶看严格度
+  - `2026-05-06` 新增 merge follow-through vbmin 后处理：
+    - `scripts/data_tools/postprocess_stage1_merge_follow_through_vbmin.py`
+    - 只用于 `merge`
+    - 不改旧 `merge_go_min_speed`；旧字段仍表示 entry 前
+      future-cover go-before boundary
+    - 新字段在 ego 进入 conflict area 后、出 area 前持续写入最近一次稳定
+      merge traffic `vbmin`，避免 entry 后速度下界突然消失
+    - 当前字段：
+      `merge_follow_through_vbmin`,
+      `merge_follow_through_vbmin_valid`,
+      `merge_follow_through_vbmin_actor_id`,
+      `merge_follow_through_vbmin_actor_valid`
+  - `2026-05-07` boundary speed naming cleanup debt:
+    - 当前有效语义应按 phase-specific speed interval 理解：
+      - `yld phase`: lower `0`, upper `yld_max`
+      - `go phase`: lower `go_min`
+      - `go phase` 的 upper 依 family 而定
+    - `merge go upper` 当前来自 `chase_speed_max` / front-following cap
+    - `junction go upper` 在 `phase=go + role=3/current_area_actor` 时使用
+      `junction_yld_max_speed`
+    - 因此 `junction_yld_max_speed` 已经不是纯 yld-only 名字，
+      更准确是当前 conflict/current-area actor 的 safe upper speed
+    - 这属于 naming cleanup，不急于改 raw 字段名
+    - 后续 label 稳定后，可以新增中性 derived fields：
+      `phase_speed_lower_mps`, `phase_speed_upper_mps`,
+      `phase_speed_lower_valid`, `phase_speed_upper_valid`,
+      `phase_speed_upper_source`
+    - 在此之前，video / consistency debug 优先用 `upper` 这种中性显示，
+      避免 `go phase` 下仍显示 `yld_max` 造成语义混淆
   - 当前更推荐的下一步顺序不是马上设计 energy 数值，而是：
     1. 先 rerun 新的 unified `conflict_area` 框架
     2. 先看：

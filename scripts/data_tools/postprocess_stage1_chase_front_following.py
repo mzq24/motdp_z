@@ -31,6 +31,12 @@ CHASE_STATUS_NAMES = {
     CHASE_STATUS_LEAD_CLOSE: "lead_close",
     CHASE_STATUS_BLOCKED_OR_TTC_LOW: "blocked_or_ttc_low",
 }
+FAMILY_CODE_TO_NAME = {
+    0: "none",
+    1: "borrow",
+    2: "merge",
+    3: "junction",
+}
 
 
 def _atomic_pickle_dump(obj, path: str) -> None:
@@ -79,9 +85,33 @@ def _to_float(value, default=np.nan) -> float:
     return float(value)
 
 
+def _to_int(value, default: int = -1) -> int:
+    try:
+        if value is None:
+            return int(default)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
 def _finite_float(value, default=np.nan) -> float:
     value = _to_float(value, default=default)
     return float(value) if np.isfinite(value) else float(default)
+
+
+def _family_name(sample: dict) -> str:
+    conflict_area = _stage1_block(sample, "conflict_area")
+    family = str(conflict_area.get("family", "none"))
+    if family != "none":
+        return family
+    return FAMILY_CODE_TO_NAME.get(_to_int(sample.get("conflict_area_family", 0), default=0), "none")
+
+
+def _is_active_junction_conflict(sample: dict) -> bool:
+    return bool(
+        _to_float(sample.get("conflict_area_active", 0.0), default=0.0) > 0.5 and
+        _family_name(sample) == "junction"
+    )
 
 
 def _sample_current_speed_mps(sample: dict) -> float:
@@ -202,6 +232,28 @@ def _status_from_dist_ttc(
 
 def _compute_chase_annotation(sample: dict, args) -> tuple[dict, dict]:
     follow_chase_only = bool(args.follow_chase_only)
+    if _is_active_junction_conflict(sample):
+        values = {
+            CHASE_HAS_LEAD_KEY: np.float32(0.0),
+            CHASE_STATUS_KEY: np.int64(CHASE_STATUS_NONE),
+            CHASE_DIST_KEY: np.float32(np.nan),
+            CHASE_DIST_VALID_KEY: np.float32(0.0),
+            CHASE_TTC_KEY: np.float32(np.nan),
+            CHASE_TTC_VALID_KEY: np.float32(0.0),
+            CHASE_SPEED_MAX_KEY: np.float32(np.nan),
+            CHASE_SPEED_MAX_VALID_KEY: np.float32(0.0),
+        }
+        debug = _default_chase_debug()
+        debug.update({
+            "filter": "junction_conflict_disabled",
+            "source": "none",
+            "distance_m": np.nan,
+            "ttc_s": np.nan,
+            "speed_max_mps": np.nan,
+            "issue_reason": "junction_uses_boundary_not_chase",
+        })
+        return values, debug
+
     current_cover = _stage1_block(sample, "current_cover")
     route_valid = isinstance(current_cover, dict) and bool(current_cover)
     if not route_valid:

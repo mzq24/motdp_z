@@ -6,6 +6,29 @@ Date: 2026-04-25
 
 This note records the current discussion around using **temporary occupancy** to improve `yld/go` phase timing.
 
+## Current Label Docs
+
+For the current stage1 label line, the two main documents to keep in sync are:
+
+- `docs/motdp.md`
+  - the higher-level project / stage1 label context
+  - stable conclusions around:
+    - `merge / junction / borrow`
+    - stage1 speed labels
+    - conflict-area route-mask expectations
+
+- `docs/tmp/temporary_occupancy_phase_reasoning_20260425.md`
+  - the detailed working note for:
+    - temporary occupancy
+    - `go_opportunity_prob`
+    - conflict-area auxiliary labels
+    - current label geometry / area conventions
+
+Practical rule:
+
+- use `docs/motdp.md` for high-level stable context
+- use this note for the latest detailed label semantics
+
 The main idea is:
 
 - We do not need dense future 4D occupancy over the whole BEV.
@@ -262,6 +285,38 @@ Instead, define a soft pair:
 
 The current implementation has moved away from the older all-actor occupancy idea.
 
+### 0. Current conflict-area geometry (2026-04-27)
+
+Current area geometry is:
+
+- `borrow`
+  - keep the existing corridor-subset logic
+  - `area start / end` come from borrow conflict progress on the corridor
+  - no major geometry change is currently needed
+
+- `merge`
+  - `area start = first_conflict_s_m`
+  - `area end = last_conflict_s_m + 8m`
+  - interpretation:
+    - merge start is already aligned to the conflict cluster start
+    - merge end keeps a modest post-margin for ego box length and small extra room
+
+- `junction`
+  - `window start = cluster center - 15m`
+  - `area start = first_conflict_s_m`
+  - `area end = cluster center + 7m`
+  - this is stricter than the older `center - 7m` start
+  - current preference is to align junction area start more directly with conflict geometry
+
+Current expectation for `conflict_area_route_mask`:
+
+- `borrow`
+  - many `17/20`, `18/20`, `19/20`, `20/20` masks are expected because the corridor can be long
+
+- `merge / junction`
+  - should **not** be dominated by `20/20`
+  - local shard reruns on `shard01` and `shard08` are consistent with this expectation
+
 ### 1. Postprocess-only temporary occupancy
 
 Current temporary occupancy is produced in a postprocess step, not in the main stage1 precompute.
@@ -275,6 +330,63 @@ Current top-level fields:
 - `go_opportunity_valid`
 
 The bins are always written route-wise inside the same active conflict window.
+
+### 1.5. New conflict-area auxiliary labels (2026-04-27)
+
+We now also want a small set of conflict-area-centered auxiliary labels directly from stage1 precompute.
+
+Current top-level fields:
+
+- `conflict_dist_to_entry_m`
+- `conflict_dist_to_exit_m`
+- `conflict_time_to_entry_s`
+- `conflict_area_status`
+
+Meaning:
+
+- `conflict_dist_to_entry_m`
+  - route distance to conflict-area entry
+  - positive means ego is still before the area
+  - `<= 0` means ego is at or beyond entry
+
+- `conflict_dist_to_exit_m`
+  - route distance to conflict-area exit
+  - useful for separating:
+    - just before entry
+    - already inside
+    - already passed
+
+- `conflict_time_to_entry_s`
+  - helper quantity only
+  - computed from:
+    - `max(conflict_dist_to_entry_m, 0) / max(|v_curr|, speed_floor)`
+  - current implementation:
+    - speed floor `= 0.5 m/s`
+    - cap `= 10s`
+  - this should not replace the distance labels as the main supervision
+
+- `conflict_area_status`
+  - 4-code enum:
+    - `0 = none`
+    - `1 = before`
+    - `2 = inside`
+    - `3 = after`
+  - practically, the useful semantic states are:
+    - before / inside / after
+
+Current implementation notes:
+
+- prefer scene-route progress when available:
+  - `area_start_s_m`
+  - `area_end_s_m`
+  - `front_s`
+- fallback to the existing local-interval logic when scene-route progress is not available
+- this makes the auxiliary labels family-agnostic enough to cover:
+  - `borrow`
+  - `merge`
+  - `junction`
+- in practice, `conflict_dist_to_entry_m` is intended to align semantically with
+  the tempocc debug quantity `distance_to_area_start_m` (`distA` in video)
 
 ### 2. Family-specific bin semantics
 
@@ -397,6 +509,145 @@ This keeps dangerous expert-launch cases visible:
 
 - `go_frame` itself can still have a moderate or low `go_prob`
 - from the next frame onward, the route is treated as committed go
+
+### 6.5. Boundary speed naming cleanup debt
+
+Current phase-boundary semantics should be interpreted as phase-specific speed
+intervals:
+
+- `yld phase`
+  - lower bound: `0`
+  - upper bound: family `yld_max`
+
+- `go phase`
+  - lower bound: family `go_min`
+  - upper bound:
+    - `merge`: `chase_speed_max` / front-following cap
+    - `junction`: use `junction_yld_max_speed` as a `go_max` when the phase
+      reference is `current_area_actor` (`role=3`)
+    - `borrow`: no dedicated go upper bound yet
+
+Important naming caveat:
+
+- `junction_yld_max_speed` is not purely a yld-only concept anymore.
+- In `junction phase=go + role=3`, the same value is currently the most
+  reliable upper-speed cap for the current area actor.
+- Video / consistency debug should therefore use neutral wording like `upper`
+  rather than `chase` or `yld` when showing the effective cap.
+
+Cleanup TODO:
+
+- After label bugs settle, consider introducing neutral derived names such as:
+  - `phase_speed_lower_mps`
+  - `phase_speed_upper_mps`
+  - `phase_speed_lower_valid`
+  - `phase_speed_upper_valid`
+  - `phase_speed_upper_source`
+- Keep existing family fields as raw/source labels until the rename is planned.
+
+### 6.6. Phase-object binding is post-hoc interpretation
+
+Current `conflict_decision_phase` is still primarily an ego-state / area-state
+label. It is not originally bound to an object.
+
+`phase_ref` in `postprocess_stage1_phase_object_binding.py` is therefore a
+post-hoc relation interpretation:
+
+```text
+phase + current_cover / future_cover / opening evidence
+-> phase_ref role / actor
+```
+
+Important implications:
+
+- `phase_ref=current_area_actor` means the postprocess found a current cover
+  that still belongs to the active conflict area.
+- It does **not** mean the original phase label was generated with that actor
+  as an explicit anchor.
+- For `merge`, current cover must still overlap the merge area before it can be
+  treated as `current_area_actor`; otherwise it may just be a front/chase cover
+  after the actor already left the merge conflict area.
+
+`open_unbounded` boundary cases:
+
+- usually mean there is no usable future/current actor boundary
+- raw scalar fallback is often the full range:
+  - `yld_max = 30`
+  - `go_min = 0`
+- this fallback is useful for debug but should not supervise scalar boundary
+  loss
+
+Current rule:
+
+- if boundary/object is missing or open-unbounded:
+  - `conflict_phase_boundary_scalar_loss_valid = 0`
+- if boundary is actor-conditioned but does not match the post-hoc phase ref:
+  - `conflict_phase_boundary_actor_match = 0`
+  - `conflict_phase_boundary_scalar_loss_valid = 0`
+
+Therefore many `phase_ref != boundary_ref` mismatches are expected and harmless,
+as long as scalar loss is masked. The cases worth inspecting are the ones where
+an actor-conditioned boundary would otherwise be used as supervision for the
+wrong phase object.
+
+Expected mismatch family: object-free / open-unbounded boundary
+
+```text
+merge + phase=yld
+phase_ref=none
+boundary_ref=open_unbounded
+current_candidate.gate_reason=merge_current_cover_outside_area
+future_candidate.gate_reason=no_future_cover
+```
+
+and similarly:
+
+```text
+junction + phase=yld
+phase_ref=none
+boundary_ref=open_unbounded
+current_candidate.gate_reason=missing_current_cover
+future_candidate.gate_reason=no_future_cover
+```
+
+Interpretation:
+
+- there is no object that can be used as an actor-conditioned boundary target
+- for merge, a current cover may exist but has already left the merge conflict area
+- for junction, there may simply be no current or future cover in the visible /
+  gated evidence
+- there is no usable future cover yet
+- therefore no actor-conditioned `yld/go` scalar boundary exists
+- raw fallback boundary is the full range:
+  - `go_min = 0`
+  - `yld_max = 30`
+- this is a normal mismatch and should not supervise scalar boundary loss
+
+Speed interpretation for this case:
+
+- `yld/go` boundary should be ignored
+- if speed reasoning is needed, use independent speed constraints:
+  - `vchase` / `chase_speed_max` where valid
+  - `merge_follow_through_vbmin` where valid
+- do not use junction `vchase`; junction cross timing should use its boundary
+  labels instead
+
+Why this can happen:
+
+- ego has entered / passed the merge area, so future cover may no longer be
+  computed as an actor-conditioned boundary
+- or the next rear actor has not reached the future-cover gate yet
+- in junction, the active/yld window can continue even when no current/future
+  actor is visible or gateable in the current frame
+
+Important phase caveat:
+
+- current `phase=yld` can still be caused by ego-state / speed behavior
+  rather than yielding to a next actor
+- e.g. ego may be decelerating because of `vchase`, not because it is yielding
+  to a future merge actor
+- this is another sign that phase cause attribution should be handled later as
+  a separate consistency/cause analysis step
 
 ### 7. Merge-specific training caveat
 
@@ -703,6 +954,75 @@ Reason:
 - and the route is still inside the same active window
 - we still want the label to remain strongly on the `go` side
 
+Important semantic distinction:
+
+- `go_opportunity_prob` means "a go opportunity is available / selectable now"
+- `decision_phase = go` means "the expert / policy actually chooses to go now"
+
+So these two labels should not be collapsed into one another.
+
+Useful interpretation:
+
+- `go_opportunity_prob` is an affordance / temporal opportunity prior
+- `decision_phase` is the chosen behavior mode
+- `go_opportunity_prob` should influence `decision_phase`, but should not hard-define it
+
+Valid combinations:
+
+- high `go_opportunity_prob` + `decision_phase=go`
+  - opportunity exists and expert chooses to take it
+- low `go_opportunity_prob` + `decision_phase=yld`
+  - no usable opportunity yet; standard wait/yield case
+- high `go_opportunity_prob` + `decision_phase=yld`
+  - opportunity may exist, but expert/policy remains conservative
+  - possible reasons: speed/reachability, chase cap, preparation state, style difference, or label noise
+- low `go_opportunity_prob` + `decision_phase=go`
+  - risky case to inspect
+  - possible reasons: already inside area, occupancy miss, aggressive expert, OOD, or label bug
+
+Training implication:
+
+- do not enforce:
+
+```text
+decision_phase=go  <=>  go_opportunity_prob high
+decision_phase=yld <=>  go_opportunity_prob low
+```
+
+- prefer:
+
+```text
+temporary occupancy
++ distance / entry status
++ speed reachability
++ boundary / chase
+-> go_opportunity_prob
+
+go_opportunity_prob
++ scene / route / state
++ expert behavior style
+-> decision_phase
+```
+
+Model-side usage:
+
+- keep the current prior-style modulation:
+
+```text
+final_decision_phase_logits =
+    base_decision_phase_logits
+  + alpha * [yld_pressure_logit, go_opportunity_logit]
+```
+
+- keep `alpha` moderate, e.g. `0.3 ~ 0.5`
+- treat `go_opportunity_prob` as a prior, not as a replacement for `decision_phase`
+
+Consistency loss should be weak and asymmetric:
+
+- `decision_phase=go` while `go_opportunity_prob` is very low can receive a small penalty
+- `decision_phase=yld` while `go_opportunity_prob` is high should not be strongly penalized
+- the latter can be a legitimate conservative choice rather than a contradiction
+
 ### 3. Reference frame and reference pass time
 
 Each active window uses:
@@ -832,3 +1152,296 @@ Current `generate_stage1_label_video_lite.py` demos the new label with:
 - `tempocc issue=...`
 
 This should be treated as the current debugging contract for validating the label.
+
+## Phase Object Binding Postprocess (2026-05-05)
+
+We added a postprocess-only label that connects area/ego phase semantics back to
+the object or opening that the phase refers to.
+
+Reason:
+
+- `conflict_decision_phase` is area / ego-state based.
+- speed boundaries are object-conditioned through `current_cover` /
+  `future_cover`.
+- front-view perception often cannot observe the next / rear vehicle until it is
+  close, so an opening may be real but object-unbounded.
+
+Role codes:
+
+- `0 none`
+- `1 yld_target_actor`
+- `2 go_before_next_actor`
+- `3 current_area_actor`
+- `4 open_unbounded`
+
+These roles are relation labels between ego's current phase and an
+object/opening, not intrinsic actor classes. In GNN terms, this is closer to an
+edge/relation attribute than a node label.
+
+Implemented fields:
+
+- `conflict_phase_ref_role`
+- `conflict_phase_ref_actor_id`
+- `conflict_phase_ref_actor_valid`
+- `conflict_phase_open_unbounded`
+- `conflict_phase_boundary_ref_role`
+- `conflict_phase_boundary_mode`
+- `conflict_phase_boundary_state_valid`
+- `conflict_phase_boundary_object_missing`
+- `conflict_phase_boundary_scalar_loss_valid`
+- `conflict_phase_boundary_ref_actor_id`
+- `conflict_phase_boundary_ref_valid`
+- `conflict_phase_boundary_actor_match`
+
+Current semantics:
+
+- `current_cover` is usually treated as an actor that currently covers the route
+  / area, so inside an active conflict window it maps to role `3`.
+- Merge is stricter: current cover must still overlap the merge area. Once that
+  actor has left the area and only remains a front/chase cover, phase-object
+  binding does not use it as `current_area_actor`.
+- Merge mixed state rule:
+  - if current cover is still inside the merge area and gated future cover is
+    already available, bind phase reference to the future actor instead of the
+    current area actor
+  - reason: merge yld/go scalar boundaries are future-actor conditioned in this
+    state, while the current area actor is mainly a clearing/chase constraint
+  - `phase=yld` uses role `1 yld_target_actor`
+  - `phase=go` uses role `2 go_before_next_actor`
+- `future_cover` becomes a next-actor reference only when it passes the default
+  gate:
+  - `frame_index <= 6`
+  - `d_bg <= 20m`; missing `d_bg` is an issue, not a fallback to `distance`
+- `phase=go` with no current cover and no close future cover becomes
+  `open_unbounded`.
+- Boundary relation modes:
+  - `future_actor_boundary`: old future-cover yld/go speed boundary.
+  - `current_clear_transition`: once the actor becomes `current_cover`, the
+    old go-before boundary is no longer meaningful, but the phase/boundary
+    relation still binds to the current actor as role `3`.
+  - `open_unbounded`: no close future cover; scalar speed thresholds may be
+    unconstrained (`yld=30`, `go_min=0`) and `actor_id=-1`, but the boundary
+    state is still valid as role `4`.
+- `conflict_phase_boundary_state_valid` means the boundary state/relation is
+  meaningful. `conflict_phase_boundary_ref_valid` only means an actor id exists.
+  Therefore `open_unbounded` has `state_valid=1` and `actor_valid=0`.
+- `conflict_phase_boundary_object_missing=1` means the phase is still active
+  but no current/future bbox reference was available to construct an
+  actor-conditioned boundary. This is different from a truly unconstrained
+  opening.
+- `conflict_phase_boundary_scalar_loss_valid=0` should mask scalar boundary
+  losses for missing-object or open-unbounded cases. Existing scalar values may
+  still contain full-range fallbacks such as `yld=30` / `go_min=0`, but these
+  should not be treated as hard supervision.
+- Boundary reference keeps the original threshold scalar source/provenance.
+  The postprocess no longer rewrites boundary relation to hide mismatches.
+- If actor-conditioned scalar boundary and post-hoc phase reference disagree,
+  `conflict_phase_boundary_actor_match=0` and
+  `conflict_phase_boundary_scalar_loss_valid=0`.
+- This label does not rewrite phase or boundary labels; it exposes their
+  object/reference alignment and masks unsafe scalar supervision for training
+  and debugging.
+
+Shard08 consistency audit note:
+
+- `yld_over_max_no_decel` examples such as
+  `Town12_Rep0_1038_0_route0_11_08_17_08_36` are better interpreted as
+  `candidate_chase_limited_go`: the label says yld because ego is slowing, but
+  the effective cause is traffic-flow / chase speed, not yielding to the next
+  future actor.
+- Single-frame `go_under_min_no_accel` / `junction_go_over_max_no_decel`
+  examples such as `Town12_Rep0_1105_0_route0_11_08_02_43_48 frame 59` are
+  dangerous-looking frames, but not label bugs. Treat them as debug-only unless
+  they form a consecutive segment of at least two frames.
+- Current route-level consistency issue filtering should therefore:
+  - skip collision routes
+  - ignore `candidate_chase_limited_go` when evaluating yld/go scalar bugs
+  - ignore one-frame isolated issues
+  - inspect `chase_over_max_no_decel` separately because chase is intentionally
+    strict and often useful.
+
+Shard01 consistency audit note:
+
+- Borrow appears heavily in shard01, so a second benign issue family appears.
+- `candidate_yield_after_actor_no_decel_needed`:
+  - examples: `Town12_Rep0_679_0_route0_11_08_05_44_31 frame 50-51`,
+    `Town13_Rep0_1073_2_route0_11_08_11_43_24 frame 36-37`
+  - surface issue: `phase=go` with `go_under_min_no_accel`
+  - interpretation: ego is probably passing behind the actor, not trying to
+    beat it in front
+  - cue: `go_min` can be very large (`>20m/s`), while `yld_max` is close to
+    the actual traffic/ego speed
+  - this means the go-before relation is not the right scalar supervision for
+    the current behavior; do not count this as a label bug unless it persists
+    in a qualitatively unsafe way.
+- Borrow `yld_over_max_no_decel` local blips:
+  - examples: `Town12_Rep0_3687_0_route0_11_09_07_06_03 frame 47-48`,
+    `Town13_Rep0_1756_0_route0_11_07_23_52_29 frame 44-45`
+  - these are inside a longer slowdown-to-stop trend
+  - a local two-frame weak decel / small accel does not mean the yld label is
+    wrong; inspect the surrounding frames before escalating.
+- For future full-dataset / new_hpc issue review, classify in this order:
+  - collision route: skip consistency bug review
+  - `candidate_chase_limited_go`: phase-cause issue, not yld-boundary bug
+  - `candidate_yield_after_actor_no_decel_needed`: relation/cause issue, not
+    go-boundary bug by itself
+  - isolated one-frame issue: debug only
+  - borrow yld blip inside longer slowdown-to-stop: debug only
+  - `chase_over_max_no_decel`: separate strict-chase review bucket
+  - remaining non-chase consecutive issues: inspect video first.
+
+### 8.5. Merge follow-through `vbmin` postprocess
+
+Current issue:
+
+- merge future-cover boundary has a `vbmin` component:
+  - `go_min = max(pass_before_speed, vbmin)`
+  - `vbmin` is approximately the background traffic speed
+- after the future actor becomes `current_cover`, the old go-before boundary is
+  no longer meaningful and `merge_go_min_speed` can become unconstrained
+- however, from a control/training perspective, ego still should not slow down
+  abruptly after entering the merge area
+
+V1 postprocess:
+
+- script:
+  - `scripts/data_tools/postprocess_stage1_merge_follow_through_vbmin.py`
+- merge-only fields:
+  - `merge_follow_through_vbmin`
+  - `merge_follow_through_vbmin_valid`
+  - `merge_follow_through_vbmin_actor_id`
+  - `merge_follow_through_vbmin_actor_valid`
+- valid region:
+  - `family == merge`
+  - active conflict window
+  - ego is inside the conflict area, using `conflict_area_status == inside`
+    or distance fallback `dist_to_entry <= 0 < dist_to_exit`
+- source:
+  - carry the strongest observed merge traffic speed from recent
+    `merge_thresholds.bg_speed_mps`, `future_cover.other_speed`, or
+    `current_cover.other_speed`
+  - do not lower the carried floor when the background/current actor slows,
+    because that slowdown can be ego-induced after insertion/collision
+- semantics:
+  - this is not the old go-before boundary
+  - it is a follow-through speed floor after ego has committed into the merge
+    area, lasting until ego exits the area
+
+### 9. Conflict-area route mask sync note
+
+As of `2026-04-27`, conflict-area localization has an offline route-token mask:
+
+- `conflict_area_route_mask`: shape `(20,)`
+- `conflict_area_route_mask_valid`: shape `(20,)`
+
+Purpose:
+
+- separate the long active `window` from the short route segment that should be treated as the actual conflict area
+- avoid the old online target where `start_frame:end_frame` could make almost all 20 route tokens positive
+- give the model a direct route-aligned supervision signal for ego distance/proximity to the conflict area
+
+Implementation contract:
+
+- generated in `scripts/data_tools/precompute_semantic_labels.py`
+- passed through by `dataset/unified_carla_dataset.py`
+- consumed by policy before falling back to the old frame-window target
+- synchronized between:
+  - main worktree: `/media/z/data/mzq/others/MoT-DP`
+  - joint worktree: `/media/z/data/mzq/others/MoT-DP-joint-state-speed`
+
+Semantics:
+
+- the mask is route-token aligned, not a time-window label
+- route tokens are mapped to local route arclength
+- conflict area uses a local interval plus a small tolerance margin
+- `merge`, `junction`, and `borrow` all use this offline route-mask path
+- borrow should not be hardcoded to all 20 positive tokens
+
+Backward compatibility:
+
+- if old packed data has no offline mask, dataset fills:
+  - `conflict_area_route_mask = zeros(20)`
+  - `conflict_area_route_mask_valid = -1`
+- policy treats valid `< 0` as unknown and falls back to the legacy online frame-window target
+
+Labeling-session checks:
+
+- inspect positive-token count by family after relabeling
+- `merge` / `junction` should not be dominated by `20/20` positives
+- `borrow` may be longer, but should still come from its area/corridor interval rather than a hardcoded all-positive mask
+- compare `window` length vs `conflict_area_route_mask` span separately in debug videos
+
+### 10. Joint-state model / training integration note
+
+As of `2026-04-27`, the joint-state worktree has started consuming the new
+conflict timing labels directly.
+
+Worktree:
+
+- `/media/z/data/mzq/others/MoT-DP-joint-state-speed`
+
+Dataset interface:
+
+- `dataset/unified_carla_dataset.py` now passes through:
+  - `conflict_dist_to_entry_m`
+  - `conflict_dist_to_exit_m`
+  - `conflict_time_to_entry_s`
+  - `conflict_area_status`
+
+Joint-state payload additions:
+
+- `conflict_area_status_logits`: 4 classes
+  - `none`
+  - `before`
+  - `inside`
+  - `after`
+- `conflict_timing_values`: 3 normalized scalars
+  - `dist_to_entry / conflict_timing_dist_norm_scale`
+  - `dist_to_exit / conflict_timing_dist_norm_scale`
+  - `time_to_entry / conflict_timing_time_norm_scale`
+
+Model changes:
+
+- `model/transformer_for_diffusion_multi_head.py`
+  - adds an `area_status` state token
+  - adds a `conflict_timing` state token
+  - decodes:
+    - `conflict_area_status_logits`
+    - `conflict_timing_values`
+
+Policy / loss changes:
+
+- `policy/annealed_energy_guidance_policy.py`
+  - config gate: `route_b.use_conflict_timing_state`
+  - direct supervised losses:
+    - `conflict_area_status_loss`
+    - `conflict_timing_loss`
+  - state diffusion reconstruction losses:
+    - `state_conflict_area_status_recon_loss`
+    - `state_conflict_timing_recon_loss`
+  - inference/debug outputs:
+    - `conflict_area_status_probs`
+    - `conflict_timing_values`
+    - `conflict_dist_to_entry_m`
+    - `conflict_dist_to_exit_m`
+    - `conflict_time_to_entry_s`
+
+Training config changes:
+
+- `config/tmp/pdm_hpc_route_b_lidar_bev_stage1_joint_state_fulltrain_val.yaml`
+  - `use_temporary_occupancy_phase: true`
+  - `use_conflict_timing_state: true`
+  - `use_speed_profile_head: false`
+  - `speed_profile_loss_weight: 0.0`
+  - `conflict_area_status_loss_weight: 0.25`
+  - `conflict_timing_loss_weight: 0.25`
+  - `conflict_timing_dist_norm_scale: 30.0`
+  - `conflict_timing_time_norm_scale: 10.0`
+
+Design intent:
+
+- `conflict_area_route_mask` tells the model where the conflict area lies on the route
+- conflict timing/status tells the model where ego is relative to that area
+- temporary occupancy tells the model whether the area is opening / blocked over future bins
+- `go_opportunity_prob` is still an affordance prior
+- `decision_phase` remains the actual chosen behavior mode

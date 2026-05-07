@@ -32,17 +32,47 @@
 #   --overwrite_existing
 
 
+# chase/front-following postprocess
+# python scripts/data_tools/postprocess_stage1_chase_front_following.py \
+#   --input_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.pkl \
+#   --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.pkl \
+#   --overwrite_existing
+
+
+# phase-object binding postprocess
+# python scripts/data_tools/postprocess_stage1_phase_object_binding.py \
+#   --input_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.pkl \
+#   --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.phaseobj.pkl \
+#   --overwrite_existing
+
+
+# merge follow-through vbmin postprocess
+# python scripts/data_tools/postprocess_stage1_merge_follow_through_vbmin.py \
+#   --input_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.phaseobj.pkl \
+#   --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.phaseobj.vbmin.pkl \
+#   --overwrite_existing
+
+
+# boundary speed consistency audit on non-collision routes
+# python scripts/data_tools/postprocess_stage1_boundary_speed_consistency.py \
+#   --input_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.phaseobj.vbmin.pkl \
+#   --output_path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.phaseobj.vbmin.consistency.pkl \
+#   --image_data_root /workspace1/z_project/dataset/pdm_lite \
+#   --issue_csv /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/boundary_speed_consistency_issues.csv \
+#   --overwrite_existing
+
+
 # project back to training index
 # python scripts/data_tools/project_stage1_fields_from_padded.py \
 #   --base /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.pkl \
-#   --padded_relabel /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.pkl \
-#   --output /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.tempocc_v2.pkl \
+#   --padded_relabel /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_padded.relabel.tempocc_v2.chase.phaseobj.vbmin.consistency.pkl \
+#   --output /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.tempocc_v2.chase.phaseobj.vbmin.consistency.pkl \
 #   --overwrite
 
 
 # split train val again for holdout
 # python scripts/data_tools/build_scene_holdout_split.py \
-#   --packed-path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.tempocc_v2.pkl \
+#   --packed-path /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh/samples_packed.stage1_merged.tempocc_v2.chase.phaseobj.vbmin.consistency.pkl \
 #   --out-root /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5 \
 #   --val-scene-ratio 0.05 \
 #   --seed 3407 \
