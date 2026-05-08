@@ -1685,6 +1685,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         lidar_bev_history_frames: int = 1,
         use_condition_group_dropout: bool = False,
         use_chase_front_following_state: bool = True,
+        semantic_motion_condition_mode: str = "full",
+        use_cover_relation_graph_decoder: bool = False,
+        cover_graph_use_traj_context: bool = False,
+        cover_graph_use_speed_context: bool = False,
+        use_route_prev_coarse_memory: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1707,6 +1712,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.lidar_bev_history_frames = max(int(lidar_bev_history_frames), 1)
         self.use_condition_group_dropout = use_condition_group_dropout
         self.use_chase_front_following_state = bool(use_chase_front_following_state)
+        self.semantic_motion_condition_mode = str(semantic_motion_condition_mode).lower()
+        if self.semantic_motion_condition_mode not in ("full", "compact_graph"):
+            raise ValueError(
+                "semantic_motion_condition_mode must be 'full' or 'compact_graph', "
+                f"got {semantic_motion_condition_mode}"
+            )
+        self.use_cover_relation_graph_decoder = bool(use_cover_relation_graph_decoder)
+        self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context)
+        self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context)
+        self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory)
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -1741,8 +1756,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.traj_area_status_condition_dim = 4
         self.traj_timing_condition_dim = 3
         self.traj_chase_condition_dim = 2
+        self.traj_current_edge_condition_dim = 6  # valid + 5-way edge mode
+        self.traj_future_edge_condition_dim = 6
+        self.traj_edge_margin_dim = 4
+        self.traj_edge_valid_dim = 4
         self.traj_borrow_aux_dim = 1
-        self.traj_branch_condition_dim = (
+        self.traj_branch_condition_full_dim = (
             self.traj_window_condition_dim
             + self.traj_dir_condition_dim
             + self.traj_decision_phase_condition_dim
@@ -1753,6 +1772,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
             + self.traj_timing_condition_dim
             + self.traj_chase_condition_dim
             + self.traj_borrow_aux_dim
+        )
+        self.traj_branch_condition_compact_graph_dim = (
+            self.traj_window_condition_dim
+            + self.traj_decision_phase_condition_dim
+            + self.traj_control_phase_condition_dim
+            + self.traj_opportunity_condition_dim
+            + self.traj_current_edge_condition_dim
+            + self.traj_future_edge_condition_dim
+            + self.traj_edge_margin_dim
+            + self.traj_edge_valid_dim
+            + self.traj_borrow_aux_dim
+        )
+        self.traj_branch_condition_dim = (
+            self.traj_branch_condition_compact_graph_dim
+            if self.semantic_motion_condition_mode == "compact_graph"
+            else self.traj_branch_condition_full_dim
         )
         self.traj_window_condition_proj = nn.Sequential(
             nn.Linear(self.traj_window_condition_dim, n_emb),
@@ -1799,6 +1834,26 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
+        self.traj_current_edge_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_current_edge_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_future_edge_condition_proj = nn.Sequential(
+            nn.Linear(self.traj_future_edge_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_edge_margin_proj = nn.Sequential(
+            nn.Linear(self.traj_edge_margin_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.traj_edge_valid_proj = nn.Sequential(
+            nn.Linear(self.traj_edge_valid_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
         self.traj_borrow_aux_proj = nn.Sequential(
             nn.Linear(self.traj_borrow_aux_dim, n_emb),
             nn.SiLU(),
@@ -1808,6 +1863,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Route-specific conditioning generator
         self.route_status_proj = nn.Sequential(
             nn.Linear(status_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        self.route_prev_coarse_memory_dim = 9  # valid + prev window(4) + prev dir(4)
+        self.route_prev_coarse_memory_proj = nn.Sequential(
+            nn.Linear(self.route_prev_coarse_memory_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
@@ -1895,6 +1956,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
         self.shared_stage1_chase_has_lead_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_chase_speed_max_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_current_edge_valid_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+        self.shared_stage1_future_edge_valid_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+        self.shared_stage1_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
+        self.shared_stage1_merge_flow_lower_speed_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
@@ -1976,6 +2045,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.semantic_transition_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
         self.semantic_transition_chase_has_lead_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_chase_speed_max_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_current_edge_valid_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+        self.semantic_transition_future_edge_valid_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+        self.semantic_transition_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
+        self.semantic_transition_merge_flow_lower_speed_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_merge_yld_max_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_merge_go_min_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_junction_yld_max_head = _make_shared_stage1_scalar_head()
@@ -2207,6 +2284,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_out, self.shared_stage1_route_summary_query
         )
         speed_summary = speed_out.squeeze(1)
+        if self.use_cover_relation_graph_decoder and not self.cover_graph_use_traj_context:
+            traj_summary = torch.zeros_like(traj_summary)
+        if self.use_cover_relation_graph_decoder and not self.cover_graph_use_speed_context:
+            speed_summary = torch.zeros_like(speed_summary)
         semantic_feature = self.shared_stage1_neck(
             torch.cat(
                 [traj_summary, route_summary, speed_summary, route_geom, conditioning],
@@ -2260,6 +2341,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_timing_values': self.shared_stage1_conflict_timing_head(semantic_feature),
             'chase_has_lead_logit': self.shared_stage1_chase_has_lead_head(semantic_feature).squeeze(-1),
             'chase_speed_max': self.shared_stage1_chase_speed_max_head(semantic_feature).squeeze(-1),
+            'current_cover_edge_valid_logit': self.shared_stage1_current_edge_valid_head(semantic_feature).squeeze(-1),
+            'current_cover_edge_mode_logits': self.shared_stage1_current_edge_mode_head(semantic_feature),
+            'future_cover_edge_valid_logit': self.shared_stage1_future_edge_valid_head(semantic_feature).squeeze(-1),
+            'future_cover_edge_mode_logits': self.shared_stage1_future_edge_mode_head(semantic_feature),
+            'current_cover_upper_speed': self.shared_stage1_current_cover_upper_speed_head(semantic_feature).squeeze(-1),
+            'future_cover_lower_speed': self.shared_stage1_future_cover_lower_speed_head(semantic_feature).squeeze(-1),
+            'front_follow_upper_speed': self.shared_stage1_front_follow_upper_speed_head(semantic_feature).squeeze(-1),
+            'merge_flow_lower_speed': self.shared_stage1_merge_flow_lower_speed_head(semantic_feature).squeeze(-1),
             'merge_yld_max': self.shared_stage1_merge_yld_max_head(semantic_feature).squeeze(-1),
             'merge_go_min': self.shared_stage1_merge_go_min_head(semantic_feature).squeeze(-1),
             'junction_yld_max': self.shared_stage1_junction_yld_max_head(semantic_feature).squeeze(-1),
@@ -2410,6 +2499,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_timing_values': self.semantic_transition_conflict_timing_head(timing_token),
             'chase_has_lead_logit': self.semantic_transition_chase_has_lead_head(chase_token).squeeze(-1),
             'chase_speed_max': self.semantic_transition_chase_speed_max_head(chase_token).squeeze(-1),
+            'current_cover_edge_valid_logit': self.semantic_transition_current_edge_valid_head(timing_token).squeeze(-1),
+            'current_cover_edge_mode_logits': self.semantic_transition_current_edge_mode_head(timing_token),
+            'future_cover_edge_valid_logit': self.semantic_transition_future_edge_valid_head(timing_token).squeeze(-1),
+            'future_cover_edge_mode_logits': self.semantic_transition_future_edge_mode_head(timing_token),
+            'current_cover_upper_speed': self.semantic_transition_current_cover_upper_speed_head(boundary_token).squeeze(-1),
+            'future_cover_lower_speed': self.semantic_transition_future_cover_lower_speed_head(boundary_token).squeeze(-1),
+            'front_follow_upper_speed': self.semantic_transition_front_follow_upper_speed_head(chase_token).squeeze(-1),
+            'merge_flow_lower_speed': self.semantic_transition_merge_flow_lower_speed_head(boundary_token).squeeze(-1),
             'merge_yld_max': self.semantic_transition_merge_yld_max_head(boundary_token).squeeze(-1),
             'merge_go_min': self.semantic_transition_merge_go_min_head(boundary_token).squeeze(-1),
             'junction_yld_max': self.semantic_transition_junction_yld_max_head(boundary_token).squeeze(-1),
@@ -2468,6 +2565,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         branch_condition: Optional[torch.Tensor] = None,
         branch_condition_scale: float = 1.0,
         branch_condition_schedule: Optional[torch.Tensor] = None,
+        prev_route_coarse_memory: Optional[torch.Tensor] = None,
         return_intermediates: bool = False,
         stage1_speed_samples: Optional[torch.Tensor] = None,
     ):
@@ -2531,37 +2629,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
                         "forward_ego expects branch_condition_schedule as "
                         f"(B, 5) or (B, 8), got {branch_condition_schedule.shape}"
                     )
-            window_cond = branch_condition[:, :self.traj_window_condition_dim]
-            dir_start = self.traj_window_condition_dim
-            dir_end = dir_start + self.traj_dir_condition_dim
-            dir_cond = branch_condition[:, dir_start:dir_end]
-            decision_start = dir_end
-            decision_end = decision_start + self.traj_decision_phase_condition_dim
-            decision_cond = branch_condition[:, decision_start:decision_end]
-            control_start = decision_end
-            control_end = control_start + self.traj_control_phase_condition_dim
-            control_cond = branch_condition[:, control_start:control_end]
-            boundary_start = control_end
-            boundary_end = boundary_start + self.traj_boundary_margin_dim
-            boundary_cond = branch_condition[:, boundary_start:boundary_end]
-            opportunity_start = boundary_end
-            opportunity_end = opportunity_start + self.traj_opportunity_condition_dim
-            opportunity_cond = branch_condition[:, opportunity_start:opportunity_end]
-            area_status_start = opportunity_end
-            area_status_end = area_status_start + self.traj_area_status_condition_dim
-            area_status_cond = branch_condition[:, area_status_start:area_status_end]
-            timing_start = area_status_end
-            timing_end = timing_start + self.traj_timing_condition_dim
-            timing_cond = branch_condition[:, timing_start:timing_end]
-            chase_start = timing_end
-            chase_end = chase_start + self.traj_chase_condition_dim
-            chase_cond = branch_condition[:, chase_start:chase_end]
-            borrow_aux = branch_condition[:, chase_end:]
-            if borrow_aux.shape[-1] != self.traj_borrow_aux_dim:
-                raise ValueError(
-                    "forward_ego expects branch_condition borrow aux dim "
-                    f"{self.traj_borrow_aux_dim}, got {borrow_aux.shape[-1]}"
-                )
             gate_window = branch_condition_schedule[:, 0:1]
             gate_dir = branch_condition_schedule[:, 1:2]
             gate_phase = branch_condition_schedule[:, 2:3]
@@ -2576,22 +2643,89 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 gate_area_status = branch_condition_schedule[:, 5:6]
                 gate_timing = branch_condition_schedule[:, 6:7]
                 gate_borrow = branch_condition_schedule[:, 7:8]
-            branch_cond_emb = (
-                self.traj_window_condition_proj(window_cond) * gate_window
-                + self.traj_dir_condition_proj(dir_cond) * gate_dir
-                + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
-                + self.traj_control_phase_condition_proj(control_cond) * gate_phase
-                + self.traj_boundary_margin_proj(boundary_cond) * gate_boundary
-                + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
-                + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status
-                + self.traj_timing_condition_proj(timing_cond) * gate_timing
-                + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
-            )
-            if self.use_chase_front_following_state:
+            if self.semantic_motion_condition_mode == "compact_graph":
+                cursor = 0
+                window_cond = branch_condition[:, cursor:cursor + self.traj_window_condition_dim]
+                cursor += self.traj_window_condition_dim
+                decision_cond = branch_condition[:, cursor:cursor + self.traj_decision_phase_condition_dim]
+                cursor += self.traj_decision_phase_condition_dim
+                control_cond = branch_condition[:, cursor:cursor + self.traj_control_phase_condition_dim]
+                cursor += self.traj_control_phase_condition_dim
+                opportunity_cond = branch_condition[:, cursor:cursor + self.traj_opportunity_condition_dim]
+                cursor += self.traj_opportunity_condition_dim
+                current_edge_cond = branch_condition[:, cursor:cursor + self.traj_current_edge_condition_dim]
+                cursor += self.traj_current_edge_condition_dim
+                future_edge_cond = branch_condition[:, cursor:cursor + self.traj_future_edge_condition_dim]
+                cursor += self.traj_future_edge_condition_dim
+                edge_margin_cond = branch_condition[:, cursor:cursor + self.traj_edge_margin_dim]
+                cursor += self.traj_edge_margin_dim
+                edge_valid_cond = branch_condition[:, cursor:cursor + self.traj_edge_valid_dim]
+                cursor += self.traj_edge_valid_dim
+                borrow_aux = branch_condition[:, cursor:]
+                if borrow_aux.shape[-1] != self.traj_borrow_aux_dim:
+                    raise ValueError(
+                        "forward_ego expects compact branch_condition borrow aux dim "
+                        f"{self.traj_borrow_aux_dim}, got {borrow_aux.shape[-1]}"
+                    )
                 branch_cond_emb = (
-                    branch_cond_emb
-                    + self.traj_chase_condition_proj(chase_cond) * gate_boundary
+                    self.traj_window_condition_proj(window_cond) * gate_window
+                    + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
+                    + self.traj_control_phase_condition_proj(control_cond) * gate_phase
+                    + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
+                    + self.traj_current_edge_condition_proj(current_edge_cond) * gate_phase
+                    + self.traj_future_edge_condition_proj(future_edge_cond) * gate_phase
+                    + self.traj_edge_margin_proj(edge_margin_cond) * gate_boundary
+                    + self.traj_edge_valid_proj(edge_valid_cond) * gate_boundary
+                    + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
                 )
+            else:
+                window_cond = branch_condition[:, :self.traj_window_condition_dim]
+                dir_start = self.traj_window_condition_dim
+                dir_end = dir_start + self.traj_dir_condition_dim
+                dir_cond = branch_condition[:, dir_start:dir_end]
+                decision_start = dir_end
+                decision_end = decision_start + self.traj_decision_phase_condition_dim
+                decision_cond = branch_condition[:, decision_start:decision_end]
+                control_start = decision_end
+                control_end = control_start + self.traj_control_phase_condition_dim
+                control_cond = branch_condition[:, control_start:control_end]
+                boundary_start = control_end
+                boundary_end = boundary_start + self.traj_boundary_margin_dim
+                boundary_cond = branch_condition[:, boundary_start:boundary_end]
+                opportunity_start = boundary_end
+                opportunity_end = opportunity_start + self.traj_opportunity_condition_dim
+                opportunity_cond = branch_condition[:, opportunity_start:opportunity_end]
+                area_status_start = opportunity_end
+                area_status_end = area_status_start + self.traj_area_status_condition_dim
+                area_status_cond = branch_condition[:, area_status_start:area_status_end]
+                timing_start = area_status_end
+                timing_end = timing_start + self.traj_timing_condition_dim
+                timing_cond = branch_condition[:, timing_start:timing_end]
+                chase_start = timing_end
+                chase_end = chase_start + self.traj_chase_condition_dim
+                chase_cond = branch_condition[:, chase_start:chase_end]
+                borrow_aux = branch_condition[:, chase_end:]
+                if borrow_aux.shape[-1] != self.traj_borrow_aux_dim:
+                    raise ValueError(
+                        "forward_ego expects branch_condition borrow aux dim "
+                        f"{self.traj_borrow_aux_dim}, got {borrow_aux.shape[-1]}"
+                    )
+                branch_cond_emb = (
+                    self.traj_window_condition_proj(window_cond) * gate_window
+                    + self.traj_dir_condition_proj(dir_cond) * gate_dir
+                    + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
+                    + self.traj_control_phase_condition_proj(control_cond) * gate_phase
+                    + self.traj_boundary_margin_proj(boundary_cond) * gate_boundary
+                    + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
+                    + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status
+                    + self.traj_timing_condition_proj(timing_cond) * gate_timing
+                    + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
+                )
+                if self.use_chase_front_following_state:
+                    branch_cond_emb = (
+                        branch_cond_emb
+                        + self.traj_chase_condition_proj(chase_cond) * gate_boundary
+                    )
             branch_cond_emb = branch_cond_emb * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)
         traj_emb = self.pre_decoder_norm(self.drop(traj_emb))
@@ -2604,6 +2738,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_wp_emb = self._embed_route_waypoint_tokens(route_points)
         route_diff_query = self.route_diff_query.expand(B, T_route, -1)
         route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
+        if self.use_route_prev_coarse_memory and prev_route_coarse_memory is not None:
+            prev_route_coarse_memory = prev_route_coarse_memory.to(device=device, dtype=model_dtype)
+            if (
+                prev_route_coarse_memory.dim() != 2
+                or prev_route_coarse_memory.shape[-1] != self.route_prev_coarse_memory_dim
+            ):
+                raise ValueError(
+                    "forward_ego expects prev_route_coarse_memory as "
+                    f"(B, {self.route_prev_coarse_memory_dim}), got {prev_route_coarse_memory.shape}"
+                )
+            route_emb = route_emb + self.route_prev_coarse_memory_proj(
+                prev_route_coarse_memory
+            ).unsqueeze(1)
         route_emb = self.pre_decoder_norm(self.drop(route_emb))
 
         ego_mask = self.decoder._create_ego_speed_mask(

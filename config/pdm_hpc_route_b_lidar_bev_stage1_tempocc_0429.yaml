@@ -121,6 +121,11 @@ route_b:
   shared_stage1_training_source_switch_epoch: 30
   use_speed_profile_head: false
   use_traj_branch_condition: true
+  semantic_motion_condition_mode: compact_graph
+  use_cover_relation_graph_decoder: true
+  cover_graph_use_traj_context: false
+  cover_graph_use_speed_context: false
+  use_route_prev_coarse_memory: true
   traj_branch_condition_scale: 2.0
   traj_branch_condition_detach: true
   traj_branch_condition_gt_prob_start: 1.0
@@ -156,6 +161,16 @@ route_b:
   chase_speed_max_loss_weight: 0.15
   chase_speed_norm_scale: 30.0
   traj_branch_condition_chase_margin_scale: 5.0
+  current_edge_valid_loss_weight: 0.10
+  current_edge_mode_loss_weight: 0.10
+  future_edge_valid_loss_weight: 0.10
+  future_edge_mode_loss_weight: 0.10
+  current_cover_upper_loss_weight: 0.15
+  future_cover_lower_loss_weight: 0.15
+  front_follow_upper_loss_weight: 0.10
+  merge_flow_lower_loss_weight: 0.10
+  use_edge_speed_consistency_loss: false
+  edge_speed_consistency_loss_weight: 0.05
   use_semantic_state_transition: true
   semantic_transition_prev_source: offline_gt
   semantic_transition_loss_weight: 1.0
@@ -220,7 +235,7 @@ training:
   max_keep_ckpts: 20
   early_stopping_patience: 15
   best_checkpoint_metric: phase_balanced
-  checkpoint_dir: /workspace1/z_project/code/motdp_z_independent_tempocc_0429/checkpoints/route_b_stage1_tempocc_chase_0501
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_independent_tempocc_0429/checkpoints/route_b_stage1_tempocc_covergraph_0509
 
 validation:
   enabled: true
@@ -232,8 +247,8 @@ validation:
 logging:
   use_wandb: true
   wandb_project: route_b_lidar_bev
-  run_name: route_b_stage1_tempocc_chase_0501
-  checkpoint_dir: /workspace1/z_project/code/motdp_z_independent_tempocc_0429/checkpoints/route_b_stage1_tempocc_chase_0501
+  run_name: route_b_stage1_tempocc_covergraph_0509
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_independent_tempocc_0429/checkpoints/route_b_stage1_tempocc_covergraph_0509
   save_every: 5
   log_freq: 50
 

@@ -176,6 +176,56 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.traj_branch_condition_boundary_margin_scale = float(
             route_b_cfg.get('traj_branch_condition_boundary_margin_scale', 5.0)
         )
+        self.semantic_motion_condition_mode = str(
+            route_b_cfg.get('semantic_motion_condition_mode', 'full')
+        ).lower()
+        if self.semantic_motion_condition_mode not in ('full', 'compact_graph'):
+            raise ValueError(
+                "semantic_motion_condition_mode must be 'full' or 'compact_graph', "
+                f"got {self.semantic_motion_condition_mode}"
+            )
+        self.use_cover_relation_graph_decoder = bool(
+            route_b_cfg.get('use_cover_relation_graph_decoder', False)
+        )
+        self.cover_graph_use_traj_context = bool(
+            route_b_cfg.get('cover_graph_use_traj_context', False)
+        )
+        self.cover_graph_use_speed_context = bool(
+            route_b_cfg.get('cover_graph_use_speed_context', False)
+        )
+        self.use_route_prev_coarse_memory = bool(
+            route_b_cfg.get('use_route_prev_coarse_memory', False)
+        )
+        self.current_edge_valid_loss_weight = float(
+            route_b_cfg.get('current_edge_valid_loss_weight', 0.10)
+        )
+        self.current_edge_mode_loss_weight = float(
+            route_b_cfg.get('current_edge_mode_loss_weight', 0.10)
+        )
+        self.future_edge_valid_loss_weight = float(
+            route_b_cfg.get('future_edge_valid_loss_weight', 0.10)
+        )
+        self.future_edge_mode_loss_weight = float(
+            route_b_cfg.get('future_edge_mode_loss_weight', 0.10)
+        )
+        self.current_cover_upper_loss_weight = float(
+            route_b_cfg.get('current_cover_upper_loss_weight', 0.15)
+        )
+        self.future_cover_lower_loss_weight = float(
+            route_b_cfg.get('future_cover_lower_loss_weight', 0.15)
+        )
+        self.front_follow_upper_loss_weight = float(
+            route_b_cfg.get('front_follow_upper_loss_weight', 0.10)
+        )
+        self.merge_flow_lower_loss_weight = float(
+            route_b_cfg.get('merge_flow_lower_loss_weight', 0.10)
+        )
+        self.use_edge_speed_consistency_loss = bool(
+            route_b_cfg.get('use_edge_speed_consistency_loss', False)
+        )
+        self.edge_speed_consistency_loss_weight = float(
+            route_b_cfg.get('edge_speed_consistency_loss_weight', 0.05)
+        )
         self.stage1_boundary_norm_scale = float(
             route_b_cfg.get('stage1_boundary_norm_scale', 30.0)
         )
@@ -344,18 +394,50 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'chase_has_lead',
             'chase_speed_margin',
         )
-        self.traj_branch_condition_names = (
-            *self.traj_window_condition_names,
-            *self.traj_dir_condition_names,
-            *self.traj_decision_phase_condition_names,
-            *self.traj_control_phase_condition_names,
-            *self.traj_boundary_condition_names,
-            *self.traj_opportunity_condition_names,
-            *self.traj_area_status_condition_names,
-            *self.traj_timing_condition_names,
-            *self.traj_chase_condition_names,
-            'borrow_time',
+        self.traj_edge_condition_names = (
+            'current_edge_valid',
+            'current_edge_none',
+            'current_edge_pass_after_current',
+            'current_edge_go_before_future',
+            'current_edge_yield_after_future',
+            'current_edge_ambiguous',
+            'future_edge_valid',
+            'future_edge_none',
+            'future_edge_pass_after_current',
+            'future_edge_go_before_future',
+            'future_edge_yield_after_future',
+            'future_edge_ambiguous',
+            'current_upper_margin',
+            'future_lower_margin',
+            'front_follow_upper_margin',
+            'merge_flow_lower_margin',
+            'current_upper_valid',
+            'future_lower_valid',
+            'front_follow_upper_valid',
+            'merge_flow_lower_valid',
         )
+        if self.semantic_motion_condition_mode == 'compact_graph':
+            self.traj_branch_condition_names = (
+                *self.traj_window_condition_names,
+                *self.traj_decision_phase_condition_names,
+                *self.traj_control_phase_condition_names,
+                *self.traj_opportunity_condition_names,
+                *self.traj_edge_condition_names,
+                'borrow_time',
+            )
+        else:
+            self.traj_branch_condition_names = (
+                *self.traj_window_condition_names,
+                *self.traj_dir_condition_names,
+                *self.traj_decision_phase_condition_names,
+                *self.traj_control_phase_condition_names,
+                *self.traj_boundary_condition_names,
+                *self.traj_opportunity_condition_names,
+                *self.traj_area_status_condition_names,
+                *self.traj_timing_condition_names,
+                *self.traj_chase_condition_names,
+                'borrow_time',
+            )
 
         status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -392,6 +474,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             lidar_bev_history_frames=self.lidar_history_frames,
             use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
             use_chase_front_following_state=self.use_chase_front_following_state,
+            semantic_motion_condition_mode=self.semantic_motion_condition_mode,
+            use_cover_relation_graph_decoder=self.use_cover_relation_graph_decoder,
+            cover_graph_use_traj_context=self.cover_graph_use_traj_context,
+            cover_graph_use_speed_context=self.cover_graph_use_speed_context,
+            use_route_prev_coarse_memory=self.use_route_prev_coarse_memory,
         )
         self.model = model
 
@@ -571,6 +658,29 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 raise ValueError(
                     "use_chase_front_following_state=true requires chase_has_lead, "
                     "and chase_speed_max in every batch"
+                )
+        if self.use_cover_relation_graph_decoder:
+            graph_required = (
+                self._resolve_stage1_batch_key(batch, 'current_cover_edge_valid'),
+                self._resolve_stage1_batch_key(batch, 'current_cover_edge_occupied'),
+                self._resolve_stage1_batch_key(batch, 'current_cover_edge_mode'),
+                self._resolve_stage1_batch_key(batch, 'current_cover_edge_mode_valid'),
+                self._resolve_stage1_batch_key(batch, 'current_cover_upper_speed_mps'),
+                self._resolve_stage1_batch_key(batch, 'current_cover_upper_speed_valid'),
+                self._resolve_stage1_batch_key(batch, 'future_cover_edge_valid'),
+                self._resolve_stage1_batch_key(batch, 'future_cover_edge_mode'),
+                self._resolve_stage1_batch_key(batch, 'future_cover_edge_mode_valid'),
+                self._resolve_stage1_batch_key(batch, 'future_cover_lower_speed_mps'),
+                self._resolve_stage1_batch_key(batch, 'future_cover_lower_speed_valid'),
+                self._resolve_stage1_batch_key(batch, 'front_follow_upper_speed_mps'),
+                self._resolve_stage1_batch_key(batch, 'front_follow_upper_speed_valid'),
+                self._resolve_stage1_batch_key(batch, 'merge_flow_lower_speed_mps'),
+                self._resolve_stage1_batch_key(batch, 'merge_flow_lower_speed_valid'),
+            )
+            if any(key is None for key in graph_required):
+                raise ValueError(
+                    "use_cover_relation_graph_decoder=true requires edge-aware "
+                    "cover relation labels. Run the graph postprocess plus project/split."
                 )
         if self.use_semantic_state_transition:
             prev_required = (
@@ -863,6 +973,88 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'speed_max_valid': speed_valid,
         }
 
+    def _get_cover_relation_graph_targets(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+        require: bool = False,
+    ) -> Optional[dict]:
+        def _float(name: str) -> Optional[torch.Tensor]:
+            value = self._get_stage1_batch_tensor(
+                batch, name, device=device, model_dtype=model_dtype
+            )
+            if value is None:
+                return None
+            return torch.nan_to_num(
+                value.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+        def _long(name: str) -> Optional[torch.Tensor]:
+            value = self._get_stage1_long_target(batch, name, device=device)
+            if value is None:
+                return None
+            return value.reshape(-1)
+
+        current_valid = _float('current_cover_edge_valid')
+        current_occupied = _float('current_cover_edge_occupied')
+        current_mode = _long('current_cover_edge_mode')
+        current_mode_valid = _float('current_cover_edge_mode_valid')
+        current_upper = _float('current_cover_upper_speed_mps')
+        current_upper_valid = _float('current_cover_upper_speed_valid')
+        future_valid = _float('future_cover_edge_valid')
+        future_mode = _long('future_cover_edge_mode')
+        future_mode_valid = _float('future_cover_edge_mode_valid')
+        future_lower = _float('future_cover_lower_speed_mps')
+        future_lower_valid = _float('future_cover_lower_speed_valid')
+        front_follow_upper = _float('front_follow_upper_speed_mps')
+        front_follow_upper_valid = _float('front_follow_upper_speed_valid')
+        merge_flow_lower = _float('merge_flow_lower_speed_mps')
+        merge_flow_lower_valid = _float('merge_flow_lower_speed_valid')
+
+        required_values = (
+            current_valid,
+            current_occupied,
+            current_mode,
+            current_mode_valid,
+            current_upper,
+            current_upper_valid,
+            future_valid,
+            future_mode,
+            future_mode_valid,
+            future_lower,
+            future_lower_valid,
+            front_follow_upper,
+            front_follow_upper_valid,
+            merge_flow_lower,
+            merge_flow_lower_valid,
+        )
+        if any(value is None for value in required_values):
+            if require:
+                raise ValueError(
+                    "cover relation graph training requires current/future edge "
+                    "valid/mode/speed labels plus front-follow and merge-flow speeds"
+                )
+            return None
+
+        return {
+            'current_valid': current_valid.clamp(0.0, 1.0),
+            'current_occupied': current_occupied.clamp(0.0, 1.0),
+            'current_mode': current_mode.clamp(min=0, max=4),
+            'current_mode_valid': current_mode_valid.clamp(0.0, 1.0) > 0.5,
+            'current_upper': current_upper.clamp(min=0.0),
+            'current_upper_valid': current_upper_valid.clamp(0.0, 1.0) > 0.5,
+            'future_valid': future_valid.clamp(0.0, 1.0),
+            'future_mode': future_mode.clamp(min=0, max=4),
+            'future_mode_valid': future_mode_valid.clamp(0.0, 1.0) > 0.5,
+            'future_lower': future_lower.clamp(min=0.0),
+            'future_lower_valid': future_lower_valid.clamp(0.0, 1.0) > 0.5,
+            'front_follow_upper': front_follow_upper.clamp(min=0.0),
+            'front_follow_upper_valid': front_follow_upper_valid.clamp(0.0, 1.0) > 0.5,
+            'merge_flow_lower': merge_flow_lower.clamp(min=0.0),
+            'merge_flow_lower_valid': merge_flow_lower_valid.clamp(0.0, 1.0) > 0.5,
+        }
+
     def _get_semantic_transition_prev_state(
         self,
         batch: Dict[str, torch.Tensor],
@@ -996,6 +1188,36 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 prev_state[key] = value * gate
         return prev_state
 
+    def _get_route_prev_coarse_memory(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_dtype: torch.dtype,
+        require: bool = False,
+    ) -> Optional[torch.Tensor]:
+        valid = self._get_stage1_batch_tensor(
+            batch, 'prev_semantic_state_valid', device=device, model_dtype=model_dtype
+        )
+        family = self._get_stage1_long_target(batch, 'prev_conflict_area_family', device=device)
+        direction = self._get_stage1_long_target(batch, 'prev_conflict_area_dir', device=device)
+        if valid is None or family is None or direction is None:
+            if require:
+                raise ValueError(
+                    "route previous coarse memory requires prev_semantic_state_valid, "
+                    "prev_conflict_area_family, and prev_conflict_area_dir"
+                )
+            return None
+        valid = torch.nan_to_num(valid.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        window = self._window_target_from_family_codes(family.reshape(-1))
+        window_oh = F.one_hot(window.clamp(min=0, max=3), num_classes=4).to(
+            device=device, dtype=model_dtype
+        )
+        dir_oh = F.one_hot(direction.reshape(-1).clamp(min=0, max=3), num_classes=4).to(
+            device=device, dtype=model_dtype
+        )
+        memory = torch.cat([valid.unsqueeze(-1), window_oh, dir_oh], dim=-1)
+        return memory * valid.unsqueeze(-1)
+
     def _build_conflict_area_route_target(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1114,6 +1336,38 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             chase_speed_max_mps = self._chase_norm_to_mps(raw_scores['chase_speed_max'])
         else:
             chase_speed_max_mps = None
+        current_edge_valid_prob = (
+            torch.sigmoid(raw_scores['current_cover_edge_valid_logit'])
+            if 'current_cover_edge_valid_logit' in raw_scores else None
+        )
+        current_edge_mode_probs = (
+            torch.softmax(raw_scores['current_cover_edge_mode_logits'], dim=-1)
+            if 'current_cover_edge_mode_logits' in raw_scores else None
+        )
+        future_edge_valid_prob = (
+            torch.sigmoid(raw_scores['future_cover_edge_valid_logit'])
+            if 'future_cover_edge_valid_logit' in raw_scores else None
+        )
+        future_edge_mode_probs = (
+            torch.softmax(raw_scores['future_cover_edge_mode_logits'], dim=-1)
+            if 'future_cover_edge_mode_logits' in raw_scores else None
+        )
+        current_cover_upper_speed_mps = (
+            self._boundary_norm_to_mps(raw_scores['current_cover_upper_speed'])
+            if 'current_cover_upper_speed' in raw_scores else None
+        )
+        future_cover_lower_speed_mps = (
+            self._boundary_norm_to_mps(raw_scores['future_cover_lower_speed'])
+            if 'future_cover_lower_speed' in raw_scores else None
+        )
+        front_follow_upper_speed_mps = (
+            self._boundary_norm_to_mps(raw_scores['front_follow_upper_speed'])
+            if 'front_follow_upper_speed' in raw_scores else None
+        )
+        merge_flow_lower_speed_mps = (
+            self._boundary_norm_to_mps(raw_scores['merge_flow_lower_speed'])
+            if 'merge_flow_lower_speed' in raw_scores else None
+        )
 
         same_opp = dir_probs[:, 1:3]
         lane_dir_relation_probs = torch.where(
@@ -1158,6 +1412,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'conflict_time_to_entry_s': conflict_time_to_entry_s,
             'chase_has_lead_prob': chase_has_lead_prob,
             'chase_speed_max_mps': chase_speed_max_mps,
+            'current_cover_edge_valid_prob': current_edge_valid_prob,
+            'current_cover_edge_mode_probs': current_edge_mode_probs,
+            'future_cover_edge_valid_prob': future_edge_valid_prob,
+            'future_cover_edge_mode_probs': future_edge_mode_probs,
+            'current_cover_upper_speed_mps': current_cover_upper_speed_mps,
+            'future_cover_lower_speed_mps': future_cover_lower_speed_mps,
+            'front_follow_upper_speed_mps': front_follow_upper_speed_mps,
+            'merge_flow_lower_speed_mps': merge_flow_lower_speed_mps,
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'merge_yld_max_mps': merge_yld_max,
             'merge_go_min_mps': merge_go_min,
@@ -1286,6 +1548,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         borrow_time_s: Optional[torch.Tensor],
         device: torch.device,
         model_dtype: torch.dtype,
+        current_edge_valid_prob: Optional[torch.Tensor] = None,
+        current_edge_mode_probs: Optional[torch.Tensor] = None,
+        current_cover_upper_speed_mps: Optional[torch.Tensor] = None,
+        current_cover_upper_valid: Optional[torch.Tensor] = None,
+        future_edge_valid_prob: Optional[torch.Tensor] = None,
+        future_edge_mode_probs: Optional[torch.Tensor] = None,
+        future_cover_lower_speed_mps: Optional[torch.Tensor] = None,
+        future_cover_lower_valid: Optional[torch.Tensor] = None,
+        front_follow_upper_speed_mps: Optional[torch.Tensor] = None,
+        front_follow_upper_valid: Optional[torch.Tensor] = None,
+        merge_flow_lower_speed_mps: Optional[torch.Tensor] = None,
+        merge_flow_lower_valid: Optional[torch.Tensor] = None,
     ):
         window_probs = self._normalize_prob_rows(
             window_probs.to(device=device, dtype=model_dtype),
@@ -1352,6 +1626,106 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ).clamp(-1.0, 1.0)
         chase_condition = torch.stack(
             [chase_has_lead_prob, chase_speed_margin],
+            dim=-1,
+        )
+
+        def _prob1(value: Optional[torch.Tensor]) -> torch.Tensor:
+            if value is None:
+                return torch.zeros((B,), device=device, dtype=model_dtype)
+            return torch.nan_to_num(
+                value.to(device=device, dtype=model_dtype).reshape(-1),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+
+        def _mode_probs(value: Optional[torch.Tensor]) -> torch.Tensor:
+            if value is None:
+                out = torch.zeros((B, 5), device=device, dtype=model_dtype)
+                out[:, 0] = 1.0
+                return out
+            value = value.to(device=device, dtype=model_dtype).reshape(B, -1)
+            if value.shape[-1] != 5:
+                raise ValueError(f"edge mode probs expects (B, 5), got {value.shape}")
+            return self._normalize_prob_rows(value, fallback_index=0)
+
+        def _speed_margin(
+            speed: Optional[torch.Tensor],
+            valid: Optional[torch.Tensor],
+            *,
+            upper: bool,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            valid_prob = _prob1(valid)
+            if speed is None:
+                margin = torch.zeros((B,), device=device, dtype=model_dtype)
+            else:
+                speed = torch.nan_to_num(
+                    speed.to(device=device, dtype=model_dtype).reshape(-1),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if upper:
+                    margin = (
+                        (speed - center_speed)
+                        / max(self.traj_branch_condition_boundary_margin_scale, 1e-6)
+                    )
+                else:
+                    margin = (
+                        (center_speed - speed)
+                        / max(self.traj_branch_condition_boundary_margin_scale, 1e-6)
+                    )
+                margin = margin.clamp(-1.0, 1.0)
+            return margin * valid_prob, valid_prob
+
+        current_edge_valid_prob = _prob1(current_edge_valid_prob)
+        future_edge_valid_prob = _prob1(future_edge_valid_prob)
+        current_edge_mode_probs = _mode_probs(current_edge_mode_probs)
+        future_edge_mode_probs = _mode_probs(future_edge_mode_probs)
+        current_upper_margin, current_upper_valid_prob = _speed_margin(
+            current_cover_upper_speed_mps,
+            current_cover_upper_valid,
+            upper=True,
+        )
+        future_lower_margin, future_lower_valid_prob = _speed_margin(
+            future_cover_lower_speed_mps,
+            future_cover_lower_valid,
+            upper=False,
+        )
+        front_follow_upper_margin, front_follow_upper_valid_prob = _speed_margin(
+            front_follow_upper_speed_mps,
+            front_follow_upper_valid,
+            upper=True,
+        )
+        merge_flow_lower_margin, merge_flow_lower_valid_prob = _speed_margin(
+            merge_flow_lower_speed_mps,
+            merge_flow_lower_valid,
+            upper=False,
+        )
+        current_edge_condition = torch.cat(
+            [current_edge_valid_prob.unsqueeze(-1), current_edge_mode_probs],
+            dim=-1,
+        )
+        future_edge_condition = torch.cat(
+            [future_edge_valid_prob.unsqueeze(-1), future_edge_mode_probs],
+            dim=-1,
+        )
+        edge_speed_margins = torch.stack(
+            [
+                current_upper_margin,
+                future_lower_margin,
+                front_follow_upper_margin,
+                merge_flow_lower_margin,
+            ],
+            dim=-1,
+        )
+        edge_speed_valids = torch.stack(
+            [
+                current_upper_valid_prob,
+                future_lower_valid_prob,
+                front_follow_upper_valid_prob,
+                merge_flow_lower_valid_prob,
+            ],
             dim=-1,
         )
 
@@ -1430,21 +1804,37 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 max=1.0,
             ) * borrow_window_score
 
-        branch_condition = torch.cat(
-            [
-                window_probs,
-                dir_probs,
-                decision_phase_probs,
-                control_phase_probs,
-                boundary_margins,
-                go_opportunity_probs,
-                conflict_area_status_probs,
-                conflict_timing_values,
-                chase_condition,
-                borrow_time_cond.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
+        if self.semantic_motion_condition_mode == 'compact_graph':
+            branch_condition = torch.cat(
+                [
+                    window_probs,
+                    decision_phase_probs,
+                    control_phase_probs,
+                    go_opportunity_probs,
+                    current_edge_condition,
+                    future_edge_condition,
+                    edge_speed_margins,
+                    edge_speed_valids,
+                    borrow_time_cond.unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+        else:
+            branch_condition = torch.cat(
+                [
+                    window_probs,
+                    dir_probs,
+                    decision_phase_probs,
+                    control_phase_probs,
+                    boundary_margins,
+                    go_opportunity_probs,
+                    conflict_area_status_probs,
+                    conflict_timing_values,
+                    chase_condition,
+                    borrow_time_cond.unsqueeze(-1),
+                ],
+                dim=-1,
+            )
         details = {
             'window_probs': window_probs,
             'dir_probs': dir_probs,
@@ -1457,6 +1847,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'chase_has_lead_prob': chase_has_lead_prob,
             'chase_speed_margin': chase_speed_margin,
             'chase_speed_max_mps': chase_speed_max_mps,
+            'current_edge_valid_prob': current_edge_valid_prob,
+            'current_edge_mode_probs': current_edge_mode_probs,
+            'future_edge_valid_prob': future_edge_valid_prob,
+            'future_edge_mode_probs': future_edge_mode_probs,
+            'edge_speed_margins': edge_speed_margins,
+            'edge_speed_valids': edge_speed_valids,
+            'current_upper_margin': current_upper_margin,
+            'future_lower_margin': future_lower_margin,
+            'front_follow_upper_margin': front_follow_upper_margin,
+            'merge_flow_lower_margin': merge_flow_lower_margin,
             'borrow_time_condition': borrow_time_cond,
             'lane_dir_relation_probs': lane_dir_relation_probs,
             'selected_yld_max_mps': selected_yld_max,
@@ -1519,7 +1919,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if not applied:
             return branch_condition, details, debug, update_history
 
-        decision_start = len(self.traj_window_condition_names) + len(self.traj_dir_condition_names)
+        if self.semantic_motion_condition_mode == 'compact_graph':
+            decision_start = len(self.traj_window_condition_names)
+        else:
+            decision_start = len(self.traj_window_condition_names) + len(self.traj_dir_condition_names)
         decision_end = decision_start + len(self.traj_decision_phase_condition_names)
         decision_override = torch.zeros_like(decision_phase_probs)
         decision_override[:, 1] = 1.0
@@ -1631,6 +2034,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
             if self.use_chase_front_following_state else None
         )
+        graph_targets = self._get_cover_relation_graph_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_cover_relation_graph_decoder,
+        )
+        graph_targets = self._get_cover_relation_graph_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_cover_relation_graph_decoder,
+        )
+        if graph_targets is not None:
+            current_edge_mode_probs = F.one_hot(
+                graph_targets['current_mode'].clamp(min=0, max=4),
+                num_classes=5,
+            ).to(device=device, dtype=model_dtype)
+            future_edge_mode_probs = F.one_hot(
+                graph_targets['future_mode'].clamp(min=0, max=4),
+                num_classes=5,
+            ).to(device=device, dtype=model_dtype)
+        else:
+            current_edge_mode_probs = None
+            future_edge_mode_probs = None
 
         return self._compose_stage1_branch_condition(
             window_probs=window_probs,
@@ -1662,6 +2089,42 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             borrow_time_s=borrow_time_s,
             device=device,
             model_dtype=model_dtype,
+            current_edge_valid_prob=(
+                graph_targets['current_valid'] if graph_targets is not None else None
+            ),
+            current_edge_mode_probs=current_edge_mode_probs,
+            current_cover_upper_speed_mps=(
+                graph_targets['current_upper'] if graph_targets is not None else None
+            ),
+            current_cover_upper_valid=(
+                graph_targets['current_upper_valid'].to(dtype=model_dtype)
+                if graph_targets is not None else None
+            ),
+            future_edge_valid_prob=(
+                graph_targets['future_valid'] if graph_targets is not None else None
+            ),
+            future_edge_mode_probs=future_edge_mode_probs,
+            future_cover_lower_speed_mps=(
+                graph_targets['future_lower'] if graph_targets is not None else None
+            ),
+            future_cover_lower_valid=(
+                graph_targets['future_lower_valid'].to(dtype=model_dtype)
+                if graph_targets is not None else None
+            ),
+            front_follow_upper_speed_mps=(
+                graph_targets['front_follow_upper'] if graph_targets is not None else None
+            ),
+            front_follow_upper_valid=(
+                graph_targets['front_follow_upper_valid'].to(dtype=model_dtype)
+                if graph_targets is not None else None
+            ),
+            merge_flow_lower_speed_mps=(
+                graph_targets['merge_flow_lower'] if graph_targets is not None else None
+            ),
+            merge_flow_lower_valid=(
+                graph_targets['merge_flow_lower_valid'].to(dtype=model_dtype)
+                if graph_targets is not None else None
+            ),
         )
 
     def _build_traj_branch_condition_from_stage1_raw(
@@ -1733,6 +2196,54 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             borrow_time_s=borrow_time_s,
             device=device,
             model_dtype=model_dtype,
+            current_edge_valid_prob=(
+                torch.sigmoid(raw_scores['current_cover_edge_valid_logit'])
+                if 'current_cover_edge_valid_logit' in raw_scores else None
+            ),
+            current_edge_mode_probs=(
+                torch.softmax(raw_scores['current_cover_edge_mode_logits'], dim=-1)
+                if 'current_cover_edge_mode_logits' in raw_scores else None
+            ),
+            current_cover_upper_speed_mps=(
+                self._boundary_norm_to_mps(raw_scores['current_cover_upper_speed'])
+                if 'current_cover_upper_speed' in raw_scores else None
+            ),
+            current_cover_upper_valid=(
+                torch.sigmoid(raw_scores['current_cover_edge_valid_logit'])
+                if 'current_cover_edge_valid_logit' in raw_scores else None
+            ),
+            future_edge_valid_prob=(
+                torch.sigmoid(raw_scores['future_cover_edge_valid_logit'])
+                if 'future_cover_edge_valid_logit' in raw_scores else None
+            ),
+            future_edge_mode_probs=(
+                torch.softmax(raw_scores['future_cover_edge_mode_logits'], dim=-1)
+                if 'future_cover_edge_mode_logits' in raw_scores else None
+            ),
+            future_cover_lower_speed_mps=(
+                self._boundary_norm_to_mps(raw_scores['future_cover_lower_speed'])
+                if 'future_cover_lower_speed' in raw_scores else None
+            ),
+            future_cover_lower_valid=(
+                torch.sigmoid(raw_scores['future_cover_edge_valid_logit'])
+                if 'future_cover_edge_valid_logit' in raw_scores else None
+            ),
+            front_follow_upper_speed_mps=(
+                self._boundary_norm_to_mps(raw_scores['front_follow_upper_speed'])
+                if 'front_follow_upper_speed' in raw_scores else None
+            ),
+            front_follow_upper_valid=(
+                torch.sigmoid(raw_scores['chase_has_lead_logit'])
+                if 'chase_has_lead_logit' in raw_scores else None
+            ),
+            merge_flow_lower_speed_mps=(
+                self._boundary_norm_to_mps(raw_scores['merge_flow_lower_speed'])
+                if 'merge_flow_lower_speed' in raw_scores else None
+            ),
+            merge_flow_lower_valid=(
+                torch.sigmoid(raw_scores['future_cover_edge_valid_logit'])
+                if 'future_cover_edge_valid_logit' in raw_scores else None
+            ),
         )
 
     def _infer_traj_branch_condition(
@@ -2092,6 +2603,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         diff_timesteps: Optional[torch.Tensor] = None,
         branch_condition: Optional[torch.Tensor] = None,
         branch_condition_schedule: Optional[torch.Tensor] = None,
+        prev_route_coarse_memory: Optional[torch.Tensor] = None,
+        speed_pred_for_consistency: Optional[torch.Tensor] = None,
     ):
         gt_abs = trajectory.unsqueeze(1)
         gt_joint_normed = self.joint_abs_to_norm(trajectory, route_gt).unsqueeze(1)
@@ -2172,6 +2685,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 branch_condition=branch_condition,
                 branch_condition_scale=self.traj_branch_condition_scale,
                 branch_condition_schedule=branch_condition_schedule if branch_condition is not None else None,
+                prev_route_coarse_memory=prev_route_coarse_memory,
                 return_intermediates=True,
             )
         else:
@@ -2185,6 +2699,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 ego_status=ego_status,
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
+                prev_route_coarse_memory=prev_route_coarse_memory,
                 return_intermediates=True,
             )
         raw_stage1_scores = self.model.compute_shared_stage1_from_ego_outputs(
@@ -2352,6 +2867,114 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 chase_speed_target_norm.float(),
             )
 
+        loss_current_edge_valid = zero
+        loss_current_edge_mode = zero
+        loss_future_edge_valid = zero
+        loss_future_edge_mode = zero
+        loss_current_cover_upper = zero
+        loss_future_cover_lower = zero
+        loss_front_follow_upper = zero
+        loss_merge_flow_lower = zero
+        loss_edge_speed_consistency = zero
+        if graph_targets is not None:
+            loss_current_edge_valid = F.binary_cross_entropy_with_logits(
+                raw_stage1_scores['current_cover_edge_valid_logit'].float(),
+                graph_targets['current_valid'].float(),
+            )
+            if graph_targets['current_mode_valid'].any():
+                loss_current_edge_mode = F.cross_entropy(
+                    raw_stage1_scores['current_cover_edge_mode_logits'][
+                        graph_targets['current_mode_valid']
+                    ].float(),
+                    graph_targets['current_mode'][graph_targets['current_mode_valid']],
+                )
+            loss_future_edge_valid = F.binary_cross_entropy_with_logits(
+                raw_stage1_scores['future_cover_edge_valid_logit'].float(),
+                graph_targets['future_valid'].float(),
+            )
+            if graph_targets['future_mode_valid'].any():
+                loss_future_edge_mode = F.cross_entropy(
+                    raw_stage1_scores['future_cover_edge_mode_logits'][
+                        graph_targets['future_mode_valid']
+                    ].float(),
+                    graph_targets['future_mode'][graph_targets['future_mode_valid']],
+                )
+
+            def _graph_speed_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+                if not valid.any():
+                    return zero
+                target_norm = (
+                    target_mps / max(self.stage1_boundary_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0)
+                return F.smooth_l1_loss(
+                    pred_norm[valid].float(),
+                    target_norm[valid].float(),
+                )
+
+            loss_current_cover_upper = _graph_speed_loss(
+                raw_stage1_scores['current_cover_upper_speed'],
+                graph_targets['current_upper'],
+                graph_targets['current_upper_valid'],
+            )
+            loss_future_cover_lower = _graph_speed_loss(
+                raw_stage1_scores['future_cover_lower_speed'],
+                graph_targets['future_lower'],
+                graph_targets['future_lower_valid'],
+            )
+            loss_front_follow_upper = _graph_speed_loss(
+                raw_stage1_scores['front_follow_upper_speed'],
+                graph_targets['front_follow_upper'],
+                graph_targets['front_follow_upper_valid'],
+            )
+            loss_merge_flow_lower = _graph_speed_loss(
+                raw_stage1_scores['merge_flow_lower_speed'],
+                graph_targets['merge_flow_lower'],
+                graph_targets['merge_flow_lower_valid'],
+            )
+            if self.use_edge_speed_consistency_loss and speed_pred_for_consistency is not None:
+                pred_speed = self.decode_speed_two_hot(
+                    speed_pred_for_consistency, self.model.speed_classes
+                ).to(device=device, dtype=model_dtype)
+
+                def _upper_violation(upper_speed: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+                    if not valid.any():
+                        return zero
+                    return F.smooth_l1_loss(
+                        pred_speed[valid],
+                        torch.minimum(pred_speed[valid], upper_speed[valid]),
+                    )
+
+                def _lower_violation(lower_speed: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+                    if not valid.any():
+                        return zero
+                    return F.smooth_l1_loss(
+                        pred_speed[valid],
+                        torch.maximum(pred_speed[valid], lower_speed[valid]),
+                    )
+
+                future_go_before_mask = (
+                    graph_targets['future_lower_valid']
+                    & (graph_targets['future_mode'] == 2)
+                )
+                loss_edge_speed_consistency = torch.stack([
+                    _upper_violation(
+                        graph_targets['current_upper'],
+                        graph_targets['current_upper_valid'],
+                    ),
+                    _lower_violation(
+                        graph_targets['future_lower'],
+                        future_go_before_mask,
+                    ),
+                    _upper_violation(
+                        graph_targets['front_follow_upper'],
+                        graph_targets['front_follow_upper_valid'],
+                    ),
+                    _lower_violation(
+                        graph_targets['merge_flow_lower'],
+                        graph_targets['merge_flow_lower_valid'],
+                    ),
+                ]).mean()
+
         loss_merge_active = zero
         loss_junction_active = zero
         loss_borrow_active = zero
@@ -2427,6 +3050,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     ego_status=ego_status,
                     bev_proj_cached=bev_proj,
                     transfuser_lidar_bev=transfuser_lidar_bev,
+                    prev_route_coarse_memory=prev_route_coarse_memory,
                     return_intermediates=True,
                 )
                 return self.model.compute_shared_stage1_from_ego_outputs(
@@ -2509,6 +3133,48 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     timing_targets['valid'],
                 )
             loss_state_consistency_timing = status_consistency + timing_consistency
+            if graph_targets is not None:
+                graph_consistency = (
+                    _sym_mse(
+                        scores_view1['current_cover_edge_valid_logit'],
+                        scores_view2['current_cover_edge_valid_logit'],
+                    )
+                    + _sym_kl_logits(
+                        scores_view1['current_cover_edge_mode_logits'],
+                        scores_view2['current_cover_edge_mode_logits'],
+                        graph_targets['current_mode_valid'],
+                    )
+                    + _sym_mse(
+                        scores_view1['future_cover_edge_valid_logit'],
+                        scores_view2['future_cover_edge_valid_logit'],
+                    )
+                    + _sym_kl_logits(
+                        scores_view1['future_cover_edge_mode_logits'],
+                        scores_view2['future_cover_edge_mode_logits'],
+                        graph_targets['future_mode_valid'],
+                    )
+                    + _sym_smooth_l1(
+                        scores_view1['current_cover_upper_speed'],
+                        scores_view2['current_cover_upper_speed'],
+                        graph_targets['current_upper_valid'],
+                    )
+                    + _sym_smooth_l1(
+                        scores_view1['future_cover_lower_speed'],
+                        scores_view2['future_cover_lower_speed'],
+                        graph_targets['future_lower_valid'],
+                    )
+                    + _sym_smooth_l1(
+                        scores_view1['front_follow_upper_speed'],
+                        scores_view2['front_follow_upper_speed'],
+                        graph_targets['front_follow_upper_valid'],
+                    )
+                    + _sym_smooth_l1(
+                        scores_view1['merge_flow_lower_speed'],
+                        scores_view2['merge_flow_lower_speed'],
+                        graph_targets['merge_flow_lower_valid'],
+                    )
+                ) / 8.0
+                loss_state_consistency_timing = loss_state_consistency_timing + graph_consistency
             loss_state_consistency = (
                 self.state_consistency_window_weight * loss_state_consistency_window
                 + self.state_consistency_phase_weight * loss_state_consistency_phase
@@ -2533,6 +3199,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.conflict_timing_loss_weight * loss_conflict_timing
             + self.energy_chase_weight * loss_chase
             + self.inside_area_go_loss_weight * loss_inside_area_go
+            + self.current_edge_valid_loss_weight * loss_current_edge_valid
+            + self.current_edge_mode_loss_weight * loss_current_edge_mode
+            + self.future_edge_valid_loss_weight * loss_future_edge_valid
+            + self.future_edge_mode_loss_weight * loss_future_edge_mode
+            + self.current_cover_upper_loss_weight * loss_current_cover_upper
+            + self.future_cover_lower_loss_weight * loss_future_cover_lower
+            + self.front_follow_upper_loss_weight * loss_front_follow_upper
+            + self.merge_flow_lower_loss_weight * loss_merge_flow_lower
+            + self.edge_speed_consistency_loss_weight * loss_edge_speed_consistency
         )
         semantic_transition_loss = zero
         semantic_transition_consistency_loss = zero
@@ -2671,6 +3346,70 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     + self.chase_speed_max_loss_weight * transition_chase_speed
                 )
 
+            transition_loss_current_edge_valid = zero
+            transition_loss_current_edge_mode = zero
+            transition_loss_future_edge_valid = zero
+            transition_loss_future_edge_mode = zero
+            transition_loss_current_cover_upper = zero
+            transition_loss_future_cover_lower = zero
+            transition_loss_front_follow_upper = zero
+            transition_loss_merge_flow_lower = zero
+            if graph_targets is not None:
+                transition_loss_current_edge_valid = F.binary_cross_entropy_with_logits(
+                    transition_stage1_scores['current_cover_edge_valid_logit'].float(),
+                    graph_targets['current_valid'].float(),
+                )
+                if graph_targets['current_mode_valid'].any():
+                    transition_loss_current_edge_mode = F.cross_entropy(
+                        transition_stage1_scores['current_cover_edge_mode_logits'][
+                            graph_targets['current_mode_valid']
+                        ].float(),
+                        graph_targets['current_mode'][graph_targets['current_mode_valid']],
+                    )
+                transition_loss_future_edge_valid = F.binary_cross_entropy_with_logits(
+                    transition_stage1_scores['future_cover_edge_valid_logit'].float(),
+                    graph_targets['future_valid'].float(),
+                )
+                if graph_targets['future_mode_valid'].any():
+                    transition_loss_future_edge_mode = F.cross_entropy(
+                        transition_stage1_scores['future_cover_edge_mode_logits'][
+                            graph_targets['future_mode_valid']
+                        ].float(),
+                        graph_targets['future_mode'][graph_targets['future_mode_valid']],
+                    )
+
+                def _transition_graph_speed_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+                    if not valid.any():
+                        return zero
+                    target_norm = (
+                        target_mps / max(self.stage1_boundary_norm_scale, 1e-6)
+                    ).clamp(0.0, 1.0)
+                    return F.smooth_l1_loss(
+                        pred_norm[valid].float(),
+                        target_norm[valid].float(),
+                    )
+
+                transition_loss_current_cover_upper = _transition_graph_speed_loss(
+                    transition_stage1_scores['current_cover_upper_speed'],
+                    graph_targets['current_upper'],
+                    graph_targets['current_upper_valid'],
+                )
+                transition_loss_future_cover_lower = _transition_graph_speed_loss(
+                    transition_stage1_scores['future_cover_lower_speed'],
+                    graph_targets['future_lower'],
+                    graph_targets['future_lower_valid'],
+                )
+                transition_loss_front_follow_upper = _transition_graph_speed_loss(
+                    transition_stage1_scores['front_follow_upper_speed'],
+                    graph_targets['front_follow_upper'],
+                    graph_targets['front_follow_upper_valid'],
+                )
+                transition_loss_merge_flow_lower = _transition_graph_speed_loss(
+                    transition_stage1_scores['merge_flow_lower_speed'],
+                    graph_targets['merge_flow_lower'],
+                    graph_targets['merge_flow_lower_valid'],
+                )
+
             semantic_transition_loss = (
                 + self.energy_merge_weight * transition_loss_merge
                 + self.energy_junction_weight * transition_loss_junction
@@ -2685,6 +3424,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 + self.conflict_timing_loss_weight * transition_loss_timing
                 + self.energy_chase_weight * transition_loss_chase
                 + self.inside_area_go_loss_weight * transition_loss_inside_go
+                + self.current_edge_valid_loss_weight * transition_loss_current_edge_valid
+                + self.current_edge_mode_loss_weight * transition_loss_current_edge_mode
+                + self.future_edge_valid_loss_weight * transition_loss_future_edge_valid
+                + self.future_edge_mode_loss_weight * transition_loss_future_edge_mode
+                + self.current_cover_upper_loss_weight * transition_loss_current_cover_upper
+                + self.future_cover_lower_loss_weight * transition_loss_future_cover_lower
+                + self.front_follow_upper_loss_weight * transition_loss_front_follow_upper
+                + self.merge_flow_lower_loss_weight * transition_loss_merge_flow_lower
             )
 
             def _transition_masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -2782,6 +3529,47 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         transition_stage1_scores['chase_speed_max'],
                     ),
                 ])
+            if graph_targets is not None:
+                transition_consistency_terms.extend([
+                    _transition_sym_mse(
+                        raw_stage1_scores['current_cover_edge_valid_logit'],
+                        transition_stage1_scores['current_cover_edge_valid_logit'],
+                    ),
+                    _transition_sym_kl(
+                        raw_stage1_scores['current_cover_edge_mode_logits'],
+                        transition_stage1_scores['current_cover_edge_mode_logits'],
+                        graph_targets['current_mode_valid'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['future_cover_edge_valid_logit'],
+                        transition_stage1_scores['future_cover_edge_valid_logit'],
+                    ),
+                    _transition_sym_kl(
+                        raw_stage1_scores['future_cover_edge_mode_logits'],
+                        transition_stage1_scores['future_cover_edge_mode_logits'],
+                        graph_targets['future_mode_valid'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['current_cover_upper_speed'],
+                        transition_stage1_scores['current_cover_upper_speed'],
+                        graph_targets['current_upper_valid'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['future_cover_lower_speed'],
+                        transition_stage1_scores['future_cover_lower_speed'],
+                        graph_targets['future_lower_valid'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['front_follow_upper_speed'],
+                        transition_stage1_scores['front_follow_upper_speed'],
+                        graph_targets['front_follow_upper_valid'],
+                    ),
+                    _transition_sym_mse(
+                        raw_stage1_scores['merge_flow_lower_speed'],
+                        transition_stage1_scores['merge_flow_lower_speed'],
+                        graph_targets['merge_flow_lower_valid'],
+                    ),
+                ])
             semantic_transition_consistency_loss = torch.stack(transition_consistency_terms).mean()
 
         if transition_stage1_scores is not None:
@@ -2803,6 +3591,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'chase_loss': loss_chase,
             'chase_has_lead_loss': loss_chase_has_lead,
             'chase_speed_max_loss': loss_chase_speed_max,
+            'current_edge_valid_loss': loss_current_edge_valid,
+            'current_edge_mode_loss': loss_current_edge_mode,
+            'future_edge_valid_loss': loss_future_edge_valid,
+            'future_edge_mode_loss': loss_future_edge_mode,
+            'current_cover_upper_loss': loss_current_cover_upper,
+            'future_cover_lower_loss': loss_future_cover_lower,
+            'front_follow_upper_loss': loss_front_follow_upper,
+            'merge_flow_lower_loss': loss_merge_flow_lower,
+            'edge_speed_consistency_loss': loss_edge_speed_consistency,
             'merge_loss': loss_merge,
             'junction_loss': loss_junction,
             'borrow_loss': loss_borrow,
@@ -2927,6 +3724,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
 
         bev_proj = self.model.decoder.compute_bev_proj(transfuser_bev_feature)
+        prev_route_coarse_memory = (
+            self._get_route_prev_coarse_memory(
+                batch,
+                device=device,
+                model_dtype=model_dtype,
+                require=False,
+            )
+            if self.use_route_prev_coarse_memory else None
+        )
 
         # ===== Forward 1: Ego denoising (M=1) =====
         if route_gt.shape[1] != self.num_waypoints:
@@ -2973,6 +3779,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 branch_condition=branch_input,
                 branch_condition_scale=self.traj_branch_condition_scale,
                 branch_condition_schedule=branch_condition_schedule if branch_input is not None else None,
+                prev_route_coarse_memory=prev_route_coarse_memory,
             )
 
         poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = _forward_ego_with_branch(
@@ -3058,6 +3865,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     traj_branch_condition is not None and self.traj_branch_condition_detach
                 ) else traj_branch_condition,
                 branch_condition_schedule=branch_condition_schedule,
+                prev_route_coarse_memory=prev_route_coarse_memory,
+                speed_pred_for_consistency=speed_pred,
             )
             energy_loss = stage1_loss_dict['stage1_loss']
             loss_front = stage1_loss_dict['chase_loss']
@@ -3093,6 +3902,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'stage1_chase_loss': stage1_loss_dict.get('chase_loss', zero_t),
                 'stage1_chase_has_lead_loss': stage1_loss_dict.get('chase_has_lead_loss', zero_t),
                 'stage1_chase_speed_max_loss': stage1_loss_dict.get('chase_speed_max_loss', zero_t),
+                'stage1_current_edge_valid_loss': stage1_loss_dict.get('current_edge_valid_loss', zero_t),
+                'stage1_current_edge_mode_loss': stage1_loss_dict.get('current_edge_mode_loss', zero_t),
+                'stage1_future_edge_valid_loss': stage1_loss_dict.get('future_edge_valid_loss', zero_t),
+                'stage1_future_edge_mode_loss': stage1_loss_dict.get('future_edge_mode_loss', zero_t),
+                'stage1_current_cover_upper_loss': stage1_loss_dict.get('current_cover_upper_loss', zero_t),
+                'stage1_future_cover_lower_loss': stage1_loss_dict.get('future_cover_lower_loss', zero_t),
+                'stage1_front_follow_upper_loss': stage1_loss_dict.get('front_follow_upper_loss', zero_t),
+                'stage1_merge_flow_lower_loss': stage1_loss_dict.get('merge_flow_lower_loss', zero_t),
+                'stage1_edge_speed_consistency_loss': stage1_loss_dict.get('edge_speed_consistency_loss', zero_t),
                 'stage1_state_consistency_loss': stage1_loss_dict.get('state_consistency_loss', zero_t),
                 'stage1_state_consistency_window_loss': stage1_loss_dict.get('state_consistency_window_loss', zero_t),
                 'stage1_state_consistency_phase_loss': stage1_loss_dict.get('state_consistency_phase_loss', zero_t),
@@ -3539,6 +4357,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 traj_branch_condition_details['chase_speed_margin']
                 if traj_branch_condition_details is not None else None
             ),
+            'traj_current_edge_condition_probs': (
+                traj_branch_condition_details['current_edge_mode_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_future_edge_condition_probs': (
+                traj_branch_condition_details['future_edge_mode_probs']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_edge_speed_margin_condition': (
+                traj_branch_condition_details['edge_speed_margins']
+                if traj_branch_condition_details is not None else None
+            ),
+            'traj_edge_speed_valid_condition': (
+                traj_branch_condition_details['edge_speed_valids']
+                if traj_branch_condition_details is not None else None
+            ),
             'traj_borrow_time_condition': (
                 traj_branch_condition_details['borrow_time_condition']
                 if traj_branch_condition_details is not None else None
@@ -3664,6 +4498,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['traj_chase_speed_margin_condition'] = (
                 sample_result['traj_chase_speed_margin_condition'].detach().float().cpu().numpy()
             )
+        if sample_result.get('traj_current_edge_condition_probs') is not None:
+            result['traj_current_edge_condition_probs'] = (
+                sample_result['traj_current_edge_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_future_edge_condition_probs') is not None:
+            result['traj_future_edge_condition_probs'] = (
+                sample_result['traj_future_edge_condition_probs'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_edge_speed_margin_condition') is not None:
+            result['traj_edge_speed_margin_condition'] = (
+                sample_result['traj_edge_speed_margin_condition'].detach().float().cpu().numpy()
+            )
+        if sample_result.get('traj_edge_speed_valid_condition') is not None:
+            result['traj_edge_speed_valid_condition'] = (
+                sample_result['traj_edge_speed_valid_condition'].detach().float().cpu().numpy()
+            )
         if sample_result.get('traj_borrow_time_condition') is not None:
             result['traj_borrow_time_condition'] = (
                 sample_result['traj_borrow_time_condition'].detach().float().cpu().numpy()
@@ -3725,6 +4575,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_time_to_entry_s',
                 'chase_has_lead_prob',
                 'chase_speed_max_mps',
+                'current_cover_edge_valid_prob',
+                'current_cover_edge_mode_probs',
+                'future_cover_edge_valid_prob',
+                'future_cover_edge_mode_probs',
+                'current_cover_upper_speed_mps',
+                'future_cover_lower_speed_mps',
+                'front_follow_upper_speed_mps',
+                'merge_flow_lower_speed_mps',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'junction_yld_max_mps',
@@ -3750,6 +4608,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_timing_values',
                 'chase_has_lead_logit',
                 'chase_speed_max',
+                'current_cover_edge_valid_logit',
+                'current_cover_edge_mode_logits',
+                'future_cover_edge_valid_logit',
+                'future_cover_edge_mode_logits',
+                'current_cover_upper_speed',
+                'future_cover_lower_speed',
+                'front_follow_upper_speed',
+                'merge_flow_lower_speed',
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
@@ -3785,6 +4651,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_time_to_entry_s',
                 'chase_has_lead_prob',
                 'chase_speed_max_mps',
+                'current_cover_edge_valid_prob',
+                'current_cover_edge_mode_probs',
+                'future_cover_edge_valid_prob',
+                'future_cover_edge_mode_probs',
+                'current_cover_upper_speed_mps',
+                'future_cover_lower_speed_mps',
+                'front_follow_upper_speed_mps',
+                'merge_flow_lower_speed_mps',
                 'merge_yld_max_mps',
                 'merge_go_min_mps',
                 'junction_yld_max_mps',
@@ -3810,6 +4684,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'conflict_timing_values',
                 'chase_has_lead_logit',
                 'chase_speed_max',
+                'current_cover_edge_valid_logit',
+                'current_cover_edge_mode_logits',
+                'future_cover_edge_valid_logit',
+                'future_cover_edge_mode_logits',
+                'current_cover_upper_speed',
+                'future_cover_lower_speed',
+                'front_follow_upper_speed',
+                'merge_flow_lower_speed',
                 'conflict_area_logits',
                 'merge_yld_max',
                 'merge_go_min',
