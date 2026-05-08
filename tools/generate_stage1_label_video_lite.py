@@ -67,6 +67,20 @@ CONFLICT_AREA_STATUS_NAMES = {
     2: "inside",
     3: "after",
 }
+COVER_EDGE_MODE_NAMES = {
+    0: "none",
+    1: "pass_after_current",
+    2: "go_before_future",
+    3: "yield_after_future",
+    4: "ambiguous",
+}
+COVER_EDGE_SPEED_SOURCE_NAMES = {
+    0: "none",
+    1: "junction_yld_max",
+    2: "family_go_min",
+    3: "chase_speed_max",
+    4: "merge_follow_through_vbmin",
+}
 
 
 def _resolve_packed_path(dataset_path=None, packed_path=None):
@@ -783,6 +797,29 @@ def _phase_object_binding_panel_lines(sample):
     ]
 
 
+def _cover_relation_graph_panel_lines(sample):
+    debug = ((sample.get("stage1_speed_debug") or {}).get("cover_relation_graph_boundary") or {})
+    cur_mode = int(sample.get("current_cover_edge_mode", 0))
+    fut_mode = int(sample.get("future_cover_edge_mode", 0))
+    cur_source = int(sample.get("current_cover_upper_speed_source", 0))
+    fut_source = int(sample.get("future_cover_lower_speed_source", 0))
+    cur_valid = int(float(sample.get("current_cover_edge_mode_valid", 0.0)) > 0.5)
+    fut_valid = int(float(sample.get("future_cover_edge_mode_valid", 0.0)) > 0.5)
+    cur_edge = int(float(sample.get("current_cover_edge_valid", 0.0)) > 0.5)
+    fut_edge = int(float(sample.get("future_cover_edge_valid", 0.0)) > 0.5)
+    occupied = int(float(sample.get("current_cover_edge_occupied", 0.0)) > 0.5)
+    cur_upper_valid = int(float(sample.get("current_cover_upper_speed_valid", 0.0)) > 0.5)
+    fut_lower_valid = int(float(sample.get("future_cover_lower_speed_valid", 0.0)) > 0.5)
+    chase_upper_valid = int(float(sample.get("front_follow_upper_speed_valid", 0.0)) > 0.5)
+    flow_lower_valid = int(float(sample.get("merge_flow_lower_speed_valid", 0.0)) > 0.5)
+    future_debug = debug.get("future_edge") or {}
+    return [
+        f"graph cur={COVER_EDGE_MODE_NAMES.get(cur_mode, str(cur_mode))}/{cur_valid} edge={cur_edge} occ={occupied} up={_fmt_float(sample.get('current_cover_upper_speed_mps', np.nan))}/{cur_upper_valid} src={COVER_EDGE_SPEED_SOURCE_NAMES.get(cur_source, str(cur_source))}",
+        f"graph fut={COVER_EDGE_MODE_NAMES.get(fut_mode, str(fut_mode))}/{fut_valid} edge={fut_edge} low={_fmt_float(sample.get('future_cover_lower_speed_mps', np.nan))}/{fut_lower_valid} src={COVER_EDGE_SPEED_SOURCE_NAMES.get(fut_source, str(fut_source))}",
+        f"graph aux chaseU={_fmt_float(sample.get('front_follow_upper_speed_mps', np.nan))}/{chase_upper_valid} flowL={_fmt_float(sample.get('merge_flow_lower_speed_mps', np.nan))}/{flow_lower_valid} fsrc={future_debug.get('mode_source', 'none')}",
+    ]
+
+
 def _draw_junction_window_start_marker(canvas, conflict_area, merge_motion, route_xy, ego_matrix, x_range, y_range):
     color = (0, 140, 255)
     window_start_world = np.asarray((conflict_area or {}).get("window_start_world_xyz", []), dtype=np.float32).reshape(-1)
@@ -1100,6 +1137,7 @@ def _build_text_panel(sample, current_meas):
         "Debug",
         [
             *_phase_object_binding_panel_lines(sample),
+            *_cover_relation_graph_panel_lines(sample),
             *_temporary_occupancy_cover_panel_lines(sample),
             _threshold_panel_line(
                 family_name,

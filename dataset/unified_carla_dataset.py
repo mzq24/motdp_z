@@ -85,6 +85,42 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
         'borrow_cross_active_time_s': 0.0,
         'chase_max_speed': float('nan'),
         'chase_max_speed_valid': 0.0,
+        'chase_has_lead': 0.0,
+        'chase_dist_m': 40.0,
+        'chase_dist_valid': 0.0,
+        'chase_ttc_s': 10.0,
+        'chase_ttc_valid': 0.0,
+        'chase_speed_max': 30.0,
+        'chase_speed_max_valid': 0.0,
+        'conflict_dist_to_entry_m': float('nan'),
+        'conflict_dist_to_exit_m': float('nan'),
+        'conflict_time_to_entry_s': float('nan'),
+        'merge_follow_through_vbmin': float('nan'),
+        'merge_follow_through_vbmin_valid': 0.0,
+        'merge_follow_through_vbmin_actor_valid': 0.0,
+        'boundary_speed_consistency_valid': 0.0,
+        'boundary_speed_consistency_issue_flag': 0.0,
+        'boundary_speed_consistency_speed_delta_mps': float('nan'),
+        'conflict_phase_ref_actor_valid': 0.0,
+        'conflict_phase_open_unbounded': 0.0,
+        'conflict_phase_boundary_ref_valid': 0.0,
+        'conflict_phase_boundary_state_valid': 0.0,
+        'conflict_phase_boundary_object_missing': 0.0,
+        'conflict_phase_boundary_scalar_loss_valid': 0.0,
+        'conflict_phase_boundary_actor_match': 0.0,
+        'current_cover_edge_valid': 0.0,
+        'current_cover_edge_occupied': 0.0,
+        'current_cover_edge_mode_valid': 0.0,
+        'future_cover_edge_valid': 0.0,
+        'future_cover_edge_mode_valid': 0.0,
+        'current_cover_upper_speed_mps': float('nan'),
+        'current_cover_upper_speed_valid': 0.0,
+        'future_cover_lower_speed_mps': float('nan'),
+        'future_cover_lower_speed_valid': 0.0,
+        'front_follow_upper_speed_mps': float('nan'),
+        'front_follow_upper_speed_valid': 0.0,
+        'merge_flow_lower_speed_mps': float('nan'),
+        'merge_flow_lower_speed_valid': 0.0,
     }
 
     speed_samples = final_sample.get('speed_sample_values')
@@ -102,6 +138,15 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
         if key not in final_sample:
             final_sample[key] = torch.tensor(default_value, dtype=torch.float32)
 
+    # Sentinel valid=-1 means the packed sample predates offline conflict-area
+    # route masks. The policy will fall back to the legacy frame-window target.
+    if 'conflict_area_route_mask' not in final_sample:
+        final_sample['conflict_area_route_mask'] = torch.zeros(20, dtype=torch.float32)
+    if 'conflict_area_route_mask_valid' not in final_sample:
+        final_sample['conflict_area_route_mask_valid'] = torch.full((20,), -1.0, dtype=torch.float32)
+    if 'conflict_area_status' not in final_sample:
+        final_sample['conflict_area_status'] = torch.tensor(0, dtype=torch.long)
+
     legacy_merge_float_defaults = {
         'merge_episode_active': 0.0,
         'merge_episode_no_go': 0.0,
@@ -114,6 +159,19 @@ def _ensure_stage1_legacy_curve_defaults(final_sample):
         'merge_episode_end_frame': -1,
         'merge_go_frame': -1,
         'merge_resolution_actor_id': -1,
+        'chase_status': 0,
+        'merge_follow_through_vbmin_actor_id': -1,
+        'boundary_speed_consistency_issue': 0,
+        'boundary_speed_consistency_required_action': 0,
+        'conflict_phase_ref_role': 0,
+        'conflict_phase_ref_actor_id': -1,
+        'conflict_phase_boundary_ref_role': 0,
+        'conflict_phase_boundary_mode': 0,
+        'conflict_phase_boundary_ref_actor_id': -1,
+        'current_cover_edge_mode': 0,
+        'future_cover_edge_mode': 0,
+        'current_cover_upper_speed_source': 0,
+        'future_cover_lower_speed_source': 0,
     }
 
     for key, default_value in legacy_merge_float_defaults.items():
@@ -195,6 +253,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._feat_mmap = None       # numpy memmap for bev_features
         self._ups_mmap = None        # numpy memmap for bev_upsamples
         self._feat_index = None      # dict: packed_path -> {offset, n_frames, frame_num_to_idx}
+        self._ups_cache_is_fullres = False
         # LRU fallback (used when memmap cache not built yet)
         self._route_pack_cache = {}
         self._route_pack_cache_maxsize = 32
@@ -399,21 +458,31 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             cache_dir = os.path.join(image_data_root, 'tmp_data')
         sfx = f'_{feature_suffix}' if feature_suffix else ''
         index_path = os.path.join(cache_dir, f'feature_index{sfx}.pkl')
+        fullres_index_path = os.path.join(cache_dir, f'feature_index{sfx}_fullres.pkl')
         feat_bin = os.path.join(cache_dir, f'bev_features_fp16{sfx}.bin')
         ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}.bin')
+        fullres_ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}_fullres.bin')
+
+        chosen_index_path = index_path
+        chosen_ups_bin = ups_bin
+        if os.path.exists(fullres_index_path) and os.path.exists(feat_bin) and os.path.exists(fullres_ups_bin):
+            chosen_index_path = fullres_index_path
+            chosen_ups_bin = fullres_ups_bin
 
         if skip_memmap:
             print(f"[Rank {rank}] Skipping memmap (will use inject_ram_features later).")
-        elif os.path.exists(index_path) and os.path.exists(feat_bin) and os.path.exists(ups_bin):
-            with open(index_path, 'rb') as f:
+        elif os.path.exists(chosen_index_path) and os.path.exists(feat_bin) and os.path.exists(chosen_ups_bin):
+            with open(chosen_index_path, 'rb') as f:
                 cache_meta = pickle.load(f)
             self._feat_index = cache_meta['index']
             self._feat_mmap = np.memmap(feat_bin, dtype=np.float16, mode='r',
                                         shape=tuple(cache_meta['bev_feat_shape']))
-            self._ups_mmap = np.memmap(ups_bin, dtype=np.float16, mode='r',
+            self._ups_mmap = np.memmap(chosen_ups_bin, dtype=np.float16, mode='r',
                                        shape=tuple(cache_meta['bev_ups_shape']))
+            self._ups_cache_is_fullres = tuple(cache_meta['bev_ups_shape'][-2:]) == (64, 64)
+            ups_variant = 'fullres_64x64' if self._ups_cache_is_fullres else 'downsampled_32x32'
             print(f"[Rank {rank}] Feature memmap loaded: {len(self._feat_index)} routes, "
-                  f"{cache_meta['total_frames']} frames (shared across ranks).")
+                  f"{cache_meta['total_frames']} frames (shared across ranks, upsample_cache={ups_variant}).")
         else:
             print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
                   f"Using LRU fallback (slow). Run: python scripts/data_tools/build_feature_cache_fp16.py")
@@ -539,6 +608,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'bev_upsamples': pack['bev_upsamples'].half(),
             }
         return self._route_pack_cache[packed_path]
+
+    @staticmethod
+    def _decode_cached_bev_upsample(ups_tensor: torch.Tensor) -> torch.Tensor:
+        """Convert cached BEV upsample tensor to the model-facing (64, 64, 64) layout."""
+        if tuple(ups_tensor.shape[-2:]) == (64, 64):
+            return ups_tensor.half()
+        return F.interpolate(
+            ups_tensor.unsqueeze(0).float(),
+            size=(64, 64),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).half()
 
     def _load_single_lidar_bev_frame(self, route_rel: str, frame_id: int, feat_rel: str) -> Optional[torch.Tensor]:
         if frame_id is None:
@@ -677,10 +758,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     cached = self._ram_features.get(abs_idx)
                     if cached is not None:
                         transfuser_bev_feature = cached[0]
-                        ups_ds = cached[1]
-                        transfuser_bev_feature_upsample = F.interpolate(
-                            ups_ds.unsqueeze(0).float(), size=(64, 64),
-                            mode='bilinear', align_corners=False).squeeze(0).half()
+                        transfuser_bev_feature_upsample = self._decode_cached_bev_upsample(cached[1])
             elif self._feat_index is not None:
                 # Fast path: memmap (zero IO after pages are faulted in)
                 route_info = self._feat_index.get(packed_path)
@@ -691,12 +769,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                         transfuser_bev_feature = torch.from_numpy(
                             self._feat_mmap[abs_idx].copy())  # (1512, 8, 8) float16
                         clone_keys.add('transfuser_bev_feature')
-                        # Stored as (64, 32, 32) after 2x downsample, interpolate back
-                        ups_ds = torch.from_numpy(
-                            self._ups_mmap[abs_idx].copy())           # (64, 32, 32) float16
-                        transfuser_bev_feature_upsample = F.interpolate(
-                            ups_ds.unsqueeze(0).float(), size=(64, 64),
-                            mode='bilinear', align_corners=False).squeeze(0).half()
+                        ups_cached = torch.from_numpy(self._ups_mmap[abs_idx].copy())
+                        transfuser_bev_feature_upsample = self._decode_cached_bev_upsample(ups_cached)
                     else:
                         import warnings
                         warnings.warn(
@@ -804,6 +878,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'borrow_cross_active_time_s',
                 'chase_max_speed',
                 'chase_max_speed_valid',
+                'chase_has_lead',
+                'chase_dist_m',
+                'chase_dist_valid',
+                'chase_ttc_s',
+                'chase_ttc_valid',
+                'chase_speed_max',
+                'chase_speed_max_valid',
                 'merge_yld_max_speed',
                 'merge_go_min_speed',
                 'merge_yld_max_speed_valid',
@@ -817,6 +898,44 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'junction_yld_max_speed_valid',
                 'junction_go_min_speed_valid',
                 'merge_threshold_train_only_negative_tail',
+                'temporary_occupancy_cover_bins',
+                'temporary_occupancy_cover_valid',
+                'go_opportunity_prob',
+                'yld_pressure_prob',
+                'go_opportunity_valid',
+                'adjusted_run_start_bins',
+                'reference_run_len',
+                'conflict_dist_to_entry_m',
+                'conflict_dist_to_exit_m',
+                'conflict_time_to_entry_s',
+                'merge_follow_through_vbmin',
+                'merge_follow_through_vbmin_valid',
+                'merge_follow_through_vbmin_actor_valid',
+                'boundary_speed_consistency_valid',
+                'boundary_speed_consistency_issue_flag',
+                'boundary_speed_consistency_speed_delta_mps',
+                'conflict_phase_ref_actor_valid',
+                'conflict_phase_open_unbounded',
+                'conflict_phase_boundary_ref_valid',
+                'conflict_phase_boundary_state_valid',
+                'conflict_phase_boundary_object_missing',
+                'conflict_phase_boundary_scalar_loss_valid',
+                'conflict_phase_boundary_actor_match',
+                'current_cover_edge_valid',
+                'current_cover_edge_occupied',
+                'current_cover_edge_mode_valid',
+                'future_cover_edge_valid',
+                'future_cover_edge_mode_valid',
+                'current_cover_upper_speed_mps',
+                'current_cover_upper_speed_valid',
+                'future_cover_lower_speed_mps',
+                'future_cover_lower_speed_valid',
+                'front_follow_upper_speed_mps',
+                'front_follow_upper_speed_valid',
+                'merge_flow_lower_speed_mps',
+                'merge_flow_lower_speed_valid',
+                'conflict_area_route_mask',
+                'conflict_area_route_mask_valid',
             }:
                 final_sample[key] = _from_numpy(value, key)
             elif key in {
@@ -827,6 +946,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 'conflict_go_frame',
                 'conflict_area_start_frame',
                 'conflict_area_end_frame',
+                'conflict_area_status',
+                'chase_status',
+                'merge_follow_through_vbmin_actor_id',
+                'boundary_speed_consistency_issue',
+                'boundary_speed_consistency_required_action',
+                'conflict_phase_ref_role',
+                'conflict_phase_ref_actor_id',
+                'conflict_phase_boundary_ref_role',
+                'conflict_phase_boundary_mode',
+                'conflict_phase_boundary_ref_actor_id',
+                'current_cover_edge_mode',
+                'future_cover_edge_mode',
+                'current_cover_upper_speed_source',
+                'future_cover_lower_speed_source',
             }:
                 if isinstance(value, np.ndarray):
                     final_sample[key] = torch.from_numpy(value).long()
