@@ -2444,6 +2444,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 neginf=0.0,
             ).clamp(0.0, 1.0)
 
+        def _predicted_speed_valid(key: str) -> torch.Tensor:
+            # Predicted-cache has no separate speed-valid heads. Preserve the
+            # graph_values slot semantics by marking availability of the
+            # corresponding scalar prediction, instead of reusing unrelated
+            # edge/chase probabilities.
+            if key not in raw_scores:
+                return torch.zeros((B, 1), device=device, dtype=model_dtype)
+            return torch.ones((B, 1), device=device, dtype=model_dtype)
+
         temp_bins = _sigmoid_field('temporary_occupancy_logits', self.temporary_occupancy_dim)
         temp_valid = torch.ones_like(temp_bins) if 'temporary_occupancy_logits' in raw_scores else torch.zeros_like(temp_bins)
         if 'go_opportunity_logits' in raw_scores:
@@ -2513,6 +2522,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         future_lower = _norm_field('future_cover_lower_speed').reshape(B, 1)
         front_follow_upper = _norm_field('front_follow_upper_speed').reshape(B, 1)
         merge_flow_lower = _norm_field('merge_flow_lower_speed').reshape(B, 1)
+        current_upper_valid = _predicted_speed_valid('current_cover_upper_speed')
+        future_lower_valid = _predicted_speed_valid('future_cover_lower_speed')
+        front_follow_upper_valid = _predicted_speed_valid('front_follow_upper_speed')
+        merge_flow_lower_valid = _predicted_speed_valid('merge_flow_lower_speed')
         graph_values = torch.cat(
             [
                 current_edge_valid,
@@ -2523,10 +2536,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 future_lower,
                 front_follow_upper,
                 merge_flow_lower,
-                current_edge_valid,
-                future_edge_valid,
-                chase_has_lead,
-                future_edge_valid,
+                current_upper_valid,
+                future_lower_valid,
+                front_follow_upper_valid,
+                merge_flow_lower_valid,
             ],
             dim=-1,
         ).clamp(0.0, 1.0)
@@ -3940,11 +3953,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 + self.semantic_transition_consistency_weight * semantic_transition_consistency_loss
                 + self.state_consistency_loss_weight * loss_state_consistency
             )
+            semantic_next_token_loss = semantic_transition_loss
+            semantic_direct_aux_log_loss = direct_stage1_base_loss
         else:
             stage1_loss = (
                 direct_stage1_base_loss
                 + self.state_consistency_loss_weight * loss_state_consistency
             )
+            semantic_next_token_loss = direct_stage1_base_loss if transition_only_state else zero
+            semantic_direct_aux_log_loss = zero if transition_only_state else direct_stage1_base_loss
         return {
             'stage1_loss': stage1_loss,
             # Backward-compatible alias while downstream logs/agents migrate.
@@ -3998,7 +4015,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'state_consistency_area_loss': loss_state_consistency_area,
             'state_consistency_tempocc_loss': loss_state_consistency_tempocc,
             'state_consistency_opportunity_loss': loss_state_consistency_opportunity,
-            'semantic_direct_aux_loss': direct_stage1_base_loss,
+            'semantic_direct_aux_loss': semantic_direct_aux_log_loss,
+            'semantic_next_token_loss': semantic_next_token_loss,
             'semantic_transition_loss': semantic_transition_loss,
             'semantic_transition_consistency_loss': semantic_transition_consistency_loss,
             'merge_yld_max_loss': loss_merge_yld,
@@ -4281,6 +4299,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 'stage1_state_consistency_tempocc_loss': stage1_loss_dict.get('state_consistency_tempocc_loss', zero_t),
                 'stage1_state_consistency_opportunity_loss': stage1_loss_dict.get('state_consistency_opportunity_loss', zero_t),
                 'stage1_semantic_direct_aux_loss': stage1_loss_dict.get('semantic_direct_aux_loss', zero_t),
+                'stage1_semantic_next_token_loss': stage1_loss_dict.get('semantic_next_token_loss', zero_t),
                 'stage1_semantic_transition_loss': stage1_loss_dict.get('semantic_transition_loss', zero_t),
                 'stage1_semantic_transition_consistency_loss': stage1_loss_dict.get('semantic_transition_consistency_loss', zero_t),
                 'stage1_merge_yld_max_loss': stage1_loss_dict.get('merge_yld_max_loss', zero_t),

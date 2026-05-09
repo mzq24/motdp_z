@@ -562,8 +562,10 @@ def _get_stage1_result(result, suffix):
     return result.get(f'speed_energy_{suffix}')
 
 
-def _append_new_stage1_val_metrics(val_metrics, batch, result):
+def _append_new_stage1_val_metrics(val_metrics, batch, result, alias_prefix=None):
     """Evaluate new direct-label stage1 heads on inference outputs."""
+    before_counts = {key: len(value) for key, value in val_metrics.items()}
+
     family = batch.get('conflict_area_family')
     if family is not None and _get_stage1_result(result, 'window_probs') is not None:
         family_np = _to_numpy_array(family).reshape(-1).astype(np.int64)
@@ -869,6 +871,16 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         val_metrics['stage1_boundary_mae'].append(float(np.mean(merged_errors)))
         val_metrics['stage1_boundary_count'].append(float(np.sum(all_valid_counts)))
 
+    if alias_prefix:
+        for key, values in list(val_metrics.items()):
+            if not key.startswith('stage1_'):
+                continue
+            start = before_counts.get(key, 0)
+            if len(values) <= start:
+                continue
+            alias_key = key.replace('stage1_', f'{alias_prefix}_', 1)
+            val_metrics[alias_key].extend(values[start:])
+
 def validate_model(
     policy,
     val_loader,
@@ -985,6 +997,10 @@ def validate_model(
                     'stage1_state_consistency_area_loss',
                     'stage1_state_consistency_tempocc_loss',
                     'stage1_state_consistency_opportunity_loss',
+                    'stage1_semantic_direct_aux_loss',
+                    'stage1_semantic_next_token_loss',
+                    'stage1_semantic_transition_loss',
+                    'stage1_semantic_transition_consistency_loss',
                     'stage1_merge_yld_max_loss',
                     'stage1_merge_go_min_loss',
                     'stage1_junction_yld_max_loss',
@@ -1069,7 +1085,15 @@ def validate_model(
                     )
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
-                    _append_new_stage1_val_metrics(val_metrics, batch, result)
+                    semantic_alias = None
+                    if getattr(model_for_inference, 'semantic_state_predictor_mode', '') == 'transition_only':
+                        semantic_alias = 'semantic_next_token'
+                    _append_new_stage1_val_metrics(
+                        val_metrics,
+                        batch,
+                        result,
+                        alias_prefix=semantic_alias,
+                    )
 
                     target_speed = result.get('target_speed', None)
                     if target_speed is not None and target_actions_eval.shape[1] >= 3:
