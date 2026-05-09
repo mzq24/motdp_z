@@ -43,6 +43,80 @@ CURRENT_ADAPTIVE_WEIGHTS = {
 REGIME_ORDER = ['startup', 'low', 'medium', 'high']
 
 
+class DistributedRouteBatchSampler(Sampler):
+    """DDP route-grouped batch sampler to reduce random memmap page faults.
+
+    It builds route-local batches globally, drops the tail to make the batch
+    count divisible by world_size, then gives each rank a strided slice.
+    """
+
+    def __init__(
+        self,
+        route_groups,
+        batch_size,
+        num_replicas=None,
+        rank=None,
+        shuffle=True,
+        drop_last=True,
+        seed=0,
+    ):
+        if num_replicas is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                num_replicas = 1
+            else:
+                num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                rank = 0
+            else:
+                rank = torch.distributed.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank={rank}, num_replicas={num_replicas}")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        self.route_groups = [list(g) for g in route_groups if len(g) > 0]
+        self.batch_size = int(batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def _build_batches(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        if self.shuffle:
+            group_order = torch.randperm(len(self.route_groups), generator=generator).tolist()
+        else:
+            group_order = list(range(len(self.route_groups)))
+
+        batches = []
+        for group_idx in group_order:
+            group = list(self.route_groups[group_idx])
+            if self.shuffle and len(group) > 1:
+                perm = torch.randperm(len(group), generator=generator).tolist()
+                group = [group[i] for i in perm]
+            for start in range(0, len(group), self.batch_size):
+                batch = group[start:start + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+
+        usable = (len(batches) // self.num_replicas) * self.num_replicas
+        return batches[:usable]
+
+    def __iter__(self):
+        batches = self._build_batches()
+        return iter(batches[self.rank::self.num_replicas])
+
+    def __len__(self):
+        return len(self._build_batches()) // self.num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+
 class WeightedDistributedSampler(Sampler):
     """Distributed weighted sampler for DDP.
 
@@ -1521,6 +1595,38 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 drop_last=True,
                 seed=window_sampler_seed,
             )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=train_batch_size,
+                sampler=sampler_train,
+                num_workers=train_num_workers,
+                pin_memory=train_pin_memory,
+                persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+                prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
+                drop_last=True,
+                collate_fn=safe_collate,
+            )
+        elif use_route_group_sampler:
+            sampler_train = DistributedRouteBatchSampler(
+                train_dataset._route_groups,
+                batch_size=train_batch_size,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+                seed=window_sampler_seed,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=sampler_train,
+                num_workers=train_num_workers,
+                pin_memory=train_pin_memory,
+                persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+                prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
+                collate_fn=safe_collate,
+            )
+            if rank == 0:
+                print("Using distributed route-grouped batch sampler")
         else:
             sampler_train = torch.utils.data.distributed.DistributedSampler(
                 train_dataset,
@@ -1529,20 +1635,20 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 rank=rank,
                 drop_last=True
             )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=train_batch_size,
+                sampler=sampler_train,
+                num_workers=train_num_workers,
+                pin_memory=train_pin_memory,
+                persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
+                prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
+                drop_last=True,
+                collate_fn=safe_collate,
+            )
         # For validation, only rank 0 needs the full dataset
         # Other ranks don't participate in validation
         sampler_val = None
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=train_batch_size,
-            sampler=sampler_train,
-            num_workers=train_num_workers,
-            pin_memory=train_pin_memory,
-            persistent_workers=train_persistent_workers if train_num_workers > 0 else False,
-            prefetch_factor=train_prefetch_factor if train_num_workers > 0 else None,
-            drop_last=True,
-            collate_fn=safe_collate,
-        )
     else:
         sampler_train = None
         sampler_val = None

@@ -13,7 +13,7 @@ device:
   - 3
 
 dataloader:
-  batch_size: 256
+  batch_size: 176
   num_workers: 4
   persistent_workers: false
   pin_memory: false
@@ -24,9 +24,10 @@ dataloader:
   val_persistent_workers: false
   train_prefetch_factor: 1
   val_prefetch_factor: 1
-  val_batch_size: 128
+  val_batch_size: 96
   shuffle: true
   use_window_weighted_sampler: true
+  use_route_group_sampler: false
   window_sampler_replacement: true
   window_sampler_weights:
     none: 1.0

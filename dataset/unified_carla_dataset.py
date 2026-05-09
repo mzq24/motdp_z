@@ -189,6 +189,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Feature loading: memmap (shared across DDP ranks, zero-copy) or LRU fallback
         self._feat_mmap = None       # numpy memmap for bev_features
         self._ups_mmap = None        # numpy memmap for bev_upsamples
+        self._ups_is_fullres = False # True when upsample cache is already 64x64
         self._feat_index = None      # dict: packed_path -> {offset, n_frames, frame_num_to_idx}
         # LRU fallback (used when memmap cache not built yet)
         self._route_pack_cache = {}
@@ -386,19 +387,36 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         index_path = os.path.join(cache_dir, f'feature_index{sfx}.pkl')
         feat_bin = os.path.join(cache_dir, f'bev_features_fp16{sfx}.bin')
         ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}.bin')
+        # Prefer pre-upsampled 64x64 detail features when available. This keeps
+        # the normal BEV feature cache unchanged while avoiding per-sample CPU
+        # bilinear interpolation from the older 32x32 upsample cache.
+        fullres_index_path = os.path.join(cache_dir, f'feature_index{sfx}_fullres.pkl')
+        fullres_ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}_fullres.bin')
 
         if skip_memmap:
             print(f"[Rank {rank}] Skipping memmap (will use inject_ram_features later).")
         elif os.path.exists(index_path) and os.path.exists(feat_bin) and os.path.exists(ups_bin):
             with open(index_path, 'rb') as f:
                 cache_meta = pickle.load(f)
+            ups_meta = cache_meta
+            ups_path = ups_bin
+            upsample_cache = 'downsampled_32x32'
+            if os.path.exists(fullres_index_path) and os.path.exists(fullres_ups_bin):
+                with open(fullres_index_path, 'rb') as f:
+                    fullres_meta = pickle.load(f)
+                if tuple(fullres_meta.get('bev_ups_shape', ())[-2:]) == (64, 64):
+                    ups_meta = fullres_meta
+                    ups_path = fullres_ups_bin
+                    upsample_cache = 'fullres_64x64'
             self._feat_index = cache_meta['index']
             self._feat_mmap = np.memmap(feat_bin, dtype=np.float16, mode='r',
                                         shape=tuple(cache_meta['bev_feat_shape']))
-            self._ups_mmap = np.memmap(ups_bin, dtype=np.float16, mode='r',
-                                       shape=tuple(cache_meta['bev_ups_shape']))
+            self._ups_mmap = np.memmap(ups_path, dtype=np.float16, mode='r',
+                                       shape=tuple(ups_meta['bev_ups_shape']))
+            self._ups_is_fullres = tuple(ups_meta['bev_ups_shape'][-2:]) == (64, 64)
             print(f"[Rank {rank}] Feature memmap loaded: {len(self._feat_index)} routes, "
-                  f"{cache_meta['total_frames']} frames (shared across ranks).")
+                  f"{cache_meta['total_frames']} frames (shared across ranks, "
+                  f"upsample_cache={upsample_cache}).")
         else:
             print(f"[Rank {rank}] WARNING: Feature memmap cache not found. "
                   f"Using LRU fallback (slow). Run: python scripts/data_tools/build_feature_cache_fp16.py")
@@ -641,10 +659,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     cached = self._ram_features.get(abs_idx)
                     if cached is not None:
                         transfuser_bev_feature = cached[0]
-                        ups_ds = cached[1]
-                        transfuser_bev_feature_upsample = F.interpolate(
-                            ups_ds.unsqueeze(0).float(), size=(64, 64),
-                            mode='bilinear', align_corners=False).squeeze(0).half()
+                        ups_tensor = cached[1]
+                        if self._ups_is_fullres:
+                            transfuser_bev_feature_upsample = ups_tensor
+                        else:
+                            transfuser_bev_feature_upsample = F.interpolate(
+                                ups_tensor.unsqueeze(0).float(), size=(64, 64),
+                                mode='bilinear', align_corners=False).squeeze(0).half()
             elif self._feat_index is not None:
                 # Fast path: memmap (zero IO after pages are faulted in)
                 route_info = self._feat_index.get(packed_path)
@@ -652,15 +673,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
                     if frame_id is not None and frame_id < n_frames:
                         abs_idx = route_info['offset'] + frame_id
+                        # np.copy() already detaches from mmap storage; avoid
+                        # sending these large tensors through the generic clone
+                        # loop again.
                         transfuser_bev_feature = torch.from_numpy(
                             self._feat_mmap[abs_idx].copy())  # (1512, 8, 8) float16
-                        clone_keys.add('transfuser_bev_feature')
-                        # Stored as (64, 32, 32) after 2x downsample, interpolate back
-                        ups_ds = torch.from_numpy(
-                            self._ups_mmap[abs_idx].copy())           # (64, 32, 32) float16
-                        transfuser_bev_feature_upsample = F.interpolate(
-                            ups_ds.unsqueeze(0).float(), size=(64, 64),
-                            mode='bilinear', align_corners=False).squeeze(0).half()
+                        ups_tensor = torch.from_numpy(self._ups_mmap[abs_idx].copy())
+                        if self._ups_is_fullres:
+                            transfuser_bev_feature_upsample = ups_tensor
+                        else:
+                            transfuser_bev_feature_upsample = F.interpolate(
+                                ups_tensor.unsqueeze(0).float(), size=(64, 64),
+                                mode='bilinear', align_corners=False).squeeze(0).half()
                     else:
                         import warnings
                         warnings.warn(
