@@ -149,12 +149,19 @@ def build_window_sample_weights(dataset, dataloader_cfg):
     weights = np.full(len(samples), none_weight, dtype=np.float64)
     counts = {'none': 0, 'merge': 0, 'junction': 0, 'borrow': 0}
     for idx, sample in enumerate(samples):
+        # Newer packed stage1 labels use conflict_area_family:
+        # 0 none, 1 borrow, 2 merge, 3 junction. Keep the legacy active-flag
+        # paths too so old packed datasets behave exactly as before.
+        family = int(round(_sample_float(sample, ('conflict_area_family',), default=-1.0)))
         merge_active = _sample_float(sample, ('merge_active', 'merge_episode_active')) > 0.5
         junction_active = _sample_float(
             sample,
             ('junction_cross_active', 'junction_cross_episode_active', 'cross_active', 'cross_episode_active'),
         ) > 0.5
         borrow_active = _sample_float(sample, ('borrow_cross_active', 'borrow_cross_episode_active')) > 0.5
+        borrow_active = borrow_active or family == 1
+        merge_active = merge_active or family == 2
+        junction_active = junction_active or family == 3
 
         sample_weight = none_weight
         if merge_active:
@@ -364,10 +371,59 @@ def _append_boundary_val_metric(val_metrics, prefix, pred, target, valid=None):
         return
 
     finite_mask = np.isfinite(pred_np) & np.isfinite(target_np)
+    if valid is not None:
+        valid_np = _to_numpy_array(valid)
+        if valid_np is None:
+            return
+        valid_np = np.asarray(valid_np).reshape(-1).astype(bool)
+        if valid_np.shape[0] != finite_mask.shape[0]:
+            return
+        finite_mask &= valid_np
     if not np.any(finite_mask):
         return
     mae = np.abs(pred_np[finite_mask] - target_np[finite_mask])
     val_metrics[f'{prefix}_mae'].append(float(np.mean(mae)))
+    val_metrics[f'{prefix}_count'].append(float(np.sum(finite_mask)))
+
+
+def _append_binary_prob_val_metrics(val_metrics, prefix, prob, target, valid_mask=None, threshold=0.5):
+    prob_np = _to_numpy_array(prob)
+    target_np = _to_numpy_array(target)
+    if prob_np is None or target_np is None:
+        return
+
+    prob_np = np.asarray(prob_np).reshape(-1).astype(np.float32)
+    target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
+    if prob_np.shape[0] != target_np.shape[0]:
+        return
+
+    finite_mask = np.isfinite(prob_np) & np.isfinite(target_np)
+    if valid_mask is not None:
+        valid_np = _to_numpy_array(valid_mask)
+        if valid_np is None:
+            return
+        valid_np = np.asarray(valid_np).reshape(-1).astype(bool)
+        if valid_np.shape[0] != finite_mask.shape[0]:
+            return
+        finite_mask &= valid_np
+    if not np.any(finite_mask):
+        return
+
+    pred_pos = prob_np[finite_mask] >= threshold
+    true_pos = target_np[finite_mask] >= 0.5
+    tp = float(np.sum(pred_pos & true_pos))
+    fp = float(np.sum(pred_pos & ~true_pos))
+    fn = float(np.sum(~pred_pos & true_pos))
+    tn = float(np.sum(~pred_pos & ~true_pos))
+    denom = max(tp + fp + fn + tn, 1.0)
+    precision = tp / max(tp + fp, 1.0)
+    recall = tp / max(tp + fn, 1.0)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-6)
+
+    val_metrics[f'{prefix}_acc'].append((tp + tn) / denom)
+    val_metrics[f'{prefix}_precision'].append(precision)
+    val_metrics[f'{prefix}_recall'].append(recall)
+    val_metrics[f'{prefix}_f1'].append(f1)
     val_metrics[f'{prefix}_count'].append(float(np.sum(finite_mask)))
 
 
@@ -559,6 +615,93 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
                 float(np.mean(np.abs(chase_speed[finite] - chase_speed_target[finite])))
             )
             val_metrics['stage1_chase_speed_max_count'].append(float(np.sum(finite)))
+
+    graph_edge_mode_names = (
+        'none',
+        'pass_after_current',
+        'go_before_future',
+        'yield_after_future',
+        'ambiguous',
+    )
+    graph_specs = (
+        (
+            'stage1_graph_current_cover_edge',
+            'current_cover_edge_valid_prob',
+            'current_cover_edge_valid',
+            'current_cover_edge_mode_probs',
+            'current_cover_edge_mode',
+            'current_cover_edge_mode_valid',
+        ),
+        (
+            'stage1_graph_future_cover_edge',
+            'future_cover_edge_valid_prob',
+            'future_cover_edge_valid',
+            'future_cover_edge_mode_probs',
+            'future_cover_edge_mode',
+            'future_cover_edge_mode_valid',
+        ),
+    )
+    for (
+        metric_prefix,
+        valid_pred_key,
+        valid_target_key,
+        mode_pred_key,
+        mode_target_key,
+        mode_valid_key,
+    ) in graph_specs:
+        _append_binary_prob_val_metrics(
+            val_metrics,
+            f'{metric_prefix}_valid',
+            _get_stage1_result(result, valid_pred_key),
+            batch.get(valid_target_key),
+        )
+        mode_valid = batch.get(mode_valid_key)
+        if mode_valid is None:
+            mode_valid = batch.get(valid_target_key)
+        _append_classification_val_metrics(
+            val_metrics,
+            f'{metric_prefix}_mode',
+            _get_stage1_result(result, mode_pred_key),
+            batch.get(mode_target_key),
+            valid_mask=mode_valid,
+            class_names=graph_edge_mode_names,
+            active_is_nonzero=True,
+        )
+
+    graph_speed_specs = (
+        (
+            'stage1_graph_current_cover_upper_speed',
+            'current_cover_upper_speed_mps',
+            'current_cover_upper_speed_mps',
+            'current_cover_upper_speed_valid',
+        ),
+        (
+            'stage1_graph_future_cover_lower_speed',
+            'future_cover_lower_speed_mps',
+            'future_cover_lower_speed_mps',
+            'future_cover_lower_speed_valid',
+        ),
+        (
+            'stage1_graph_front_follow_upper_speed',
+            'front_follow_upper_speed_mps',
+            'front_follow_upper_speed_mps',
+            'front_follow_upper_speed_valid',
+        ),
+        (
+            'stage1_graph_merge_flow_lower_speed',
+            'merge_flow_lower_speed_mps',
+            'merge_flow_lower_speed_mps',
+            'merge_flow_lower_speed_valid',
+        ),
+    )
+    for metric_prefix, pred_key, target_key, valid_key in graph_speed_specs:
+        _append_boundary_val_metric(
+            val_metrics,
+            metric_prefix,
+            _get_stage1_result(result, pred_key),
+            batch.get(target_key),
+            valid=batch.get(valid_key),
+        )
 
     boundary_specs = (
         ('stage1_merge_yld_max', 'merge_yld_max_mps', 'merge_yld_max_speed'),
