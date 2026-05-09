@@ -148,7 +148,7 @@ route_b:
   conflict_timing_time_norm_scale: 10.0
   use_independent_state_consistency_loss: false
   state_consistency_loss_weight: 1.0
-  state_consistency_prob: 0.25
+  state_consistency_prob: 0.0
   state_consistency_window_weight: 0.01
   state_consistency_phase_weight: 0.005
   state_consistency_boundary_weight: 0.01
@@ -173,10 +173,14 @@ route_b:
   use_edge_speed_consistency_loss: false
   edge_speed_consistency_loss_weight: 0.05
   use_semantic_state_transition: true
+  semantic_state_predictor_mode: transition_only
   semantic_transition_prev_source: offline_gt
   semantic_transition_loss_weight: 0.5
-  semantic_direct_aux_loss_weight: 0.10
-  semantic_transition_consistency_weight: 0.05
+  semantic_direct_aux_loss_weight: 0.0
+  semantic_transition_consistency_weight: 0.0
+  use_semantic_state_fusion: false
+  semantic_state_fusion_alpha: 1.0
+  semantic_state_fusion_update_cache: true
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
   speed_loss_weight: 0.2

@@ -501,6 +501,60 @@ def _append_binary_prob_val_metrics(val_metrics, prefix, prob, target, valid_mas
     val_metrics[f'{prefix}_count'].append(float(np.sum(finite_mask)))
 
 
+def _append_binary_prob_calibration_metrics(
+    val_metrics,
+    prefix,
+    prob,
+    target,
+    valid_mask=None,
+    thresholds=(0.2, 0.3, 0.4, 0.5),
+):
+    prob_np = _to_numpy_array(prob)
+    target_np = _to_numpy_array(target)
+    if prob_np is None or target_np is None:
+        return
+
+    prob_np = np.asarray(prob_np).reshape(-1).astype(np.float32)
+    target_np = np.asarray(target_np).reshape(-1).astype(np.float32)
+    if prob_np.shape[0] != target_np.shape[0]:
+        return
+
+    finite_mask = np.isfinite(prob_np) & np.isfinite(target_np)
+    if valid_mask is not None:
+        valid_np = _to_numpy_array(valid_mask)
+        if valid_np is None:
+            return
+        valid_np = np.asarray(valid_np).reshape(-1).astype(bool)
+        if valid_np.shape[0] != finite_mask.shape[0]:
+            return
+        finite_mask &= valid_np
+    if not np.any(finite_mask):
+        return
+
+    prob_eval = prob_np[finite_mask]
+    target_pos = target_np[finite_mask] >= 0.5
+    val_metrics[f'{prefix}_target_pos_rate'].append(float(np.mean(target_pos)))
+    val_metrics[f'{prefix}_prob_mean'].append(float(np.mean(prob_eval)))
+    if np.any(target_pos):
+        val_metrics[f'{prefix}_pos_prob_mean'].append(float(np.mean(prob_eval[target_pos])))
+    if np.any(~target_pos):
+        val_metrics[f'{prefix}_neg_prob_mean'].append(float(np.mean(prob_eval[~target_pos])))
+
+    for threshold in thresholds:
+        pred_pos = prob_eval >= float(threshold)
+        tp = float(np.sum(pred_pos & target_pos))
+        fp = float(np.sum(pred_pos & ~target_pos))
+        fn = float(np.sum(~pred_pos & target_pos))
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        f1 = 2.0 * precision * recall / max(precision + recall, 1e-6)
+        suffix = f'thr{int(round(float(threshold) * 100)):02d}'
+        val_metrics[f'{prefix}_{suffix}_precision'].append(precision)
+        val_metrics[f'{prefix}_{suffix}_recall'].append(recall)
+        val_metrics[f'{prefix}_{suffix}_f1'].append(f1)
+        val_metrics[f'{prefix}_{suffix}_pred_pos_rate'].append(float(np.mean(pred_pos)))
+
+
 def _get_stage1_result(result, suffix):
     """Prefer renamed stage1 outputs while accepting older speed_energy aliases."""
     if f'stage1_{suffix}' in result:
@@ -726,6 +780,12 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result):
         _append_binary_prob_val_metrics(
             val_metrics,
             f'{metric_prefix}_valid',
+            _get_stage1_result(result, valid_pred_key),
+            batch.get(valid_target_key),
+        )
+        _append_binary_prob_calibration_metrics(
+            val_metrics,
+            f'{metric_prefix}_valid_calib',
             _get_stage1_result(result, valid_pred_key),
             batch.get(valid_target_key),
         )

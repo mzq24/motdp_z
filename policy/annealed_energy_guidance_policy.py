@@ -331,6 +331,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_semantic_state_transition = bool(
             route_b_cfg.get('use_semantic_state_transition', False)
         )
+        self.semantic_state_predictor_mode = str(
+            route_b_cfg.get('semantic_state_predictor_mode', 'direct_transition')
+        ).lower()
+        if self.semantic_state_predictor_mode not in ('direct_transition', 'transition_only'):
+            raise ValueError(
+                "semantic_state_predictor_mode must be 'direct_transition' "
+                f"or 'transition_only', got {self.semantic_state_predictor_mode}"
+            )
+        if self.semantic_state_predictor_mode == 'transition_only' and not self.use_semantic_state_transition:
+            raise ValueError("transition_only semantic state predictor requires use_semantic_state_transition=true")
         self.semantic_transition_prev_source = str(
             route_b_cfg.get('semantic_transition_prev_source', 'offline_gt')
         ).lower()
@@ -348,6 +358,16 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.semantic_transition_consistency_weight = float(
             route_b_cfg.get('semantic_transition_consistency_weight', 0.05)
         )
+        self.use_semantic_state_fusion = bool(
+            route_b_cfg.get('use_semantic_state_fusion', False)
+        )
+        self.semantic_state_fusion_alpha = float(
+            route_b_cfg.get('semantic_state_fusion_alpha', 0.35)
+        )
+        self.semantic_state_fusion_update_cache = bool(
+            route_b_cfg.get('semantic_state_fusion_update_cache', True)
+        )
+        self._semantic_state_cache: Optional[dict] = None
         self.traj_phase_energy_band_offsets = torch.tensor([-2.0, 0.0, 2.0], dtype=torch.float32)
         self.traj_window_condition_names = (
             'none',
@@ -1099,6 +1119,21 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 raise ValueError(f"{key} expects width={width}, got {value.shape}")
             return torch.nan_to_num(value, nan=default, posinf=default, neginf=default)
 
+        def _optional_float_field(key: str, *, width: int = 1, default: float = 0.0) -> torch.Tensor:
+            value = self._get_stage1_batch_tensor(batch, key, device=device, model_dtype=model_dtype)
+            if value is None:
+                return torch.full((B, width), default, device=device, dtype=model_dtype)
+            value = value.reshape(B, -1)
+            if value.shape[1] != width:
+                raise ValueError(f"{key} expects width={width}, got {value.shape}")
+            return torch.nan_to_num(value, nan=default, posinf=default, neginf=default)
+
+        def _optional_long_field(key: str, *, default: int = 0, max_value: int = 4) -> torch.Tensor:
+            value = self._get_stage1_long_target(batch, key, device=device)
+            if value is None:
+                return torch.full((B,), default, device=device, dtype=torch.long)
+            return value.reshape(B).long().clamp(min=0, max=max_value)
+
         area_mask = _float_field('prev_conflict_area_route_mask', width=route_steps)
         temp_bins = _float_field('prev_temporary_occupancy_cover_bins', width=self.temporary_occupancy_dim)
         temp_valid = _float_field('prev_temporary_occupancy_cover_valid', width=self.temporary_occupancy_dim)
@@ -1162,6 +1197,43 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ],
             dim=-1,
         )
+        prev_current_mode = _optional_long_field('prev_current_cover_edge_mode', max_value=4)
+        prev_future_mode = _optional_long_field('prev_future_cover_edge_mode', max_value=4)
+        prev_current_mode_oh = F.one_hot(prev_current_mode, num_classes=5).to(
+            device=device, dtype=model_dtype
+        )
+        prev_future_mode_oh = F.one_hot(prev_future_mode, num_classes=5).to(
+            device=device, dtype=model_dtype
+        )
+        graph_values = torch.cat(
+            [
+                _optional_float_field('prev_current_cover_edge_valid').clamp(0.0, 1.0),
+                prev_current_mode_oh,
+                _optional_float_field('prev_future_cover_edge_valid').clamp(0.0, 1.0),
+                prev_future_mode_oh,
+                (
+                    _optional_float_field('prev_current_cover_upper_speed_mps')
+                    / max(self.stage1_boundary_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0),
+                (
+                    _optional_float_field('prev_future_cover_lower_speed_mps')
+                    / max(self.stage1_boundary_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0),
+                (
+                    _optional_float_field('prev_front_follow_upper_speed_mps')
+                    / max(self.stage1_boundary_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0),
+                (
+                    _optional_float_field('prev_merge_flow_lower_speed_mps')
+                    / max(self.stage1_boundary_norm_scale, 1e-6)
+                ).clamp(0.0, 1.0),
+                _optional_float_field('prev_current_cover_upper_speed_valid').clamp(0.0, 1.0),
+                _optional_float_field('prev_future_cover_lower_speed_valid').clamp(0.0, 1.0),
+                _optional_float_field('prev_front_follow_upper_speed_valid').clamp(0.0, 1.0),
+                _optional_float_field('prev_merge_flow_lower_speed_valid').clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
         prev_state = {
             **categorical,
             'valid': valid,
@@ -1175,6 +1247,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'conflict_timing_valid': timing_valid.clamp(0.0, 1.0),
             'boundary_values': boundary,
             'chase_values': chase_values,
+            'graph_values': graph_values,
         }
         # Invalid prev samples are true sequence starts; hide semantic content but
         # keep the validity bit so the transition branch can learn the reset case.
@@ -2246,6 +2319,283 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ),
         )
 
+    def reset_semantic_state_cache(self) -> None:
+        """Clear the inference-only semantic transition memory."""
+        self._semantic_state_cache = None
+
+    def _build_neutral_semantic_prev_state(
+        self,
+        batch_size: int,
+        route_steps: int,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> dict:
+        zeros_1 = torch.zeros((batch_size,), device=device, dtype=model_dtype)
+        zeros_route = torch.zeros((batch_size, route_steps), device=device, dtype=model_dtype)
+        zeros_temp = torch.zeros((batch_size, self.temporary_occupancy_dim), device=device, dtype=model_dtype)
+        return {
+            'valid': zeros_1,
+            'family': torch.zeros((batch_size,), device=device, dtype=torch.long),
+            'dir': torch.zeros((batch_size,), device=device, dtype=torch.long),
+            'status': torch.zeros((batch_size,), device=device, dtype=torch.long),
+            'decision_phase': torch.zeros((batch_size,), device=device, dtype=torch.long),
+            'control_phase': torch.zeros((batch_size,), device=device, dtype=torch.long),
+            'conflict_area_route_mask': zeros_route,
+            'temporary_occupancy_cover_bins': zeros_temp,
+            'temporary_occupancy_cover_valid': zeros_temp,
+            'go_opportunity_prob': torch.full((batch_size, 1), 0.5, device=device, dtype=model_dtype),
+            'yld_pressure_prob': torch.full((batch_size, 1), 0.5, device=device, dtype=model_dtype),
+            'go_opportunity_valid': torch.zeros((batch_size, 1), device=device, dtype=model_dtype),
+            'conflict_timing_values': torch.zeros((batch_size, 3), device=device, dtype=model_dtype),
+            'conflict_timing_valid': torch.zeros((batch_size, 1), device=device, dtype=model_dtype),
+            'boundary_values': torch.zeros((batch_size, 6), device=device, dtype=model_dtype),
+            'chase_values': torch.zeros((batch_size, 2), device=device, dtype=model_dtype),
+            'graph_values': torch.zeros((batch_size, 20), device=device, dtype=model_dtype),
+        }
+
+    def _semantic_state_cache_to_device(
+        self,
+        cache: dict,
+        *,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> dict:
+        out = {}
+        for key, value in cache.items():
+            if not isinstance(value, torch.Tensor):
+                out[key] = value
+            elif value.dtype.is_floating_point:
+                out[key] = value.to(device=device, dtype=model_dtype)
+            else:
+                out[key] = value.to(device=device)
+        return out
+
+    def _get_inference_semantic_prev_state(
+        self,
+        batch_size: int,
+        route_steps: int,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> dict:
+        cache = self._semantic_state_cache
+        if cache is None:
+            return self._build_neutral_semantic_prev_state(
+                batch_size, route_steps, device, model_dtype
+            )
+        valid = cache.get('valid')
+        if not isinstance(valid, torch.Tensor) or valid.reshape(-1).shape[0] != batch_size:
+            return self._build_neutral_semantic_prev_state(
+                batch_size, route_steps, device, model_dtype
+            )
+        return self._semantic_state_cache_to_device(
+            cache, device=device, model_dtype=model_dtype
+        )
+
+    def _stage1_raw_scores_to_prev_state(
+        self,
+        raw_scores: dict,
+        *,
+        route_steps: int,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        valid: Optional[torch.Tensor] = None,
+    ) -> dict:
+        window_probs = torch.softmax(raw_scores['window_logits'].detach().float(), dim=-1)
+        window_class = window_probs.argmax(dim=-1)
+        # Window head order is none/merge/junction/borrow, while label-family
+        # order is none/borrow/merge/junction.
+        family_lookup = torch.tensor([0, 2, 3, 1], device=window_class.device, dtype=torch.long)
+        family = family_lookup[window_class.clamp(min=0, max=3)]
+        active = (window_class > 0).long()
+
+        dir_class = torch.softmax(raw_scores['dir_logits'].detach().float(), dim=-1).argmax(dim=-1)
+        status_class = torch.softmax(
+            raw_scores['conflict_area_status_logits'].detach().float(), dim=-1
+        ).argmax(dim=-1) if 'conflict_area_status_logits' in raw_scores else torch.zeros_like(window_class)
+        decision_class = torch.softmax(
+            raw_scores['decision_phase_logits'].detach().float(), dim=-1
+        ).argmax(dim=-1) + 1
+        control_class = torch.softmax(
+            raw_scores['control_phase_logits'].detach().float(), dim=-1
+        ).argmax(dim=-1) + 1
+        decision_class = decision_class * active
+        control_class = control_class * active
+
+        B = window_class.shape[0]
+        if valid is None:
+            valid = torch.ones((B,), device=device, dtype=model_dtype)
+        else:
+            valid = valid.to(device=device, dtype=model_dtype).reshape(-1).clamp(0.0, 1.0)
+
+        def _sigmoid_field(key: str, width: int) -> torch.Tensor:
+            value = raw_scores.get(key)
+            if value is None:
+                return torch.zeros((B, width), device=device, dtype=model_dtype)
+            return torch.sigmoid(value.detach().to(device=device, dtype=model_dtype)).reshape(B, width)
+
+        def _norm_field(key: str) -> torch.Tensor:
+            value = raw_scores.get(key)
+            if value is None:
+                return torch.zeros((B,), device=device, dtype=model_dtype)
+            return torch.nan_to_num(
+                value.detach().to(device=device, dtype=model_dtype).reshape(-1),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+
+        temp_bins = _sigmoid_field('temporary_occupancy_logits', self.temporary_occupancy_dim)
+        temp_valid = torch.ones_like(temp_bins) if 'temporary_occupancy_logits' in raw_scores else torch.zeros_like(temp_bins)
+        if 'go_opportunity_logits' in raw_scores:
+            opportunity = torch.softmax(
+                raw_scores['go_opportunity_logits'].detach().to(device=device, dtype=model_dtype),
+                dim=-1,
+            )
+            yld_prob = opportunity[:, 0:1]
+            go_prob = opportunity[:, 1:2]
+            go_valid = torch.ones((B, 1), device=device, dtype=model_dtype)
+        else:
+            yld_prob = torch.full((B, 1), 0.5, device=device, dtype=model_dtype)
+            go_prob = torch.full((B, 1), 0.5, device=device, dtype=model_dtype)
+            go_valid = torch.zeros((B, 1), device=device, dtype=model_dtype)
+
+        timing_values = raw_scores.get('conflict_timing_values')
+        if timing_values is None:
+            timing_values = torch.zeros((B, 3), device=device, dtype=model_dtype)
+            timing_valid = torch.zeros((B, 1), device=device, dtype=model_dtype)
+        else:
+            timing_values = torch.nan_to_num(
+                timing_values.detach().to(device=device, dtype=model_dtype).reshape(B, 3),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(-2.0, 2.0)
+            timing_valid = (status_class.to(device=device).reshape(B, 1) > 0).to(dtype=model_dtype)
+
+        boundary_values = torch.stack(
+            [
+                _norm_field('merge_yld_max'),
+                _norm_field('merge_go_min'),
+                _norm_field('junction_yld_max'),
+                _norm_field('junction_go_min'),
+                _norm_field('borrow_yld_max'),
+                _norm_field('borrow_go_min'),
+            ],
+            dim=-1,
+        )
+        chase_has_lead = (
+            torch.sigmoid(raw_scores['chase_has_lead_logit'].detach().to(device=device, dtype=model_dtype))
+            if 'chase_has_lead_logit' in raw_scores else
+            torch.zeros((B,), device=device, dtype=model_dtype)
+        ).reshape(B, 1)
+        chase_speed = _norm_field('chase_speed_max').reshape(B, 1)
+        current_edge_valid = (
+            torch.sigmoid(raw_scores['current_cover_edge_valid_logit'].detach().to(device=device, dtype=model_dtype))
+            if 'current_cover_edge_valid_logit' in raw_scores else
+            torch.zeros((B,), device=device, dtype=model_dtype)
+        ).reshape(B, 1)
+        current_edge_mode = (
+            torch.softmax(raw_scores['current_cover_edge_mode_logits'].detach().to(device=device, dtype=model_dtype), dim=-1)
+            if 'current_cover_edge_mode_logits' in raw_scores else
+            F.one_hot(torch.zeros((B,), device=device, dtype=torch.long), num_classes=5).to(dtype=model_dtype)
+        )
+        future_edge_valid = (
+            torch.sigmoid(raw_scores['future_cover_edge_valid_logit'].detach().to(device=device, dtype=model_dtype))
+            if 'future_cover_edge_valid_logit' in raw_scores else
+            torch.zeros((B,), device=device, dtype=model_dtype)
+        ).reshape(B, 1)
+        future_edge_mode = (
+            torch.softmax(raw_scores['future_cover_edge_mode_logits'].detach().to(device=device, dtype=model_dtype), dim=-1)
+            if 'future_cover_edge_mode_logits' in raw_scores else
+            F.one_hot(torch.zeros((B,), device=device, dtype=torch.long), num_classes=5).to(dtype=model_dtype)
+        )
+        current_upper = _norm_field('current_cover_upper_speed').reshape(B, 1)
+        future_lower = _norm_field('future_cover_lower_speed').reshape(B, 1)
+        front_follow_upper = _norm_field('front_follow_upper_speed').reshape(B, 1)
+        merge_flow_lower = _norm_field('merge_flow_lower_speed').reshape(B, 1)
+        graph_values = torch.cat(
+            [
+                current_edge_valid,
+                current_edge_mode,
+                future_edge_valid,
+                future_edge_mode,
+                current_upper,
+                future_lower,
+                front_follow_upper,
+                merge_flow_lower,
+                current_edge_valid,
+                future_edge_valid,
+                chase_has_lead,
+                future_edge_valid,
+            ],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+
+        prev_state = {
+            'valid': valid.detach(),
+            'family': family.to(device=device).detach(),
+            'dir': dir_class.to(device=device).detach(),
+            'status': status_class.to(device=device).detach(),
+            'decision_phase': decision_class.to(device=device).detach(),
+            'control_phase': control_class.to(device=device).detach(),
+            'conflict_area_route_mask': _sigmoid_field('conflict_area_logits', route_steps).detach(),
+            'temporary_occupancy_cover_bins': temp_bins.detach(),
+            'temporary_occupancy_cover_valid': temp_valid.detach(),
+            'go_opportunity_prob': go_prob.detach(),
+            'yld_pressure_prob': yld_prob.detach(),
+            'go_opportunity_valid': go_valid.detach(),
+            'conflict_timing_values': timing_values.detach(),
+            'conflict_timing_valid': timing_valid.detach(),
+            'boundary_values': boundary_values.detach(),
+            'chase_values': torch.cat([chase_has_lead, chase_speed], dim=-1).detach(),
+            'graph_values': graph_values.detach(),
+        }
+        return self._semantic_state_cache_to_device(
+            prev_state, device=torch.device('cpu'), model_dtype=torch.float32
+        )
+
+    def _fuse_stage1_raw_scores(
+        self,
+        direct_scores: dict,
+        transition_scores: Optional[dict],
+        prev_valid: Optional[torch.Tensor],
+    ) -> Tuple[dict, Dict[str, torch.Tensor]]:
+        if (
+            not self.use_semantic_state_fusion
+            or transition_scores is None
+            or prev_valid is None
+        ):
+            device = next(iter(direct_scores.values())).device
+            dtype = next(iter(direct_scores.values())).dtype
+            zero_gate = torch.zeros((next(iter(direct_scores.values())).shape[0],), device=device, dtype=dtype)
+            return direct_scores, {
+                'enabled': zero_gate.new_tensor(float(self.use_semantic_state_fusion)),
+                'gate': zero_gate,
+            }
+
+        fused = dict(direct_scores)
+        first_tensor = next(value for value in direct_scores.values() if isinstance(value, torch.Tensor))
+        gate = prev_valid.to(device=first_tensor.device, dtype=first_tensor.dtype).reshape(-1)
+        gate = gate.clamp(0.0, 1.0) * float(self.semantic_state_fusion_alpha)
+        for key, direct_value in direct_scores.items():
+            transition_value = transition_scores.get(key)
+            if (
+                not isinstance(direct_value, torch.Tensor)
+                or not isinstance(transition_value, torch.Tensor)
+                or direct_value.shape != transition_value.shape
+                or not direct_value.dtype.is_floating_point
+            ):
+                continue
+            gate_view = gate
+            while gate_view.dim() < direct_value.dim():
+                gate_view = gate_view.unsqueeze(-1)
+            transition_value = transition_value.to(device=direct_value.device, dtype=direct_value.dtype)
+            fused[key] = direct_value * (1.0 - gate_view) + transition_value * gate_view
+        return fused, {
+            'enabled': gate.new_tensor(1.0),
+            'gate': gate.detach(),
+        }
+
     def _infer_traj_branch_condition(
         self,
         *,
@@ -2702,20 +3052,25 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 prev_route_coarse_memory=prev_route_coarse_memory,
                 return_intermediates=True,
             )
-        raw_stage1_scores = self.model.compute_shared_stage1_from_ego_outputs(
-            traj_out=shared_forward['traj_out'],
-            route_out=shared_forward['route_out'],
-            speed_out=shared_forward['speed_out'],
-            route_points=shared_forward['route_points'],
-            conditioning=shared_forward['conditioning'],
-        )
+        transition_only_state = self.semantic_state_predictor_mode == 'transition_only'
+        route_steps = self.num_waypoints
+        raw_stage1_scores = None
+        if not transition_only_state:
+            raw_stage1_scores = self.model.compute_shared_stage1_from_ego_outputs(
+                traj_out=shared_forward['traj_out'],
+                route_out=shared_forward['route_out'],
+                speed_out=shared_forward['speed_out'],
+                route_points=shared_forward['route_points'],
+                conditioning=shared_forward['conditioning'],
+            )
+            route_steps = raw_stage1_scores['conflict_area_logits'].shape[1]
         transition_stage1_scores = None
         if self.use_semantic_state_transition:
             prev_state = self._get_semantic_transition_prev_state(
                 batch=batch,
                 device=device,
                 model_dtype=model_dtype,
-                route_steps=raw_stage1_scores['conflict_area_logits'].shape[1],
+                route_steps=route_steps,
                 require=True,
             )
             transition_stage1_scores = self.model.compute_shared_stage1_transition_from_ego_outputs(
@@ -2726,6 +3081,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 conditioning=shared_forward['conditioning'],
                 prev_state=prev_state,
             )
+            if transition_only_state:
+                raw_stage1_scores = transition_stage1_scores
+                transition_stage1_scores = None
+        if raw_stage1_scores is None:
+            raise RuntimeError("semantic state training produced no state scores")
 
         zero = gt_abs.new_tensor(0.0)
 
@@ -2994,6 +3354,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         loss_state_consistency_opportunity = zero
         if (
             self.use_independent_state_consistency_loss
+            and not transition_only_state
             and self.state_consistency_loss_weight > 0
             and self.state_consistency_prob > 0
             and noisy_joint is not None
@@ -4101,6 +4462,22 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         pass1_trajectory = None
         phase_go_smoothing_debug = None
         phase_go_smoothing_history_updated = False
+        semantic_prev_state = None
+        semantic_prev_valid = None
+        semantic_fusion_debug = None
+        transition_only_state = self.semantic_state_predictor_mode == 'transition_only'
+        use_infer_semantic_transition = (
+            (self.use_semantic_state_fusion or transition_only_state)
+            and self.use_semantic_state_transition
+            and self.use_stage1_speed_energy
+        )
+        if use_infer_semantic_transition:
+            semantic_prev_state = self._get_inference_semantic_prev_state(
+                B, self.num_waypoints, device, model_dtype
+            )
+            semantic_prev_valid = semantic_prev_state['valid'].to(
+                device=device, dtype=model_dtype
+            ).reshape(-1)
 
         for step_i, k in enumerate(roll_timesteps):
             t_cur = k.item()
@@ -4156,14 +4533,38 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         stage1_speed_samples = self._build_local_phase_energy_samples(
                             branch_speed_ref.detach(), device, model_dtype
                         )
-                        stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
-                            traj_out=pass1_shared['traj_out'],
-                            route_out=pass1_shared['route_out'],
-                            speed_out=pass1_shared['speed_out'],
-                            route_points=pass1_shared['route_points'],
-                            conditioning=pass1_shared['conditioning'],
-                            speed_samples=stage1_speed_samples,
-                        )
+                        if not transition_only_state:
+                            stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
+                                traj_out=pass1_shared['traj_out'],
+                                route_out=pass1_shared['route_out'],
+                                speed_out=pass1_shared['speed_out'],
+                                route_points=pass1_shared['route_points'],
+                                conditioning=pass1_shared['conditioning'],
+                                speed_samples=stage1_speed_samples,
+                            )
+                        if use_infer_semantic_transition and semantic_prev_state is not None:
+                            transition_stage1_raw_scores = (
+                                self.model.compute_shared_stage1_transition_from_ego_outputs(
+                                    traj_out=pass1_shared['traj_out'],
+                                    route_out=pass1_shared['route_out'],
+                                    speed_out=pass1_shared['speed_out'],
+                                    route_points=pass1_shared['route_points'],
+                                    conditioning=pass1_shared['conditioning'],
+                                    prev_state=semantic_prev_state,
+                                )
+                            )
+                            if transition_only_state:
+                                stage1_raw_scores = transition_stage1_raw_scores
+                                semantic_fusion_debug = {
+                                    'enabled': torch.ones((), device=device, dtype=model_dtype),
+                                    'gate': torch.ones((B,), device=device, dtype=model_dtype),
+                                }
+                            else:
+                                stage1_raw_scores, semantic_fusion_debug = self._fuse_stage1_raw_scores(
+                                    stage1_raw_scores,
+                                    transition_stage1_raw_scores,
+                                    semantic_prev_valid,
+                                )
                     traj_branch_condition_probs, traj_branch_condition_details = self._infer_traj_branch_condition(
                         stage1_raw_scores=stage1_raw_scores,
                         speed_ref=branch_speed_ref.detach(),
@@ -4260,15 +4661,50 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 transfuser_lidar_bev=transfuser_lidar_bev,
                 return_intermediates=True,
             )
-            stage1_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
-                traj_out=shared_eval['traj_out'],
-                route_out=shared_eval['route_out'],
-                speed_out=shared_eval['speed_out'],
-                route_points=shared_eval['route_points'],
-                conditioning=shared_eval['conditioning'],
-                speed_samples=stage1_speed_samples,
-            )
+            stage1_scores_raw = None
+            if not transition_only_state:
+                stage1_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
+                    traj_out=shared_eval['traj_out'],
+                    route_out=shared_eval['route_out'],
+                    speed_out=shared_eval['speed_out'],
+                    route_points=shared_eval['route_points'],
+                    conditioning=shared_eval['conditioning'],
+                    speed_samples=stage1_speed_samples,
+                )
+            if use_infer_semantic_transition and semantic_prev_state is not None:
+                transition_stage1_scores_raw = (
+                    self.model.compute_shared_stage1_transition_from_ego_outputs(
+                        traj_out=shared_eval['traj_out'],
+                        route_out=shared_eval['route_out'],
+                        speed_out=shared_eval['speed_out'],
+                        route_points=shared_eval['route_points'],
+                        conditioning=shared_eval['conditioning'],
+                        prev_state=semantic_prev_state,
+                    )
+                )
+                if transition_only_state:
+                    stage1_scores_raw = transition_stage1_scores_raw
+                    semantic_fusion_debug = {
+                        'enabled': torch.ones((), device=device, dtype=model_dtype),
+                        'gate': torch.ones((B,), device=device, dtype=model_dtype),
+                    }
+                else:
+                    stage1_scores_raw, semantic_fusion_debug = self._fuse_stage1_raw_scores(
+                        stage1_scores_raw,
+                        transition_stage1_scores_raw,
+                        semantic_prev_valid,
+                    )
+            if stage1_scores_raw is None:
+                raise RuntimeError("semantic inference produced no stage1 scores")
             stage1_scores = self._compose_stage1_outputs(stage1_scores_raw)
+            if use_infer_semantic_transition and self.semantic_state_fusion_update_cache:
+                self._semantic_state_cache = self._stage1_raw_scores_to_prev_state(
+                    stage1_scores_raw,
+                    route_steps=self.num_waypoints,
+                    device=device,
+                    model_dtype=model_dtype,
+                    valid=torch.ones((B,), device=device, dtype=model_dtype),
+                )
             traj_speed_1s_ref, traj_speed_05s_ref = self._compute_inference_traj_speed_refs(
                 best_trajectory, model_dtype
             )
@@ -4276,14 +4712,37 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             stage1_speed_ref_speeds = torch.stack(
                 [head_speed_ref, traj_speed_1s_ref, traj_speed_05s_ref], dim=-1
             ).clamp_(0.0, 20.0)
-            stage1_ref_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
-                traj_out=shared_eval['traj_out'],
-                route_out=shared_eval['route_out'],
-                speed_out=shared_eval['speed_out'],
-                route_points=shared_eval['route_points'],
-                conditioning=shared_eval['conditioning'],
-                speed_samples=stage1_speed_ref_speeds,
-            )
+            stage1_ref_scores_raw = None
+            if not transition_only_state:
+                stage1_ref_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
+                    traj_out=shared_eval['traj_out'],
+                    route_out=shared_eval['route_out'],
+                    speed_out=shared_eval['speed_out'],
+                    route_points=shared_eval['route_points'],
+                    conditioning=shared_eval['conditioning'],
+                    speed_samples=stage1_speed_ref_speeds,
+                )
+            if use_infer_semantic_transition and semantic_prev_state is not None:
+                transition_stage1_ref_scores_raw = (
+                    self.model.compute_shared_stage1_transition_from_ego_outputs(
+                        traj_out=shared_eval['traj_out'],
+                        route_out=shared_eval['route_out'],
+                        speed_out=shared_eval['speed_out'],
+                        route_points=shared_eval['route_points'],
+                        conditioning=shared_eval['conditioning'],
+                        prev_state=semantic_prev_state,
+                    )
+                )
+                if transition_only_state:
+                    stage1_ref_scores_raw = transition_stage1_ref_scores_raw
+                else:
+                    stage1_ref_scores_raw, _ = self._fuse_stage1_raw_scores(
+                        stage1_ref_scores_raw,
+                        transition_stage1_ref_scores_raw,
+                        semantic_prev_valid,
+                    )
+            if stage1_ref_scores_raw is None:
+                raise RuntimeError("semantic inference produced no stage1 ref scores")
             stage1_ref_scores = self._compose_stage1_outputs(stage1_ref_scores_raw)
 
         if phase_go_smoothing_debug is None:
@@ -4299,6 +4758,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             key: torch.tensor([value], device=device, dtype=model_dtype)
             for key, value in phase_go_smoothing_debug.items()
         }
+        if semantic_fusion_debug is None:
+            semantic_fusion_enabled = torch.tensor(
+                [float(use_infer_semantic_transition)], device=device, dtype=model_dtype
+            )
+            semantic_fusion_gate = torch.zeros((B,), device=device, dtype=model_dtype)
+        else:
+            semantic_fusion_enabled = semantic_fusion_debug['enabled'].reshape(1).to(
+                device=device, dtype=model_dtype
+            )
+            semantic_fusion_gate = semantic_fusion_debug['gate'].to(
+                device=device, dtype=model_dtype
+            ).reshape(-1)
 
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
@@ -4387,6 +4858,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'traj_phase_go_smoothing_smoothed_go_prob': phase_go_smoothing_tensors['smoothed_go_prob'],
             'traj_phase_go_smoothing_history_len': phase_go_smoothing_tensors['history_len'],
             'traj_phase_go_smoothing_threshold': phase_go_smoothing_tensors['threshold'],
+            'semantic_state_fusion_enabled': semantic_fusion_enabled,
+            'semantic_state_fusion_gate': semantic_fusion_gate,
             'pass1_trajectory': pass1_trajectory,
             'pass2_trajectory': best_trajectory,
             'poses_cls': poses_cls,                   # (B, 1)
@@ -4421,6 +4894,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             prev_relation_probs = prev_relation_probs.to(device=device, dtype=model_dtype)
             if prev_relation_probs.dim() == 1:
                 prev_relation_probs = prev_relation_probs.unsqueeze(0)
+        reset_semantic_state_cache = bool(kwargs.get('reset_semantic_state_cache', False))
+        semantic_reset = nobs.get('semantic_state_reset', None)
+        if semantic_reset is not None:
+            reset_semantic_state_cache = reset_semantic_state_cache or bool(
+                (semantic_reset.to(device=device).reshape(-1) > 0.5).any().item()
+            )
+        if reset_semantic_state_cache:
+            self.reset_semantic_state_cache()
 
         # Accept dynamic energy weights from kwargs (LLM Router interface)
         energy_weights = kwargs.get('energy_weights', None)
@@ -4529,6 +5010,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'traj_phase_go_smoothing_smoothed_go_prob',
             'traj_phase_go_smoothing_history_len',
             'traj_phase_go_smoothing_threshold',
+            'semantic_state_fusion_enabled',
+            'semantic_state_fusion_gate',
         ):
             if sample_result.get(key) is not None:
                 result[key] = sample_result[key].detach().float().cpu().numpy()

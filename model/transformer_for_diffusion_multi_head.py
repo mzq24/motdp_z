@@ -1946,6 +1946,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 nn.Linear(n_emb // 2, out_dim),
             )
 
+        def _make_route_stage1_head(out_dim: int = 1):
+            return nn.Sequential(
+                nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, out_dim),
+            )
+
         self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
         self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
         self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
@@ -1960,6 +1966,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.shared_stage1_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
         self.shared_stage1_future_edge_valid_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+        self.shared_stage1_route_current_edge_valid_head = _make_route_stage1_head()
+        self.shared_stage1_route_current_edge_mode_head = _make_route_stage1_head(out_dim=5)
+        self.shared_stage1_route_future_edge_valid_head = _make_route_stage1_head()
+        self.shared_stage1_route_future_edge_mode_head = _make_route_stage1_head(out_dim=5)
         self.shared_stage1_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
         self.shared_stage1_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
@@ -2021,6 +2031,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
         )
+        self.semantic_transition_graph_proj = nn.Sequential(
+            nn.Linear(20, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
         transition_layer = nn.TransformerEncoderLayer(
             d_model=n_emb,
             nhead=n_head,
@@ -2049,6 +2064,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.semantic_transition_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
         self.semantic_transition_future_edge_valid_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+        self.semantic_transition_route_current_edge_valid_head = _make_route_stage1_head()
+        self.semantic_transition_route_current_edge_mode_head = _make_route_stage1_head(out_dim=5)
+        self.semantic_transition_route_future_edge_valid_head = _make_route_stage1_head()
+        self.semantic_transition_route_future_edge_mode_head = _make_route_stage1_head(out_dim=5)
         self.semantic_transition_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
         self.semantic_transition_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
@@ -2309,6 +2328,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'route_geom_tokens': route_geom_tokens,
         }
 
+    @staticmethod
+    def _pool_route_graph_logits(route_logits: torch.Tensor) -> torch.Tensor:
+        """Smoothly pool per-route graph logits into a sample-level prediction."""
+        if route_logits.dim() < 2:
+            return route_logits
+        route_count = max(int(route_logits.shape[1]), 1)
+        return torch.logsumexp(route_logits, dim=1) - math.log(route_count)
+
     def _compute_shared_stage1_scores(
         self,
         traj_out: torch.Tensor,
@@ -2327,6 +2354,35 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         semantic_feature = context['semantic_feature']
         conflict_area_input = torch.cat([route_out, context['route_geom_tokens']], dim=-1)
+        semantic_route_tokens = semantic_feature.unsqueeze(1).expand(-1, route_out.shape[1], -1)
+        graph_route_input = torch.cat(
+            [route_out, context['route_geom_tokens'], semantic_route_tokens],
+            dim=-1,
+        )
+        current_edge_valid_logit = (
+            self.shared_stage1_current_edge_valid_head(semantic_feature).squeeze(-1)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_current_edge_valid_head(graph_route_input).squeeze(-1)
+            )
+        )
+        current_edge_mode_logits = (
+            self.shared_stage1_current_edge_mode_head(semantic_feature)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_current_edge_mode_head(graph_route_input)
+            )
+        )
+        future_edge_valid_logit = (
+            self.shared_stage1_future_edge_valid_head(semantic_feature).squeeze(-1)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_future_edge_valid_head(graph_route_input).squeeze(-1)
+            )
+        )
+        future_edge_mode_logits = (
+            self.shared_stage1_future_edge_mode_head(semantic_feature)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_future_edge_mode_head(graph_route_input)
+            )
+        )
 
         decision_phase_logits = self.shared_stage1_decision_phase_head(semantic_feature)
         return {
@@ -2341,10 +2397,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_timing_values': self.shared_stage1_conflict_timing_head(semantic_feature),
             'chase_has_lead_logit': self.shared_stage1_chase_has_lead_head(semantic_feature).squeeze(-1),
             'chase_speed_max': self.shared_stage1_chase_speed_max_head(semantic_feature).squeeze(-1),
-            'current_cover_edge_valid_logit': self.shared_stage1_current_edge_valid_head(semantic_feature).squeeze(-1),
-            'current_cover_edge_mode_logits': self.shared_stage1_current_edge_mode_head(semantic_feature),
-            'future_cover_edge_valid_logit': self.shared_stage1_future_edge_valid_head(semantic_feature).squeeze(-1),
-            'future_cover_edge_mode_logits': self.shared_stage1_future_edge_mode_head(semantic_feature),
+            'current_cover_edge_valid_logit': current_edge_valid_logit,
+            'current_cover_edge_mode_logits': current_edge_mode_logits,
+            'future_cover_edge_valid_logit': future_edge_valid_logit,
+            'future_cover_edge_mode_logits': future_edge_mode_logits,
             'current_cover_upper_speed': self.shared_stage1_current_cover_upper_speed_head(semantic_feature).squeeze(-1),
             'future_cover_lower_speed': self.shared_stage1_future_cover_lower_speed_head(semantic_feature).squeeze(-1),
             'front_follow_upper_speed': self.shared_stage1_front_follow_upper_speed_head(semantic_feature).squeeze(-1),
@@ -2431,6 +2487,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         chase_token = self.semantic_transition_chase_proj(
             _float('chase_values', 2)
         )
+        graph_token = self.semantic_transition_graph_proj(
+            _float('graph_values', 20)
+        )
+        timing_token = timing_token + graph_token
+        boundary_token = boundary_token + graph_token
+        chase_token = chase_token + graph_token
 
         tokens = torch.stack(
             [
@@ -2486,6 +2548,38 @@ class TransformerForDiffusion(ModuleAttrMixin):
             [route_out, context['route_geom_tokens'], area_token_seq],
             dim=-1,
         )
+        graph_relation_token = timing_token
+        graph_boundary_token = boundary_token
+        graph_chase_token = chase_token
+        timing_token_seq = graph_relation_token.unsqueeze(1).expand(-1, route_out.shape[1], -1)
+        graph_route_input = torch.cat(
+            [route_out, context['route_geom_tokens'], timing_token_seq],
+            dim=-1,
+        )
+        current_edge_valid_logit = (
+            self.semantic_transition_current_edge_valid_head(graph_relation_token).squeeze(-1)
+            + self._pool_route_graph_logits(
+                self.semantic_transition_route_current_edge_valid_head(graph_route_input).squeeze(-1)
+            )
+        )
+        current_edge_mode_logits = (
+            self.semantic_transition_current_edge_mode_head(graph_relation_token)
+            + self._pool_route_graph_logits(
+                self.semantic_transition_route_current_edge_mode_head(graph_route_input)
+            )
+        )
+        future_edge_valid_logit = (
+            self.semantic_transition_future_edge_valid_head(graph_relation_token).squeeze(-1)
+            + self._pool_route_graph_logits(
+                self.semantic_transition_route_future_edge_valid_head(graph_route_input).squeeze(-1)
+            )
+        )
+        future_edge_mode_logits = (
+            self.semantic_transition_future_edge_mode_head(graph_relation_token)
+            + self._pool_route_graph_logits(
+                self.semantic_transition_route_future_edge_mode_head(graph_route_input)
+            )
+        )
         decision_phase_logits = self.semantic_transition_decision_phase_head(phase_token)
         return {
             'window_logits': self.semantic_transition_window_head(window_token),
@@ -2499,14 +2593,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_timing_values': self.semantic_transition_conflict_timing_head(timing_token),
             'chase_has_lead_logit': self.semantic_transition_chase_has_lead_head(chase_token).squeeze(-1),
             'chase_speed_max': self.semantic_transition_chase_speed_max_head(chase_token).squeeze(-1),
-            'current_cover_edge_valid_logit': self.semantic_transition_current_edge_valid_head(timing_token).squeeze(-1),
-            'current_cover_edge_mode_logits': self.semantic_transition_current_edge_mode_head(timing_token),
-            'future_cover_edge_valid_logit': self.semantic_transition_future_edge_valid_head(timing_token).squeeze(-1),
-            'future_cover_edge_mode_logits': self.semantic_transition_future_edge_mode_head(timing_token),
-            'current_cover_upper_speed': self.semantic_transition_current_cover_upper_speed_head(boundary_token).squeeze(-1),
-            'future_cover_lower_speed': self.semantic_transition_future_cover_lower_speed_head(boundary_token).squeeze(-1),
-            'front_follow_upper_speed': self.semantic_transition_front_follow_upper_speed_head(chase_token).squeeze(-1),
-            'merge_flow_lower_speed': self.semantic_transition_merge_flow_lower_speed_head(boundary_token).squeeze(-1),
+            'current_cover_edge_valid_logit': current_edge_valid_logit,
+            'current_cover_edge_mode_logits': current_edge_mode_logits,
+            'future_cover_edge_valid_logit': future_edge_valid_logit,
+            'future_cover_edge_mode_logits': future_edge_mode_logits,
+            'current_cover_upper_speed': self.semantic_transition_current_cover_upper_speed_head(graph_boundary_token).squeeze(-1),
+            'future_cover_lower_speed': self.semantic_transition_future_cover_lower_speed_head(graph_boundary_token).squeeze(-1),
+            'front_follow_upper_speed': self.semantic_transition_front_follow_upper_speed_head(graph_chase_token).squeeze(-1),
+            'merge_flow_lower_speed': self.semantic_transition_merge_flow_lower_speed_head(graph_boundary_token).squeeze(-1),
             'merge_yld_max': self.semantic_transition_merge_yld_max_head(boundary_token).squeeze(-1),
             'merge_go_min': self.semantic_transition_merge_go_min_head(boundary_token).squeeze(-1),
             'junction_yld_max': self.semantic_transition_junction_yld_max_head(boundary_token).squeeze(-1),
