@@ -130,7 +130,7 @@ route_b:
   traj_branch_condition_scale: 2.0
   traj_branch_condition_detach: true
   traj_branch_condition_gt_prob_start: 1.0
-  traj_branch_condition_gt_prob_end: 0.7
+  traj_branch_condition_gt_prob_end: 0.8
   traj_branch_condition_gt_decay_epochs: 80
   traj_branch_condition_affinity_scale: 6.0
   traj_branch_condition_borrow_time_scale: 8.0
@@ -138,15 +138,15 @@ route_b:
   stage1_boundary_norm_scale: 30.0
   use_temporary_occupancy_phase: true
   temporary_occupancy_dim: 13
-  temporary_occupancy_loss_weight: 0.15
-  go_opportunity_loss_weight: 0.15
+  temporary_occupancy_loss_weight: 0.10
+  go_opportunity_loss_weight: 0.06
   temporary_occupancy_phase_alpha: 0.0
   use_conflict_timing_state: true
   conflict_area_status_loss_weight: 0.15
   conflict_timing_loss_weight: 0.15
   conflict_timing_dist_norm_scale: 30.0
   conflict_timing_time_norm_scale: 10.0
-  use_independent_state_consistency_loss: true
+  use_independent_state_consistency_loss: false
   state_consistency_loss_weight: 1.0
   state_consistency_prob: 0.25
   state_consistency_window_weight: 0.01
@@ -156,7 +156,7 @@ route_b:
   state_consistency_tempocc_weight: 0.05
   state_consistency_opportunity_weight: 0.02
   state_consistency_timing_weight: 0.05
-  inside_area_go_loss_weight: 0.1
+  inside_area_go_loss_weight: 0.05
   use_chase_front_following_state: true
   chase_has_lead_loss_weight: 0.05
   chase_speed_max_loss_weight: 0.15
@@ -174,8 +174,8 @@ route_b:
   edge_speed_consistency_loss_weight: 0.05
   use_semantic_state_transition: true
   semantic_transition_prev_source: offline_gt
-  semantic_transition_loss_weight: 1.0
-  semantic_direct_aux_loss_weight: 0.25
+  semantic_transition_loss_weight: 0.5
+  semantic_direct_aux_loss_weight: 0.10
   semantic_transition_consistency_weight: 0.05
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
@@ -186,7 +186,7 @@ route_b:
   stage1_meet_weight: 1.0
   stage1_ped_weight: 1.0
   stage1_window_weight: 0.25
-  stage1_phase_weight: 0.15
+  stage1_phase_weight: 0.10
   stage1_conflict_area_weight: 0.15
   train_max_timesteps: 1000
   alignment_loss_weight: 0.0
