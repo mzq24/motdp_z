@@ -1360,6 +1360,14 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     val_filter_bad_routes = config.get('dataset', {}).get('val_filter_bad_routes', True)
     train_retain_bad_routes_for_energy = config.get('dataset', {}).get('train_retain_bad_routes_for_energy', False)
     val_retain_bad_routes_for_energy = config.get('dataset', {}).get('val_retain_bad_routes_for_energy', False)
+    use_fullres_upsample_cache = config.get('dataset', {}).get('use_fullres_upsample_cache', True)
+    train_warmup_memmap_page_cache = bool(config.get('dataset', {}).get('train_warmup_memmap_page_cache', False))
+    train_warmup_lidar_page_cache = bool(config.get('dataset', {}).get('train_warmup_lidar_page_cache', False))
+    train_warmup_max_samples = config.get('dataset', {}).get('train_warmup_max_samples', None)
+    if train_warmup_max_samples in (None, 0, "0"):
+        train_warmup_max_samples = None
+    else:
+        train_warmup_max_samples = int(train_warmup_max_samples)
     use_lidar_bev_detail = config.get('route_b', {}).get('use_lidar_bev_detail', False)
 
     policy_type = config.get('policy_type', 'anchor_free')
@@ -1394,6 +1402,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         lidar_history_frames=lidar_history_frames,
         filter_bad_routes=train_filter_bad_routes,
         retain_bad_routes_for_energy=train_retain_bad_routes_for_energy,
+        use_fullres_upsample_cache=use_fullres_upsample_cache,
     )
     val_dataset_orig = None
     val_dataset = None
@@ -1408,6 +1417,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             lidar_history_frames=lidar_history_frames,
             filter_bad_routes=val_filter_bad_routes,
             retain_bad_routes_for_energy=val_retain_bad_routes_for_energy,
+            use_fullres_upsample_cache=use_fullres_upsample_cache,
         )
         val_dataset = val_dataset_orig
 
@@ -1500,6 +1510,16 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             print("Validation features: using packed samples + memmap directly.")
         elif use_per_frame:
             print("Validation features: using per-frame loading.")
+
+    if train_warmup_memmap_page_cache:
+        if rank == 0:
+            train_dataset.warmup_train_memmap_page_cache(
+                rank=rank,
+                include_lidar=train_warmup_lidar_page_cache,
+                max_samples=train_warmup_max_samples,
+            )
+        if world_size > 1:
+            torch.distributed.barrier()
 
     def safe_collate(batch):
         try:

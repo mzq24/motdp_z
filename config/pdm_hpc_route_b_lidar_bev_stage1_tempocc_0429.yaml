@@ -214,6 +214,10 @@ reg_loss_weight: 6.0
 dataset:
   use_per_frame: false
   feature_suffix: ensemble
+  use_fullres_upsample_cache: false
+  train_warmup_memmap_page_cache: true
+  train_warmup_lidar_page_cache: false
+  train_warmup_max_samples: 0
   cache_dir: null
   train_filter_bad_routes: false
   val_filter_bad_routes: true

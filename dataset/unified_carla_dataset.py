@@ -181,6 +181,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  retain_bad_routes_for_energy: bool = False,
                  load_exact_next_speed_online: bool = False,
                  next_speed_frame_offset: int = 2,
+                 use_fullres_upsample_cache: bool = True,
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -202,6 +203,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._retain_bad_routes_for_energy = bool(retain_bad_routes_for_energy)
         self._load_exact_next_speed_online = bool(load_exact_next_speed_online)
         self._next_speed_frame_offset = max(int(next_speed_frame_offset), 1)
+        self._use_fullres_upsample_cache = bool(use_fullres_upsample_cache)
         self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
         self._route_speed_cache = {}
@@ -401,7 +403,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             ups_meta = cache_meta
             ups_path = ups_bin
             upsample_cache = 'downsampled_32x32'
-            if os.path.exists(fullres_index_path) and os.path.exists(fullres_ups_bin):
+            if (
+                self._use_fullres_upsample_cache
+                and os.path.exists(fullres_index_path)
+                and os.path.exists(fullres_ups_bin)
+            ):
                 with open(fullres_index_path, 'rb') as f:
                     fullres_meta = pickle.load(f)
                 if tuple(fullres_meta.get('bev_ups_shape', ())[-2:]) == (64, 64):
@@ -508,6 +514,129 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         mem_mb = sum(v[0].nbytes + v[1].nbytes for v in ram.values() if isinstance(v, tuple)) / 1e6
         print(f"[Rank {rank}] inject_ram_features: {len(unique_abs)} unique frames "
               f"({len(sidx_to_abs)} samples) -> {mem_mb:.0f} MB in RAM")
+
+    def _feature_abs_indices_for_samples(self, sample_indices=None, max_samples=None):
+        """Collect feature memmap absolute indices without touching feature pages."""
+        if self._feat_mmap is None or self._feat_index is None:
+            return []
+        if sample_indices is None:
+            sample_indices = range(len(self.sample_files))
+        if max_samples is not None and max_samples > 0:
+            sample_indices = list(sample_indices)[:int(max_samples)]
+
+        abs_indices = []
+        for idx in sample_indices:
+            sample = self._sample_cache[int(idx)]
+            feat_rel = sample.get('transfuser_bev_feature')
+            if not feat_rel:
+                continue
+            bev_feature_path = os.path.join(self.image_data_root, feat_rel)
+            packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
+            frame_id = sample.get('frame_id')
+            route_info = self._feat_index.get(packed_path)
+            if route_info is None or frame_id is None:
+                continue
+            n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
+            if int(frame_id) >= n_frames:
+                continue
+            abs_indices.append(route_info['offset'] + int(frame_id))
+        return sorted(set(abs_indices))
+
+    def _lidar_abs_indices_for_samples(self, sample_indices=None, max_samples=None):
+        """Collect LiDAR BEV memmap absolute indices for history frames."""
+        if self._lidar_bev_mmap is None or self._lidar_bev_index is None:
+            return []
+        if sample_indices is None:
+            sample_indices = range(len(self.sample_files))
+        if max_samples is not None and max_samples > 0:
+            sample_indices = list(sample_indices)[:int(max_samples)]
+
+        abs_indices = []
+        for idx in sample_indices:
+            sample = self._sample_cache[int(idx)]
+            feat_rel = sample.get('transfuser_bev_feature')
+            frame_id = sample.get('frame_id')
+            if not feat_rel or frame_id is None:
+                continue
+            route_rel = os.path.dirname(os.path.dirname(feat_rel))
+            route_info = self._lidar_bev_index.get(route_rel)
+            if route_info is None:
+                continue
+            fid_to_local = route_info.get('fid_to_local', {})
+            start_frame = int(frame_id) - (self._lidar_history_frames - 1)
+            for hist_frame_id in range(start_frame, int(frame_id) + 1):
+                local_idx = fid_to_local.get(int(hist_frame_id))
+                if local_idx is not None:
+                    abs_indices.append(route_info['offset'] + int(local_idx))
+        return sorted(set(abs_indices))
+
+    @staticmethod
+    def _warmup_memmap_pages(mmap_array, abs_indices, *, desc, rank=0, chunk_frames=512):
+        """Sequentially touch memmap pages so later random access hits OS page cache.
+
+        This does not keep a Python copy of the data, so the cache is shared by
+        all DDP ranks and remains reclaimable by the OS.
+        """
+        if mmap_array is None or not abs_indices:
+            return 0
+        total_touched = 0
+        checksum = 0.0
+        sorted_idx = sorted(set(int(i) for i in abs_indices))
+        ranges = []
+        start = prev = sorted_idx[0]
+        for idx in sorted_idx[1:]:
+            if idx == prev + 1:
+                prev = idx
+            else:
+                ranges.append((start, prev + 1))
+                start = prev = idx
+        ranges.append((start, prev + 1))
+
+        iterator = tqdm(ranges, desc=desc, disable=(rank != 0))
+        for start, stop in iterator:
+            for chunk_start in range(start, stop, int(chunk_frames)):
+                chunk_stop = min(chunk_start + int(chunk_frames), stop)
+                # Sum forces the OS to fault/read the pages; value is unused.
+                checksum += float(np.asarray(mmap_array[chunk_start:chunk_stop]).sum(dtype=np.float32))
+                total_touched += chunk_stop - chunk_start
+        # Prevent aggressive interpreters from considering checksum unused.
+        if rank == 0:
+            print(f"{desc}: touched {total_touched} frames (checksum_mod={checksum % 997:.3f})")
+        return total_touched
+
+    def warmup_train_memmap_page_cache(
+        self,
+        *,
+        rank=0,
+        include_lidar=False,
+        max_samples=None,
+        chunk_frames=512,
+    ):
+        """Warm OS page cache for training memmaps using sequential reads."""
+        feature_abs = self._feature_abs_indices_for_samples(max_samples=max_samples)
+        self._warmup_memmap_pages(
+            self._feat_mmap,
+            feature_abs,
+            desc=f"[Rank {rank}] Warming BEV feature page cache",
+            rank=rank,
+            chunk_frames=chunk_frames,
+        )
+        self._warmup_memmap_pages(
+            self._ups_mmap,
+            feature_abs,
+            desc=f"[Rank {rank}] Warming BEV upsample page cache",
+            rank=rank,
+            chunk_frames=chunk_frames,
+        )
+        if include_lidar:
+            lidar_abs = self._lidar_abs_indices_for_samples(max_samples=max_samples)
+            self._warmup_memmap_pages(
+                self._lidar_bev_mmap,
+                lidar_abs,
+                desc=f"[Rank {rank}] Warming LiDAR BEV page cache",
+                rank=rank,
+                chunk_frames=chunk_frames,
+            )
 
     def _get_route_pack_lru(self, packed_path: str) -> dict:
         """Fallback: load route_features.pt into LRU cache (used when memmap not available)."""
