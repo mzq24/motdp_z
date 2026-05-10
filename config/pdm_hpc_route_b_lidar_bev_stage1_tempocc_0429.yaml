@@ -173,13 +173,14 @@ route_b:
   use_edge_speed_consistency_loss: false
   edge_speed_consistency_loss_weight: 0.05
   use_semantic_state_transition: true
-  semantic_state_predictor_mode: transition_only
+  semantic_state_predictor_mode: direct_transition
   semantic_transition_prev_source: offline_gt
-  semantic_transition_loss_weight: 0.5
-  semantic_direct_aux_loss_weight: 0.0
-  semantic_transition_consistency_weight: 0.0
-  use_semantic_state_fusion: false
-  semantic_state_fusion_alpha: 1.0
+  semantic_transition_loss_weight: 1.0
+  semantic_direct_aux_loss_weight: 0.25
+  semantic_transition_consistency_weight: 0.05
+  semantic_transition_prev_dropout_prob: 0.2
+  use_semantic_state_fusion: true
+  semantic_state_fusion_alpha: 0.35
   semantic_state_fusion_update_cache: true
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
@@ -252,6 +253,9 @@ validation:
   preload_to_ram: false
   subset_size: 0
   max_batches: 0
+  ordered_semantic_rollout_enabled: true
+  ordered_semantic_rollout_max_routes: 0
+  ordered_semantic_rollout_max_frames: 0
 
 logging:
   use_wandb: true

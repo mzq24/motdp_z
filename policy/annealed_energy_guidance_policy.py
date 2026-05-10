@@ -358,6 +358,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.semantic_transition_consistency_weight = float(
             route_b_cfg.get('semantic_transition_consistency_weight', 0.05)
         )
+        self.semantic_transition_prev_dropout_prob = float(
+            route_b_cfg.get('semantic_transition_prev_dropout_prob', 0.0)
+        )
         self.use_semantic_state_fusion = bool(
             route_b_cfg.get('use_semantic_state_fusion', False)
         )
@@ -1260,6 +1263,57 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     gate = gate.unsqueeze(-1)
                 prev_state[key] = value * gate
         return prev_state
+
+    def _apply_semantic_transition_prev_dropout(
+        self,
+        prev_state: Optional[dict],
+        *,
+        route_steps: int,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[dict]:
+        """Sample-level training dropout for offline-GT prev semantic state."""
+        if prev_state is None or (not self.training):
+            return prev_state
+        p = float(self.semantic_transition_prev_dropout_prob)
+        if p <= 0.0:
+            return prev_state
+        valid = prev_state.get('valid')
+        if not isinstance(valid, torch.Tensor):
+            return prev_state
+        valid = valid.to(device=device, dtype=model_dtype).reshape(-1).clamp(0.0, 1.0)
+        B = valid.shape[0]
+        p = min(max(p, 0.0), 1.0)
+        keep = (torch.rand((B,), device=device, dtype=model_dtype) >= p).to(dtype=model_dtype)
+        neutral = self._build_neutral_semantic_prev_state(
+            B, route_steps, device=device, model_dtype=model_dtype
+        )
+        dropped = {}
+        for key, value in prev_state.items():
+            if not isinstance(value, torch.Tensor):
+                dropped[key] = value
+                continue
+            neutral_value = neutral.get(key)
+            if key == 'valid':
+                dropped[key] = valid * keep
+                continue
+            if neutral_value is None:
+                neutral_value = torch.zeros_like(value)
+            if value.dtype.is_floating_point:
+                value_t = value.to(device=device, dtype=model_dtype)
+                neutral_t = neutral_value.to(device=device, dtype=model_dtype)
+                gate = keep
+                while gate.dim() < value_t.dim():
+                    gate = gate.unsqueeze(-1)
+                dropped[key] = value_t * gate + neutral_t * (1.0 - gate)
+            else:
+                value_t = value.to(device=device)
+                neutral_t = neutral_value.to(device=device, dtype=value_t.dtype)
+                gate_bool = keep.to(dtype=torch.bool)
+                while gate_bool.dim() < value_t.dim():
+                    gate_bool = gate_bool.unsqueeze(-1)
+                dropped[key] = torch.where(gate_bool, value_t, neutral_t)
+        return dropped
 
     def _get_route_prev_coarse_memory(
         self,
@@ -3086,6 +3140,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 route_steps=route_steps,
                 require=True,
             )
+            prev_state = self._apply_semantic_transition_prev_dropout(
+                prev_state,
+                route_steps=route_steps,
+                device=device,
+                model_dtype=model_dtype,
+            )
             transition_stage1_scores = self.model.compute_shared_stage1_transition_from_ego_outputs(
                 traj_out=shared_forward['traj_out'],
                 route_out=shared_forward['route_out'],
@@ -4440,6 +4500,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         transfuser_lidar_bev: Optional[torch.Tensor] = None,
         borrow_time_s: Optional[torch.Tensor] = None,
         prev_relation_probs: Optional[torch.Tensor] = None,
+        disable_semantic_state_cache: bool = False,
     ):
         """
         DDIM from N(0,I) with annealed energy gradient guidance.
@@ -4486,6 +4547,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         semantic_fusion_debug = None
         transition_only_state = self.semantic_state_predictor_mode == 'transition_only'
         use_infer_semantic_transition = (
+            (not disable_semantic_state_cache)
+            and
             (self.use_semantic_state_fusion or transition_only_state)
             and self.use_semantic_state_transition
             and self.use_stage1_speed_energy
@@ -4921,6 +4984,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
         if reset_semantic_state_cache:
             self.reset_semantic_state_cache()
+        disable_semantic_state_cache = bool(kwargs.get('disable_semantic_state_cache', False))
 
         # Accept dynamic energy weights from kwargs (LLM Router interface)
         energy_weights = kwargs.get('energy_weights', None)
@@ -4936,6 +5000,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             transfuser_lidar_bev=transfuser_lidar_bev,
             borrow_time_s=borrow_time_s,
             prev_relation_probs=prev_relation_probs,
+            disable_semantic_state_cache=disable_semantic_state_cache,
         )
 
         best_traj = sample_result['best_trajectory']

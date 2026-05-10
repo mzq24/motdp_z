@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from collections import defaultdict
 import argparse
 import datetime
+from typing import Any, Dict, List, Optional, Tuple
 from torch.distributed.elastic.multiprocessing.errors import record
 from diffusers.training_utils import EMAModel
 
@@ -881,6 +882,223 @@ def _append_new_stage1_val_metrics(val_metrics, batch, result, alias_prefix=None
             alias_key = key.replace('stage1_', f'{alias_prefix}_', 1)
             val_metrics[alias_key].extend(values[start:])
 
+
+def _ordered_basename_frame_id(path: str) -> Optional[int]:
+    base = os.path.basename(path)
+    stem = os.path.splitext(base)[0]
+    digits = "".join(ch for ch in stem if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _ordered_frame_id(sample: Dict[str, Any]) -> Optional[int]:
+    for key in ("frame_id", "frame", "tick"):
+        if key in sample:
+            try:
+                return int(sample[key])
+            except (TypeError, ValueError):
+                pass
+    for key in ("transfuser_bev_feature", "bev_feature", "image_path"):
+        value = sample.get(key)
+        if value:
+            frame = _ordered_basename_frame_id(str(value))
+            if frame is not None:
+                return frame
+    return None
+
+
+def _ordered_route_key(sample: Dict[str, Any]) -> Tuple[str, ...]:
+    parts: List[str] = []
+    for key in (
+        "scene_id",
+        "route_id",
+        "route_name",
+        "scenario_id",
+        "town",
+        "log_id",
+    ):
+        value = sample.get(key)
+        if value is not None and str(value) != "":
+            parts.append(f"{key}={value}")
+    feat_rel = str(sample.get("transfuser_bev_feature", "") or "")
+    if feat_rel:
+        parent = os.path.dirname(os.path.dirname(feat_rel))
+        if parent:
+            parts.append(f"feat_parent={parent}")
+    if not parts:
+        parts.append(f"singleton={id(sample)}")
+    return tuple(parts)
+
+
+def _ordered_dataset_groups(dataset):
+    """Rebuild route/frame order from packed sample metadata."""
+    base_dataset = dataset
+    local_to_base = None
+    if isinstance(dataset, torch.utils.data.Subset):
+        base_dataset = dataset.dataset
+        local_to_base = list(dataset.indices)
+    samples = getattr(base_dataset, 'samples', None)
+    if samples is None:
+        return None, "dataset has no samples metadata"
+    if local_to_base is None:
+        local_to_base = list(range(len(base_dataset)))
+
+    grouped = defaultdict(list)
+    for local_idx, base_idx in enumerate(local_to_base):
+        sample = samples[int(base_idx)]
+        frame = _ordered_frame_id(sample)
+        if frame is None:
+            return None, f"sample {base_idx} has no frame id"
+        grouped[_ordered_route_key(sample)].append((frame, local_idx))
+    groups = []
+    for items in grouped.values():
+        items.sort(key=lambda item: item[0])
+        groups.append([local_idx for _, local_idx in items])
+    groups.sort(key=lambda group: _ordered_route_key(samples[int(local_to_base[group[0]])]))
+    return groups, None
+
+
+def _move_batch_to_device(batch, device):
+    for key in batch:
+        if isinstance(batch[key], torch.Tensor):
+            batch[key] = batch[key].to(device, non_blocking=True)
+    return batch
+
+
+def _build_route_b_obs_dict(batch, model_for_inference):
+    obs_dict = {
+        'transfuser_bev_feature': batch['transfuser_bev_feature'],
+        'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
+        'transfuser_lidar_bev': batch['transfuser_lidar_bev'],
+        'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],
+    }
+    if 'borrow_cross_active_time_s' in batch:
+        obs_dict['borrow_cross_active_time_s'] = batch['borrow_cross_active_time_s']
+    return obs_dict
+
+
+def _gather_metric_lists(metric_lists, world_size):
+    if (
+        world_size <= 1
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return metric_lists
+    gathered = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, {k: list(v) for k, v in metric_lists.items()})
+    merged = defaultdict(list)
+    for item in gathered:
+        if not item:
+            continue
+        for key, values in item.items():
+            merged[key].extend(values)
+    return merged
+
+
+def validate_ordered_semantic_rollout(
+    policy,
+    val_loader,
+    device,
+    rank=0,
+    world_size=1,
+    use_amp=False,
+    amp_dtype=torch.float16,
+    max_routes=0,
+    max_frames=0,
+):
+    """Route-ordered semantic cache rollout validation for next-token state."""
+    model_for_inference = policy.module if world_size > 1 else policy
+    groups, warning = _ordered_dataset_groups(val_loader.dataset)
+    if groups is None:
+        if rank == 0:
+            print(f"[Val ordered rollout] skipped: {warning}")
+        return {}
+    if max_routes and max_routes > 0:
+        groups = groups[:int(max_routes)]
+
+    local_metrics = defaultdict(list)
+    local_groups = [
+        (idx, group) for idx, group in enumerate(groups)
+        if (idx % max(world_size, 1)) == rank
+    ]
+    total_frames = sum(len(group) for _, group in local_groups)
+    if max_frames and max_frames > 0:
+        total_frames = min(total_frames, int(max_frames))
+    iterator = tqdm(
+        local_groups,
+        desc="Ordered semantic rollout val",
+        leave=False,
+    ) if rank == 0 else local_groups
+
+    frames_seen = 0
+    with torch.no_grad():
+        for _, group in iterator:
+            if hasattr(model_for_inference, 'reset_semantic_state_cache'):
+                model_for_inference.reset_semantic_state_cache()
+            for frame_pos, dataset_idx in enumerate(group):
+                if max_frames and max_frames > 0 and frames_seen >= int(max_frames):
+                    break
+                batch = default_collate([val_loader.dataset[dataset_idx]])
+                batch = _move_batch_to_device(batch, device)
+                obs_dict = _build_route_b_obs_dict(batch, model_for_inference)
+                target_actions = batch['agent_pos']
+                try:
+                    with autocast_cuda(use_amp, amp_dtype):
+                        result = model_for_inference.predict_action(
+                            obs_dict,
+                            no_noise=False,
+                            use_server_style=False,
+                            gt_trajectory=target_actions,
+                            reset_semantic_state_cache=(frame_pos == 0),
+                            disable_semantic_state_cache=False,
+                        )
+                    predicted_actions = torch.from_numpy(result['action']).to(device)
+                    target_actions_eval = target_actions
+                    if target_actions_eval.dim() == 3:
+                        target_actions_eval = target_actions_eval[:, :predicted_actions.shape[1]]
+                    elif target_actions_eval.dim() == 2:
+                        target_actions_eval = target_actions_eval.unsqueeze(1)
+                    driving_metrics = compute_driving_metrics(
+                        predicted_actions,
+                        target_actions_eval,
+                        fut_obstacles=batch.get('fut_obstacles', None),
+                    )
+                    for key, value in driving_metrics.items():
+                        local_metrics[f'ordered_{key}'].append(value)
+                    _append_new_stage1_val_metrics(
+                        local_metrics,
+                        batch,
+                        result,
+                        alias_prefix='ordered_semantic_rollout',
+                    )
+                    if 'route' in batch and batch['route'] is not None and 'route_pred' in result:
+                        route_gt = batch['route'].to(device)
+                        route_pred = result['route_pred']
+                        route_l2 = torch.sqrt(((route_pred - route_gt) ** 2).sum(dim=-1))
+                        local_metrics['ordered_route_L2'].append(route_l2.mean().item())
+                        local_metrics['ordered_route_L2_final'].append(route_l2[:, -1].mean().item())
+                except Exception as e:
+                    if rank == 0:
+                        print(f"[Val ordered rollout] sample failed: {e}")
+                    continue
+                frames_seen += 1
+            if max_frames and max_frames > 0 and frames_seen >= int(max_frames):
+                break
+    if hasattr(model_for_inference, 'reset_semantic_state_cache'):
+        model_for_inference.reset_semantic_state_cache()
+
+    merged = _gather_metric_lists(local_metrics, world_size)
+    return {
+        f'val_{key}': float(np.mean(values))
+        for key, values in merged.items()
+        if values and (key.startswith('ordered_') or key.startswith('ordered_semantic_rollout_'))
+    }
+
+
 def validate_model(
     policy,
     val_loader,
@@ -891,6 +1109,9 @@ def validate_model(
     amp_dtype=torch.float16,
     max_batches=None,
     speed_adaptive_json_path=None,
+    ordered_semantic_rollout_enabled=True,
+    ordered_semantic_rollout_max_routes=0,
+    ordered_semantic_rollout_max_frames=0,
 ):
     """
     Validation function for distributed training
@@ -919,9 +1140,7 @@ def validate_model(
         for batch_idx, batch in enumerate(pbar):
             if max_batches is not None and batch_idx >= max_batches:
                 break
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device, non_blocking=True)
+            batch = _move_batch_to_device(batch, device)
 
             with autocast_cuda(use_amp, amp_dtype):
                 loss_dict = model_for_inference(batch, return_loss_dict=True, phase=route_b_phase)
@@ -1053,21 +1272,24 @@ def validate_model(
                 for key, value in loss_dict.items():
                     if key.startswith('speed_profile_step') and key.endswith('_loss'):
                         val_metrics[key].append(value.item() if isinstance(value, torch.Tensor) else value)
+                if 'stage1_semantic_transition_loss' in loss_dict:
+                    val_metrics['gtprev_semantic_transition_loss'].append(
+                        loss_dict['stage1_semantic_transition_loss'].item()
+                    )
                 
                 # Route B model only needs BEV/detail features plus ego status.
-                obs_dict = {
-                    'transfuser_bev_feature': batch['transfuser_bev_feature'],
-                    'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
-                    'transfuser_lidar_bev': batch['transfuser_lidar_bev'],
-                    'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],
-                }
-                if 'borrow_cross_active_time_s' in batch:
-                    obs_dict['borrow_cross_active_time_s'] = batch['borrow_cross_active_time_s']
+                obs_dict = _build_route_b_obs_dict(batch, model_for_inference)
                 target_actions = batch['agent_pos']
                 
                 try:
                     # Model always returns route prediction
-                    result = model_for_inference.predict_action(obs_dict, no_noise=False,use_server_style=False, gt_trajectory=target_actions)
+                    result = model_for_inference.predict_action(
+                        obs_dict,
+                        no_noise=False,
+                        use_server_style=False,
+                        gt_trajectory=target_actions,
+                        disable_semantic_state_cache=True,
+                    )
                     predicted_actions = torch.from_numpy(result['action']).to(device)
 
                     target_actions_eval = target_actions
@@ -1085,14 +1307,11 @@ def validate_model(
                     )
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
-                    semantic_alias = None
-                    if getattr(model_for_inference, 'semantic_state_predictor_mode', '') == 'transition_only':
-                        semantic_alias = 'semantic_next_token'
                     _append_new_stage1_val_metrics(
                         val_metrics,
                         batch,
                         result,
-                        alias_prefix=semantic_alias,
+                        alias_prefix='semantic_direct',
                     )
 
                     target_speed = result.get('target_speed', None)
@@ -1151,7 +1370,11 @@ def validate_model(
                         try:
                             setattr(model_for_inference, steps_attr, 1)
                             result_1step = model_for_inference.predict_action(
-                                obs_dict, no_noise=False, use_server_style=False, gt_trajectory=target_actions
+                                obs_dict,
+                                no_noise=False,
+                                use_server_style=False,
+                                gt_trajectory=target_actions,
+                                disable_semantic_state_cache=True,
                             )
                             predicted_actions_1step = torch.from_numpy(result_1step['action']).to(device)
 
@@ -1256,6 +1479,20 @@ def validate_model(
             os.makedirs(os.path.dirname(speed_adaptive_json_path), exist_ok=True)
             with open(speed_adaptive_json_path, 'w') as f:
                 json.dump(summary, f, indent=2)
+
+    if ordered_semantic_rollout_enabled:
+        ordered_metrics = validate_ordered_semantic_rollout(
+            policy,
+            val_loader,
+            device,
+            rank=rank,
+            world_size=world_size,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            max_routes=ordered_semantic_rollout_max_routes,
+            max_frames=ordered_semantic_rollout_max_frames,
+        )
+        averaged_metrics.update(ordered_metrics)
 
     return averaged_metrics
 
@@ -1560,6 +1797,15 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         val_max_batches = int(raw_val_max_batches)
         if val_max_batches <= 0:
             val_max_batches = None
+    ordered_semantic_rollout_enabled = bool(
+        validation_cfg.get('ordered_semantic_rollout_enabled', True)
+    )
+    ordered_semantic_rollout_max_routes = int(
+        validation_cfg.get('ordered_semantic_rollout_max_routes', 0) or 0
+    )
+    ordered_semantic_rollout_max_frames = int(
+        validation_cfg.get('ordered_semantic_rollout_max_frames', 0) or 0
+    )
 
     val_subset_indices = None
     raw_val_subset_size = validation_cfg.get('subset_size', None)
@@ -2159,6 +2405,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 policy, val_loader, device, rank=rank, world_size=world_size,
                 use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches,
                 speed_adaptive_json_path=speed_adaptive_json_path,
+                ordered_semantic_rollout_enabled=ordered_semantic_rollout_enabled,
+                ordered_semantic_rollout_max_routes=ordered_semantic_rollout_max_routes,
+                ordered_semantic_rollout_max_frames=ordered_semantic_rollout_max_frames,
             )
             if rank == 0:
                 print(f"\n✓ Validation completed")
@@ -2438,6 +2687,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     policy, val_loader, device, rank=rank, world_size=world_size,
                     use_amp=use_amp, amp_dtype=amp_dtype, max_batches=val_max_batches,
                     speed_adaptive_json_path=speed_adaptive_json_path,
+                    ordered_semantic_rollout_enabled=ordered_semantic_rollout_enabled,
+                    ordered_semantic_rollout_max_routes=ordered_semantic_rollout_max_routes,
+                    ordered_semantic_rollout_max_frames=ordered_semantic_rollout_max_frames,
                 )
             except Exception as e:
                 if rank == 0:
