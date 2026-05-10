@@ -4761,11 +4761,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         semantic_fusion_debug = None
         transition_only_state = self.semantic_state_predictor_mode == 'transition_only'
         direct_only_state = self.semantic_state_predictor_mode == 'direct_only'
+        direct_prev_modulated_state = self.semantic_state_predictor_mode == 'direct_prev_modulated'
         use_infer_semantic_transition = (
             (not disable_semantic_state_cache)
             and (not direct_only_state)
             and
-            (self.use_semantic_state_fusion or transition_only_state)
+            (self.use_semantic_state_fusion or transition_only_state or direct_prev_modulated_state)
             and self.use_semantic_state_transition
             and self.use_stage1_speed_energy
         )
@@ -4853,6 +4854,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                                 semantic_fusion_debug = {
                                     'enabled': torch.ones((), device=device, dtype=model_dtype),
                                     'gate': torch.ones((B,), device=device, dtype=model_dtype),
+                                }
+                            elif direct_prev_modulated_state:
+                                stage1_raw_scores = transition_stage1_raw_scores
+                                semantic_fusion_debug = {
+                                    'enabled': torch.zeros((), device=device, dtype=model_dtype),
+                                    'gate': semantic_prev_valid.detach() if semantic_prev_valid is not None else torch.zeros((B,), device=device, dtype=model_dtype),
                                 }
                             else:
                                 stage1_raw_scores, semantic_fusion_debug = self._fuse_stage1_raw_scores(
@@ -4980,6 +4987,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         'enabled': torch.ones((), device=device, dtype=model_dtype),
                         'gate': torch.ones((B,), device=device, dtype=model_dtype),
                     }
+                elif direct_prev_modulated_state:
+                    stage1_scores_raw = transition_stage1_scores_raw
+                    semantic_fusion_debug = {
+                        'enabled': torch.zeros((), device=device, dtype=model_dtype),
+                        'gate': semantic_prev_valid.detach() if semantic_prev_valid is not None else torch.zeros((B,), device=device, dtype=model_dtype),
+                    }
                 else:
                     stage1_scores_raw, semantic_fusion_debug = self._fuse_stage1_raw_scores(
                         stage1_scores_raw,
@@ -5024,6 +5037,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     )
                 )
                 if transition_only_state:
+                    stage1_ref_scores_raw = transition_stage1_ref_scores_raw
+                elif direct_prev_modulated_state:
                     stage1_ref_scores_raw = transition_stage1_ref_scores_raw
                 else:
                     stage1_ref_scores_raw, _ = self._fuse_stage1_raw_scores(

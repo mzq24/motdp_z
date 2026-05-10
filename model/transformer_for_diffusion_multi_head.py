@@ -2660,7 +2660,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         gamma, beta = gamma_beta.chunk(2, dim=-1)
         route_delta = self.semantic_prev_route_modulation_proj(prev_summary)
 
-        scale = float(prev_modulation_scale)
+        prev_valid = prev_state.get('valid')
+        if isinstance(prev_valid, torch.Tensor):
+            prev_valid = prev_valid.to(
+                device=prev_summary.device,
+                dtype=prev_summary.dtype,
+            ).reshape(-1, 1).clamp(0.0, 1.0)
+        else:
+            prev_valid = torch.zeros(
+                (prev_summary.shape[0], 1),
+                device=prev_summary.device,
+                dtype=prev_summary.dtype,
+            )
+        scale = float(prev_modulation_scale) * prev_valid
         if self.training and prev_modulation_dropout_prob > 0.0:
             drop_p = min(max(float(prev_modulation_dropout_prob), 0.0), 1.0)
             keep = (
@@ -2671,15 +2683,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 )
                 >= drop_p
             ).to(dtype=prev_summary.dtype)
-            gamma = gamma * keep
-            beta = beta * keep
-            route_delta = route_delta * keep
+            scale = scale * keep
 
         semantic_feature = (
             context['semantic_feature'] * (1.0 + scale * torch.tanh(gamma))
             + scale * beta
         )
-        route_out_modulated = route_out + scale * torch.tanh(route_delta).unsqueeze(1)
+        route_out_modulated = route_out + scale.unsqueeze(1) * torch.tanh(route_delta).unsqueeze(1)
         return self._decode_shared_stage1_scores(
             context=context,
             route_out=route_out_modulated,
