@@ -34,6 +34,13 @@ dataloader:
     merge: 3.0
     junction: 4.0
     borrow: 3.0
+  use_semantic_shift_sampler: true
+  semantic_shift_window_weight: 4.0
+  semantic_shift_phase_weight: 3.0
+  semantic_shift_area_weight: 2.0
+  semantic_shift_edge_weight: 2.0
+  semantic_shift_opportunity_weight: 2.0
+  semantic_shift_max_weight: 8.0
 
 obs_horizon: 4
 pred_horizon: 10
@@ -173,14 +180,30 @@ route_b:
   use_edge_speed_consistency_loss: false
   edge_speed_consistency_loss_weight: 0.05
   use_semantic_state_transition: true
-  semantic_state_predictor_mode: direct_transition
+  semantic_state_predictor_mode: direct_prev_modulated
   semantic_transition_prev_source: offline_gt
   semantic_transition_loss_weight: 1.0
   semantic_direct_aux_loss_weight: 0.25
   semantic_transition_consistency_weight: 0.05
   semantic_transition_prev_dropout_prob: 0.2
+  semantic_prev_token_dropout_prob: 0.6
+  semantic_prev_window_dropout_prob: 0.9
+  semantic_prev_dir_dropout_prob: 0.9
+  semantic_prev_area_dropout_prob: 0.8
+  semantic_prev_tempocc_dropout_prob: 0.8
+  semantic_prev_phase_dropout_prob: 0.7
+  semantic_prev_graph_dropout_prob: 0.7
+  semantic_prev_boundary_dropout_prob: 0.5
+  semantic_prev_chase_dropout_prob: 0.5
+  semantic_prev_random_replace_prob: 0.2
+  semantic_prev_replace_to_none_prob: 0.5
+  semantic_prev_prefix_dropout_frames: 8
+  semantic_prev_prefix_dropout_prob: 1.0
+  semantic_prev_modulation_scale: 0.2
+  semantic_prev_modulation_dropout_prob: 0.5
   use_semantic_state_fusion: true
-  semantic_state_fusion_alpha: 0.35
+  semantic_state_fusion_alpha: 0.25
+  semantic_state_fusion_warmup_frames: 8
   semantic_state_fusion_update_cache: true
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
@@ -253,7 +276,7 @@ validation:
   preload_to_ram: false
   subset_size: 0
   max_batches: 0
-  ordered_semantic_rollout_enabled: true
+  ordered_semantic_rollout_enabled: false
   ordered_semantic_rollout_max_routes: 0
   ordered_semantic_rollout_max_frames: 0
 

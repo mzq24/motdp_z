@@ -209,6 +209,13 @@ def _sample_float(sample, keys, default=0.0):
     return float(default)
 
 
+def _sample_int(sample, keys, default=-1):
+    value = _sample_float(sample, keys, default=float(default))
+    if not np.isfinite(value):
+        return int(default)
+    return int(round(value))
+
+
 def build_window_sample_weights(dataset, dataloader_cfg):
     """Build simple window-aware sample weights from cached stage1 active fields."""
     samples = getattr(dataset, '_sample_cache', None)
@@ -220,9 +227,17 @@ def build_window_sample_weights(dataset, dataloader_cfg):
     merge_weight = float(weight_cfg.get('merge', dataloader_cfg.get('window_sampler_merge_weight', 3.0)))
     junction_weight = float(weight_cfg.get('junction', dataloader_cfg.get('window_sampler_junction_weight', 3.0)))
     borrow_weight = float(weight_cfg.get('borrow', dataloader_cfg.get('window_sampler_borrow_weight', 5.0)))
+    use_semantic_shift_sampler = bool(dataloader_cfg.get('use_semantic_shift_sampler', False))
+    shift_window_weight = float(dataloader_cfg.get('semantic_shift_window_weight', 4.0))
+    shift_phase_weight = float(dataloader_cfg.get('semantic_shift_phase_weight', 3.0))
+    shift_area_weight = float(dataloader_cfg.get('semantic_shift_area_weight', 2.0))
+    shift_edge_weight = float(dataloader_cfg.get('semantic_shift_edge_weight', 2.0))
+    shift_opportunity_weight = float(dataloader_cfg.get('semantic_shift_opportunity_weight', 2.0))
+    shift_max_weight = float(dataloader_cfg.get('semantic_shift_max_weight', 8.0))
 
     weights = np.full(len(samples), none_weight, dtype=np.float64)
     counts = {'none': 0, 'merge': 0, 'junction': 0, 'borrow': 0}
+    shift_counts = {'window': 0, 'phase': 0, 'area': 0, 'edge': 0, 'opportunity': 0}
     for idx, sample in enumerate(samples):
         # Newer packed stage1 labels use conflict_area_family:
         # 0 none, 1 borrow, 2 merge, 3 junction. Keep the legacy active-flag
@@ -250,16 +265,87 @@ def build_window_sample_weights(dataset, dataloader_cfg):
             counts['borrow'] += 1
         if not (merge_active or junction_active or borrow_active):
             counts['none'] += 1
+        if use_semantic_shift_sampler:
+            shift_bonus = 0.0
+            prev_family = _sample_int(sample, ('prev_conflict_area_family',), default=-1)
+            if prev_family >= 0 and family >= 0 and prev_family != family:
+                shift_bonus += shift_window_weight
+                shift_counts['window'] += 1
+
+            decision = _sample_int(sample, ('conflict_decision_phase',), default=-1)
+            prev_decision = _sample_int(sample, ('prev_conflict_decision_phase',), default=-1)
+            control = _sample_int(sample, ('conflict_control_phase',), default=-1)
+            prev_control = _sample_int(sample, ('prev_conflict_control_phase',), default=-1)
+            phase_shift = (
+                prev_decision > 0 and decision > 0 and prev_decision != decision
+            ) or (
+                prev_control > 0 and control > 0 and prev_control != control
+            )
+            if phase_shift:
+                shift_bonus += shift_phase_weight
+                shift_counts['phase'] += 1
+
+            status = _sample_int(sample, ('conflict_area_status',), default=-1)
+            prev_status = _sample_int(sample, ('prev_conflict_area_status',), default=-1)
+            if prev_status >= 0 and status >= 0 and prev_status != status:
+                shift_bonus += shift_area_weight
+                shift_counts['area'] += 1
+
+            has_prev_edge = (
+                'prev_current_cover_edge_valid' in sample
+                or 'prev_future_cover_edge_valid' in sample
+            )
+            if has_prev_edge:
+                current_edge_valid = _sample_float(sample, ('current_cover_edge_valid',), default=0.0) > 0.5
+                prev_current_edge_valid = _sample_float(sample, ('prev_current_cover_edge_valid',), default=0.0) > 0.5
+                future_edge_valid = _sample_float(sample, ('future_cover_edge_valid',), default=0.0) > 0.5
+                prev_future_edge_valid = _sample_float(sample, ('prev_future_cover_edge_valid',), default=0.0) > 0.5
+                current_mode = _sample_int(sample, ('current_cover_edge_mode',), default=-1)
+                prev_current_mode = _sample_int(sample, ('prev_current_cover_edge_mode',), default=-1)
+                future_mode = _sample_int(sample, ('future_cover_edge_mode',), default=-1)
+                prev_future_mode = _sample_int(sample, ('prev_future_cover_edge_mode',), default=-1)
+                edge_shift = (
+                    current_edge_valid != prev_current_edge_valid
+                    or future_edge_valid != prev_future_edge_valid
+                    or (
+                        current_edge_valid and prev_current_edge_valid
+                        and current_mode >= 0 and prev_current_mode >= 0
+                        and current_mode != prev_current_mode
+                    )
+                    or (
+                        future_edge_valid and prev_future_edge_valid
+                        and future_mode >= 0 and prev_future_mode >= 0
+                        and future_mode != prev_future_mode
+                    )
+                )
+                if edge_shift:
+                    shift_bonus += shift_edge_weight
+                    shift_counts['edge'] += 1
+
+            go_prob = _sample_float(sample, ('go_opportunity_prob',), default=0.5)
+            prev_go_prob = _sample_float(sample, ('prev_go_opportunity_prob',), default=0.5)
+            yld_prob = _sample_float(sample, ('yld_pressure_prob',), default=0.5)
+            prev_yld_prob = _sample_float(sample, ('prev_yld_pressure_prob',), default=0.5)
+            go_cross = (prev_go_prob < 0.5 <= go_prob) or (prev_go_prob >= 0.5 > go_prob)
+            yld_cross = (prev_yld_prob < 0.5 <= yld_prob) or (prev_yld_prob >= 0.5 > yld_prob)
+            if go_cross or yld_cross:
+                shift_bonus += shift_opportunity_weight
+                shift_counts['opportunity'] += 1
+
+            sample_weight = min(sample_weight + shift_bonus, shift_max_weight)
         weights[idx] = sample_weight
 
     weights = np.maximum(weights, 1e-6)
     summary = {
         'counts': counts,
+        'shift_counts': shift_counts,
         'weights': {
             'none': none_weight,
             'merge': merge_weight,
             'junction': junction_weight,
             'borrow': borrow_weight,
+            'semantic_shift_enabled': float(use_semantic_shift_sampler),
+            'semantic_shift_max': shift_max_weight,
         },
         'mean_weight': float(weights.mean()) if weights.size else 0.0,
         'max_weight': float(weights.max()) if weights.size else 0.0,
@@ -1778,10 +1864,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         train_sample_weights, weight_summary = build_window_sample_weights(train_dataset, dataloader_cfg)
         if rank == 0:
             counts = weight_summary['counts']
+            shift_counts = weight_summary.get('shift_counts', {})
             weights_cfg = weight_summary['weights']
             print(
                 "Using window-aware weighted sampler: "
-                f"counts={counts}, weights={weights_cfg}, "
+                f"counts={counts}, shift_counts={shift_counts}, weights={weights_cfg}, "
                 f"mean_weight={weight_summary['mean_weight']:.3f}, "
                 f"max_weight={weight_summary['max_weight']:.3f}, "
                 f"replacement={window_sampler_replacement}"

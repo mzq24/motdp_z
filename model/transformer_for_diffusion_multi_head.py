@@ -2082,6 +2082,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
             nn.Linear(n_emb // 2, 1),
         )
+        self.semantic_prev_modulation_proj = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, 2 * n_emb),
+        )
+        self.semantic_prev_route_modulation_proj = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
@@ -2336,23 +2346,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_count = max(int(route_logits.shape[1]), 1)
         return torch.logsumexp(route_logits, dim=1) - math.log(route_count)
 
-    def _compute_shared_stage1_scores(
+    def _decode_shared_stage1_scores(
         self,
-        traj_out: torch.Tensor,
+        context: dict,
         route_out: torch.Tensor,
-        speed_out: torch.Tensor,
-        route_points: torch.Tensor,
-        conditioning: torch.Tensor,
+        semantic_feature: Optional[torch.Tensor] = None,
         speed_samples: Optional[torch.Tensor] = None,
     ) -> dict:
-        context = self._build_shared_stage1_context(
-            traj_out=traj_out,
-            route_out=route_out,
-            speed_out=speed_out,
-            route_points=route_points,
-            conditioning=conditioning,
-        )
-        semantic_feature = context['semantic_feature']
+        if semantic_feature is None:
+            semantic_feature = context['semantic_feature']
         conflict_area_input = torch.cat([route_out, context['route_geom_tokens']], dim=-1)
         semantic_route_tokens = semantic_feature.unsqueeze(1).expand(-1, route_out.shape[1], -1)
         graph_route_input = torch.cat(
@@ -2413,6 +2415,28 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'borrow_go_min': self.shared_stage1_borrow_go_min_head(semantic_feature).squeeze(-1),
             'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
         }
+
+    def _compute_shared_stage1_scores(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        speed_samples: Optional[torch.Tensor] = None,
+    ) -> dict:
+        context = self._build_shared_stage1_context(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+        )
+        return self._decode_shared_stage1_scores(
+            context=context,
+            route_out=route_out,
+            speed_samples=speed_samples,
+        )
 
     def _encode_prev_semantic_state(self, prev_state: dict, context: dict) -> torch.Tensor:
         semantic_feature = context['semantic_feature']
@@ -2610,6 +2634,59 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_area_logits': self.semantic_transition_conflict_area_head(conflict_area_input).squeeze(-1),
         }
 
+    def _compute_shared_stage1_prev_modulated_scores(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        prev_state: dict,
+        prev_modulation_scale: float = 0.2,
+        prev_modulation_dropout_prob: float = 0.0,
+        speed_samples: Optional[torch.Tensor] = None,
+    ) -> dict:
+        context = self._build_shared_stage1_context(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+        )
+        prev_tokens = self._encode_prev_semantic_state(prev_state, context)
+        prev_tokens = self.semantic_transition_norm(self.semantic_transition_encoder(prev_tokens))
+        prev_summary = prev_tokens.mean(dim=1)
+        gamma_beta = self.semantic_prev_modulation_proj(prev_summary)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        route_delta = self.semantic_prev_route_modulation_proj(prev_summary)
+
+        scale = float(prev_modulation_scale)
+        if self.training and prev_modulation_dropout_prob > 0.0:
+            drop_p = min(max(float(prev_modulation_dropout_prob), 0.0), 1.0)
+            keep = (
+                torch.rand(
+                    (prev_summary.shape[0], 1),
+                    device=prev_summary.device,
+                    dtype=prev_summary.dtype,
+                )
+                >= drop_p
+            ).to(dtype=prev_summary.dtype)
+            gamma = gamma * keep
+            beta = beta * keep
+            route_delta = route_delta * keep
+
+        semantic_feature = (
+            context['semantic_feature'] * (1.0 + scale * torch.tanh(gamma))
+            + scale * beta
+        )
+        route_out_modulated = route_out + scale * torch.tanh(route_delta).unsqueeze(1)
+        return self._decode_shared_stage1_scores(
+            context=context,
+            route_out=route_out_modulated,
+            semantic_feature=semantic_feature,
+            speed_samples=speed_samples,
+        )
+
     def compute_shared_stage1_from_ego_outputs(
         self,
         traj_out: torch.Tensor,
@@ -2644,6 +2721,30 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_points=route_points,
             conditioning=conditioning,
             prev_state=prev_state,
+        )
+
+    def compute_shared_stage1_prev_modulated_from_ego_outputs(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        prev_state: dict,
+        prev_modulation_scale: float = 0.2,
+        prev_modulation_dropout_prob: float = 0.0,
+        speed_samples: Optional[torch.Tensor] = None,
+    ) -> dict:
+        return self._compute_shared_stage1_prev_modulated_scores(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+            prev_state=prev_state,
+            prev_modulation_scale=prev_modulation_scale,
+            prev_modulation_dropout_prob=prev_modulation_dropout_prob,
+            speed_samples=speed_samples,
         )
 
     def forward_ego(

@@ -331,16 +331,31 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_semantic_state_transition = bool(
             route_b_cfg.get('use_semantic_state_transition', False)
         )
-        self.semantic_state_predictor_mode = str(
-            route_b_cfg.get('semantic_state_predictor_mode', 'direct_transition')
+        semantic_state_predictor_mode = str(
+            route_b_cfg.get('semantic_state_predictor_mode', 'direct_plus_transition')
         ).lower()
-        if self.semantic_state_predictor_mode not in ('direct_transition', 'transition_only'):
+        if semantic_state_predictor_mode == 'direct_transition':
+            semantic_state_predictor_mode = 'direct_plus_transition'
+        self.semantic_state_predictor_mode = semantic_state_predictor_mode
+        if self.semantic_state_predictor_mode not in (
+            'direct_plus_transition',
+            'direct_prev_modulated',
+            'direct_only',
+            'transition_only',
+        ):
             raise ValueError(
-                "semantic_state_predictor_mode must be 'direct_transition' "
-                f"or 'transition_only', got {self.semantic_state_predictor_mode}"
+                "semantic_state_predictor_mode must be one of "
+                "'direct_plus_transition', 'direct_prev_modulated', "
+                f"'direct_only', or 'transition_only', got {self.semantic_state_predictor_mode}"
             )
-        if self.semantic_state_predictor_mode == 'transition_only' and not self.use_semantic_state_transition:
-            raise ValueError("transition_only semantic state predictor requires use_semantic_state_transition=true")
+        if (
+            self.semantic_state_predictor_mode in ('transition_only', 'direct_prev_modulated')
+            and not self.use_semantic_state_transition
+        ):
+            raise ValueError(
+                f"{self.semantic_state_predictor_mode} semantic state predictor "
+                "requires use_semantic_state_transition=true"
+            )
         self.semantic_transition_prev_source = str(
             route_b_cfg.get('semantic_transition_prev_source', 'offline_gt')
         ).lower()
@@ -361,16 +376,65 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.semantic_transition_prev_dropout_prob = float(
             route_b_cfg.get('semantic_transition_prev_dropout_prob', 0.0)
         )
+        self.semantic_prev_token_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_token_dropout_prob', 0.0)
+        )
+        self.semantic_prev_window_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_window_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_dir_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_dir_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_area_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_area_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_tempocc_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_tempocc_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_phase_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_phase_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_graph_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_graph_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_boundary_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_boundary_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_chase_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_chase_dropout_prob', self.semantic_prev_token_dropout_prob)
+        )
+        self.semantic_prev_random_replace_prob = float(
+            route_b_cfg.get('semantic_prev_random_replace_prob', 0.0)
+        )
+        self.semantic_prev_replace_to_none_prob = float(
+            route_b_cfg.get('semantic_prev_replace_to_none_prob', 1.0)
+        )
+        self.semantic_prev_prefix_dropout_frames = int(
+            route_b_cfg.get('semantic_prev_prefix_dropout_frames', 0) or 0
+        )
+        self.semantic_prev_prefix_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_prefix_dropout_prob', 0.0)
+        )
+        self.semantic_prev_modulation_scale = float(
+            route_b_cfg.get('semantic_prev_modulation_scale', 0.2)
+        )
+        self.semantic_prev_modulation_dropout_prob = float(
+            route_b_cfg.get('semantic_prev_modulation_dropout_prob', 0.0)
+        )
         self.use_semantic_state_fusion = bool(
             route_b_cfg.get('use_semantic_state_fusion', False)
         )
         self.semantic_state_fusion_alpha = float(
             route_b_cfg.get('semantic_state_fusion_alpha', 0.35)
         )
+        self.semantic_state_fusion_warmup_frames = int(
+            route_b_cfg.get('semantic_state_fusion_warmup_frames', 0) or 0
+        )
         self.semantic_state_fusion_update_cache = bool(
             route_b_cfg.get('semantic_state_fusion_update_cache', True)
         )
         self._semantic_state_cache: Optional[dict] = None
+        self._semantic_state_cache_frame: int = 0
         self.traj_phase_energy_band_offsets = torch.tensor([-2.0, 0.0, 2.0], dtype=torch.float32)
         self.traj_window_condition_names = (
             'none',
@@ -1271,23 +1335,67 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_steps: int,
         device: torch.device,
         model_dtype: torch.dtype,
+        batch: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Optional[dict]:
-        """Sample-level training dropout for offline-GT prev semantic state."""
+        """Training-time corruption for offline-GT prev semantic state.
+
+        Sample-level dropout simulates route/cache reset. Group-level dropout
+        and replacement prevent the transition branch from learning a pure
+        previous-token copy prior.
+        """
         if prev_state is None or (not self.training):
             return prev_state
-        p = float(self.semantic_transition_prev_dropout_prob)
-        if p <= 0.0:
+        all_probs = (
+            self.semantic_transition_prev_dropout_prob,
+            self.semantic_prev_token_dropout_prob,
+            self.semantic_prev_window_dropout_prob,
+            self.semantic_prev_dir_dropout_prob,
+            self.semantic_prev_area_dropout_prob,
+            self.semantic_prev_tempocc_dropout_prob,
+            self.semantic_prev_phase_dropout_prob,
+            self.semantic_prev_graph_dropout_prob,
+            self.semantic_prev_boundary_dropout_prob,
+            self.semantic_prev_chase_dropout_prob,
+            self.semantic_prev_prefix_dropout_prob,
+            self.semantic_prev_random_replace_prob,
+        )
+        if max(float(p) for p in all_probs) <= 0.0:
             return prev_state
         valid = prev_state.get('valid')
         if not isinstance(valid, torch.Tensor):
             return prev_state
         valid = valid.to(device=device, dtype=model_dtype).reshape(-1).clamp(0.0, 1.0)
         B = valid.shape[0]
-        p = min(max(p, 0.0), 1.0)
-        keep = (torch.rand((B,), device=device, dtype=model_dtype) >= p).to(dtype=model_dtype)
         neutral = self._build_neutral_semantic_prev_state(
             B, route_steps, device=device, model_dtype=model_dtype
         )
+
+        sample_drop_p = min(max(float(self.semantic_transition_prev_dropout_prob), 0.0), 1.0)
+        sample_drop = torch.rand((B,), device=device) < sample_drop_p
+        prefix_frames = max(int(self.semantic_prev_prefix_dropout_frames), 0)
+        prefix_p = min(max(float(self.semantic_prev_prefix_dropout_prob), 0.0), 1.0)
+        if batch is not None and prefix_frames > 0 and prefix_p > 0.0:
+            prefix_index = None
+            for key in (
+                'semantic_route_frame_index',
+                'semantic_prev_route_frame_index',
+                'route_local_frame_index',
+                'route_frame_index',
+                'frame_in_route',
+                'sample_route_index',
+            ):
+                value = self._get_stage1_batch_tensor(
+                    batch, key, device=device, model_dtype=model_dtype
+                )
+                if value is not None:
+                    prefix_index = value.reshape(-1)
+                    break
+            if prefix_index is not None and prefix_index.shape[0] == B:
+                prefix_mask = prefix_index < float(prefix_frames)
+                prefix_drop = prefix_mask & (torch.rand((B,), device=device) < prefix_p)
+                sample_drop = sample_drop | prefix_drop
+
+        keep = (~sample_drop).to(dtype=model_dtype)
         dropped = {}
         for key, value in prev_state.items():
             if not isinstance(value, torch.Tensor):
@@ -1313,6 +1421,81 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 while gate_bool.dim() < value_t.dim():
                     gate_bool = gate_bool.unsqueeze(-1)
                 dropped[key] = torch.where(gate_bool, value_t, neutral_t)
+
+        def _prob(value: float) -> float:
+            return min(max(float(value), 0.0), 1.0)
+
+        def _mask(prob: float) -> torch.Tensor:
+            prob = _prob(max(prob, self.semantic_prev_token_dropout_prob))
+            if prob <= 0.0:
+                return torch.zeros((B,), device=device, dtype=torch.bool)
+            return torch.rand((B,), device=device) < prob
+
+        def _replace_categorical(key: str, mask: torch.Tensor, max_value: int) -> None:
+            value = dropped.get(key)
+            neutral_value = neutral.get(key)
+            if not isinstance(value, torch.Tensor) or neutral_value is None or not mask.any():
+                return
+            value_t = value.to(device=device)
+            neutral_t = neutral_value.to(device=device, dtype=value_t.dtype)
+            random_p = _prob(self.semantic_prev_random_replace_prob)
+            none_p = _prob(self.semantic_prev_replace_to_none_prob)
+            random_mask = torch.zeros_like(mask)
+            if random_p > 0.0:
+                random_mask = mask & (torch.rand((B,), device=device) < random_p)
+                random_values = torch.randint(
+                    low=0,
+                    high=max_value + 1,
+                    size=value_t.reshape(B).shape,
+                    device=device,
+                    dtype=value_t.dtype,
+                )
+                none_mask = random_mask & (torch.rand((B,), device=device) < none_p)
+                replacement = torch.where(none_mask, neutral_t.reshape(B), random_values)
+                value_t = torch.where(random_mask, replacement, value_t.reshape(B))
+            value_t = torch.where(mask & ~random_mask, neutral_t.reshape(B), value_t.reshape(B))
+            dropped[key] = value_t
+
+        def _replace_float(key: str, mask: torch.Tensor) -> None:
+            value = dropped.get(key)
+            neutral_value = neutral.get(key)
+            if not isinstance(value, torch.Tensor) or neutral_value is None or not mask.any():
+                return
+            value_t = value.to(device=device, dtype=model_dtype)
+            neutral_t = neutral_value.to(device=device, dtype=model_dtype)
+            gate = mask.to(dtype=model_dtype)
+            while gate.dim() < value_t.dim():
+                gate = gate.unsqueeze(-1)
+            dropped[key] = value_t * (1.0 - gate) + neutral_t * gate
+
+        group_masks = {
+            'window': _mask(self.semantic_prev_window_dropout_prob),
+            'dir': _mask(self.semantic_prev_dir_dropout_prob),
+            'phase': _mask(self.semantic_prev_phase_dropout_prob),
+            'area': _mask(self.semantic_prev_area_dropout_prob),
+            'tempocc': _mask(self.semantic_prev_tempocc_dropout_prob),
+            'graph': _mask(self.semantic_prev_graph_dropout_prob),
+            'boundary': _mask(self.semantic_prev_boundary_dropout_prob),
+            'chase': _mask(self.semantic_prev_chase_dropout_prob),
+        }
+        _replace_categorical('family', group_masks['window'], 3)
+        _replace_categorical('dir', group_masks['dir'], 3)
+        _replace_categorical('decision_phase', group_masks['phase'], 2)
+        _replace_categorical('control_phase', group_masks['phase'], 4)
+        _replace_categorical('status', group_masks['area'], 3)
+        for key in ('conflict_area_route_mask', 'conflict_timing_values', 'conflict_timing_valid'):
+            _replace_float(key, group_masks['area'])
+        for key in (
+            'temporary_occupancy_cover_bins',
+            'temporary_occupancy_cover_valid',
+            'go_opportunity_prob',
+            'yld_pressure_prob',
+            'go_opportunity_valid',
+        ):
+            _replace_float(key, group_masks['tempocc'])
+        _replace_float('graph_values', group_masks['graph'])
+        _replace_float('boundary_values', group_masks['boundary'])
+        _replace_float('chase_values', group_masks['chase'])
         return dropped
 
     def _get_route_prev_coarse_memory(
@@ -1344,6 +1527,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         memory = torch.cat([valid.unsqueeze(-1), window_oh, dir_oh], dim=-1)
         return memory * valid.unsqueeze(-1)
+
+    def _compute_semantic_transition_scores_from_shared(
+        self,
+        shared_forward: dict,
+        prev_state: dict,
+        speed_samples: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Compute the temporal semantic branch for the resolved predictor mode."""
+        kwargs = dict(
+            traj_out=shared_forward['traj_out'],
+            route_out=shared_forward['route_out'],
+            speed_out=shared_forward['speed_out'],
+            route_points=shared_forward['route_points'],
+            conditioning=shared_forward['conditioning'],
+            prev_state=prev_state,
+        )
+        if self.semantic_state_predictor_mode == 'direct_prev_modulated':
+            return self.model.compute_shared_stage1_prev_modulated_from_ego_outputs(
+                **kwargs,
+                prev_modulation_scale=self.semantic_prev_modulation_scale,
+                prev_modulation_dropout_prob=self.semantic_prev_modulation_dropout_prob,
+                speed_samples=speed_samples,
+            )
+        return self.model.compute_shared_stage1_transition_from_ego_outputs(**kwargs)
 
     def _build_conflict_area_route_target(
         self,
@@ -2376,6 +2583,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
     def reset_semantic_state_cache(self) -> None:
         """Clear the inference-only semantic transition memory."""
         self._semantic_state_cache = None
+        self._semantic_state_cache_frame = 0
 
     def _build_neutral_semantic_prev_state(
         self,
@@ -2644,6 +2852,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         first_tensor = next(value for value in direct_scores.values() if isinstance(value, torch.Tensor))
         gate = prev_valid.to(device=first_tensor.device, dtype=first_tensor.dtype).reshape(-1)
         gate = gate.clamp(0.0, 1.0) * float(self.semantic_state_fusion_alpha)
+        warmup_frames = max(int(self.semantic_state_fusion_warmup_frames), 0)
+        if warmup_frames > 0:
+            warmup_scale = min(
+                max(float(getattr(self, '_semantic_state_cache_frame', 0)) / float(warmup_frames), 0.0),
+                1.0,
+            )
+            gate = gate * warmup_scale
         for key, direct_value in direct_scores.items():
             transition_value = transition_scores.get(key)
             if (
@@ -3120,6 +3335,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 return_intermediates=True,
             )
         transition_only_state = self.semantic_state_predictor_mode == 'transition_only'
+        direct_only_state = self.semantic_state_predictor_mode == 'direct_only'
+        use_transition_state = self.use_semantic_state_transition and not direct_only_state
         route_steps = self.num_waypoints
         raw_stage1_scores = None
         if not transition_only_state:
@@ -3132,7 +3349,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
             route_steps = raw_stage1_scores['conflict_area_logits'].shape[1]
         transition_stage1_scores = None
-        if self.use_semantic_state_transition:
+        if use_transition_state:
             prev_state = self._get_semantic_transition_prev_state(
                 batch=batch,
                 device=device,
@@ -3145,13 +3362,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 route_steps=route_steps,
                 device=device,
                 model_dtype=model_dtype,
+                batch=batch,
             )
-            transition_stage1_scores = self.model.compute_shared_stage1_transition_from_ego_outputs(
-                traj_out=shared_forward['traj_out'],
-                route_out=shared_forward['route_out'],
-                speed_out=shared_forward['speed_out'],
-                route_points=shared_forward['route_points'],
-                conditioning=shared_forward['conditioning'],
+            transition_stage1_scores = self._compute_semantic_transition_scores_from_shared(
+                shared_forward,
                 prev_state=prev_state,
             )
             if transition_only_state:
@@ -4546,8 +4760,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         semantic_prev_valid = None
         semantic_fusion_debug = None
         transition_only_state = self.semantic_state_predictor_mode == 'transition_only'
+        direct_only_state = self.semantic_state_predictor_mode == 'direct_only'
         use_infer_semantic_transition = (
             (not disable_semantic_state_cache)
+            and (not direct_only_state)
             and
             (self.use_semantic_state_fusion or transition_only_state)
             and self.use_semantic_state_transition
@@ -4626,13 +4842,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                             )
                         if use_infer_semantic_transition and semantic_prev_state is not None:
                             transition_stage1_raw_scores = (
-                                self.model.compute_shared_stage1_transition_from_ego_outputs(
-                                    traj_out=pass1_shared['traj_out'],
-                                    route_out=pass1_shared['route_out'],
-                                    speed_out=pass1_shared['speed_out'],
-                                    route_points=pass1_shared['route_points'],
-                                    conditioning=pass1_shared['conditioning'],
+                                self._compute_semantic_transition_scores_from_shared(
+                                    pass1_shared,
                                     prev_state=semantic_prev_state,
+                                    speed_samples=stage1_speed_samples,
                                 )
                             )
                             if transition_only_state:
@@ -4755,13 +4968,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
             if use_infer_semantic_transition and semantic_prev_state is not None:
                 transition_stage1_scores_raw = (
-                    self.model.compute_shared_stage1_transition_from_ego_outputs(
-                        traj_out=shared_eval['traj_out'],
-                        route_out=shared_eval['route_out'],
-                        speed_out=shared_eval['speed_out'],
-                        route_points=shared_eval['route_points'],
-                        conditioning=shared_eval['conditioning'],
+                    self._compute_semantic_transition_scores_from_shared(
+                        shared_eval,
                         prev_state=semantic_prev_state,
+                        speed_samples=stage1_speed_samples,
                     )
                 )
                 if transition_only_state:
@@ -4787,6 +4997,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     model_dtype=model_dtype,
                     valid=torch.ones((B,), device=device, dtype=model_dtype),
                 )
+                self._semantic_state_cache_frame += 1
             traj_speed_1s_ref, traj_speed_05s_ref = self._compute_inference_traj_speed_refs(
                 best_trajectory, model_dtype
             )
@@ -4806,13 +5017,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
             if use_infer_semantic_transition and semantic_prev_state is not None:
                 transition_stage1_ref_scores_raw = (
-                    self.model.compute_shared_stage1_transition_from_ego_outputs(
-                        traj_out=shared_eval['traj_out'],
-                        route_out=shared_eval['route_out'],
-                        speed_out=shared_eval['speed_out'],
-                        route_points=shared_eval['route_points'],
-                        conditioning=shared_eval['conditioning'],
+                    self._compute_semantic_transition_scores_from_shared(
+                        shared_eval,
                         prev_state=semantic_prev_state,
+                        speed_samples=stage1_speed_ref_speeds,
                     )
                 )
                 if transition_only_state:
@@ -4852,6 +5060,32 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             semantic_fusion_gate = semantic_fusion_debug['gate'].to(
                 device=device, dtype=model_dtype
             ).reshape(-1)
+        mode_id_map = {
+            'direct_only': 0.0,
+            'direct_plus_transition': 1.0,
+            'transition_only': 2.0,
+            'direct_prev_modulated': 3.0,
+        }
+        semantic_mode_id = torch.full(
+            (B,),
+            mode_id_map.get(self.semantic_state_predictor_mode, -1.0),
+            device=device,
+            dtype=model_dtype,
+        )
+        semantic_prev_corruption_enabled = torch.full(
+            (B,),
+            float(
+                max(
+                    self.semantic_transition_prev_dropout_prob,
+                    self.semantic_prev_token_dropout_prob,
+                    self.semantic_prev_random_replace_prob,
+                    self.semantic_prev_prefix_dropout_prob,
+                )
+                > 0.0
+            ),
+            device=device,
+            dtype=model_dtype,
+        )
 
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
@@ -4942,6 +5176,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'traj_phase_go_smoothing_threshold': phase_go_smoothing_tensors['threshold'],
             'semantic_state_fusion_enabled': semantic_fusion_enabled,
             'semantic_state_fusion_gate': semantic_fusion_gate,
+            'semantic_state_predictor_mode_resolved': semantic_mode_id,
+            'semantic_prev_corruption_enabled': semantic_prev_corruption_enabled,
             'pass1_trajectory': pass1_trajectory,
             'pass2_trajectory': best_trajectory,
             'poses_cls': poses_cls,                   # (B, 1)
@@ -5096,6 +5332,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'traj_phase_go_smoothing_threshold',
             'semantic_state_fusion_enabled',
             'semantic_state_fusion_gate',
+            'semantic_state_predictor_mode_resolved',
+            'semantic_prev_corruption_enabled',
         ):
             if sample_result.get(key) is not None:
                 result[key] = sample_result[key].detach().float().cpu().numpy()
