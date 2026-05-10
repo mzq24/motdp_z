@@ -1302,8 +1302,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		)
 		return os.path.join(checkpoint_base_path, self.get_checkpoint_filename())
 
-	def _predict_dp_action(self, dp_obs_dict):
-		return self.net.predict_action(dp_obs_dict, no_noise=True)
+	def _reset_dp_semantic_state_cache(self):
+		self.semantic_state_cache_started = False
+		reset_fn = getattr(getattr(self, 'net', None), 'reset_semantic_state_cache', None)
+		if callable(reset_fn):
+			reset_fn()
+
+	def _predict_dp_action(
+		self,
+		dp_obs_dict,
+		reset_semantic_state_cache=False,
+		disable_semantic_state_cache=False,
+	):
+		return self.net.predict_action(
+			dp_obs_dict,
+			no_noise=True,
+			reset_semantic_state_cache=reset_semantic_state_cache,
+			disable_semantic_state_cache=disable_semantic_state_cache,
+		)
 
 	def _get_observed_borrow_time_s(self, current_time_s):
 		if self.borrow_latched and self.borrow_candidate_start_time_s is not None:
@@ -1918,6 +1934,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_path = self.resolve_checkpoint_path()
 		self.net = load_best_model(checkpoint_path, self.config, device)
+		self._reset_dp_semantic_state_cache()
 		if NUM_INFERENCE_STEPS_OVERRIDE:
 			override_steps = int(NUM_INFERENCE_STEPS_OVERRIDE)
 			self.net.num_inference_steps = override_steps
@@ -2200,6 +2217,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_steer_debug = {}
 
 	def _init(self):
+		self._reset_dp_semantic_state_cache()
 		# Use _global_plan_world_coord directly (already in CARLA coordinates)
 		# This avoids the GPS-to-CARLA conversion which can fail when fsolve doesn't converge
 		# Get lat_ref/lon_ref from CARLA map directly
@@ -3920,7 +3938,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 						[borrow_time_cond_s], device='cuda', dtype=torch.float32
 					),
 				}
-			dp_pred_traj = self._predict_dp_action(dp_obs_dict)
+			reset_semantic_state_cache = not getattr(
+				self, 'semantic_state_cache_started', False
+			)
+			dp_pred_traj = self._predict_dp_action(
+				dp_obs_dict,
+				reset_semantic_state_cache=reset_semantic_state_cache,
+			)
+			self.semantic_state_cache_started = True
 			self._update_borrow_semantic_state(dp_pred_traj, current_time_s)
 			# Store predicted target speed for control_pid
 			self._last_target_speed = dp_pred_traj.get('target_speed', None)
@@ -4011,6 +4036,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'traj_conflict_timing_condition',
 				'traj_chase_has_lead_condition',
 				'traj_chase_speed_margin_condition',
+				'traj_current_edge_condition_probs',
+				'traj_future_edge_condition_probs',
+				'traj_edge_speed_margin_condition',
+				'traj_edge_speed_valid_condition',
 				'lane_dir_relation_probs',
 				'traj_phase_go_smoothing_enabled',
 				'traj_phase_go_smoothing_applied',
@@ -4018,6 +4047,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'traj_phase_go_smoothing_smoothed_go_prob',
 				'traj_phase_go_smoothing_history_len',
 				'traj_phase_go_smoothing_threshold',
+				'semantic_state_fusion_enabled',
+				'semantic_state_fusion_gate',
 			]:
 				semantic_value = dp_pred_traj.get(semantic_key)
 				if semantic_value is None:
@@ -5227,7 +5258,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		return bev_img
 
 	def destroy(self):
-		del self.net
+		self._reset_dp_semantic_state_cache()
+		if hasattr(self, 'net'):
+			del self.net
 		torch.cuda.empty_cache()
 
 	def gps_to_location(self, gps):
