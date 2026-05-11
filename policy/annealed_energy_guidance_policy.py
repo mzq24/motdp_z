@@ -1528,6 +1528,47 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         memory = torch.cat([valid.unsqueeze(-1), window_oh, dir_oh], dim=-1)
         return memory * valid.unsqueeze(-1)
 
+    def _route_prev_coarse_memory_from_prev_state(
+        self,
+        prev_state: Optional[dict],
+        *,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Build route-token coarse memory from the closed-loop semantic cache."""
+        if not self.use_route_prev_coarse_memory or prev_state is None:
+            return None
+        valid = prev_state.get('valid')
+        family = prev_state.get('family')
+        direction = prev_state.get('dir')
+        if not (
+            isinstance(valid, torch.Tensor)
+            and isinstance(family, torch.Tensor)
+            and isinstance(direction, torch.Tensor)
+        ):
+            return None
+
+        valid = torch.nan_to_num(
+            valid.to(device=device, dtype=model_dtype).reshape(-1),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        family = family.to(device=device, dtype=torch.long).reshape(-1)
+        direction = direction.to(device=device, dtype=torch.long).reshape(-1)
+
+        window = self._window_target_from_family_codes(family)
+        window_oh = F.one_hot(window.clamp(min=0, max=3), num_classes=4).to(
+            device=device,
+            dtype=model_dtype,
+        )
+        dir_oh = F.one_hot(direction.clamp(min=0, max=3), num_classes=4).to(
+            device=device,
+            dtype=model_dtype,
+        )
+        memory = torch.cat([valid.unsqueeze(-1), window_oh, dir_oh], dim=-1)
+        return memory * valid.unsqueeze(-1)
+
     def _compute_semantic_transition_scores_from_shared(
         self,
         shared_forward: dict,
@@ -4777,6 +4818,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             semantic_prev_valid = semantic_prev_state['valid'].to(
                 device=device, dtype=model_dtype
             ).reshape(-1)
+        prev_route_coarse_memory = self._route_prev_coarse_memory_from_prev_state(
+            semantic_prev_state,
+            device=device,
+            model_dtype=model_dtype,
+        )
 
         for step_i, k in enumerate(roll_timesteps):
             t_cur = k.item()
@@ -4803,6 +4849,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         bev_proj_cached=bev_proj,
                         transfuser_lidar_bev=transfuser_lidar_bev,
                         return_intermediates=True,
+                        prev_route_coarse_memory=prev_route_coarse_memory,
                     )
                     poses_reg = pass1_shared['poses_reg']
                     route_pred = pass1_shared['route_pred']
@@ -4818,6 +4865,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         ego_status=ego_status,
                         bev_proj_cached=bev_proj,
                         transfuser_lidar_bev=transfuser_lidar_bev,
+                        prev_route_coarse_memory=prev_route_coarse_memory,
                     )
                 pass1_trajectory = self.norm_to_abs(poses_reg.detach())
                 if self.use_traj_branch_condition and self.use_stage1_speed_energy:
@@ -4907,6 +4955,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         branch_condition=branch_input,
                         branch_condition_scale=self.traj_branch_condition_scale,
                         branch_condition_schedule=branch_schedule,
+                        prev_route_coarse_memory=prev_route_coarse_memory,
                     )
             energy_scores = None
             pred_x0_corrected = torch.cat([
@@ -4962,6 +5011,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 bev_proj_cached=bev_proj,
                 transfuser_lidar_bev=transfuser_lidar_bev,
                 return_intermediates=True,
+                prev_route_coarse_memory=prev_route_coarse_memory,
             )
             stage1_scores_raw = None
             if not transition_only_state:
