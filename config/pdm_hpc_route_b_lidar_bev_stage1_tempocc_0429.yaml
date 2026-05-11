@@ -134,6 +134,8 @@ route_b:
   cover_graph_use_traj_context: false
   cover_graph_use_speed_context: false
   use_route_prev_coarse_memory: true
+  use_route_intent_token: true
+  route_intent_gate_init: 0.1
   traj_branch_condition_scale: 2.0
   traj_branch_condition_detach: true
   traj_branch_condition_gt_prob_start: 1.0
@@ -234,6 +236,7 @@ truncated_diffusion:
   eta: 0.0
   prediction_type: "sample"
   route_loss_weight: 4.0
+  route_final_loss_weight: 2.0
 
 num_modes: 32
 cls_loss_weight: 0.0
@@ -243,10 +246,12 @@ dataset:
   use_per_frame: false
   feature_suffix: ensemble
   use_fullres_upsample_cache: false
-  train_warmup_memmap_page_cache: true
+  stage_feature_cache_to_ram: true
+  cache_source_dir: /workspace1/z_project/dataset/pdm_lite/tmp_data
+  cache_dir: /dev/shm/motdp_feature_cache_ensemble
+  train_warmup_memmap_page_cache: false
   train_warmup_lidar_page_cache: false
   train_warmup_max_samples: 0
-  cache_dir: null
   train_filter_bad_routes: false
   val_filter_bad_routes: true
   train_retain_bad_routes_for_energy: true

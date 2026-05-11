@@ -4,6 +4,7 @@ import sys
 import torch
 import json
 import csv
+import shutil
 try:
     from torch.amp import autocast as torch_autocast, GradScaler
 
@@ -42,6 +43,70 @@ CURRENT_ADAPTIVE_WEIGHTS = {
     'high': [0.30, 0.37, 0.33],
 }
 REGIME_ORDER = ['startup', 'low', 'medium', 'high']
+
+
+def _stage_feature_cache_to_ram(
+    *,
+    source_dir: str,
+    target_dir: str,
+    feature_suffix: str = '',
+    use_fullres_upsample_cache: bool = True,
+    include_lidar: bool = False,
+    rank: int = 0,
+):
+    """Copy shared feature memmap files to a RAM-backed cache directory.
+
+    This keeps the dataset on the memmap path, but moves the underlying files to
+    tmpfs (for example /dev/shm) so random training access is not at the mercy of
+    the OS page cache being evicted by other jobs.
+    """
+    source_dir = os.path.realpath(source_dir)
+    target_dir = os.path.realpath(target_dir)
+    if source_dir == target_dir:
+        if rank == 0:
+            print(f"Feature RAM staging skipped: source and target are both {target_dir}")
+        return
+
+    sfx = f'_{feature_suffix}' if feature_suffix else ''
+    required_files = [
+        f'feature_index{sfx}.pkl',
+        f'bev_features_fp16{sfx}.bin',
+        f'bev_upsamples_fp16{sfx}.bin',
+    ]
+    optional_files = []
+    if use_fullres_upsample_cache:
+        optional_files.extend([
+            f'feature_index{sfx}_fullres.pkl',
+            f'bev_upsamples_fp16{sfx}_fullres.bin',
+        ])
+    if include_lidar:
+        optional_files.extend([
+            'lidar_bev_index.pkl',
+            'lidar_bev_fp16.bin',
+        ])
+
+    os.makedirs(target_dir, exist_ok=True)
+
+    def _copy_one(name: str, *, required: bool):
+        src = os.path.join(source_dir, name)
+        dst = os.path.join(target_dir, name)
+        if not os.path.exists(src):
+            if required:
+                raise FileNotFoundError(f"Required feature cache file missing: {src}")
+            return
+        src_size = os.path.getsize(src)
+        if os.path.exists(dst) and os.path.getsize(dst) == src_size:
+            return
+        print(f"  staging {name} -> {target_dir}")
+        shutil.copy2(src, dst)
+
+    if rank == 0:
+        print(f"Staging feature cache to RAM: {source_dir} -> {target_dir}")
+        for filename in required_files:
+            _copy_one(filename, required=True)
+        for filename in optional_files:
+            _copy_one(filename, required=False)
+        print("Feature RAM staging complete.")
 
 
 class DistributedRouteBatchSampler(Sampler):
@@ -1775,6 +1840,11 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         train_warmup_max_samples = None
     else:
         train_warmup_max_samples = int(train_warmup_max_samples)
+    stage_feature_cache_to_ram = bool(config.get('dataset', {}).get('stage_feature_cache_to_ram', False))
+    cache_source_dir = config.get('dataset', {}).get(
+        'cache_source_dir',
+        os.path.join(image_data_root, 'tmp_data') if image_data_root else None,
+    )
     use_lidar_bev_detail = config.get('route_b', {}).get('use_lidar_bev_detail', False)
 
     policy_type = config.get('policy_type', 'anchor_free')
@@ -1793,6 +1863,22 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     )
 
     feature_suffix = config.get('dataset', {}).get('feature_suffix', '')
+    if stage_feature_cache_to_ram:
+        if not cache_dir:
+            raise ValueError("dataset.stage_feature_cache_to_ram=true requires dataset.cache_dir")
+        if cache_source_dir is None:
+            raise ValueError("dataset.stage_feature_cache_to_ram=true requires dataset.cache_source_dir")
+        if rank == 0:
+            _stage_feature_cache_to_ram(
+                source_dir=cache_source_dir,
+                target_dir=cache_dir,
+                feature_suffix=feature_suffix,
+                use_fullres_upsample_cache=use_fullres_upsample_cache,
+                include_lidar=use_lidar_bev_detail,
+                rank=rank,
+            )
+        if world_size > 1:
+            torch.distributed.barrier()
     validation_cfg = config.get('validation', {})
     validation_enabled = validation_cfg.get('enabled', True)
     validation_use_memmap = validation_cfg.get('use_memmap', True)

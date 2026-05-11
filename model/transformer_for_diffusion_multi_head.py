@@ -1690,6 +1690,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         cover_graph_use_traj_context: bool = False,
         cover_graph_use_speed_context: bool = False,
         use_route_prev_coarse_memory: bool = False,
+        use_route_intent_token: bool = False,
+        route_intent_gate_init: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -1722,6 +1724,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context)
         self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context)
         self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory)
+        self.use_route_intent_token = bool(use_route_intent_token)
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -1871,6 +1874,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(self.route_prev_coarse_memory_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
+        )
+        # Explicit route-intent embedding: command(6) + target_point(2) + next_target_point(2).
+        # It is added as a small gated route-only residual so target intent is audible for
+        # branch/exit decisions without becoming a hard planner override.
+        self.route_intent_dim = 10
+        self.route_intent_proj = nn.Sequential(
+            nn.Linear(self.route_intent_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        route_intent_gate_init = min(max(float(route_intent_gate_init), 1e-4), 1.0 - 1e-4)
+        self.route_intent_gate = nn.Parameter(
+            torch.tensor(
+                math.log(route_intent_gate_init / (1.0 - route_intent_gate_init)),
+                dtype=torch.float32,
+            )
         )
 
         # ========== Unified Decoder (UnifiedDecoderOnlyTransformer) ==========
@@ -2192,6 +2211,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 no_decay.add(name)
             elif 'guidance_gate' in name:
                 # Route guidance gate - no weight decay
+                no_decay.add(name)
+            elif 'route_intent_gate' in name:
+                # Route intent residual gate - no weight decay
                 no_decay.add(name)
             elif 'route_temp_' in name or 'route_bias_' in name:
                 # Route-specific temperature and bias parameters - no weight decay
@@ -2943,6 +2965,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_wp_emb = self._embed_route_waypoint_tokens(route_points)
         route_diff_query = self.route_diff_query.expand(B, T_route, -1)
         route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
+        if self.use_route_intent_token:
+            if current_status.shape[-1] < 12:
+                raise ValueError(
+                    "route intent token expects ego_status layout with "
+                    "command + target_point + target_point_next at indices 2:12"
+                )
+            route_intent = current_status[:, 2:12]
+            route_intent_emb = self.route_intent_proj(route_intent)
+            route_emb = route_emb + torch.sigmoid(self.route_intent_gate) * route_intent_emb.unsqueeze(1)
         if self.use_route_prev_coarse_memory and prev_route_coarse_memory is not None:
             prev_route_coarse_memory = prev_route_coarse_memory.to(device=device, dtype=model_dtype)
             if (

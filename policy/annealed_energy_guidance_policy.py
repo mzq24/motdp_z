@@ -196,6 +196,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_route_prev_coarse_memory = bool(
             route_b_cfg.get('use_route_prev_coarse_memory', False)
         )
+        self.use_route_intent_token = bool(
+            route_b_cfg.get('use_route_intent_token', False)
+        )
+        self.route_intent_gate_init = float(
+            route_b_cfg.get('route_intent_gate_init', 0.1)
+        )
         self.current_edge_valid_loss_weight = float(
             route_b_cfg.get('current_edge_valid_loss_weight', 0.10)
         )
@@ -566,6 +572,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             cover_graph_use_traj_context=self.cover_graph_use_traj_context,
             cover_graph_use_speed_context=self.cover_graph_use_speed_context,
             use_route_prev_coarse_memory=self.use_route_prev_coarse_memory,
+            use_route_intent_token=self.use_route_intent_token,
+            route_intent_gate_init=self.route_intent_gate_init,
         )
         self.model = model
 
