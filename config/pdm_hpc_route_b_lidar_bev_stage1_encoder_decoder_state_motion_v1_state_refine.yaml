@@ -1,5 +1,6 @@
-# Route B independent-state temp-occ 0429 on new_hpc.
-# Full train + val run, defaulting to 4 GPUs (0-3).
+# Route B encoder-decoder state-refine E-step on new_hpc.
+# Resume from a converged route/motion checkpoint, freeze motion paths, and
+# train only semantic-state / graph heads.
 
 policy_type: anchor_free
 abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/abs_stats.npz
@@ -61,7 +62,9 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
-  lr: 5.0e-05
+  lr: 1.0e-05
+  resume_override_lr: 1.0e-05
+  scale_lr: false
   weight_decay: 1.0e-04
 
 shape_meta:
@@ -141,8 +144,8 @@ route_b:
   state_warmup_epochs: 15
   freeze_scene_encoder_after_state: true
   detach_semantic_condition_after_freeze: true
-  post_state_stage1_loss_weight: 0.0
-  train_state_refine_only: false
+  post_state_stage1_loss_weight: 1.0
+  train_state_refine_only: true
   state_refine_train_state_route_scene: false
   state_refine_train_scene_encoder: false
   use_semantic_motion_global_bridge: true
@@ -221,7 +224,7 @@ route_b:
   semantic_state_fusion_update_cache: true
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
-  speed_loss_weight: 0.2
+  speed_loss_weight: 0.0
   speed_profile_loss_weight: 0.0
   speed_profile_dt: 0.5
   stage1_chase_weight: 1.0
@@ -235,10 +238,10 @@ route_b:
   stage1_noisy_training: false
   alignment_warmup_epochs: 50
   stage1_grad_clip_norm: 1.0
-  train_stage1_until_epoch: 70
-  train_stage1_after_update_every: 5
-  train_speed_head_until_epoch: 70
-  train_speed_head_after_update_every: 5
+  train_stage1_until_epoch: 999
+  train_stage1_after_update_every: 1
+  train_speed_head_until_epoch: 0
+  train_speed_head_after_update_every: 1
 
 truncated_diffusion:
   num_train_timesteps: 1000
@@ -247,12 +250,12 @@ truncated_diffusion:
   num_diffusion_steps: 10
   eta: 0.0
   prediction_type: "sample"
-  route_loss_weight: 4.0
+  route_loss_weight: 0.0
   route_final_loss_weight: 2.0
 
 num_modes: 32
 cls_loss_weight: 0.0
-reg_loss_weight: 6.0
+reg_loss_weight: 0.0
 
 dataset:
   use_per_frame: false
@@ -270,22 +273,22 @@ dataset:
   val_retain_bad_routes_for_energy: false
 
 training:
-  num_epochs: 50
+  num_epochs: 40
   max_grad_norm: 1.0
-  warmup_epochs: 3
+  warmup_epochs: 1
   use_lr_scheduler: true
   resume_rebuild_scheduler: true
-  scheduler_total_epochs: 50
+  scheduler_total_epochs: 40
   dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_prevstate
   image_data_root: /workspace1/z_project/dataset/pdm_lite
   sample_interval: 1
-  lr_final: 1.0e-07
+  lr_final: 2.0e-06
   validation_freq: 5
   save_freq: 5
   max_keep_ckpts: 20
   early_stopping_patience: 15
   best_checkpoint_metric: phase_balanced
-  checkpoint_dir: /workspace1/z_project/code/motdp_z_encoder_decoder_state_motion_v1/checkpoints/route_b_stage1_encoder_decoder_state_motion_v1
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_encoder_decoder_state_motion_v1/checkpoints/route_b_stage1_encoder_decoder_state_motion_v1_state_refine_e30
 
 validation:
   enabled: true
@@ -300,8 +303,8 @@ validation:
 logging:
   use_wandb: true
   wandb_project: route_b_lidar_bev
-  run_name: route_b_stage1_encoder_decoder_state_motion_v1
-  checkpoint_dir: /workspace1/z_project/code/motdp_z_encoder_decoder_state_motion_v1/checkpoints/route_b_stage1_encoder_decoder_state_motion_v1
+  run_name: route_b_stage1_encoder_decoder_state_motion_v1_state_refine_e30
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_encoder_decoder_state_motion_v1/checkpoints/route_b_stage1_encoder_decoder_state_motion_v1_state_refine_e30
   save_every: 5
   log_freq: 50
 

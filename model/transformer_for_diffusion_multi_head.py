@@ -1733,6 +1733,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.use_encoder_decoder_state_motion = bool(use_encoder_decoder_state_motion)
         self.use_semantic_motion_global_bridge = bool(use_semantic_motion_global_bridge)
         self.encoder_decoder_state_frozen = False
+        self.state_refine_only = False
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -2387,6 +2388,44 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 freeze_param = freeze_param or name.startswith(scene_prefixes)
             if freeze_param:
                 param.requires_grad = not frozen
+
+    def set_state_refine_only(
+        self,
+        enabled: bool,
+        train_state_route_scene: bool = False,
+        train_scene_encoder: bool = False,
+    ) -> None:
+        """Freeze motion/route/speed paths and train only semantic-state heads.
+
+        This is used for EM-style refinement: after route/motion converges,
+        keep the motion path fixed and adapt the semantic bottleneck heads to the
+        fixed representation.  By default we also keep the state route-scene
+        extractor fixed so route predictions through the global bridge stay
+        comparable to the checkpoint we resume from.
+        """
+        self.state_refine_only = bool(enabled)
+        if not enabled:
+            return
+
+        trainable_prefixes = [
+            'shared_stage1_',
+            'semantic_transition_',
+            'semantic_prev_',
+        ]
+        if train_state_route_scene:
+            trainable_prefixes.extend([
+                'state_route_scene_',
+            ])
+        if train_scene_encoder:
+            trainable_prefixes.extend([
+                'scene_context_',
+                'decoder.bev_feature_proj',
+                'decoder.combined_pos_emb',
+            ])
+
+        trainable_prefixes = tuple(trainable_prefixes)
+        for name, param in self.named_parameters():
+            param.requires_grad = name.startswith(trainable_prefixes)
 
     def _compute_scene_memory(
         self,

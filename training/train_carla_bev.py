@@ -2367,6 +2367,18 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             if rank == 0:
                 print("  ✓ AMP scaler state restored")
 
+    # Apply EM-step state-refine freezing before DDP/optimizer construction so
+    # the trainable set is explicit for logs and gradient synchronization.
+    if getattr(policy, 'train_state_refine_only', False):
+        policy._apply_state_refine_only_schedule()
+        if rank == 0:
+            trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+            frozen_params = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
+            print(
+                "  ✓ State-refine-only mode: "
+                f"trainable={trainable_params:,}, frozen={frozen_params:,}"
+            )
+
     # Wrap model with DistributedDataParallel for multi-GPU training
     if world_size > 1:
         policy = torch.nn.parallel.DistributedDataParallel(

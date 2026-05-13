@@ -216,6 +216,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.post_state_stage1_loss_weight = float(
             route_b_cfg.get('post_state_stage1_loss_weight', 0.0)
         )
+        self.train_state_refine_only = bool(
+            route_b_cfg.get('train_state_refine_only', False)
+        )
+        self.state_refine_train_state_route_scene = bool(
+            route_b_cfg.get('state_refine_train_state_route_scene', False)
+        )
+        self.state_refine_train_scene_encoder = bool(
+            route_b_cfg.get('state_refine_train_scene_encoder', False)
+        )
         self.use_semantic_motion_global_bridge = bool(
             route_b_cfg.get('use_semantic_motion_global_bridge', False)
         )
@@ -226,6 +235,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_b_cfg.get('semantic_motion_global_bridge_gate_init', 0.1)
         )
         self._encoder_decoder_state_frozen_applied = None
+        self._state_refine_only_applied = None
         self.current_edge_valid_loss_weight = float(
             route_b_cfg.get('current_edge_valid_loss_weight', 0.10)
         )
@@ -4422,6 +4432,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
     def _encoder_decoder_state_should_freeze(self) -> bool:
         if not self.use_encoder_decoder_state_motion:
             return False
+        if self.train_state_refine_only:
+            return False
         return (self._current_epoch + 1) > max(int(self.state_warmup_epochs), 0)
 
     def _apply_encoder_decoder_state_freeze_schedule(self) -> bool:
@@ -4436,6 +4448,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self._encoder_decoder_state_frozen_applied = should_freeze
         return should_freeze
 
+    def _apply_state_refine_only_schedule(self) -> bool:
+        if not self.train_state_refine_only:
+            return False
+        if self._state_refine_only_applied:
+            return True
+        if hasattr(self.model, 'set_state_refine_only'):
+            self.model.set_state_refine_only(
+                True,
+                train_state_route_scene=self.state_refine_train_state_route_scene,
+                train_scene_encoder=self.state_refine_train_scene_encoder,
+            )
+        self._state_refine_only_applied = True
+        return True
+
     # ========== Unified Training: Single Forward Pass ==========
     def compute_split_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -4447,6 +4473,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
         encoder_decoder_state_frozen = self._apply_encoder_decoder_state_freeze_schedule()
+        state_refine_only = self._apply_state_refine_only_schedule()
 
         trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
         B, T, D = trajectory.shape
@@ -4468,6 +4495,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self.train_speed_head_until_epoch,
             self.train_speed_head_after_update_every,
         )
+        if state_refine_only:
+            train_speed_head_active = False
         train_stage1_active = (
             has_stage1_labels
             and self.train_energy
@@ -4476,6 +4505,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 self.train_stage1_speed_energy_after_update_every,
             )
         )
+        if state_refine_only:
+            train_stage1_active = has_stage1_labels and self.train_energy
         stage1_loss_scale = 1.0
         if encoder_decoder_state_frozen:
             stage1_loss_scale = max(float(self.post_state_stage1_loss_weight), 0.0)
@@ -4695,13 +4726,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 if key.startswith('stage1_')
             })
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        reg_loss_weight = 0.0 if state_refine_only else self.reg_loss_weight
+        route_loss_weight = 0.0 if state_refine_only else self.route_loss_weight
+        speed_loss_weight = 0.0 if state_refine_only else self.speed_loss_weight
+        speed_profile_loss_weight = (
+            0.0 if state_refine_only else self.speed_profile_loss_weight
+        )
 
         total_loss = (
             self.energy_loss_weight * stage1_loss_scale * energy_loss
-            + self.reg_loss_weight * loss_reg
-            + self.route_loss_weight * route_loss
-            + self.speed_loss_weight * speed_loss
-            + self.speed_profile_loss_weight * speed_profile_loss
+            + reg_loss_weight * loss_reg
+            + route_loss_weight * route_loss
+            + speed_loss_weight * speed_loss
+            + speed_profile_loss_weight * speed_profile_loss
         )
 
         loss_dict = {
@@ -4727,6 +4764,18 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ),
             'stage1_loss_scale': torch.tensor(
                 float(stage1_loss_scale), device=device, dtype=model_dtype
+            ),
+            'state_refine_only': torch.tensor(
+                float(state_refine_only), device=device, dtype=model_dtype
+            ),
+            'reg_loss_weight_effective': torch.tensor(
+                float(reg_loss_weight), device=device, dtype=model_dtype
+            ),
+            'route_loss_weight_effective': torch.tensor(
+                float(route_loss_weight), device=device, dtype=model_dtype
+            ),
+            'speed_loss_weight_effective': torch.tensor(
+                float(speed_loss_weight), device=device, dtype=model_dtype
             ),
         }
         if self.use_speed_profile_head:
