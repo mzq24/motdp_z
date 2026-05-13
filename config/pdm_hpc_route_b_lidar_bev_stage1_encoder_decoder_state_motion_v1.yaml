@@ -138,7 +138,7 @@ route_b:
   route_intent_gate_init: 0.1
   use_encoder_decoder_state_motion: true
   scene_encoder_layers: 1
-  state_warmup_epochs: 25
+  state_warmup_epochs: 15
   freeze_scene_encoder_after_state: true
   detach_semantic_condition_after_freeze: true
   post_state_stage1_loss_weight: 0.0
@@ -255,9 +255,9 @@ dataset:
   use_per_frame: false
   feature_suffix: ensemble
   use_fullres_upsample_cache: false
-  stage_feature_cache_to_ram: true
-  cache_source_dir: /workspace1/z_project/dataset/pdm_lite/tmp_data
-  cache_dir: /dev/shm/motdp_feature_cache_ensemble
+  stage_feature_cache_to_ram: false
+  cache_source_dir: null
+  cache_dir: null
   train_warmup_memmap_page_cache: false
   train_warmup_lidar_page_cache: false
   train_warmup_max_samples: 0
@@ -267,13 +267,13 @@ dataset:
   val_retain_bad_routes_for_energy: false
 
 training:
-  num_epochs: 80
+  num_epochs: 50
   max_grad_norm: 1.0
   warmup_epochs: 3
   use_lr_scheduler: true
   resume_rebuild_scheduler: true
-  scheduler_total_epochs: 80
-  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_chase
+  scheduler_total_epochs: 50
+  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_prevstate
   image_data_root: /workspace1/z_project/dataset/pdm_lite
   sample_interval: 1
   lr_final: 1.0e-07
