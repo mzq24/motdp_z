@@ -196,6 +196,36 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_route_prev_coarse_memory = bool(
             route_b_cfg.get('use_route_prev_coarse_memory', False)
         )
+        self.use_route_intent_token = bool(
+            route_b_cfg.get('use_route_intent_token', False)
+        )
+        self.route_intent_gate_init = float(
+            route_b_cfg.get('route_intent_gate_init', 0.1)
+        )
+        self.use_encoder_decoder_state_motion = bool(
+            route_b_cfg.get('use_encoder_decoder_state_motion', False)
+        )
+        self.scene_encoder_layers = int(route_b_cfg.get('scene_encoder_layers', 1))
+        self.state_warmup_epochs = int(route_b_cfg.get('state_warmup_epochs', 25))
+        self.freeze_scene_encoder_after_state = bool(
+            route_b_cfg.get('freeze_scene_encoder_after_state', True)
+        )
+        self.detach_semantic_condition_after_freeze = bool(
+            route_b_cfg.get('detach_semantic_condition_after_freeze', True)
+        )
+        self.post_state_stage1_loss_weight = float(
+            route_b_cfg.get('post_state_stage1_loss_weight', 0.0)
+        )
+        self.use_semantic_motion_global_bridge = bool(
+            route_b_cfg.get('use_semantic_motion_global_bridge', False)
+        )
+        self.semantic_motion_global_bridge_layers = int(
+            route_b_cfg.get('semantic_motion_global_bridge_layers', 1)
+        )
+        self.semantic_motion_global_bridge_gate_init = float(
+            route_b_cfg.get('semantic_motion_global_bridge_gate_init', 0.1)
+        )
+        self._encoder_decoder_state_frozen_applied = None
         self.current_edge_valid_loss_weight = float(
             route_b_cfg.get('current_edge_valid_loss_weight', 0.10)
         )
@@ -566,6 +596,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             cover_graph_use_traj_context=self.cover_graph_use_traj_context,
             cover_graph_use_speed_context=self.cover_graph_use_speed_context,
             use_route_prev_coarse_memory=self.use_route_prev_coarse_memory,
+            use_route_intent_token=self.use_route_intent_token,
+            route_intent_gate_init=self.route_intent_gate_init,
+            use_encoder_decoder_state_motion=self.use_encoder_decoder_state_motion,
+            scene_encoder_layers=self.scene_encoder_layers,
+            use_semantic_motion_global_bridge=self.use_semantic_motion_global_bridge,
+            semantic_motion_global_bridge_layers=self.semantic_motion_global_bridge_layers,
+            semantic_motion_global_bridge_gate_init=self.semantic_motion_global_bridge_gate_init,
         )
         self.model = model
 
@@ -1578,7 +1615,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         """Compute the temporal semantic branch for the resolved predictor mode."""
         kwargs = dict(
             traj_out=shared_forward['traj_out'],
-            route_out=shared_forward['route_out'],
+            route_out=self._state_route_out_from_shared(shared_forward),
             speed_out=shared_forward['speed_out'],
             route_points=shared_forward['route_points'],
             conditioning=shared_forward['conditioning'],
@@ -1592,6 +1629,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 speed_samples=speed_samples,
             )
         return self.model.compute_shared_stage1_transition_from_ego_outputs(**kwargs)
+
+    @staticmethod
+    def _state_route_out_from_shared(shared_forward: dict) -> torch.Tensor:
+        state_route_out = shared_forward.get('state_route_out')
+        return state_route_out if state_route_out is not None else shared_forward['route_out']
 
     def _build_conflict_area_route_target(
         self,
@@ -3383,7 +3425,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if not transition_only_state:
             raw_stage1_scores = self.model.compute_shared_stage1_from_ego_outputs(
                 traj_out=shared_forward['traj_out'],
-                route_out=shared_forward['route_out'],
+                route_out=self._state_route_out_from_shared(shared_forward),
                 speed_out=shared_forward['speed_out'],
                 route_points=shared_forward['route_points'],
                 conditioning=shared_forward['conditioning'],
@@ -3744,7 +3786,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
                 return self.model.compute_shared_stage1_from_ego_outputs(
                     traj_out=view_forward['traj_out'],
-                    route_out=view_forward['route_out'],
+                    route_out=self._state_route_out_from_shared(view_forward),
                     speed_out=view_forward['speed_out'],
                     route_points=view_forward['route_points'],
                     conditioning=view_forward['conditioning'],
@@ -4377,6 +4419,23 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         else:
             return loss_dict['total_loss']
 
+    def _encoder_decoder_state_should_freeze(self) -> bool:
+        if not self.use_encoder_decoder_state_motion:
+            return False
+        return (self._current_epoch + 1) > max(int(self.state_warmup_epochs), 0)
+
+    def _apply_encoder_decoder_state_freeze_schedule(self) -> bool:
+        should_freeze = self._encoder_decoder_state_should_freeze()
+        if self._encoder_decoder_state_frozen_applied == should_freeze:
+            return should_freeze
+        if hasattr(self.model, 'set_encoder_decoder_state_frozen'):
+            self.model.set_encoder_decoder_state_frozen(
+                should_freeze,
+                freeze_scene_encoder=self.freeze_scene_encoder_after_state,
+            )
+        self._encoder_decoder_state_frozen_applied = should_freeze
+        return should_freeze
+
     # ========== Unified Training: Single Forward Pass ==========
     def compute_split_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -4387,6 +4446,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
+        encoder_decoder_state_frozen = self._apply_encoder_decoder_state_freeze_schedule()
 
         trajectory = batch['agent_pos'].to(device=device, dtype=model_dtype)  # (B, T, 2)
         B, T, D = trajectory.shape
@@ -4416,6 +4476,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 self.train_stage1_speed_energy_after_update_every,
             )
         )
+        stage1_loss_scale = 1.0
+        if encoder_decoder_state_frozen:
+            stage1_loss_scale = max(float(self.post_state_stage1_loss_weight), 0.0)
+            if stage1_loss_scale <= 0.0:
+                train_stage1_active = False
 
         bev_proj = self.model.decoder.compute_bev_proj(transfuser_bev_feature)
         prev_route_coarse_memory = (
@@ -4632,7 +4697,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         alignment_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
 
         total_loss = (
-            self.energy_loss_weight * energy_loss
+            self.energy_loss_weight * stage1_loss_scale * energy_loss
             + self.reg_loss_weight * loss_reg
             + self.route_loss_weight * route_loss
             + self.speed_loss_weight * speed_loss
@@ -4657,6 +4722,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'route_loss': route_loss,
             'speed_loss': speed_loss,
             'alignment_loss': alignment_loss,
+            'encoder_decoder_state_frozen': torch.tensor(
+                float(encoder_decoder_state_frozen), device=device, dtype=model_dtype
+            ),
+            'stage1_loss_scale': torch.tensor(
+                float(stage1_loss_scale), device=device, dtype=model_dtype
+            ),
         }
         if self.use_speed_profile_head:
             loss_dict['speed_profile_loss'] = speed_profile_loss
@@ -4883,7 +4954,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         if not transition_only_state:
                             stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
                                 traj_out=pass1_shared['traj_out'],
-                                route_out=pass1_shared['route_out'],
+                                route_out=self._state_route_out_from_shared(pass1_shared),
                                 speed_out=pass1_shared['speed_out'],
                                 route_points=pass1_shared['route_points'],
                                 conditioning=pass1_shared['conditioning'],
@@ -5017,7 +5088,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if not transition_only_state:
                 stage1_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
                     traj_out=shared_eval['traj_out'],
-                    route_out=shared_eval['route_out'],
+                    route_out=self._state_route_out_from_shared(shared_eval),
                     speed_out=shared_eval['speed_out'],
                     route_points=shared_eval['route_points'],
                     conditioning=shared_eval['conditioning'],
@@ -5072,7 +5143,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             if not transition_only_state:
                 stage1_ref_scores_raw = self.model.compute_shared_stage1_from_ego_outputs(
                     traj_out=shared_eval['traj_out'],
-                    route_out=shared_eval['route_out'],
+                    route_out=self._state_route_out_from_shared(shared_eval),
                     speed_out=shared_eval['speed_out'],
                     route_points=shared_eval['route_points'],
                     conditioning=shared_eval['conditioning'],

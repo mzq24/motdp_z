@@ -1690,6 +1690,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         cover_graph_use_traj_context: bool = False,
         cover_graph_use_speed_context: bool = False,
         use_route_prev_coarse_memory: bool = False,
+        use_route_intent_token: bool = False,
+        route_intent_gate_init: float = 0.1,
+        use_encoder_decoder_state_motion: bool = False,
+        scene_encoder_layers: int = 1,
+        use_semantic_motion_global_bridge: bool = False,
+        semantic_motion_global_bridge_layers: int = 1,
+        semantic_motion_global_bridge_gate_init: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -1722,6 +1729,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context)
         self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context)
         self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory)
+        self.use_route_intent_token = bool(use_route_intent_token)
+        self.use_encoder_decoder_state_motion = bool(use_encoder_decoder_state_motion)
+        self.use_semantic_motion_global_bridge = bool(use_semantic_motion_global_bridge)
+        self.encoder_decoder_state_frozen = False
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -1871,6 +1882,73 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(self.route_prev_coarse_memory_dim, n_emb),
             nn.SiLU(),
             nn.Linear(n_emb, n_emb),
+        )
+        # Explicit route-intent embedding: command(6) + target_point(2) + next_target_point(2).
+        # It is added as a small gated route-only residual so target intent is audible for
+        # branch/exit decisions without becoming a hard planner override.
+        self.route_intent_dim = 10
+        self.route_intent_proj = nn.Sequential(
+            nn.Linear(self.route_intent_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        route_intent_gate_init = min(max(float(route_intent_gate_init), 1e-4), 1.0 - 1e-4)
+        self.route_intent_gate = nn.Parameter(
+            torch.tensor(
+                math.log(route_intent_gate_init / (1.0 - route_intent_gate_init)),
+                dtype=torch.float32,
+            )
+        )
+
+        # ========== Encoder-decoder state/motion split ==========
+        # SceneContextEncoder turns projected BEV tokens into reusable memory.
+        # Motion decoder and StateGraphDecoder both read this memory, but state can
+        # later be frozen without freezing the motion decoder itself.
+        scene_encoder_layers = max(int(scene_encoder_layers), 0)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=n_emb,
+            nhead=n_head,
+            dim_feedforward=4 * n_emb,
+            dropout=p_drop_attn,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.scene_context_encoder = (
+            nn.TransformerEncoder(encoder_layer, num_layers=scene_encoder_layers)
+            if scene_encoder_layers > 0 else nn.Identity()
+        )
+        self.scene_context_norm = nn.LayerNorm(n_emb)
+        self.state_route_scene_attn = nn.MultiheadAttention(
+            n_emb, n_head, dropout=p_drop_attn, batch_first=True
+        )
+        self.state_route_scene_norm = nn.LayerNorm(n_emb)
+        self.state_route_scene_ffn = nn.Sequential(
+            nn.Linear(n_emb, 4 * n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop_attn),
+            nn.Linear(4 * n_emb, n_emb),
+        )
+        self.state_route_scene_ffn_norm = nn.LayerNorm(n_emb)
+        semantic_motion_global_bridge_layers = max(int(semantic_motion_global_bridge_layers), 0)
+        self.semantic_motion_bridge_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * n_emb,
+                dropout=p_drop_attn,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(semantic_motion_global_bridge_layers)
+        ])
+        bridge_gate_init = min(max(float(semantic_motion_global_bridge_gate_init), 1e-4), 1.0 - 1e-4)
+        self.semantic_motion_bridge_gate = nn.Parameter(
+            torch.tensor(
+                math.log(bridge_gate_init / (1.0 - bridge_gate_init)),
+                dtype=torch.float32,
+            )
         )
 
         # ========== Unified Decoder (UnifiedDecoderOnlyTransformer) ==========
@@ -2154,7 +2232,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         decay = set()
         no_decay = set()
         whitelist = (nn.Linear, nn.MultiheadAttention, nn.Conv1d, nn.Conv2d, nn.GRU)
-        blacklist = (nn.LayerNorm, nn.Embedding, RMSNorm)
+        blacklist = (nn.LayerNorm, nn.GroupNorm, nn.Embedding, RMSNorm)
         
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
@@ -2170,7 +2248,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         for name in param_dict:
             if 'pos_emb' in name or '_dummy_variable' in name or 'segment_emb' in name:
                 no_decay.add(name)
-            elif 'route_queries' in name or 'pool_query' in name or 'route_diff_query' in name or 'speed_query' in name:
+            elif (
+                'route_queries' in name
+                or 'pool_query' in name
+                or 'diff_mode_query' in name
+                or 'route_diff_query' in name
+                or 'speed_query' in name
+                or 'query_token' in name
+                or 'slot_embed' in name
+            ):
                 no_decay.add(name)
             elif 'gating_factor' in name:
                 no_decay.add(name)
@@ -2193,10 +2279,20 @@ class TransformerForDiffusion(ModuleAttrMixin):
             elif 'guidance_gate' in name:
                 # Route guidance gate - no weight decay
                 no_decay.add(name)
+            elif 'route_intent_gate' in name:
+                # Route intent residual gate - no weight decay
+                no_decay.add(name)
+            elif 'semantic_motion_bridge_gate' in name:
+                # Semantic-motion bridge gate - no weight decay
+                no_decay.add(name)
             elif 'route_temp_' in name or 'route_bias_' in name:
                 # Route-specific temperature and bias parameters - no weight decay
                 no_decay.add(name)
         
+        # New nested TransformerEncoder modules can expose the same parameter via
+        # multiple module paths during the recursive named_parameters walk.  When
+        # an explicit no-decay rule matches, let it win.
+        decay = decay - no_decay
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0
@@ -2262,6 +2358,102 @@ class TransformerForDiffusion(ModuleAttrMixin):
             dropped[waypoints_mask, :, 12:14] = 0.0
 
         return dropped
+
+    def set_encoder_decoder_state_frozen(
+        self,
+        frozen: bool,
+        freeze_scene_encoder: bool = True,
+    ) -> None:
+        """Freeze/unfreeze the encoder-decoder semantic state path.
+
+        This is intentionally prefix-based so the training policy can switch
+        state stability mode by epoch without knowing every submodule object.
+        Motion decoder layers and traj/route/speed heads remain trainable.
+        """
+        self.encoder_decoder_state_frozen = bool(frozen)
+        state_prefixes = (
+            'state_route_scene_',
+            'shared_stage1_',
+            'semantic_prev_',
+        )
+        scene_prefixes = (
+            'scene_context_',
+            'decoder.bev_feature_proj',
+            'decoder.combined_pos_emb',
+        )
+        for name, param in self.named_parameters():
+            freeze_param = name.startswith(state_prefixes)
+            if freeze_scene_encoder:
+                freeze_param = freeze_param or name.startswith(scene_prefixes)
+            if freeze_param:
+                param.requires_grad = not frozen
+
+    def _compute_scene_memory(
+        self,
+        transfuser_bev_feature: torch.Tensor,
+        bev_proj_cached: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Build reusable scene memory for encoder-decoder mode."""
+        if bev_proj_cached is not None:
+            scene_memory = bev_proj_cached
+        else:
+            scene_memory = self.decoder.compute_bev_proj(transfuser_bev_feature)
+        scene_memory = self.scene_context_encoder(scene_memory)
+        return self.scene_context_norm(scene_memory)
+
+    def _compute_state_route_tokens(
+        self,
+        route_emb: torch.Tensor,
+        scene_memory: torch.Tensor,
+    ) -> torch.Tensor:
+        """StateGraphDecoder route-token backbone independent from motion route_out."""
+        attn_out, _ = self.state_route_scene_attn(
+            query=route_emb,
+            key=scene_memory,
+            value=scene_memory,
+            need_weights=False,
+        )
+        state_route = self.state_route_scene_norm(route_emb + attn_out)
+        state_route = self.state_route_scene_ffn_norm(
+            state_route + self.state_route_scene_ffn(state_route)
+        )
+        return state_route
+
+    def _apply_semantic_motion_bridge(
+        self,
+        speed_out: torch.Tensor,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        state_route_out: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            not self.use_semantic_motion_global_bridge
+            or state_route_out is None
+            or len(self.semantic_motion_bridge_layers) == 0
+        ):
+            return speed_out, traj_out, route_out, state_route_out
+
+        T_speed = speed_out.shape[1]
+        T_traj = traj_out.shape[1]
+        T_route = route_out.shape[1]
+        state_for_bridge = (
+            state_route_out.detach()
+            if self.encoder_decoder_state_frozen else state_route_out
+        )
+        tokens = torch.cat([speed_out, traj_out, route_out, state_for_bridge], dim=1)
+        bridged = tokens
+        for layer in self.semantic_motion_bridge_layers:
+            bridged = layer(bridged)
+        gate = torch.sigmoid(self.semantic_motion_bridge_gate)
+        tokens = tokens + gate * (bridged - tokens)
+
+        speed_new = tokens[:, :T_speed, :]
+        traj_new = tokens[:, T_speed:T_speed + T_traj, :]
+        route_new = tokens[:, T_speed + T_traj:T_speed + T_traj + T_route, :]
+        state_new = tokens[:, T_speed + T_traj + T_route:, :]
+        if self.encoder_decoder_state_frozen:
+            state_new = state_route_out.detach()
+        return speed_new, traj_new, route_new, state_new
 
     def _embed_waypoint_tokens(self, traj_abs: torch.Tensor) -> torch.Tensor:
         """Waypoint-level embedding for ego path: (B, T, 2) -> (B, T, n_emb)."""
@@ -2813,6 +3005,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         conditioning, current_status, route_conditioning = self._compute_conditioning(
             timestep, ego_status, device, model_dtype
         )
+        scene_memory = None
+        decoder_bev_proj = bev_proj_cached
+        if self.use_encoder_decoder_state_motion:
+            scene_memory = self._compute_scene_memory(
+                transfuser_bev_feature,
+                bev_proj_cached=bev_proj_cached,
+            )
+            decoder_bev_proj = scene_memory
 
         wp_emb = self._embed_waypoint_tokens(traj_points)
         diff_query = self.diff_mode_query.expand(B, T_traj, -1)
@@ -2943,6 +3143,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_wp_emb = self._embed_route_waypoint_tokens(route_points)
         route_diff_query = self.route_diff_query.expand(B, T_route, -1)
         route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
+        if self.use_route_intent_token:
+            if current_status.shape[-1] < 12:
+                raise ValueError(
+                    "route intent token expects ego_status layout with "
+                    "command + target_point + target_point_next at indices 2:12"
+                )
+            route_intent = current_status[:, 2:12]
+            route_intent_emb = self.route_intent_proj(route_intent)
+            route_emb = route_emb + torch.sigmoid(self.route_intent_gate) * route_intent_emb.unsqueeze(1)
         if self.use_route_prev_coarse_memory and prev_route_coarse_memory is not None:
             prev_route_coarse_memory = prev_route_coarse_memory.to(device=device, dtype=model_dtype)
             if (
@@ -2957,6 +3166,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 prev_route_coarse_memory
             ).unsqueeze(1)
         route_emb = self.pre_decoder_norm(self.drop(route_emb))
+        state_route_out = None
+        if self.use_encoder_decoder_state_motion:
+            if scene_memory is None:
+                raise RuntimeError("encoder-decoder state/motion path expected scene_memory")
+            state_route_out = self._compute_state_route_tokens(route_emb, scene_memory)
 
         ego_mask = self.decoder._create_ego_speed_mask(
             T_traj=T_traj,
@@ -2975,7 +3189,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_points=route_points,
             timesteps=timestep,
             route_conditioning=route_conditioning,
-            bev_proj_cached=bev_proj_cached,
+            bev_proj_cached=decoder_bev_proj,
             self_attn_mask=ego_mask,
             route_pos_offset=T_traj,
             spatial_mode="ego",
@@ -2983,6 +3197,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         if speed_out is None:
             raise RuntimeError("Decoder ego path expected a speed token output")
+        speed_out, traj_out, route_out, state_route_out = self._apply_semantic_motion_bridge(
+            speed_out=speed_out,
+            traj_out=traj_out,
+            route_out=route_out,
+            state_route_out=state_route_out,
+        )
 
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
         poses_reg = traj_pred.unsqueeze(1)
@@ -3005,6 +3225,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 'traj_out': traj_out,
                 'route_out': route_out,
                 'speed_out': speed_out,
+                'state_route_out': state_route_out,
+                'scene_memory': scene_memory,
                 'route_points': route_points,
                 'conditioning': conditioning,
                 'speed_pred': speed_pred,
@@ -3012,9 +3234,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             }
             if stage1_speed_samples is not None:
                 stage1_speed_samples = stage1_speed_samples.to(device=device, dtype=model_dtype)
+                stage1_route_out = state_route_out if state_route_out is not None else route_out
                 result['stage1_raw_scores'] = self._compute_shared_stage1_scores(
                     traj_out=traj_out,
-                    route_out=route_out,
+                    route_out=stage1_route_out,
                     speed_out=speed_out,
                     route_points=route_points,
                     conditioning=conditioning,
