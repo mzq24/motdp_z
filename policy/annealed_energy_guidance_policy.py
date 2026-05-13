@@ -184,6 +184,23 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 "semantic_motion_condition_mode must be 'full' or 'compact_graph', "
                 f"got {self.semantic_motion_condition_mode}"
             )
+        self.semantic_motion_condition_profile = str(
+            route_b_cfg.get('semantic_motion_condition_profile', 'all')
+        ).lower()
+        semantic_motion_condition_profile_choices = {
+            'all',
+            'window_only',
+            'window_decision',
+            'window_decision_control',
+            'window_phase_opportunity',
+            'compact_safe',
+        }
+        if self.semantic_motion_condition_profile not in semantic_motion_condition_profile_choices:
+            raise ValueError(
+                "semantic_motion_condition_profile must be one of "
+                f"{sorted(semantic_motion_condition_profile_choices)}, "
+                f"got {self.semantic_motion_condition_profile}"
+            )
         self.use_cover_relation_graph_decoder = bool(
             route_b_cfg.get('use_cover_relation_graph_decoder', False)
         )
@@ -568,6 +585,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
             use_chase_front_following_state=self.use_chase_front_following_state,
             semantic_motion_condition_mode=self.semantic_motion_condition_mode,
+            semantic_motion_condition_profile=self.semantic_motion_condition_profile,
             use_cover_relation_graph_decoder=self.use_cover_relation_graph_decoder,
             cover_graph_use_traj_context=self.cover_graph_use_traj_context,
             cover_graph_use_speed_context=self.cover_graph_use_speed_context,
@@ -5159,6 +5177,25 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             device=device,
             dtype=model_dtype,
         )
+        profile_id_map = {
+            'all': 0.0,
+            'window_only': 1.0,
+            'window_decision': 2.0,
+            'window_decision_control': 3.0,
+            'window_phase_opportunity': 4.0,
+            'compact_safe': 5.0,
+        }
+        semantic_motion_profile_id = torch.full(
+            (B,),
+            profile_id_map.get(self.semantic_motion_condition_profile, -1.0),
+            device=device,
+            dtype=model_dtype,
+        )
+        group_mask = getattr(self.model, 'semantic_motion_condition_group_mask', None)
+        if group_mask is not None:
+            semantic_motion_group_mask = group_mask.to(device=device, dtype=model_dtype).reshape(1, -1).expand(B, -1)
+        else:
+            semantic_motion_group_mask = None
 
         return {
             'best_trajectory': best_trajectory,       # (B, T, 2)
@@ -5251,6 +5288,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'semantic_state_fusion_gate': semantic_fusion_gate,
             'semantic_state_predictor_mode_resolved': semantic_mode_id,
             'semantic_prev_corruption_enabled': semantic_prev_corruption_enabled,
+            'semantic_motion_condition_profile': semantic_motion_profile_id,
+            'semantic_motion_condition_profile_id': semantic_motion_profile_id,
+            'semantic_motion_condition_group_mask': semantic_motion_group_mask,
             'pass1_trajectory': pass1_trajectory,
             'pass2_trajectory': best_trajectory,
             'poses_cls': poses_cls,                   # (B, 1)
@@ -5407,9 +5447,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'semantic_state_fusion_gate',
             'semantic_state_predictor_mode_resolved',
             'semantic_prev_corruption_enabled',
+            'semantic_motion_condition_profile',
+            'semantic_motion_condition_profile_id',
         ):
             if sample_result.get(key) is not None:
                 result[key] = sample_result[key].detach().float().cpu().numpy()
+        if sample_result.get('semantic_motion_condition_group_mask') is not None:
+            result['semantic_motion_condition_group_mask'] = (
+                sample_result['semantic_motion_condition_group_mask'].detach().float().cpu().numpy()
+            )
         if sample_result.get('pass1_trajectory') is not None:
             result['pass1_trajectory'] = (
                 sample_result['pass1_trajectory'].detach().float().cpu().numpy()

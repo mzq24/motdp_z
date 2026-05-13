@@ -1686,6 +1686,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         use_condition_group_dropout: bool = False,
         use_chase_front_following_state: bool = True,
         semantic_motion_condition_mode: str = "full",
+        semantic_motion_condition_profile: str = "all",
         use_cover_relation_graph_decoder: bool = False,
         cover_graph_use_traj_context: bool = False,
         cover_graph_use_speed_context: bool = False,
@@ -1719,6 +1720,20 @@ class TransformerForDiffusion(ModuleAttrMixin):
             raise ValueError(
                 "semantic_motion_condition_mode must be 'full' or 'compact_graph', "
                 f"got {semantic_motion_condition_mode}"
+            )
+        self.semantic_motion_condition_profile = str(semantic_motion_condition_profile).lower()
+        profile_choices = {
+            "all",
+            "window_only",
+            "window_decision",
+            "window_decision_control",
+            "window_phase_opportunity",
+            "compact_safe",
+        }
+        if self.semantic_motion_condition_profile not in profile_choices:
+            raise ValueError(
+                "semantic_motion_condition_profile must be one of "
+                f"{sorted(profile_choices)}, got {semantic_motion_condition_profile}"
             )
         self.use_cover_relation_graph_decoder = bool(use_cover_relation_graph_decoder)
         self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context)
@@ -1791,6 +1806,63 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.traj_branch_condition_compact_graph_dim
             if self.semantic_motion_condition_mode == "compact_graph"
             else self.traj_branch_condition_full_dim
+        )
+        if self.semantic_motion_condition_mode == "compact_graph":
+            group_names = (
+                "window",
+                "decision",
+                "control",
+                "opportunity",
+                "current_edge",
+                "future_edge",
+                "edge_margin",
+                "edge_valid",
+                "borrow",
+            )
+            profile_groups = {
+                "all": group_names,
+                "window_only": ("window",),
+                "window_decision": ("window", "decision"),
+                "window_decision_control": ("window", "decision", "control"),
+                "window_phase_opportunity": ("window", "decision", "control", "opportunity"),
+                "compact_safe": (
+                    "window",
+                    "decision",
+                    "control",
+                    "opportunity",
+                    "current_edge",
+                    "future_edge",
+                    "edge_margin",
+                    "edge_valid",
+                ),
+            }
+        else:
+            group_names = (
+                "window",
+                "dir",
+                "decision",
+                "control",
+                "boundary",
+                "opportunity",
+                "area_status",
+                "timing",
+                "chase",
+                "borrow",
+            )
+            profile_groups = {
+                "all": group_names,
+                "window_only": ("window",),
+                "window_decision": ("window", "decision"),
+                "window_decision_control": ("window", "decision", "control"),
+                "window_phase_opportunity": ("window", "decision", "control", "opportunity"),
+                "compact_safe": ("window", "decision", "control", "boundary", "opportunity", "chase"),
+            }
+        enabled_groups = set(profile_groups[self.semantic_motion_condition_profile])
+        self.semantic_motion_condition_group_names = group_names
+        self.register_buffer(
+            "semantic_motion_condition_group_mask",
+            torch.tensor([1.0 if name in enabled_groups else 0.0 for name in group_names], dtype=torch.float32),
+            persistent=False,
         )
         self.traj_window_condition_proj = nn.Sequential(
             nn.Linear(self.traj_window_condition_dim, n_emb),
@@ -2871,6 +2943,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 gate_timing = branch_condition_schedule[:, 6:7]
                 gate_borrow = branch_condition_schedule[:, 7:8]
             if self.semantic_motion_condition_mode == "compact_graph":
+                profile_mask = self.semantic_motion_condition_group_mask.to(device=device, dtype=model_dtype)
                 cursor = 0
                 window_cond = branch_condition[:, cursor:cursor + self.traj_window_condition_dim]
                 cursor += self.traj_window_condition_dim
@@ -2895,17 +2968,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
                         f"{self.traj_borrow_aux_dim}, got {borrow_aux.shape[-1]}"
                     )
                 branch_cond_emb = (
-                    self.traj_window_condition_proj(window_cond) * gate_window
-                    + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
-                    + self.traj_control_phase_condition_proj(control_cond) * gate_phase
-                    + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
-                    + self.traj_current_edge_condition_proj(current_edge_cond) * gate_phase
-                    + self.traj_future_edge_condition_proj(future_edge_cond) * gate_phase
-                    + self.traj_edge_margin_proj(edge_margin_cond) * gate_boundary
-                    + self.traj_edge_valid_proj(edge_valid_cond) * gate_boundary
-                    + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
+                    self.traj_window_condition_proj(window_cond) * gate_window * profile_mask[0]
+                    + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase * profile_mask[1]
+                    + self.traj_control_phase_condition_proj(control_cond) * gate_phase * profile_mask[2]
+                    + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity * profile_mask[3]
+                    + self.traj_current_edge_condition_proj(current_edge_cond) * gate_phase * profile_mask[4]
+                    + self.traj_future_edge_condition_proj(future_edge_cond) * gate_phase * profile_mask[5]
+                    + self.traj_edge_margin_proj(edge_margin_cond) * gate_boundary * profile_mask[6]
+                    + self.traj_edge_valid_proj(edge_valid_cond) * gate_boundary * profile_mask[7]
+                    + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow * profile_mask[8]
                 )
             else:
+                profile_mask = self.semantic_motion_condition_group_mask.to(device=device, dtype=model_dtype)
                 window_cond = branch_condition[:, :self.traj_window_condition_dim]
                 dir_start = self.traj_window_condition_dim
                 dir_end = dir_start + self.traj_dir_condition_dim
@@ -2938,20 +3012,20 @@ class TransformerForDiffusion(ModuleAttrMixin):
                         f"{self.traj_borrow_aux_dim}, got {borrow_aux.shape[-1]}"
                     )
                 branch_cond_emb = (
-                    self.traj_window_condition_proj(window_cond) * gate_window
-                    + self.traj_dir_condition_proj(dir_cond) * gate_dir
-                    + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase
-                    + self.traj_control_phase_condition_proj(control_cond) * gate_phase
-                    + self.traj_boundary_margin_proj(boundary_cond) * gate_boundary
-                    + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity
-                    + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status
-                    + self.traj_timing_condition_proj(timing_cond) * gate_timing
-                    + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow
+                    self.traj_window_condition_proj(window_cond) * gate_window * profile_mask[0]
+                    + self.traj_dir_condition_proj(dir_cond) * gate_dir * profile_mask[1]
+                    + self.traj_decision_phase_condition_proj(decision_cond) * gate_phase * profile_mask[2]
+                    + self.traj_control_phase_condition_proj(control_cond) * gate_phase * profile_mask[3]
+                    + self.traj_boundary_margin_proj(boundary_cond) * gate_boundary * profile_mask[4]
+                    + self.traj_opportunity_condition_proj(opportunity_cond) * gate_opportunity * profile_mask[5]
+                    + self.traj_area_status_condition_proj(area_status_cond) * gate_area_status * profile_mask[6]
+                    + self.traj_timing_condition_proj(timing_cond) * gate_timing * profile_mask[7]
+                    + self.traj_borrow_aux_proj(borrow_aux) * gate_borrow * profile_mask[9]
                 )
                 if self.use_chase_front_following_state:
                     branch_cond_emb = (
                         branch_cond_emb
-                        + self.traj_chase_condition_proj(chase_cond) * gate_boundary
+                        + self.traj_chase_condition_proj(chase_cond) * gate_boundary * profile_mask[8]
                     )
             branch_cond_emb = branch_cond_emb * float(branch_condition_scale)
             traj_emb = traj_emb + branch_cond_emb.unsqueeze(1)

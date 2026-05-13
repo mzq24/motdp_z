@@ -130,6 +130,7 @@ route_b:
   use_speed_profile_head: false
   use_traj_branch_condition: true
   semantic_motion_condition_mode: compact_graph
+  semantic_motion_condition_profile: all
   use_cover_relation_graph_decoder: true
   cover_graph_use_traj_context: false
   cover_graph_use_speed_context: false
@@ -246,9 +247,9 @@ dataset:
   use_per_frame: false
   feature_suffix: ensemble
   use_fullres_upsample_cache: false
-  stage_feature_cache_to_ram: true
-  cache_source_dir: /workspace1/z_project/dataset/pdm_lite/tmp_data
-  cache_dir: /dev/shm/motdp_feature_cache_ensemble
+  stage_feature_cache_to_ram: false
+  cache_source_dir: null
+  cache_dir: null
   train_warmup_memmap_page_cache: false
   train_warmup_lidar_page_cache: false
   train_warmup_max_samples: 0
