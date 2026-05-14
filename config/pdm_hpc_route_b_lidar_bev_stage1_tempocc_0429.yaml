@@ -131,6 +131,7 @@ route_b:
   use_traj_branch_condition: true
   semantic_motion_condition_mode: compact_graph
   semantic_motion_condition_profile: all
+  semantic_state_supervision_profile: all
   use_cover_relation_graph_decoder: true
   cover_graph_use_traj_context: false
   cover_graph_use_speed_context: false

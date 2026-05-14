@@ -201,6 +201,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 f"{sorted(semantic_motion_condition_profile_choices)}, "
                 f"got {self.semantic_motion_condition_profile}"
             )
+        self.semantic_state_supervision_profile = str(
+            route_b_cfg.get('semantic_state_supervision_profile', 'all')
+        ).lower()
+        semantic_state_supervision_profile_choices = {
+            'all',
+            'window_only',
+            'window_decision',
+            'window_decision_control',
+            'window_phase_opportunity',
+            'compact_safe',
+        }
+        if self.semantic_state_supervision_profile not in semantic_state_supervision_profile_choices:
+            raise ValueError(
+                "semantic_state_supervision_profile must be one of "
+                f"{sorted(semantic_state_supervision_profile_choices)}, "
+                f"got {self.semantic_state_supervision_profile}"
+            )
+        self.semantic_state_supervision_groups = self._semantic_state_supervision_groups(
+            self.semantic_state_supervision_profile
+        )
         self.use_cover_relation_graph_decoder = bool(
             route_b_cfg.get('use_cover_relation_graph_decoder', False)
         )
@@ -1842,6 +1862,47 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         progress = min(max(float(self._current_epoch), 0.0) / float(decay_epochs), 1.0)
         return start + (end - start) * progress
 
+    @staticmethod
+    def _semantic_state_supervision_groups(profile: str) -> set:
+        all_groups = {
+            'window',
+            'dir',
+            'decision',
+            'control',
+            'boundary',
+            'conflict_area',
+            'tempocc',
+            'opportunity',
+            'area_status',
+            'timing',
+            'inside_area_go',
+            'chase',
+            'graph',
+            'edge_speed_consistency',
+        }
+        profile_groups = {
+            'all': all_groups,
+            'window_only': {'window'},
+            'window_decision': {'window', 'decision'},
+            'window_decision_control': {'window', 'decision', 'control'},
+            'window_phase_opportunity': {'window', 'decision', 'control', 'opportunity'},
+            'compact_safe': {
+                'window',
+                'decision',
+                'control',
+                'opportunity',
+                'chase',
+                'graph',
+                'edge_speed_consistency',
+            },
+        }
+        if profile not in profile_groups:
+            raise ValueError(f"Unknown semantic_state_supervision_profile: {profile}")
+        return set(profile_groups[profile])
+
+    def _supervise_state_group(self, group: str) -> bool:
+        return group in self.semantic_state_supervision_groups
+
     def _build_traj_condition_schedule(
         self,
         timestep: torch.Tensor,
@@ -3442,6 +3503,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             raise RuntimeError("semantic state training produced no state scores")
 
         zero = gt_abs.new_tensor(0.0)
+        supervise_window = self._supervise_state_group('window')
+        supervise_dir = self._supervise_state_group('dir')
+        supervise_decision = self._supervise_state_group('decision')
+        supervise_control = self._supervise_state_group('control')
+        supervise_boundary = self._supervise_state_group('boundary')
+        supervise_conflict_area = self._supervise_state_group('conflict_area')
+        supervise_tempocc = self._supervise_state_group('tempocc')
+        supervise_opportunity = self._supervise_state_group('opportunity')
+        supervise_area_status = self._supervise_state_group('area_status')
+        supervise_timing = self._supervise_state_group('timing')
+        supervise_inside_area_go = self._supervise_state_group('inside_area_go')
+        supervise_chase = self._supervise_state_group('chase')
+        supervise_graph = self._supervise_state_group('graph')
+        supervise_edge_speed_consistency = self._supervise_state_group('edge_speed_consistency')
 
         def _boundary_loss(pred_norm: torch.Tensor, target_mps: torch.Tensor) -> torch.Tensor:
             target_norm = torch.nan_to_num(
@@ -3786,33 +3861,49 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             scores_view1 = _stage1_scores_for_noisy_view(noisy_joint.detach(), diff_timesteps.detach())
             scores_view2 = _stage1_scores_for_noisy_view(noisy_view2_flat.unsqueeze(1), timesteps_view2)
 
-            loss_state_consistency_window = 0.5 * (
-                _sym_kl_logits(scores_view1['window_logits'], scores_view2['window_logits'])
-                + _sym_kl_logits(scores_view1['dir_logits'], scores_view2['dir_logits'])
+            window_consistency_terms = []
+            if supervise_window:
+                window_consistency_terms.append(
+                    _sym_kl_logits(scores_view1['window_logits'], scores_view2['window_logits'])
+                )
+            if supervise_dir:
+                window_consistency_terms.append(
+                    _sym_kl_logits(scores_view1['dir_logits'], scores_view2['dir_logits'])
+                )
+            loss_state_consistency_window = (
+                torch.stack(window_consistency_terms).mean()
+                if window_consistency_terms else zero
             )
-            loss_state_consistency_phase = 0.5 * (
-                _sym_kl_logits(
+            phase_consistency_terms = []
+            if supervise_decision:
+                phase_consistency_terms.append(_sym_kl_logits(
                     scores_view1['decision_phase_logits'],
                     scores_view2['decision_phase_logits'],
                     decision_phase_valid_mask,
-                )
-                + _sym_kl_logits(
+                ))
+            if supervise_control:
+                phase_consistency_terms.append(_sym_kl_logits(
                     scores_view1['control_phase_logits'],
                     scores_view2['control_phase_logits'],
                     control_phase_valid_mask,
-                )
+                ))
+            loss_state_consistency_phase = (
+                torch.stack(phase_consistency_terms).mean()
+                if phase_consistency_terms else zero
             )
-            boundary_consistency = (
-                _sym_smooth_l1(scores_view1['merge_yld_max'], scores_view2['merge_yld_max'], merge_yld_valid)
-                + _sym_smooth_l1(scores_view1['merge_go_min'], scores_view2['merge_go_min'], merge_go_valid)
-                + _sym_smooth_l1(scores_view1['junction_yld_max'], scores_view2['junction_yld_max'], junction_yld_valid)
-                + _sym_smooth_l1(scores_view1['junction_go_min'], scores_view2['junction_go_min'], junction_go_valid)
-                + _sym_smooth_l1(scores_view1['borrow_yld_max'], scores_view2['borrow_yld_max'], borrow_yld_valid)
-                + _sym_smooth_l1(scores_view1['borrow_go_min'], scores_view2['borrow_go_min'], borrow_go_valid)
-            ) / 6.0
+            boundary_consistency = zero
+            if supervise_boundary:
+                boundary_consistency = (
+                    _sym_smooth_l1(scores_view1['merge_yld_max'], scores_view2['merge_yld_max'], merge_yld_valid)
+                    + _sym_smooth_l1(scores_view1['merge_go_min'], scores_view2['merge_go_min'], merge_go_valid)
+                    + _sym_smooth_l1(scores_view1['junction_yld_max'], scores_view2['junction_yld_max'], junction_yld_valid)
+                    + _sym_smooth_l1(scores_view1['junction_go_min'], scores_view2['junction_go_min'], junction_go_valid)
+                    + _sym_smooth_l1(scores_view1['borrow_yld_max'], scores_view2['borrow_yld_max'], borrow_yld_valid)
+                    + _sym_smooth_l1(scores_view1['borrow_go_min'], scores_view2['borrow_go_min'], borrow_go_valid)
+                ) / 6.0
             loss_state_consistency_boundary = boundary_consistency
             area_consistency = zero
-            if conflict_area_valid_mask is not None:
+            if supervise_conflict_area and conflict_area_valid_mask is not None:
                 area_consistency = _sym_mse(
                     scores_view1['conflict_area_logits'],
                     scores_view2['conflict_area_logits'],
@@ -3822,33 +3913,37 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             temp_consistency = zero
             go_consistency = zero
             if temp_targets is not None:
-                temp_consistency = _sym_mse(
-                    scores_view1['temporary_occupancy_logits'],
-                    scores_view2['temporary_occupancy_logits'],
-                    temp_targets['valid'],
-                )
-                go_consistency = _sym_kl_logits(
-                    scores_view1['go_opportunity_logits'],
-                    scores_view2['go_opportunity_logits'],
-                    temp_targets['go_opportunity_valid'],
-                )
+                if supervise_tempocc:
+                    temp_consistency = _sym_mse(
+                        scores_view1['temporary_occupancy_logits'],
+                        scores_view2['temporary_occupancy_logits'],
+                        temp_targets['valid'],
+                    )
+                if supervise_opportunity:
+                    go_consistency = _sym_kl_logits(
+                        scores_view1['go_opportunity_logits'],
+                        scores_view2['go_opportunity_logits'],
+                        temp_targets['go_opportunity_valid'],
+                    )
             loss_state_consistency_tempocc = temp_consistency
             loss_state_consistency_opportunity = go_consistency
             status_consistency = zero
             timing_consistency = zero
             if timing_targets is not None:
-                status_consistency = _sym_kl_logits(
-                    scores_view1['conflict_area_status_logits'],
-                    scores_view2['conflict_area_status_logits'],
-                    None,
-                )
-                timing_consistency = _sym_smooth_l1(
-                    scores_view1['conflict_timing_values'],
-                    scores_view2['conflict_timing_values'],
-                    timing_targets['valid'],
-                )
+                if supervise_area_status:
+                    status_consistency = _sym_kl_logits(
+                        scores_view1['conflict_area_status_logits'],
+                        scores_view2['conflict_area_status_logits'],
+                        None,
+                    )
+                if supervise_timing:
+                    timing_consistency = _sym_smooth_l1(
+                        scores_view1['conflict_timing_values'],
+                        scores_view2['conflict_timing_values'],
+                        timing_targets['valid'],
+                    )
             loss_state_consistency_timing = status_consistency + timing_consistency
-            if graph_targets is not None:
+            if supervise_graph and graph_targets is not None:
                 graph_consistency = (
                     _sym_mse(
                         scores_view1['current_cover_edge_valid_logit'],
@@ -3900,30 +3995,59 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 + self.state_consistency_timing_weight * loss_state_consistency_timing
             )
 
-        direct_stage1_base_loss = (
-            + self.energy_merge_weight * loss_merge
-            + self.energy_junction_weight * loss_junction
-            + self.energy_borrow_weight * loss_borrow
-            + self.energy_relation_weight * loss_dir
-            + self.energy_window_weight * loss_window
-            + self.energy_phase_weight * loss_phase
-            + self.energy_conflict_area_weight * loss_conflict_area
-            + self.temporary_occupancy_loss_weight * loss_temporary_occupancy
-            + self.go_opportunity_loss_weight * loss_go_opportunity
-            + self.conflict_area_status_loss_weight * loss_conflict_area_status
-            + self.conflict_timing_loss_weight * loss_conflict_timing
-            + self.energy_chase_weight * loss_chase
-            + self.inside_area_go_loss_weight * loss_inside_area_go
-            + self.current_edge_valid_loss_weight * loss_current_edge_valid
-            + self.current_edge_mode_loss_weight * loss_current_edge_mode
-            + self.future_edge_valid_loss_weight * loss_future_edge_valid
-            + self.future_edge_mode_loss_weight * loss_future_edge_mode
-            + self.current_cover_upper_loss_weight * loss_current_cover_upper
-            + self.future_cover_lower_loss_weight * loss_future_cover_lower
-            + self.front_follow_upper_loss_weight * loss_front_follow_upper
-            + self.merge_flow_lower_loss_weight * loss_merge_flow_lower
-            + self.edge_speed_consistency_loss_weight * loss_edge_speed_consistency
+        loss_phase_supervised = (
+            (loss_decision_phase if supervise_decision else zero)
+            + (loss_control_phase if supervise_control else zero)
         )
+        direct_stage1_base_loss = zero
+        if supervise_boundary:
+            direct_stage1_base_loss = direct_stage1_base_loss + (
+                self.energy_merge_weight * loss_merge
+                + self.energy_junction_weight * loss_junction
+                + self.energy_borrow_weight * loss_borrow
+            )
+        if supervise_dir:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.energy_relation_weight * loss_dir
+        if supervise_window:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.energy_window_weight * loss_window
+        if supervise_decision or supervise_control:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.energy_phase_weight * loss_phase_supervised
+        if supervise_conflict_area:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.energy_conflict_area_weight * loss_conflict_area
+        if supervise_tempocc:
+            direct_stage1_base_loss = (
+                direct_stage1_base_loss
+                + self.temporary_occupancy_loss_weight * loss_temporary_occupancy
+            )
+        if supervise_opportunity:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.go_opportunity_loss_weight * loss_go_opportunity
+        if supervise_area_status:
+            direct_stage1_base_loss = (
+                direct_stage1_base_loss
+                + self.conflict_area_status_loss_weight * loss_conflict_area_status
+            )
+        if supervise_timing:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.conflict_timing_loss_weight * loss_conflict_timing
+        if supervise_chase:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.energy_chase_weight * loss_chase
+        if supervise_inside_area_go:
+            direct_stage1_base_loss = direct_stage1_base_loss + self.inside_area_go_loss_weight * loss_inside_area_go
+        if supervise_graph:
+            direct_stage1_base_loss = direct_stage1_base_loss + (
+                self.current_edge_valid_loss_weight * loss_current_edge_valid
+                + self.current_edge_mode_loss_weight * loss_current_edge_mode
+                + self.future_edge_valid_loss_weight * loss_future_edge_valid
+                + self.future_edge_mode_loss_weight * loss_future_edge_mode
+                + self.current_cover_upper_loss_weight * loss_current_cover_upper
+                + self.future_cover_lower_loss_weight * loss_future_cover_lower
+                + self.front_follow_upper_loss_weight * loss_front_follow_upper
+                + self.merge_flow_lower_loss_weight * loss_merge_flow_lower
+            )
+        if supervise_edge_speed_consistency:
+            direct_stage1_base_loss = (
+                direct_stage1_base_loss
+                + self.edge_speed_consistency_loss_weight * loss_edge_speed_consistency
+            )
         semantic_transition_loss = zero
         semantic_transition_consistency_loss = zero
         if transition_stage1_scores is not None:
@@ -4125,29 +4249,78 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     graph_targets['merge_flow_lower_valid'],
                 )
 
-            semantic_transition_loss = (
-                + self.energy_merge_weight * transition_loss_merge
-                + self.energy_junction_weight * transition_loss_junction
-                + self.energy_borrow_weight * transition_loss_borrow
-                + self.energy_relation_weight * transition_loss_dir
-                + self.energy_window_weight * transition_loss_window
-                + self.energy_phase_weight * transition_loss_phase
-                + self.energy_conflict_area_weight * transition_loss_conflict_area
-                + self.temporary_occupancy_loss_weight * transition_loss_tempocc
-                + self.go_opportunity_loss_weight * transition_loss_go_opp
-                + self.conflict_area_status_loss_weight * transition_loss_status
-                + self.conflict_timing_loss_weight * transition_loss_timing
-                + self.energy_chase_weight * transition_loss_chase
-                + self.inside_area_go_loss_weight * transition_loss_inside_go
-                + self.current_edge_valid_loss_weight * transition_loss_current_edge_valid
-                + self.current_edge_mode_loss_weight * transition_loss_current_edge_mode
-                + self.future_edge_valid_loss_weight * transition_loss_future_edge_valid
-                + self.future_edge_mode_loss_weight * transition_loss_future_edge_mode
-                + self.current_cover_upper_loss_weight * transition_loss_current_cover_upper
-                + self.future_cover_lower_loss_weight * transition_loss_future_cover_lower
-                + self.front_follow_upper_loss_weight * transition_loss_front_follow_upper
-                + self.merge_flow_lower_loss_weight * transition_loss_merge_flow_lower
+            transition_loss_phase_supervised = (
+                (transition_loss_decision_phase if supervise_decision else zero)
+                + (transition_loss_control_phase if supervise_control else zero)
             )
+            semantic_transition_loss = zero
+            if supervise_boundary:
+                semantic_transition_loss = semantic_transition_loss + (
+                    self.energy_merge_weight * transition_loss_merge
+                    + self.energy_junction_weight * transition_loss_junction
+                    + self.energy_borrow_weight * transition_loss_borrow
+                )
+            if supervise_dir:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.energy_relation_weight * transition_loss_dir
+                )
+            if supervise_window:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.energy_window_weight * transition_loss_window
+                )
+            if supervise_decision or supervise_control:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.energy_phase_weight * transition_loss_phase_supervised
+                )
+            if supervise_conflict_area:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.energy_conflict_area_weight * transition_loss_conflict_area
+                )
+            if supervise_tempocc:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.temporary_occupancy_loss_weight * transition_loss_tempocc
+                )
+            if supervise_opportunity:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.go_opportunity_loss_weight * transition_loss_go_opp
+                )
+            if supervise_area_status:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.conflict_area_status_loss_weight * transition_loss_status
+                )
+            if supervise_timing:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.conflict_timing_loss_weight * transition_loss_timing
+                )
+            if supervise_chase:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.energy_chase_weight * transition_loss_chase
+                )
+            if supervise_inside_area_go:
+                semantic_transition_loss = (
+                    semantic_transition_loss
+                    + self.inside_area_go_loss_weight * transition_loss_inside_go
+                )
+            if supervise_graph:
+                semantic_transition_loss = semantic_transition_loss + (
+                    self.current_edge_valid_loss_weight * transition_loss_current_edge_valid
+                    + self.current_edge_mode_loss_weight * transition_loss_current_edge_mode
+                    + self.future_edge_valid_loss_weight * transition_loss_future_edge_valid
+                    + self.future_edge_mode_loss_weight * transition_loss_future_edge_mode
+                    + self.current_cover_upper_loss_weight * transition_loss_current_cover_upper
+                    + self.future_cover_lower_loss_weight * transition_loss_future_cover_lower
+                    + self.front_follow_upper_loss_weight * transition_loss_front_follow_upper
+                    + self.merge_flow_lower_loss_weight * transition_loss_merge_flow_lower
+                )
 
             def _transition_masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
                 if mask is None:
@@ -4178,62 +4351,71 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
                 return _transition_masked_mean(loss, mask)
 
-            transition_consistency_terms = [
-                _transition_sym_kl(raw_stage1_scores['window_logits'], transition_stage1_scores['window_logits']),
-                _transition_sym_kl(raw_stage1_scores['dir_logits'], transition_stage1_scores['dir_logits']),
-                _transition_sym_kl(
+            transition_consistency_terms = []
+            if supervise_window:
+                transition_consistency_terms.append(
+                    _transition_sym_kl(raw_stage1_scores['window_logits'], transition_stage1_scores['window_logits'])
+                )
+            if supervise_dir:
+                transition_consistency_terms.append(
+                    _transition_sym_kl(raw_stage1_scores['dir_logits'], transition_stage1_scores['dir_logits'])
+                )
+            if supervise_decision:
+                transition_consistency_terms.append(_transition_sym_kl(
                     raw_stage1_scores['decision_phase_logits'],
                     transition_stage1_scores['decision_phase_logits'],
                     decision_phase_valid_mask,
-                ),
-                _transition_sym_kl(
+                ))
+            if supervise_control:
+                transition_consistency_terms.append(_transition_sym_kl(
                     raw_stage1_scores['control_phase_logits'],
                     transition_stage1_scores['control_phase_logits'],
                     control_phase_valid_mask,
-                ),
-                _transition_sym_mse(
+                ))
+            if supervise_conflict_area:
+                transition_consistency_terms.append(_transition_sym_mse(
                     raw_stage1_scores['conflict_area_logits'],
                     transition_stage1_scores['conflict_area_logits'],
                     conflict_area_valid_mask,
-                ),
-            ]
+                ))
             if temp_targets is not None:
-                transition_consistency_terms.extend([
-                    _transition_sym_mse(
+                if supervise_tempocc:
+                    transition_consistency_terms.append(_transition_sym_mse(
                         raw_stage1_scores['temporary_occupancy_logits'],
                         transition_stage1_scores['temporary_occupancy_logits'],
                         temp_targets['valid'],
-                    ),
-                    _transition_sym_kl(
+                    ))
+                if supervise_opportunity:
+                    transition_consistency_terms.append(_transition_sym_kl(
                         raw_stage1_scores['go_opportunity_logits'],
                         transition_stage1_scores['go_opportunity_logits'],
                         temp_targets['go_opportunity_valid'],
-                    ),
-                ])
+                    ))
             if timing_targets is not None:
-                transition_consistency_terms.extend([
-                    _transition_sym_kl(
+                if supervise_area_status:
+                    transition_consistency_terms.append(_transition_sym_kl(
                         raw_stage1_scores['conflict_area_status_logits'],
                         transition_stage1_scores['conflict_area_status_logits'],
-                    ),
-                    _transition_sym_mse(
+                    ))
+                if supervise_timing:
+                    transition_consistency_terms.append(_transition_sym_mse(
                         raw_stage1_scores['conflict_timing_values'],
                         transition_stage1_scores['conflict_timing_values'],
                         timing_targets['valid'],
-                    ),
-                ])
-            for key in (
-                'merge_yld_max',
-                'merge_go_min',
-                'junction_yld_max',
-                'junction_go_min',
-                'borrow_yld_max',
-                'borrow_go_min',
-            ):
-                transition_consistency_terms.append(
-                    _transition_sym_mse(raw_stage1_scores[key], transition_stage1_scores[key])
-                )
-            if self.use_chase_front_following_state and chase_targets is not None:
+                    ))
+            if supervise_boundary:
+                for key in (
+                    'merge_yld_max',
+                    'merge_go_min',
+                    'junction_yld_max',
+                    'junction_go_min',
+                    'borrow_yld_max',
+                    'borrow_go_min',
+                ):
+                    transition_consistency_terms.append(
+                        _transition_sym_mse(raw_stage1_scores[key], transition_stage1_scores[key])
+                    )
+            if supervise_chase and self.use_chase_front_following_state and chase_targets is not None:
                 transition_consistency_terms.extend([
                     _transition_sym_mse(
                         raw_stage1_scores['chase_has_lead_logit'],
@@ -4244,7 +4426,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         transition_stage1_scores['chase_speed_max'],
                     ),
                 ])
-            if graph_targets is not None:
+            if supervise_graph and graph_targets is not None:
                 transition_consistency_terms.extend([
                     _transition_sym_mse(
                         raw_stage1_scores['current_cover_edge_valid_logit'],
@@ -4285,7 +4467,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         graph_targets['merge_flow_lower_valid'],
                     ),
                 ])
-            semantic_transition_consistency_loss = torch.stack(transition_consistency_terms).mean()
+            semantic_transition_consistency_loss = (
+                torch.stack(transition_consistency_terms).mean()
+                if transition_consistency_terms else zero
+            )
 
         if transition_stage1_scores is not None:
             stage1_loss = (
@@ -5191,6 +5376,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             device=device,
             dtype=model_dtype,
         )
+        semantic_state_supervision_profile_id = torch.full(
+            (B,),
+            profile_id_map.get(self.semantic_state_supervision_profile, -1.0),
+            device=device,
+            dtype=model_dtype,
+        )
         group_mask = getattr(self.model, 'semantic_motion_condition_group_mask', None)
         if group_mask is not None:
             semantic_motion_group_mask = group_mask.to(device=device, dtype=model_dtype).reshape(1, -1).expand(B, -1)
@@ -5290,6 +5481,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'semantic_prev_corruption_enabled': semantic_prev_corruption_enabled,
             'semantic_motion_condition_profile': semantic_motion_profile_id,
             'semantic_motion_condition_profile_id': semantic_motion_profile_id,
+            'semantic_state_supervision_profile': semantic_state_supervision_profile_id,
+            'semantic_state_supervision_profile_id': semantic_state_supervision_profile_id,
             'semantic_motion_condition_group_mask': semantic_motion_group_mask,
             'pass1_trajectory': pass1_trajectory,
             'pass2_trajectory': best_trajectory,
@@ -5449,6 +5642,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'semantic_prev_corruption_enabled',
             'semantic_motion_condition_profile',
             'semantic_motion_condition_profile_id',
+            'semantic_state_supervision_profile',
+            'semantic_state_supervision_profile_id',
         ):
             if sample_result.get(key) is not None:
                 result[key] = sample_result[key].detach().float().cpu().numpy()
