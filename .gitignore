@@ -163,3 +163,12 @@ yarn-error.log*
 config/secrets.yaml
 config/private.yaml
 *.secret.yaml
+
+# NAVSIM local scratch
+GPU
+config/tmp/
+docs/tmp/
+scripts/codex_bash/
+scripts/_recover_*.sh
+scripts/_r2a_split.sh
+scripts/_run_shard1.sh

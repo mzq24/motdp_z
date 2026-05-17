@@ -1,0 +1,52 @@
+# NavSim Simple White-Noise Diffusion Config
+# Phase 1: pure diffusion, no modes, no semantic state
+
+# ---- Paths ----
+navsim:
+  data_root: /workspace2/data/navsim
+  log_split: trainval     # trainval, test, mini
+  navtrain_sensors: false  # set true after downloading navtrain sensor subset
+  maps_root: /workspace2/data/navsim/maps
+  openscene_root: /workspace2/data/navsim
+
+lead:
+  checkpoint: /workspace1/z_project/models/navsim_backbones/tfv6_navsim/model_0060.pth
+  config: /workspace1/z_project/models/navsim_backbones/tfv6_navsim/config.json
+
+# ---- Model ----
+model:
+  d_model: 512
+  n_head: 8
+  n_layer: 4
+  d_ffn: 2048
+  p_drop_attn: 0.1
+  p_drop_emb: 0.1
+  traj_horizon: 8         # 8 waypoints @ 2Hz = 4s
+  traj_dim: 2
+  ego_input_dim: 14
+  ego_history_frames: 4
+  prediction_type: sample  # predict x0 directly
+  num_inference_steps: 10
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+
+# ---- Training ----
+training:
+  batch_size: 64
+  epochs: 60
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  warmup_epochs: 3
+  lr_final: 1.0e-7
+  max_grad_norm: 1.0
+  use_bf16: true
+  num_workers: 8
+  prefetch_factor: 4
+  val_every_epochs: 5
+
+# ---- Scene Filter (matching navtrain) ----
+scene_filter:
+  num_history_frames: 4
+  num_future_frames: 10
+  frame_interval: 1
+  has_route: true
