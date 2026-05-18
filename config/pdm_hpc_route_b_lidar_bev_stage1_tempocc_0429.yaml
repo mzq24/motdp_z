@@ -43,8 +43,8 @@ dataloader:
   semantic_shift_max_weight: 8.0
 
 obs_horizon: 4
-pred_horizon: 10
-action_horizon: 6
+pred_horizon: 8
+action_horizon: 8
 n_obs_steps: 4
 
 ema:
@@ -95,13 +95,14 @@ shape_meta:
 enable_action_normalization: true
 
 bev_encoder:
-  state_dim: 14
+  state_dim: 8
 
 policy:
   input_dim: 2
   output_dim: 2
-  horizon: 6
+  horizon: 8
   n_obs_steps: 4
+  num_waypoints: 50
   cond_dim: 256
   obs_as_global_cond: true
   n_layer: 4
@@ -113,9 +114,9 @@ policy:
   time_as_cond: true
   obs_as_cond: true
   n_cond_layers: 6
-  action_horizon: 6
+  action_horizon: 8
   traj_can_attend_route: true
-  use_condition_group_dropout: true
+  use_condition_group_dropout: false
 
 route_b:
   num_samples: 1
@@ -127,14 +128,14 @@ route_b:
   use_stage1_state: true
   shared_stage1_training_source: clean_then_noisy
   shared_stage1_training_source_switch_epoch: 30
-  use_speed_profile_head: false
+  use_speed_profile_head: true
   use_traj_branch_condition: true
   semantic_motion_condition_mode: compact_graph
   use_cover_relation_graph_decoder: true
   cover_graph_use_traj_context: false
   cover_graph_use_speed_context: false
   use_route_prev_coarse_memory: true
-  use_route_intent_token: true
+  use_route_intent_token: false
   route_intent_gate_init: 0.1
   traj_branch_condition_scale: 2.0
   traj_branch_condition_detach: true
@@ -210,7 +211,10 @@ route_b:
   guidance_scale: 0.0
   stage1_loss_weight: 1.0
   speed_loss_weight: 0.2
-  speed_profile_loss_weight: 0.0
+  speed_profile_loss_weight: 0.1
+  use_acceleration_profile_aux_loss: false
+  acceleration_profile_loss_weight: 0.0
+  acceleration_profile_dt: 0.5
   speed_profile_dt: 0.5
   stage1_chase_weight: 1.0
   stage1_meet_weight: 1.0
@@ -244,6 +248,12 @@ reg_loss_weight: 6.0
 
 dataset:
   use_per_frame: false
+  speed_profile_dt: 0.5
+  trajectory_horizon: 8
+  route_num_waypoints: 50
+  ego_status_dim: 8
+  load_exact_next_speed_online: false
+  next_speed_frame_offset: 2
   feature_suffix: ensemble
   use_fullres_upsample_cache: false
   stage_feature_cache_to_ram: true

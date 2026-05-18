@@ -2262,10 +2262,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if not (self.training and self.use_condition_group_dropout):
             return ego_status
         if ego_status.shape[-1] < 14:
-            raise ValueError(
-                "Condition group dropout expects ego_status layout "
-                "[speed, theta, command(6), target_point(2), target_point_next(2), waypoints(2)]."
-            )
+            return ego_status
 
         dropped = ego_status.clone()
         B = dropped.shape[0]
@@ -2965,12 +2962,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_wp_emb = self._embed_route_waypoint_tokens(route_points)
         route_diff_query = self.route_diff_query.expand(B, T_route, -1)
         route_emb = route_wp_emb + route_diff_query + conditioning.unsqueeze(1)
-        if self.use_route_intent_token:
-            if current_status.shape[-1] < 12:
-                raise ValueError(
-                    "route intent token expects ego_status layout with "
-                    "command + target_point + target_point_next at indices 2:12"
-                )
+        if self.use_route_intent_token and current_status.shape[-1] >= 12:
             route_intent = current_status[:, 2:12]
             route_intent_emb = self.route_intent_proj(route_intent)
             route_emb = route_emb + torch.sigmoid(self.route_intent_gate) * route_intent_emb.unsqueeze(1)

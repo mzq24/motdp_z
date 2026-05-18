@@ -1332,6 +1332,8 @@ def validate_model(
                     val_metrics['speed_loss'].append(loss_dict['speed_loss'].item())
                 if 'speed_profile_loss' in loss_dict:
                     val_metrics['speed_profile_loss'].append(loss_dict['speed_profile_loss'].item())
+                if 'acceleration_profile_loss' in loss_dict:
+                    val_metrics['acceleration_profile_loss'].append(loss_dict['acceleration_profile_loss'].item())
                 for key in (
                     'stage1_merge_yld_loss',
                     'stage1_merge_go_loss',
@@ -1422,6 +1424,8 @@ def validate_model(
                         val_metrics[key].append(loss_dict[key].item())
                 for key, value in loss_dict.items():
                     if key.startswith('speed_profile_step') and key.endswith('_loss'):
+                        val_metrics[key].append(value.item() if isinstance(value, torch.Tensor) else value)
+                    if key.startswith('acceleration_profile_step') and key.endswith('_loss'):
                         val_metrics[key].append(value.item() if isinstance(value, torch.Tensor) else value)
                 if 'stage1_semantic_transition_loss' in loss_dict:
                     val_metrics['gtprev_semantic_transition_loss'].append(
@@ -1826,21 +1830,22 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     val_dataset_path = os.path.join(dataset_path_root, 'val')
     image_data_root = config.get('training', {}).get('image_data_root')
     
-    use_per_frame = config.get('dataset', {}).get('use_per_frame', False)
-    cache_dir = config.get('dataset', {}).get('cache_dir', None)  # e.g. /tmp/tmp_data for tmpfs
-    train_filter_bad_routes = config.get('dataset', {}).get('train_filter_bad_routes', True)
-    val_filter_bad_routes = config.get('dataset', {}).get('val_filter_bad_routes', True)
-    train_retain_bad_routes_for_energy = config.get('dataset', {}).get('train_retain_bad_routes_for_energy', False)
-    val_retain_bad_routes_for_energy = config.get('dataset', {}).get('val_retain_bad_routes_for_energy', False)
-    use_fullres_upsample_cache = config.get('dataset', {}).get('use_fullres_upsample_cache', True)
-    train_warmup_memmap_page_cache = bool(config.get('dataset', {}).get('train_warmup_memmap_page_cache', False))
-    train_warmup_lidar_page_cache = bool(config.get('dataset', {}).get('train_warmup_lidar_page_cache', False))
-    train_warmup_max_samples = config.get('dataset', {}).get('train_warmup_max_samples', None)
+    dataset_cfg = config.get('dataset', {})
+    use_per_frame = dataset_cfg.get('use_per_frame', False)
+    cache_dir = dataset_cfg.get('cache_dir', None)  # e.g. /tmp/tmp_data for tmpfs
+    train_filter_bad_routes = dataset_cfg.get('train_filter_bad_routes', True)
+    val_filter_bad_routes = dataset_cfg.get('val_filter_bad_routes', True)
+    train_retain_bad_routes_for_energy = dataset_cfg.get('train_retain_bad_routes_for_energy', False)
+    val_retain_bad_routes_for_energy = dataset_cfg.get('val_retain_bad_routes_for_energy', False)
+    use_fullres_upsample_cache = dataset_cfg.get('use_fullres_upsample_cache', True)
+    train_warmup_memmap_page_cache = bool(dataset_cfg.get('train_warmup_memmap_page_cache', False))
+    train_warmup_lidar_page_cache = bool(dataset_cfg.get('train_warmup_lidar_page_cache', False))
+    train_warmup_max_samples = dataset_cfg.get('train_warmup_max_samples', None)
     if train_warmup_max_samples in (None, 0, "0"):
         train_warmup_max_samples = None
     else:
         train_warmup_max_samples = int(train_warmup_max_samples)
-    stage_feature_cache_to_ram = bool(config.get('dataset', {}).get('stage_feature_cache_to_ram', False))
+    stage_feature_cache_to_ram = bool(dataset_cfg.get('stage_feature_cache_to_ram', False))
     cache_source_dir = config.get('dataset', {}).get(
         'cache_source_dir',
         os.path.join(image_data_root, 'tmp_data') if image_data_root else None,
@@ -1857,6 +1862,12 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     gps_noise_cfg = config.get('augmentation', {}).get('gps_noise', {})
     route_b_cfg = config.get('route_b', {})
     policy_cfg = config.get('policy', {})
+    load_exact_next_speed_online = bool(dataset_cfg.get('load_exact_next_speed_online', False))
+    next_speed_frame_offset = int(dataset_cfg.get('next_speed_frame_offset', 2))
+    speed_profile_dt = float(dataset_cfg.get('speed_profile_dt', route_b_cfg.get('speed_profile_dt', 0.5)))
+    trajectory_horizon = int(dataset_cfg.get('trajectory_horizon', policy_cfg.get('horizon', config.get('action_horizon', 8))))
+    route_num_waypoints = int(dataset_cfg.get('route_num_waypoints', policy_cfg.get('num_waypoints', 50)))
+    ego_status_dim = int(dataset_cfg.get('ego_status_dim', config.get('bev_encoder', {}).get('state_dim', 8)))
     lidar_history_frames = max(
         int(route_b_cfg.get('lidar_history_frames', policy_cfg.get('ego_status_seq_len', config.get('obs_horizon', 1)))),
         1,
@@ -1895,7 +1906,13 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         lidar_history_frames=lidar_history_frames,
         filter_bad_routes=train_filter_bad_routes,
         retain_bad_routes_for_energy=train_retain_bad_routes_for_energy,
+        load_exact_next_speed_online=load_exact_next_speed_online,
+        next_speed_frame_offset=next_speed_frame_offset,
+        speed_profile_dt=speed_profile_dt,
         use_fullres_upsample_cache=use_fullres_upsample_cache,
+        trajectory_horizon=trajectory_horizon,
+        route_num_waypoints=route_num_waypoints,
+        ego_status_dim=ego_status_dim,
     )
     val_dataset_orig = None
     val_dataset = None
@@ -1910,7 +1927,13 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             lidar_history_frames=lidar_history_frames,
             filter_bad_routes=val_filter_bad_routes,
             retain_bad_routes_for_energy=val_retain_bad_routes_for_energy,
+            load_exact_next_speed_online=load_exact_next_speed_online,
+            next_speed_frame_offset=next_speed_frame_offset,
+            speed_profile_dt=speed_profile_dt,
             use_fullres_upsample_cache=use_fullres_upsample_cache,
+            trajectory_horizon=trajectory_horizon,
+            route_num_waypoints=route_num_waypoints,
+            ego_status_dim=ego_status_dim,
         )
         val_dataset = val_dataset_orig
 
@@ -2698,6 +2721,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                     postfix['spd'] = f'{loss_dict["speed_loss"].item():.3f}'
                 if 'speed_profile_loss' in loss_dict:
                     postfix['spf'] = f'{loss_dict["speed_profile_loss"].item():.3f}'
+                if 'acceleration_profile_loss' in loss_dict:
+                    postfix['acc'] = f'{loss_dict["acceleration_profile_loss"].item():.3f}'
                 pbar.set_postfix(postfix)
 
             # Log to wandb less frequently to reduce overhead
@@ -2716,6 +2741,7 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                 }
                 # Individual losses
                 for lk in ('cls_loss', 'reg_loss', 'route_loss', 'speed_loss', 'speed_profile_loss',
+                           'acceleration_profile_loss',
                            'stage1_loss', 'energy_loss', 'alignment_loss',
                            'energy_front_loss', 'energy_left_loss', 'energy_right_loss',
                            'energy_chase_loss', 'energy_merge_loss', 'energy_cross_loss',
@@ -2782,6 +2808,8 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
                 for lk, val in loss_dict.items():
                     if lk.startswith('speed_profile_step') and lk.endswith('_loss'):
+                        log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
+                    if lk.startswith('acceleration_profile_step') and lk.endswith('_loss'):
                         log_data[f"train/{lk}"] = val.item() if isinstance(val, torch.Tensor) else val
                 # Weighted losses (Route A only)
                 for wk in ('cls_loss_weighted', 'reg_loss_weighted', 'route_loss_weighted'):

@@ -294,3 +294,65 @@ Full official LEAD navtest run is still active.
 - Last observed cache log timestamp: `2026-05-16 16:06:50 UTC` (`2026-05-17 00:06:50 SGT`)
 
 No action taken; leave the tmux job running.
+
+### Full navtest 0145 Sharded Run: 2026-05-17
+
+Goal: reproduce the official LEAD planner full navtest result with LEAD repo code, and inspect whether official LEAD has the same `two_frame_extended_comfort` weakness as MoT-DP diffusion.
+
+Code changes:
+
+- `scripts/_run_lead_official_navtest.sh` now accepts `LOG_NAMES_JSON` and forwards it to `train_test_split.scene_filter.log_names`.
+- `scripts/_run_lead_official_navtest_shards_0145.sh` launches four official LEAD PDM runs over precomputed navtest log shards.
+
+Existing single-GPU run is still active and left untouched:
+
+- tmux: `lead_navtest_full_0516`
+- log: `/workspace2/z_project/navsim_exp_lead_official/logs/lead_navtest_full_eval_20260516.log`
+- GPU: `2`
+
+0145 sharded run:
+
+```bash
+cd /workspace1/z_project/code/motdp_z_navsim_motdp
+EXP_PREFIX=lead_official_navtest_full_model0060_0145_20260517 \
+GPUS_STR="0 1 4 5" \
+scripts/_run_lead_official_navtest_shards_0145.sh
+```
+
+Tmux session:
+
+`lead0145`
+
+Driver log:
+
+`/workspace2/z_project/navsim_exp_lead_official/logs/lead_official_navtest_full_model0060_0145_20260517_driver.log`
+
+Shard logs:
+
+- `/workspace2/z_project/navsim_exp_lead_official/logs/lead_official_navtest_full_model0060_0145_20260517_shard0_of4_gpu0_20260517_110150.log`
+- `/workspace2/z_project/navsim_exp_lead_official/logs/lead_official_navtest_full_model0060_0145_20260517_shard1_of4_gpu1_20260517_110150.log`
+- `/workspace2/z_project/navsim_exp_lead_official/logs/lead_official_navtest_full_model0060_0145_20260517_shard2_of4_gpu4_20260517_110150.log`
+- `/workspace2/z_project/navsim_exp_lead_official/logs/lead_official_navtest_full_model0060_0145_20260517_shard3_of4_gpu5_20260517_110150.log`
+
+Shard sizes from reused balanced navtest log shards:
+
+- shard0: 3,034 scenarios
+- shard1: 3,041 scenarios
+- shard2: 3,037 scenarios
+- shard3: 3,034 scenarios
+- total: 12,146 scenarios
+
+Initial status at launch:
+
+- all four shard processes started successfully;
+- Hydra override includes shard-specific `train_test_split.scene_filter.log_names`;
+- all four logs entered `Processing scenario ... / 30xx`;
+- metric cache is reused from `/workspace2/z_project/navsim_exp_lead_official/metric_cache_navtest_v1_1`.
+
+When finished, merge/compare the four CSVs and record:
+
+- full average score;
+- `history_comfort`;
+- `two_frame_extended_comfort`;
+- DAC/NC/TTC/EP/lane keeping;
+- whether official LEAD comfort is high enough to indicate postprocessing/planner temporal consistency rather than model-only quality.

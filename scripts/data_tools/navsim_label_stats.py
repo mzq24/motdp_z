@@ -152,7 +152,10 @@ def sample_path_by_distance(
 ) -> Tuple[np.ndarray, np.ndarray]:
     path = np.zeros((int(num_points), 2), dtype=np.float32)
     mask = np.zeros(int(num_points), dtype=bool)
-    if points.shape[0] < 2:
+    if points.shape[0] == 0:
+        return path, mask
+    if points.shape[0] == 1:
+        path[:] = points[0, :2]
         return path, mask
 
     seg_lens = np.linalg.norm(np.diff(points, axis=0), axis=1)
@@ -160,18 +163,15 @@ def sample_path_by_distance(
     keep = np.concatenate([[True], np.diff(dist) > 1e-3])
     dist = dist[keep]
     points = points[keep]
-    if points.shape[0] < 2 or dist[-1] < step_m:
+    if points.shape[0] < 2:
+        path[:] = points[-1, :2]
         return path, mask
 
     targets = np.arange(step_m, step_m * (int(num_points) + 1), step_m, dtype=np.float32)
+    path[:, 0] = np.interp(targets, dist, points[:, 0])
+    path[:, 1] = np.interp(targets, dist, points[:, 1])
     valid = targets <= dist[-1]
-    if not np.any(valid):
-        return path, mask
-
-    targets_valid = targets[valid]
-    path[: len(targets_valid), 0] = np.interp(targets_valid, dist, points[:, 0])
-    path[: len(targets_valid), 1] = np.interp(targets_valid, dist, points[:, 1])
-    mask[: len(targets_valid)] = True
+    mask[:] = valid
     return path, mask
 
 

@@ -542,7 +542,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
             output_dim=policy_cfg.get('output_dim', 2),
-            horizon=policy_cfg.get('horizon', 6),
+            horizon=policy_cfg.get('horizon', 8),
             n_obs_steps=self.n_obs_steps,
             cond_dim=256,
             n_layer=policy_cfg.get('n_layer', 8),
@@ -610,6 +610,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.energy_loss_weight = self.stage1_loss_weight
         self.speed_loss_weight = route_b_cfg.get('speed_loss_weight', 1.0)
         self.speed_profile_loss_weight = route_b_cfg.get('speed_profile_loss_weight', 1.0)
+        self.acceleration_profile_loss_weight = route_b_cfg.get('acceleration_profile_loss_weight', 0.0)
+        self.use_acceleration_profile_aux_loss = bool(route_b_cfg.get(
+            'use_acceleration_profile_aux_loss',
+            self.acceleration_profile_loss_weight > 0.0,
+        ))
+        self.acceleration_profile_dt = max(
+            float(route_b_cfg.get('acceleration_profile_dt', self.speed_profile_dt)),
+            1e-6,
+        )
 
         # DDIM Scheduler
         self.diffusion_scheduler = DDIMScheduler(
@@ -696,6 +705,66 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             displacements = first_disp
         speed_profile = displacements.norm(dim=-1) / max(self.speed_profile_dt, 1e-6)
         return speed_profile.to(device=device, dtype=model_dtype).clamp(min=0.0, max=20.0)
+
+    def _fit_profile_time_dim(self, target: torch.Tensor, target_len: int) -> torch.Tensor:
+        if target.shape[1] == target_len:
+            return target
+        if target.shape[1] > target_len:
+            return target[:, :target_len]
+        if target.shape[1] == 0:
+            pad_value = target.new_zeros(target.shape[0], 1)
+        else:
+            pad_value = target[:, -1:]
+        pad = pad_value.expand(-1, target_len - target.shape[1])
+        return torch.cat([target, pad], dim=1)
+
+    def _get_speed_profile_target(
+        self,
+        batch: Dict[str, torch.Tensor],
+        trajectory: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        target_len: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        target = batch.get('speed_profile_target_mps')
+        if target is not None:
+            target = target.to(device=device, dtype=model_dtype)
+            if target.ndim == 1:
+                target = target.unsqueeze(-1)
+            elif target.ndim > 2:
+                target = target.reshape(target.shape[0], -1)
+            target = target.clamp(min=0.0, max=20.0)
+        else:
+            target = self._compute_speed_profile_target(trajectory, device, model_dtype)
+
+        if target is not None and target_len is not None:
+            target = self._fit_profile_time_dim(target, target_len)
+        return target
+
+    def _get_acceleration_profile_target(
+        self,
+        batch: Dict[str, torch.Tensor],
+        speed_profile_target: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        target_len: int,
+    ) -> Optional[torch.Tensor]:
+        target = batch.get('acceleration_profile_target_mps2')
+        if target is not None:
+            target = target.to(device=device, dtype=model_dtype)
+            if target.ndim == 1:
+                target = target.unsqueeze(-1)
+            elif target.ndim > 2:
+                target = target.reshape(target.shape[0], -1)
+        elif speed_profile_target is not None and speed_profile_target.shape[1] >= 2:
+            target = (
+                speed_profile_target[:, 1:] - speed_profile_target[:, :-1]
+            ) / self.acceleration_profile_dt
+        else:
+            return None
+
+        target = target.clamp(min=-20.0, max=20.0)
+        return self._fit_profile_time_dim(target, target_len)
 
     def _has_stage1_labels(self, batch: Dict[str, torch.Tensor]) -> bool:
         if not self.use_stage1_speed_energy:
@@ -3154,6 +3223,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             return self.abs_z_norm(abs_traj)
         return self.z_norm(self.abs_to_delta(abs_traj))
 
+
+    @staticmethod
+    def _fit_point_stats(values: torch.Tensor, target_len: int, extrapolate_xy: bool = False) -> torch.Tensor:
+        if values.shape[0] == target_len:
+            return values
+        if values.shape[0] > target_len:
+            return values[:target_len]
+        if values.shape[0] == 0:
+            return values.new_zeros(target_len, *values.shape[1:])
+        pad_len = target_len - values.shape[0]
+        if extrapolate_xy and values.ndim == 2 and values.shape[-1] == 2 and values.shape[0] >= 2:
+            step = values[-1] - values[-2]
+            if torch.linalg.norm(step).item() < 1e-6:
+                step = values.new_tensor([1.0, 0.0])
+            extra_steps = torch.arange(1, pad_len + 1, dtype=values.dtype, device=values.device).unsqueeze(-1)
+            pad = values[-1:].expand(pad_len, -1) + extra_steps * step.unsqueeze(0)
+        else:
+            pad = values[-1:].expand(pad_len, *values.shape[1:])
+        return torch.cat([values, pad], dim=0)
+
     # ========== Normalization: Per-Timestep Abs Z-Score ==========
     def register_abs_stats(self, abs_mean, abs_std):
         """Register per-step abs mean/std for z-score normalization.
@@ -3163,6 +3252,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             abs_mean = torch.from_numpy(abs_mean).float()
         if isinstance(abs_std, np.ndarray):
             abs_std = torch.from_numpy(abs_std).float()
+        abs_mean = self._fit_point_stats(abs_mean, self.horizon, extrapolate_xy=True)
+        abs_std = self._fit_point_stats(abs_std, self.horizon, extrapolate_xy=False)
         device = next(self.parameters()).device
         self.register_buffer('abs_mean', abs_mean.to(device))
         self.register_buffer('abs_std', abs_std.to(device))
@@ -3190,6 +3281,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             route_abs_mean = torch.from_numpy(route_abs_mean).float()
         if isinstance(route_abs_std, np.ndarray):
             route_abs_std = torch.from_numpy(route_abs_std).float()
+        route_abs_mean = self._fit_point_stats(route_abs_mean, self.num_waypoints, extrapolate_xy=True)
+        route_abs_std = self._fit_point_stats(route_abs_std, self.num_waypoints, extrapolate_xy=False)
         device = next(self.parameters()).device
         self.register_buffer('route_abs_mean', route_abs_mean.to(device))
         self.register_buffer('route_abs_std', route_abs_std.to(device))
@@ -4404,12 +4497,27 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
         transfuser_lidar_bev = self._get_transfuser_lidar_bev(batch, device, model_dtype)
         ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
+        if trajectory.shape[1] != self.horizon:
+            if trajectory.shape[1] > self.horizon:
+                trajectory = trajectory[:, :self.horizon]
+            else:
+                pad_value = trajectory[:, -1:] if trajectory.shape[1] > 0 else trajectory.new_zeros(B, 1, D)
+                pad = pad_value.expand(-1, self.horizon - trajectory.shape[1], -1)
+                trajectory = torch.cat([trajectory, pad], dim=1)
 
         route_gt = batch.get('route', None)
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)
         else:
             raise KeyError("Joint Route B ego diffusion requires 'route' in the training batch")
+        route_mask = batch.get('route_mask', batch.get('path_mask', None))
+        if route_mask is not None:
+            route_mask = route_mask.to(device=device, dtype=model_dtype)
+            if route_mask.ndim > 2:
+                route_mask = route_mask.reshape(route_mask.shape[0], -1)
+            elif route_mask.ndim == 1:
+                route_mask = route_mask.unsqueeze(-1)
+            route_mask = self._fit_profile_time_dim(route_mask, route_gt.shape[1]).clamp(0.0, 1.0)
 
         has_stage1_labels = self._has_stage1_labels(batch)
         train_speed_head_active = self._train_branch_enabled_with_schedule(
@@ -4497,12 +4605,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         route_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         if route_pred is not None:
-            route_recon = self._reduce_per_sample(
-                F.l1_loss(route_pred_abs, route_gt, reduction='none')
-            )
-            route_fde = self._reduce_per_sample(
-                F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='none')
-            )
+            if route_mask is not None:
+                route_per_point = F.l1_loss(route_pred_abs, route_gt, reduction='none').mean(dim=-1)
+                route_denom = route_mask.sum(dim=-1).clamp(min=1.0)
+                route_recon = (route_per_point * route_mask).sum(dim=-1) / route_denom
+                route_fde = F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='none').mean(dim=-1)
+                route_fde = route_fde * route_mask[:, -1]
+            else:
+                route_recon = self._reduce_per_sample(
+                    F.l1_loss(route_pred_abs, route_gt, reduction='none')
+                )
+                route_fde = self._reduce_per_sample(
+                    F.l1_loss(route_pred_abs[:, -1], route_gt[:, -1], reduction='none')
+                )
             route_loss = self._masked_batch_mean(
                 route_recon + self.route_final_loss_weight * route_fde,
                 good_route_mask,
@@ -4511,7 +4626,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # Speed loss: two-hot cross-entropy
         speed_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         speed_profile_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
+        acceleration_profile_loss = torch.tensor(0.0, device=device, dtype=model_dtype)
         speed_profile_step_losses = []
+        acceleration_profile_step_losses = []
+        speed_profile_target = None
         if speed_pred is not None and train_speed_head_active:
             speed_target = self._compute_speed_target(trajectory, device, batch=batch)
             if speed_target is not None:
@@ -4522,7 +4640,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 )
                 speed_loss = self._masked_batch_mean(speed_per_sample, good_route_mask)
         if self.use_speed_profile_head and speed_profile_pred is not None and train_speed_head_active:
-            speed_profile_target = self._compute_speed_profile_target(trajectory, device, model_dtype)
+            speed_profile_target = self._get_speed_profile_target(
+                batch, trajectory, device, model_dtype, target_len=speed_profile_pred.shape[1]
+            )
             if speed_profile_target is not None:
                 step_weights = self.speed_profile_step_weights[:speed_profile_pred.shape[1]].to(
                     device=device, dtype=model_dtype
@@ -4540,6 +4660,39 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     profile_per_step * step_weights.unsqueeze(0)
                 ).sum(dim=-1) / step_weights.sum().clamp(min=1e-6)
                 speed_profile_loss = self._masked_batch_mean(profile_per_sample, good_route_mask)
+
+        if (
+            self.use_acceleration_profile_aux_loss
+            and speed_profile_pred is not None
+            and train_speed_head_active
+            and speed_profile_pred.shape[1] >= 2
+        ):
+            if speed_profile_target is None:
+                speed_profile_target = self._get_speed_profile_target(
+                    batch, trajectory, device, model_dtype, target_len=speed_profile_pred.shape[1]
+                )
+            acceleration_profile_target = self._get_acceleration_profile_target(
+                batch,
+                speed_profile_target,
+                device,
+                model_dtype,
+                target_len=speed_profile_pred.shape[1] - 1,
+            )
+            if acceleration_profile_target is not None:
+                acceleration_profile_pred = (
+                    speed_profile_pred[:, 1:] - speed_profile_pred[:, :-1]
+                ) / self.acceleration_profile_dt
+                acceleration_per_step = F.smooth_l1_loss(
+                    acceleration_profile_pred,
+                    acceleration_profile_target,
+                    reduction='none',
+                )
+                acceleration_profile_step_losses = [
+                    self._masked_batch_mean(acceleration_per_step[:, step_idx], good_route_mask)
+                    for step_idx in range(acceleration_per_step.shape[1])
+                ]
+                acceleration_per_sample = acceleration_per_step.mean(dim=-1)
+                acceleration_profile_loss = self._masked_batch_mean(acceleration_per_sample, good_route_mask)
 
         # ===== Forward 2: Stage1 state training (clean/noisy shared path) =====
         zero_t = torch.tensor(0.0, device=device, dtype=model_dtype)
@@ -4645,6 +4798,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             + self.route_loss_weight * route_loss
             + self.speed_loss_weight * speed_loss
             + self.speed_profile_loss_weight * speed_profile_loss
+            + self.acceleration_profile_loss_weight * acceleration_profile_loss
         )
 
         loss_dict = {
@@ -4670,6 +4824,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             loss_dict['speed_profile_loss'] = speed_profile_loss
             for step_idx, step_loss in enumerate(speed_profile_step_losses):
                 loss_dict[f'speed_profile_step{step_idx}_loss'] = step_loss
+        if self.use_acceleration_profile_aux_loss:
+            loss_dict['acceleration_profile_loss'] = acceleration_profile_loss
+            for step_idx, step_loss in enumerate(acceleration_profile_step_losses):
+                loss_dict[f'acceleration_profile_step{step_idx}_loss'] = step_loss
         if stage1_extra_losses:
             loss_dict['stage1_loss'] = energy_loss
         loss_dict.update(stage1_extra_losses)

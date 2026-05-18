@@ -109,6 +109,10 @@ if [[ -n "${MAX_SCENES}" ]]; then
   OVERRIDES+=("train_test_split.scene_filter.max_scenes=${MAX_SCENES}")
 fi
 
+if [[ -n "${LOG_NAMES_JSON:-}" ]]; then
+  OVERRIDES+=("train_test_split.scene_filter.log_names=${LOG_NAMES_JSON}")
+fi
+
 echo "LEAD_PROJECT_ROOT=${LEAD_PROJECT_ROOT}"
 echo "NAVSIM_DEVKIT_ROOT=${NAVSIM_DEVKIT_ROOT}"
 echo "NAVSIM_EXP_ROOT=${NAVSIM_EXP_ROOT}"
@@ -118,6 +122,7 @@ echo "METRIC_CACHE_PATH=${METRIC_CACHE_PATH}"
 echo "MODE=${MODE}"
 echo "EXPERIMENT_NAME=${EXPERIMENT_NAME}"
 echo "MAX_SCENES=${MAX_SCENES:-FULL}"
+echo "LOG_NAMES_JSON=${LOG_NAMES_JSON:-FULL}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "CONDA_ENV=${CONDA_ENV}"
 

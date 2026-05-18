@@ -338,7 +338,7 @@ class NavSimSimpleDiffusion(nn.Module):
         p_drop_emb: float = 0.1,
         traj_horizon: int = 8,
         traj_dim: int = 2,
-        ego_input_dim: int = 14,
+        ego_input_dim: int = 8,
         ego_history_frames: int = 4,
         prediction_type: str = "sample",  # "sample" = predict x0, "epsilon" = predict noise
         num_inference_steps: int = 10,
@@ -441,7 +441,7 @@ class NavSimSimpleDiffusion(nn.Module):
 
     def _compute_conditioning(self, ego_status: torch.Tensor, timesteps: torch.Tensor):
         """
-        ego_status: (B, T_hist, 14) - 4 frames of ego status
+        ego_status: (B, T_hist, ego_input_dim) - 4 frames of ego status
         timesteps: (B,) - diffusion timesteps
         returns: (B, d_model) - conditioning vector
         """
@@ -457,7 +457,7 @@ class NavSimSimpleDiffusion(nn.Module):
         x_t: (B, 1, T, 2) - noisy trajectory (normalized)
         timesteps: (B,)
         bev_grid: (B, 64, 64, 64) - BEV upsample features
-        ego_status: (B, T_hist, 14)
+        ego_status: (B, T_hist, ego_input_dim)
         returns: pred_x0 (B, 1, T, 2) or pred_eps
         """
         B = x_t.shape[0]
@@ -512,7 +512,7 @@ class NavSimSimpleDiffusion(nn.Module):
         """
         DDIM sampling from pure noise N(0, I).
         bev_grid: (B, 64, 64, 64)
-        ego_status: (B, T_hist, 14)
+        ego_status: (B, T_hist, ego_input_dim)
         returns: trajectory (B, T, 2) in unnormalized space
         """
         num_steps = num_steps or self.num_inference_steps
@@ -563,7 +563,7 @@ class NavSimSimpleDiffusion(nn.Module):
         Compute diffusion training loss.
         batch:
           bev_grid: (B, 64, 64, 64)
-          ego_status: (B, T_hist, 14)
+          ego_status: (B, T_hist, ego_input_dim)
           trajectory: (B, T, 2) - ground truth trajectory in physical space
         """
         gt_traj = batch["trajectory"]  # (B, T, 2)

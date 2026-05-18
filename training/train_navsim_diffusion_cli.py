@@ -79,7 +79,7 @@ DEFAULTS: Dict[str, Any] = dict(
     p_drop_emb=0.1,
     traj_horizon=8,
     traj_dim=2,
-    ego_input_dim=14,
+    ego_input_dim=8,
     ego_history_frames=4,
     prediction_type="sample",
     num_inference_steps=10,
@@ -122,6 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d-ffn", type=int, default=DEFAULTS["d_ffn"])
     parser.add_argument("--p-drop-attn", type=float, default=DEFAULTS["p_drop_attn"])
     parser.add_argument("--p-drop-emb", type=float, default=DEFAULTS["p_drop_emb"])
+    parser.add_argument("--traj-horizon", type=int, default=DEFAULTS["traj_horizon"])
+    parser.add_argument("--traj-dim", type=int, default=DEFAULTS["traj_dim"])
+    parser.add_argument("--ego-input-dim", type=int, default=DEFAULTS["ego_input_dim"])
+    parser.add_argument("--ego-history-frames", type=int, default=DEFAULTS["ego_history_frames"])
     parser.add_argument("--num-inference-steps", type=int, default=DEFAULTS["num_inference_steps"])
     parser.add_argument("--num-train-timesteps", type=int, default=DEFAULTS["num_train_timesteps"])
     parser.add_argument("--beta-schedule", default=DEFAULTS["beta_schedule"])
@@ -270,6 +274,7 @@ def train(cfg: Dict[str, Any]) -> None:
         token_filter_file=cfg["token_filter_file"],
         dedupe_tokens=cfg["dedupe_tokens"],
         load_mode=cfg["load_mode"],
+        ego_input_dim=cfg["ego_input_dim"],
     )
     print("Loading val dataset...")
     val_dataset = NavSimCachedDataset(
@@ -281,6 +286,7 @@ def train(cfg: Dict[str, Any]) -> None:
         token_filter_file=cfg["token_filter_file"],
         dedupe_tokens=cfg["dedupe_tokens"],
         load_mode=cfg["load_mode"],
+        ego_input_dim=cfg["ego_input_dim"],
     )
     print(f"Dataset init finished in {(time.time() - t_load) / 60:.1f}min")
 

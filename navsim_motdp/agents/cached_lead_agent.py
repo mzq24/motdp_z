@@ -12,7 +12,11 @@ class CachedLeadAgent(AbstractAgent):
 
     def __init__(self, checkpoint_path, cache_dir, device='cuda',
                  trajectory_sampling=TrajectorySampling(time_horizon=4, interval_length=0.5)):
-        super().__init__(trajectory_sampling=trajectory_sampling, requires_scene=True)
+        try:
+            super().__init__(requires_scene=True)
+        except TypeError:
+            super().__init__(trajectory_sampling=trajectory_sampling, requires_scene=True)
+        self._trajectory_sampling = trajectory_sampling
         self.checkpoint_path = str(checkpoint_path)
         self.cache_dir = Path(cache_dir)
         self.device_name = device

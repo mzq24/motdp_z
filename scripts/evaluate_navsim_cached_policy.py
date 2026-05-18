@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dataset.navsim_cached_dataset import NavSimCachedDataset, collate_fn
+from model.navsim_joint_route_speed_diffusion import NavSimJointRouteSpeedDiffusion
 from model.navsim_simple_diffusion import NavSimSimpleDiffusion
 
 
@@ -58,7 +59,30 @@ def resolve_token_filter(cache_dir: str, explicit: str | None) -> str | None:
     return str(candidate) if candidate.is_file() else None
 
 
-def build_model(config: Dict[str, Any], device: torch.device) -> NavSimSimpleDiffusion:
+def build_model(config: Dict[str, Any], device: torch.device):
+    if str(config.get("model_type", "")) == "navsim_joint_route_speed_diffusion" or "route_mean" in config:
+        return NavSimJointRouteSpeedDiffusion(
+            d_model=config.get("d_model", 512),
+            n_head=config.get("n_head", 8),
+            n_layer=config.get("n_layer", 4),
+            d_ffn=config.get("d_ffn", 2048),
+            p_drop_attn=config.get("p_drop_attn", 0.1),
+            p_drop_emb=config.get("p_drop_emb", 0.1),
+            traj_horizon=config.get("traj_horizon", 8),
+            traj_dim=config.get("traj_dim", 2),
+            route_points=config.get("route_points", 50),
+            speed_horizon=config.get("speed_horizon", 8),
+            ego_input_dim=config.get("ego_input_dim", 8),
+            ego_history_frames=config.get("ego_history_frames", 4),
+            prediction_type=config.get("prediction_type", "sample"),
+            num_inference_steps=config.get("num_inference_steps", 10),
+            num_train_timesteps=config.get("num_train_timesteps", 1000),
+            beta_schedule=config.get("beta_schedule", "cosine"),
+            route_loss_weight=config.get("route_loss_weight", 1.0),
+            speed_loss_weight=config.get("speed_loss_weight", 0.5),
+            use_raw_bev_feature=config.get("use_raw_bev_feature", True),
+            raw_bev_dim=config.get("raw_bev_dim", 512),
+        ).to(device)
     return NavSimSimpleDiffusion(
         d_model=config.get("d_model", 512),
         n_head=config.get("n_head", 8),
@@ -68,7 +92,7 @@ def build_model(config: Dict[str, Any], device: torch.device) -> NavSimSimpleDif
         p_drop_emb=config.get("p_drop_emb", 0.1),
         traj_horizon=config.get("traj_horizon", 8),
         traj_dim=config.get("traj_dim", 2),
-        ego_input_dim=config.get("ego_input_dim", 14),
+        ego_input_dim=config.get("ego_input_dim", 8),
         ego_history_frames=config.get("ego_history_frames", 4),
         prediction_type=config.get("prediction_type", "sample"),
         num_inference_steps=config.get("num_inference_steps", 10),
@@ -79,20 +103,27 @@ def build_model(config: Dict[str, Any], device: torch.device) -> NavSimSimpleDif
 
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device)
-    config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
-    model = build_model(config, device)
+    config = dict(ckpt.get("config", {})) if isinstance(ckpt, dict) else {}
     state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    if "ego_input_dim" not in config and isinstance(state, dict) and "ego_proj.weight" in state:
+        config["ego_input_dim"] = int(state["ego_proj.weight"].shape[1])
+    model = build_model(config, device)
     model.load_state_dict(state, strict=True)
     if isinstance(ckpt, dict):
         if "traj_mean" in ckpt:
             model.traj_mean.copy_(torch.as_tensor(ckpt["traj_mean"], device=device, dtype=torch.float32))
         if "traj_std" in ckpt:
             model.traj_std.copy_(torch.as_tensor(ckpt["traj_std"], device=device, dtype=torch.float32))
+        if isinstance(model, NavSimJointRouteSpeedDiffusion) and "route_mean" in ckpt:
+            model.route_mean.copy_(torch.as_tensor(ckpt["route_mean"], device=device, dtype=torch.float32))
+            model.route_std.copy_(torch.as_tensor(ckpt["route_std"], device=device, dtype=torch.float32))
+            model.speed_mean.copy_(torch.as_tensor(ckpt["speed_mean"], device=device, dtype=torch.float32))
+            model.speed_std.copy_(torch.as_tensor(ckpt["speed_std"], device=device, dtype=torch.float32))
     model.eval()
     return model, ckpt if isinstance(ckpt, dict) else {}
 
 
-def make_loader(args: argparse.Namespace) -> DataLoader:
+def make_loader(args: argparse.Namespace, ego_input_dim: int = 8) -> DataLoader:
     dataset = NavSimCachedDataset(
         cache_dir=args.cache_dir,
         split=args.split,
@@ -102,6 +133,7 @@ def make_loader(args: argparse.Namespace) -> DataLoader:
         token_filter_file=resolve_token_filter(args.cache_dir, args.token_filter_file),
         dedupe_tokens=args.dedupe_tokens,
         load_mode=args.load_mode,
+        ego_input_dim=ego_input_dim,
     )
     if args.max_samples is not None:
         dataset = Subset(dataset, range(min(args.max_samples, len(dataset))))
@@ -142,7 +174,7 @@ def main() -> None:
     print(f"Sampler steps: {model.num_inference_steps}")
     print(f"Traj stats: mean={model.traj_mean.detach().cpu().numpy()} std={model.traj_std.detach().cpu().numpy()}")
 
-    loader = make_loader(args)
+    loader = make_loader(args, ego_input_dim=int(model.ego_proj.in_features))
     total_samples = 0
     total_ade = 0.0
     total_fde = 0.0
@@ -159,11 +191,17 @@ def main() -> None:
             if args.max_batches is not None and batch_idx >= args.max_batches:
                 break
             bev_grid = batch["bev_grid"].to(device, non_blocking=True).float()
+            bev_feature = batch.get("bev_feature")
+            if bev_feature is not None:
+                bev_feature = bev_feature.to(device, non_blocking=True).float()
             ego_status = batch["ego_status"].to(device, non_blocking=True).float()
             target = batch["trajectory"].to(device, non_blocking=True).float()
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype(args.amp_dtype), enabled=use_amp):
-                pred = model.sample(bev_grid, ego_status, return_trajectory=True)
+                if isinstance(model, NavSimJointRouteSpeedDiffusion):
+                    pred = model.sample(bev_grid, ego_status, bev_feature=bev_feature, return_trajectory=True)
+                else:
+                    pred = model.sample(bev_grid, ego_status, return_trajectory=True)
             pred = pred.float()
 
             l2 = torch.linalg.norm(pred - target, dim=-1)

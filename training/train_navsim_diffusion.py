@@ -115,7 +115,7 @@ def main():
     log('Creating model...')
     model = NavSimSimpleDiffusion(
         d_model=args.d_model, n_head=8, n_layer=args.n_layer, d_ffn=2048,
-        traj_horizon=8, traj_dim=2, ego_input_dim=14, ego_history_frames=4,
+        traj_horizon=8, traj_dim=2, ego_input_dim=8, ego_history_frames=4,
         p_drop_attn=0.1, p_drop_emb=0.1,
         prediction_type='sample', num_inference_steps=10,
         num_train_timesteps=1000, beta_schedule='cosine',

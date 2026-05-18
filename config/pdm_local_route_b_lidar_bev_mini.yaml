@@ -10,6 +10,9 @@ device:
   gpu_ids:
   - 0
 dataset:
+  trajectory_horizon: 8
+  route_num_waypoints: 50
+  ego_status_dim: 8
   use_per_frame: false
   # No feature_suffix: use default (non-ensemble) memmap cache
 dataloader:
@@ -21,8 +24,8 @@ dataloader:
   shuffle: true
   use_route_group_sampler: false
 obs_horizon: 4
-pred_horizon: 10
-action_horizon: 6
+pred_horizon: 8
+action_horizon: 8
 n_obs_steps: 4
 ema:
   inv_gamma: 1.0
@@ -67,12 +70,13 @@ shape_meta:
       type: low_dim
 enable_action_normalization: true
 bev_encoder:
-  state_dim: 14
+  state_dim: 8
 policy:
   input_dim: 2
   output_dim: 2
-  horizon: 6
+  horizon: 8
   n_obs_steps: 4
+  num_waypoints: 50
   cond_dim: 256
   obs_as_global_cond: true
   n_layer: 4
@@ -84,7 +88,7 @@ policy:
   time_as_cond: true
   obs_as_cond: true
   n_cond_layers: 6
-  action_horizon: 6
+  action_horizon: 8
   traj_can_attend_route: true
 
 route_b:

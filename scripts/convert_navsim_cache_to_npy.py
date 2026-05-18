@@ -20,7 +20,7 @@ from tqdm import tqdm
 ARRAY_SPECS = {
     "bev_grid": ((64, 64, 64), np.float16),
     "bev_feature": ((512, 8, 8), np.float16),
-    "ego_status": ((4, 14), np.float32),
+    "ego_status": ((4, 8), np.float32),
     "trajectory": ((8, 2), np.float32),
 }
 
@@ -138,12 +138,21 @@ def main():
         print(f"Writing {path.name}: {len(keep)} samples")
         with np.load(path, allow_pickle=False) as d:
             end = offset + len(keep)
-            for name, (_, dtype) in ARRAY_SPECS.items():
+            for name, (shape_tail, dtype) in ARRAY_SPECS.items():
                 src = d[name]
                 for start in tqdm(range(0, len(keep), 1024), desc=f"{path.name}:{name}", leave=False):
                     chunk_idx = keep[start : start + 1024]
                     out_slice = slice(offset + start, offset + start + len(chunk_idx))
-                    arrays[name][out_slice] = src[chunk_idx].astype(dtype, copy=False)
+                    chunk = src[chunk_idx].astype(dtype, copy=False)
+                    if name == "ego_status" and chunk.shape[-1] != shape_tail[-1]:
+                        target_dim = shape_tail[-1]
+                        if chunk.shape[-1] > target_dim:
+                            chunk = chunk[..., :target_dim]
+                        else:
+                            pad_shape = (*chunk.shape[:-1], target_dim - chunk.shape[-1])
+                            pad = np.zeros(pad_shape, dtype=dtype)
+                            chunk = np.concatenate([chunk, pad], axis=-1)
+                    arrays[name][out_slice] = chunk
             offset = end
         all_tokens.append(tokens)
         all_log_names.append(log_names)

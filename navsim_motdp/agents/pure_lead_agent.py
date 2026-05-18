@@ -31,7 +31,11 @@ class PureLeadAgent(AbstractAgent):
         deterministic_seed: int = 20260516,
         trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=4, interval_length=0.5),
     ) -> None:
-        super().__init__(trajectory_sampling=trajectory_sampling)
+        try:
+            super().__init__(requires_scene=False)
+        except TypeError:
+            super().__init__(trajectory_sampling=trajectory_sampling)
+        self._trajectory_sampling = trajectory_sampling
         self.lead_ckpt_path = str(lead_ckpt_path)
         self.device_name = device
         self.deterministic_seed = int(deterministic_seed)

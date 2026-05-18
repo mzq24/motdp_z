@@ -90,7 +90,7 @@ def build_ego_status(raw_frames, current_idx):
             dt = (f["timestamp"] - raw_frames[i-1]["timestamp"]) / 1e6
             if dt > 0: acc = (vel - pv) / dt
         cmd = np.array(f["driving_command"], dtype=np.float32)
-        feats.append(np.concatenate([vel, acc, cmd, np.zeros(6, dtype=np.float32)]))
+        feats.append(np.concatenate([vel, acc, cmd]))
     return np.stack(feats, axis=0).astype(np.float32)
 
 

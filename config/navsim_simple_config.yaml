@@ -23,7 +23,7 @@ model:
   p_drop_emb: 0.1
   traj_horizon: 8         # 8 waypoints @ 2Hz = 4s
   traj_dim: 2
-  ego_input_dim: 14
+  ego_input_dim: 8
   ego_history_frames: 4
   prediction_type: sample  # predict x0 directly
   num_inference_steps: 10

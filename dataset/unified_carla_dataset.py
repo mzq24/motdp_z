@@ -22,6 +22,62 @@ import matplotlib.pyplot as plt
 import textwrap
 
 
+
+def _fit_polyline_num_points(points: torch.Tensor, target_count: Optional[int]) -> torch.Tensor:
+    """Fit a local-frame polyline to a fixed token count by truncating or linear tail extension."""
+    points = torch.as_tensor(points, dtype=torch.float32)
+    if target_count is None or int(target_count) <= 0:
+        return points[..., :2]
+    target_count = int(target_count)
+    if points.ndim != 2 or points.shape[-1] < 2:
+        return points
+    points = points[:, :2]
+    n = int(points.shape[0])
+    if n == target_count:
+        return points
+    if n == 0:
+        return torch.zeros(target_count, 2, dtype=torch.float32)
+    if n > target_count:
+        return points[:target_count]
+    if n == 1:
+        step = torch.tensor([1.0, 0.0], dtype=points.dtype, device=points.device)
+    else:
+        step = points[-1] - points[-2]
+        if torch.linalg.norm(step).item() < 1e-4:
+            step = torch.tensor([1.0, 0.0], dtype=points.dtype, device=points.device)
+    extra_steps = torch.arange(1, target_count - n + 1, dtype=points.dtype, device=points.device).unsqueeze(-1)
+    extra = points[-1:].expand(target_count - n, -1) + extra_steps * step.unsqueeze(0)
+    return torch.cat([points, extra], dim=0)
+
+
+def _fit_mask_num_points(mask: Optional[torch.Tensor], target_count: int, fallback_len: int) -> torch.Tensor:
+    if mask is None:
+        return torch.ones(target_count, dtype=torch.float32)
+    mask = torch.as_tensor(mask, dtype=torch.float32).reshape(-1)
+    if mask.numel() == target_count:
+        return mask
+    if mask.numel() > target_count:
+        return mask[:target_count]
+    if mask.numel() == 0:
+        fill = torch.ones(1, dtype=torch.float32)
+    else:
+        fill = mask[-1:].clone()
+    pad = fill.expand(target_count - mask.numel())
+    return torch.cat([mask, pad], dim=0)
+
+
+def _fit_last_dim(tensor: torch.Tensor, target_dim: int) -> torch.Tensor:
+    tensor = torch.as_tensor(tensor, dtype=torch.float32)
+    cur_dim = int(tensor.shape[-1])
+    target_dim = int(target_dim)
+    if cur_dim == target_dim:
+        return tensor
+    if cur_dim > target_dim:
+        return tensor[..., :target_dim]
+    pad_shape = (*tensor.shape[:-1], target_dim - cur_dim)
+    pad = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([tensor, pad], dim=-1)
+
 def _apply_stage1_near_zero_speed_snap(final_sample, eps_mps=0.1):
     if 'speed_sample_values' not in final_sample:
         return
@@ -181,7 +237,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  retain_bad_routes_for_energy: bool = False,
                  load_exact_next_speed_online: bool = False,
                  next_speed_frame_offset: int = 2,
+                 speed_profile_dt: float = 0.5,
                  use_fullres_upsample_cache: bool = True,
+                 trajectory_horizon: Optional[int] = None,
+                 route_num_waypoints: Optional[int] = None,
+                 ego_status_dim: int = 14,
                  ):
 
         self.image_data_root = os.path.realpath(image_data_root)
@@ -203,7 +263,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._retain_bad_routes_for_energy = bool(retain_bad_routes_for_energy)
         self._load_exact_next_speed_online = bool(load_exact_next_speed_online)
         self._next_speed_frame_offset = max(int(next_speed_frame_offset), 1)
+        self._speed_profile_dt = max(float(speed_profile_dt), 1e-6)
         self._use_fullres_upsample_cache = bool(use_fullres_upsample_cache)
+        self._trajectory_horizon = int(trajectory_horizon) if trajectory_horizon is not None else None
+        self._route_num_waypoints = int(route_num_waypoints) if route_num_waypoints is not None else None
+        self._ego_status_dim = int(ego_status_dim)
         self._lidar_bev_mmap = None     # numpy memmap for lidar_bev_fp16.bin
         self._lidar_bev_index = None    # dict: route_rel -> {offset, n_frames, frame_ids}
         self._route_speed_cache = {}
@@ -747,6 +811,29 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             return None
         return float(target_speed)
 
+    def _derive_speed_profile_target(self, agent_pos: torch.Tensor) -> Optional[torch.Tensor]:
+        if not isinstance(agent_pos, torch.Tensor) or agent_pos.ndim < 2 or agent_pos.shape[-1] < 2:
+            return None
+        xy = agent_pos[..., :2].to(dtype=torch.float32)
+        if xy.shape[0] < 1:
+            return None
+        first_disp = xy[:1]
+        if xy.shape[0] > 1:
+            displacements = torch.cat([first_disp, xy[1:] - xy[:-1]], dim=0)
+        else:
+            displacements = first_disp
+        speed_profile = displacements.norm(dim=-1) / self._speed_profile_dt
+        return speed_profile.clamp(min=0.0, max=20.0)
+
+    def _derive_acceleration_profile_target(self, speed_profile: torch.Tensor) -> Optional[torch.Tensor]:
+        if not isinstance(speed_profile, torch.Tensor):
+            return None
+        speed_profile = speed_profile.to(dtype=torch.float32).reshape(-1)
+        if speed_profile.numel() < 2:
+            return torch.zeros(0, dtype=torch.float32)
+        acceleration_profile = (speed_profile[1:] - speed_profile[:-1]) / self._speed_profile_dt
+        return acceleration_profile.clamp(min=-20.0, max=20.0)
+
     def __getitem__(self, idx):
         sample = self._sample_cache[idx]
         clone_keys = set()
@@ -865,9 +952,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'vqa':
                 continue
             elif key == 'route':
-                # Load route waypoints (expected shape: (20, 2))
                 route_data = _from_numpy(value, 'route')
                 final_sample['route'] = route_data
+            elif key in ('route_mask', 'path', 'path_mask', 'speed_profile_target_mps', 'acceleration_profile_target_mps2'):
+                final_sample[key] = _from_numpy(value, key)
             elif key == 'target_point_hist':
                 # Two data formats exist:
                 #   Old HPC packed: (T, 4) = [target_point, target_point_next] concatenated
@@ -1095,15 +1183,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample['route'] = final_sample['route'] + current_noise
                 gps_noise_applied = True
 
-        # Build or update ego_status: [speed | theta | command | tp | tp_next | waypoints]
+        # Build or update ego_status. The compact Route-B status is
+        # [speed | theta | command(6)] = 8 dims. Legacy 14-dim samples are sliced
+        # or padded according to dataset.ego_status_dim.
         if 'ego_status' in final_sample:
-            if gps_noise_applied:
+            if gps_noise_applied and final_sample['ego_status'].shape[-1] >= 14:
                 if 'ego_status' in clone_keys:
                     final_sample['ego_status'] = final_sample['ego_status'].clone()
                     clone_keys.discard('ego_status')
                 final_sample['ego_status'][..., 8:10] = final_sample['target_point_hist']
                 final_sample['ego_status'][..., 10:12] = final_sample['target_point_next_hist']
                 final_sample['ego_status'][..., 12:14] = final_sample['waypoints_hist']
+            final_sample['ego_status'] = _fit_last_dim(final_sample['ego_status'], self._ego_status_dim)
         else:
             ego_status_components = []
 
@@ -1118,17 +1209,52 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             command_data = final_sample['command_hist']
             ego_status_components.append(command_data)  # (obs_horizon, 6)
 
-            target_point_data = final_sample['target_point_hist']
-            ego_status_components.append(target_point_data)  # (obs_horizon, 2)
+            if self._ego_status_dim > 8:
+                ego_status_components.append(final_sample['target_point_hist'])
+                ego_status_components.append(final_sample['target_point_next_hist'])
+                ego_status_components.append(final_sample['waypoints_hist'])
 
-            target_point_next_data = final_sample['target_point_next_hist']
-            ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
+            final_sample['ego_status'] = _fit_last_dim(torch.cat(ego_status_components, dim=-1), self._ego_status_dim)
 
-            waypoints_data = final_sample['waypoints_hist']
-            ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
+        if 'route' in final_sample:
+            route = torch.as_tensor(final_sample['route'], dtype=torch.float32)
+            target_route_points = self._route_num_waypoints or int(route.shape[0])
+            raw_route_len = int(route.shape[0])
+            route = _fit_polyline_num_points(route, target_route_points)
+            route_mask = final_sample.get('route_mask', final_sample.get('path_mask', None))
+            final_sample['route'] = route
+            final_sample['route_mask'] = _fit_mask_num_points(route_mask, target_route_points, raw_route_len)
+            if 'path' not in final_sample:
+                final_sample['path'] = route.clone()
+            else:
+                final_sample['path'] = _fit_polyline_num_points(final_sample['path'], target_route_points)
+            path_mask = final_sample.get('path_mask', final_sample['route_mask'])
+            final_sample['path_mask'] = _fit_mask_num_points(path_mask, target_route_points, raw_route_len)
 
-            final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, 14)
+        if 'agent_pos' in final_sample:
+            if self._trajectory_horizon is not None:
+                final_sample['agent_pos'] = _fit_polyline_num_points(final_sample['agent_pos'], self._trajectory_horizon)
+            if 'speed_profile_target_mps' in final_sample:
+                final_sample['speed_profile_target_mps'] = torch.as_tensor(
+                    final_sample['speed_profile_target_mps'], dtype=torch.float32)
+            else:
+                speed_profile = self._derive_speed_profile_target(final_sample['agent_pos'])
+                if speed_profile is not None:
+                    final_sample['speed_profile_target_mps'] = speed_profile
 
+            if 'acceleration_profile_target_mps2' in final_sample:
+                final_sample['acceleration_profile_target_mps2'] = torch.as_tensor(
+                    final_sample['acceleration_profile_target_mps2'], dtype=torch.float32)
+            elif 'speed_profile_target_mps' in final_sample:
+                acceleration_profile = self._derive_acceleration_profile_target(
+                    final_sample['speed_profile_target_mps'])
+                if acceleration_profile is not None:
+                    final_sample['acceleration_profile_target_mps2'] = acceleration_profile
+
+            if 'next_speed_target_mps' not in final_sample and 'speed_profile_target_mps' in final_sample:
+                speed_profile = final_sample['speed_profile_target_mps'].reshape(-1)
+                if speed_profile.numel() > 0:
+                    final_sample['next_speed_target_mps'] = speed_profile[0].clone().detach()
 
         # Only tensors created from numpy-backed storage need a clone for safe multi-worker collate.
         for key in clone_keys:
