@@ -3,22 +3,22 @@ abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/abs_stats.npz
 route_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/route_abs_stats.npz
 device:
   gpu_ids:
-  - 0
-  - 1
   - 2
   - 3
+  - 4
+  - 5
 dataloader:
   batch_size: 256
-  num_workers: 8
+  num_workers: 2
   persistent_workers: true
   pin_memory: false
-  prefetch_factor: 2
-  train_num_workers: 8
-  val_num_workers: 4
+  prefetch_factor: 1
+  train_num_workers: 2
+  val_num_workers: 1
   train_persistent_workers: true
   val_persistent_workers: true
-  train_prefetch_factor: 2
-  val_prefetch_factor: 2
+  train_prefetch_factor: 1
+  val_prefetch_factor: 1
   val_batch_size: 128
   shuffle: true
   use_window_weighted_sampler: true

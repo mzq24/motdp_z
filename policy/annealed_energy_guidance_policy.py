@@ -3923,6 +3923,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             )
             if self.use_chase_front_following_state else None
         )
+        graph_targets = self._get_cover_relation_graph_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_cover_relation_graph_decoder,
+        )
 
         stage1_training_source = self.shared_stage1_training_source
         if stage1_training_source == 'clean_then_noisy':
