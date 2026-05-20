@@ -1726,7 +1726,7 @@ def _write_validation_metrics_artifacts(checkpoint_dir, epoch, train_loss, val_m
     return epoch_json, csv_path
 
 @record  # Records error and tracebacks in case of failure
-def train_pdm_policy(config_path, resume_path=None, val_only=False):
+def train_pdm_policy(config_path, resume_path=None, val_only=False, init_checkpoint_path=None):
     """
     Multi-GPU distributed training for PDM policy
 
@@ -2313,6 +2313,37 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
             )
     else:
         raise ValueError("route_abs_stats_path is required for Route B ego diffusion")
+
+    init_checkpoint_path = init_checkpoint_path or config.get('training', {}).get('init_checkpoint_path', None)
+    if init_checkpoint_path is not None and resume_path is None:
+        if rank == 0:
+            print(f"Initializing model from checkpoint (partial/non-strict): {init_checkpoint_path}")
+        init_ckpt = torch.load(init_checkpoint_path, map_location=device)
+        init_state = init_ckpt.get('model_state_dict', init_ckpt)
+        current_state = policy.state_dict()
+        compatible = {}
+        skipped_missing = []
+        skipped_shape = []
+        for key, value in init_state.items():
+            if key not in current_state:
+                skipped_missing.append(key)
+                continue
+            if tuple(current_state[key].shape) != tuple(value.shape):
+                skipped_shape.append((key, tuple(value.shape), tuple(current_state[key].shape)))
+                continue
+            compatible[key] = value
+        current_state.update(compatible)
+        policy.load_state_dict(current_state, strict=True)
+        if rank == 0:
+            print(
+                f"  ✓ Partial init loaded {len(compatible)} tensors; "
+                f"skipped_missing={len(skipped_missing)}, skipped_shape={len(skipped_shape)}"
+            )
+            if skipped_missing:
+                print(f"  skipped missing preview: {skipped_missing[:8]}{'...' if len(skipped_missing) > 8 else ''}")
+            if skipped_shape:
+                preview = [f"{k}: ckpt{s} -> model{m}" for k, s, m in skipped_shape[:8]]
+                print(f"  skipped shape preview: {preview}{'...' if len(skipped_shape) > 8 else ''}")
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -2949,7 +2980,14 @@ if __name__ == "__main__":
                         help='Path to the configuration YAML file')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--init_checkpoint', type=str, default=None,
+                        help='Path to checkpoint for partial/non-strict weight initialization')
     parser.add_argument('--val_only', action='store_true',
                         help='Only run validation (requires --resume)')
     args = parser.parse_args()
-    train_pdm_policy(config_path=args.config_path, resume_path=args.resume, val_only=args.val_only)
+    train_pdm_policy(
+        config_path=args.config_path,
+        resume_path=args.resume,
+        val_only=args.val_only,
+        init_checkpoint_path=args.init_checkpoint,
+    )

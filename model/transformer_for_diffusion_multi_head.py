@@ -1693,6 +1693,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         use_route_prev_coarse_memory: bool = False,
         use_route_intent_token: bool = False,
         route_intent_gate_init: float = 0.1,
+        use_speed_delta_head: bool = False,
+        delta_speed_norm_scale: float = 5.0,
+        use_state_motion_adapter: bool = False,
+        state_motion_adapter_zero_init: bool = True,
+        state_motion_adapter_state_source: str = "pred_detached",
+        state_motion_adapter_modify_route: bool = False,
+        state_motion_adapter_gate_init: float = 1.0,
+        state_motion_adapter_speed_norm_scale: float = 30.0,
+        state_motion_adapter_margin_scale: float = 5.0,
     ) -> None:
         super().__init__()
 
@@ -1740,6 +1749,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context)
         self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory)
         self.use_route_intent_token = bool(use_route_intent_token)
+        self.use_speed_delta_head = bool(use_speed_delta_head)
+        self.delta_speed_norm_scale = float(delta_speed_norm_scale)
+        self.use_state_motion_adapter = bool(use_state_motion_adapter)
+        self.state_motion_adapter_zero_init = bool(state_motion_adapter_zero_init)
+        self.state_motion_adapter_state_source = str(state_motion_adapter_state_source).lower()
+        if self.state_motion_adapter_state_source not in ("pred_detached", "pred"):
+            raise ValueError(
+                "state_motion_adapter_state_source must be 'pred_detached' or 'pred', "
+                f"got {state_motion_adapter_state_source}"
+            )
+        self.state_motion_adapter_modify_route = bool(state_motion_adapter_modify_route)
+        self.state_motion_adapter_speed_norm_scale = float(state_motion_adapter_speed_norm_scale)
+        self.state_motion_adapter_margin_scale = float(state_motion_adapter_margin_scale)
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -2214,11 +2236,60 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.ReLU(inplace=True),
             nn.Linear(n_emb, horizon),
         )
+        self.speed_delta_head = (
+            nn.Sequential(
+                nn.Linear(n_emb * 2, n_emb // 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(n_emb // 2, 1),
+            )
+            if self.use_speed_delta_head else None
+        )
+
+        self.state_motion_adapter_condition_dim = self.traj_branch_condition_compact_graph_dim + 1
+        self.state_motion_adapter_condition_proj = nn.Sequential(
+            nn.Linear(self.state_motion_adapter_condition_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+
+        def _make_state_motion_adapter_head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.LayerNorm(n_emb),
+                nn.Linear(n_emb, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+
+        self.state_motion_adapter_traj_head = _make_state_motion_adapter_head()
+        self.state_motion_adapter_speed_head = _make_state_motion_adapter_head()
+        self.state_motion_adapter_route_head = (
+            _make_state_motion_adapter_head() if self.state_motion_adapter_modify_route else None
+        )
+        self.state_motion_adapter_global_gate = nn.Parameter(
+            torch.tensor(float(state_motion_adapter_gate_init), dtype=torch.float32)
+        )
 
         self.apply(self._init_weights)
+        if self.state_motion_adapter_zero_init:
+            self._zero_init_state_motion_adapter()
         
         logger.info("TransformerForDiffusion (Multimodal) - parameters: %e", 
                    sum(p.numel() for p in self.parameters()))
+
+    def _zero_init_state_motion_adapter(self):
+        """Keep the untrained adapter residual-free while preserving gradients."""
+        for module in (
+            self.state_motion_adapter_traj_head,
+            self.state_motion_adapter_speed_head,
+            self.state_motion_adapter_route_head,
+        ):
+            if module is None:
+                continue
+            last = module[-1]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                if last.bias is not None:
+                    nn.init.zeros_(last.bias)
     
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -2286,6 +2357,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 no_decay.add(name)
             elif 'route_intent_gate' in name:
                 # Route intent residual gate - no weight decay
+                no_decay.add(name)
+            elif 'state_motion_adapter_global_gate' in name:
+                # Adapter gate - no weight decay
                 no_decay.add(name)
             elif 'route_temp_' in name or 'route_bias_' in name:
                 # Route-specific temperature and bias parameters - no weight decay
@@ -2851,6 +2925,134 @@ class TransformerForDiffusion(ModuleAttrMixin):
             speed_samples=speed_samples,
         )
 
+    def _compose_state_motion_adapter_condition(
+        self,
+        stage1_scores: dict,
+        current_status: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build compact interaction features for the frozen-S -> motion adapter."""
+        dtype = current_status.dtype
+        device = current_status.device
+        B = current_status.shape[0]
+        speed_scale = max(float(self.state_motion_adapter_speed_norm_scale), 1e-6)
+        margin_scale = max(float(self.state_motion_adapter_margin_scale), 1e-6)
+        current_speed = current_status[:, 0].to(device=device, dtype=dtype).reshape(-1)
+
+        def _softmax(name: str, dim: int, fallback_index: int = 0) -> torch.Tensor:
+            logits = stage1_scores.get(name)
+            if logits is None:
+                out = torch.zeros((B, dim), device=device, dtype=dtype)
+                out[:, fallback_index] = 1.0
+                return out
+            return torch.softmax(logits.to(device=device, dtype=dtype).reshape(B, dim), dim=-1)
+
+        def _sigmoid(name: str) -> torch.Tensor:
+            value = stage1_scores.get(name)
+            if value is None:
+                return torch.zeros((B,), device=device, dtype=dtype)
+            return torch.sigmoid(value.to(device=device, dtype=dtype).reshape(-1)).clamp(0.0, 1.0)
+
+        def _speed_mps(name: str) -> torch.Tensor:
+            value = stage1_scores.get(name)
+            if value is None:
+                return torch.zeros((B,), device=device, dtype=dtype)
+            value = torch.nan_to_num(
+                value.to(device=device, dtype=dtype).reshape(-1),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            return (value * speed_scale).clamp(0.0, speed_scale)
+
+        window_probs = _softmax('window_logits', 4, fallback_index=0)
+        decision_probs = _softmax('decision_phase_logits', 2, fallback_index=0)
+        control_probs = _softmax('control_phase_logits', 4, fallback_index=0)
+        opportunity_probs = _softmax('go_opportunity_logits', 2, fallback_index=1)
+
+        current_edge_valid = _sigmoid('current_cover_edge_valid_logit')
+        future_edge_valid = _sigmoid('future_cover_edge_valid_logit')
+        current_edge_mode = _softmax('current_cover_edge_mode_logits', 5, fallback_index=0)
+        future_edge_mode = _softmax('future_cover_edge_mode_logits', 5, fallback_index=0)
+        chase_has_lead = _sigmoid('chase_has_lead_logit')
+
+        current_upper = _speed_mps('current_cover_upper_speed')
+        future_lower = _speed_mps('future_cover_lower_speed')
+        front_follow_upper = _speed_mps('front_follow_upper_speed')
+        merge_flow_lower = _speed_mps('merge_flow_lower_speed')
+
+        current_upper_margin = ((current_upper - current_speed) / margin_scale).clamp(-1.0, 1.0) * current_edge_valid
+        future_lower_margin = ((current_speed - future_lower) / margin_scale).clamp(-1.0, 1.0) * future_edge_valid
+        front_follow_upper_margin = ((front_follow_upper - current_speed) / margin_scale).clamp(-1.0, 1.0) * chase_has_lead
+        merge_flow_lower_margin = ((current_speed - merge_flow_lower) / margin_scale).clamp(-1.0, 1.0) * future_edge_valid
+
+        compact_condition = torch.cat(
+            [
+                window_probs,
+                decision_probs,
+                control_probs,
+                opportunity_probs,
+                torch.cat([current_edge_valid.unsqueeze(-1), current_edge_mode], dim=-1),
+                torch.cat([future_edge_valid.unsqueeze(-1), future_edge_mode], dim=-1),
+                torch.stack(
+                    [
+                        current_upper_margin,
+                        future_lower_margin,
+                        front_follow_upper_margin,
+                        merge_flow_lower_margin,
+                    ],
+                    dim=-1,
+                ),
+                torch.stack(
+                    [
+                        current_edge_valid,
+                        future_edge_valid,
+                        chase_has_lead,
+                        future_edge_valid,
+                    ],
+                    dim=-1,
+                ),
+                torch.zeros((B, self.traj_borrow_aux_dim), device=device, dtype=dtype),
+            ],
+            dim=-1,
+        )
+        current_speed_norm = (current_speed / speed_scale).clamp(0.0, 1.0).unsqueeze(-1)
+        return torch.cat([compact_condition, current_speed_norm], dim=-1)
+
+    def _apply_state_motion_adapter(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        adapter_condition: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        if adapter_condition.dim() != 2 or adapter_condition.shape[-1] != self.state_motion_adapter_condition_dim:
+            raise ValueError(
+                "state motion adapter expects condition as "
+                f"(B, {self.state_motion_adapter_condition_dim}), got {adapter_condition.shape}"
+            )
+        if self.state_motion_adapter_state_source == "pred_detached":
+            adapter_condition = adapter_condition.detach()
+        state_emb = self.state_motion_adapter_condition_proj(adapter_condition)
+        gate = self.state_motion_adapter_global_gate.to(device=traj_out.device, dtype=traj_out.dtype)
+
+        traj_delta = self.state_motion_adapter_traj_head(traj_out + state_emb.unsqueeze(1))
+        speed_delta = self.state_motion_adapter_speed_head(speed_out.squeeze(1) + state_emb).unsqueeze(1)
+        route_delta = None
+        if self.state_motion_adapter_route_head is not None:
+            route_delta = self.state_motion_adapter_route_head(route_out + state_emb.unsqueeze(1))
+            route_out = route_out + gate * route_delta
+
+        traj_out = traj_out + gate * traj_delta
+        speed_out = speed_out + gate * speed_delta
+        info = {
+            'state_motion_adapter_condition': adapter_condition,
+            'state_motion_adapter_gate': gate.reshape(()),
+            'state_motion_adapter_traj_delta': traj_delta,
+            'state_motion_adapter_speed_delta': speed_delta,
+            'state_motion_adapter_route_delta': route_delta,
+        }
+        return traj_out, route_out, speed_out, info
+
     def forward_ego(
         self,
         x_t: torch.Tensor,
@@ -3089,6 +3291,27 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if speed_out is None:
             raise RuntimeError("Decoder ego path expected a speed token output")
 
+        state_motion_adapter_info = None
+        if self.use_state_motion_adapter:
+            adapter_stage1_scores = self._compute_shared_stage1_scores(
+                traj_out=traj_out,
+                route_out=route_out,
+                speed_out=speed_out,
+                route_points=route_points,
+                conditioning=conditioning,
+                speed_samples=None,
+            )
+            adapter_condition = self._compose_state_motion_adapter_condition(
+                adapter_stage1_scores,
+                ego_status[:, -1, :].to(device=device, dtype=model_dtype),
+            )
+            traj_out, route_out, speed_out, state_motion_adapter_info = self._apply_state_motion_adapter(
+                traj_out=traj_out,
+                route_out=route_out,
+                speed_out=speed_out,
+                adapter_condition=adapter_condition,
+            )
+
         traj_pred = self.trajectory_wp_head(traj_out, conditioning, route_features=route_out)
         poses_reg = traj_pred.unsqueeze(1)
         route_pred = self.route_norm_head(route_out, conditioning, current_status)
@@ -3097,6 +3320,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             conditioning,
         ], dim=-1)
         speed_pred = self.speed_head(speed_input)  # (B, num_speed_classes)
+        speed_delta_pred = None
+        if self.speed_delta_head is not None:
+            speed_delta_pred = torch.tanh(self.speed_delta_head(speed_input).squeeze(-1)) * float(self.delta_speed_norm_scale)
         speed_profile_input = torch.cat([
             speed_out.squeeze(1),
             traj_out.mean(dim=1),
@@ -3113,8 +3339,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 'route_points': route_points,
                 'conditioning': conditioning,
                 'speed_pred': speed_pred,
+                'speed_delta_pred': speed_delta_pred,
                 'speed_profile_pred': speed_profile_pred,
             }
+            if state_motion_adapter_info is not None:
+                result.update(state_motion_adapter_info)
             if stage1_speed_samples is not None:
                 stage1_speed_samples = stage1_speed_samples.to(device=device, dtype=model_dtype)
                 result['stage1_raw_scores'] = self._compute_shared_stage1_scores(
