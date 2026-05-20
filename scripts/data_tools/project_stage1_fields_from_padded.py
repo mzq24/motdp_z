@@ -88,6 +88,17 @@ STAGE1_FIELDS = (
     "front_follow_upper_speed_valid",
     "merge_flow_lower_speed_mps",
     "merge_flow_lower_speed_valid",
+    "phase_speed_lower_mps",
+    "phase_speed_upper_mps",
+    "phase_speed_lower_valid",
+    "phase_speed_upper_valid",
+    "phase_speed_lower_source",
+    "phase_speed_upper_source",
+    "state_motion_speed_interval_valid",
+    "state_motion_expert_speed_relation",
+    "state_motion_expert_speed_margin_lower_mps",
+    "state_motion_expert_speed_margin_upper_mps",
+    "state_motion_risky_passable",
     "stage1_speed_debug",
 )
 
