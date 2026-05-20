@@ -286,6 +286,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         with open(packed_path, 'rb') as f:
             all_samples = pickle.load(f)
 
+        if cache_dir is None:
+            cache_dir = os.path.join(image_data_root, 'tmp_data')
+        sfx = f'_{feature_suffix}' if feature_suffix else ''
+        index_path = os.path.join(cache_dir, f'feature_index{sfx}.pkl')
+        feat_bin = os.path.join(cache_dir, f'bev_features_fp16{sfx}.bin')
+        ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}.bin')
+        feature_memmap_available = (
+            (not skip_memmap)
+            and os.path.exists(index_path)
+            and os.path.exists(feat_bin)
+            and os.path.exists(ups_bin)
+        )
+        require_route_features_pt = self._use_per_frame or not feature_memmap_available
+
         # Build route_name -> event_name mapping from disk (event_name is None in old pkl)
         route_name_to_event = {}
         for entry in os.scandir(image_data_root):
@@ -296,13 +310,20 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     route_name_to_event[route_entry.name] = entry.name
         print(f"[Rank {rank}] Scanned {len(route_name_to_event)} routes on disk.")
 
-        # Build set of routes that have route_features.pt
+        # Build set of routes that have route_features.pt. In memmap mode the
+        # per-route route_features.pt files are intentionally absent; the cache
+        # index is the source of truth, so do not drop samples here.
         route_has_features = set()
-        for rn, ev in route_name_to_event.items():
-            feat_pt = os.path.join(image_data_root, ev, rn, 'transfuser_feature', 'route_features.pt')
-            if os.path.exists(feat_pt):
-                route_has_features.add(rn)
-        print(f"[Rank {rank}] Routes with route_features.pt: {len(route_has_features)}/{len(route_name_to_event)}")
+        if require_route_features_pt:
+            for rn, ev in route_name_to_event.items():
+                feat_pt = os.path.join(image_data_root, ev, rn, 'transfuser_feature', 'route_features.pt')
+                if os.path.exists(feat_pt):
+                    route_has_features.add(rn)
+            print(f"[Rank {rank}] Routes with route_features.pt: "
+                  f"{len(route_has_features)}/{len(route_name_to_event)}")
+        else:
+            print(f"[Rank {rank}] Feature memmap cache found ({os.path.basename(index_path)}); "
+                  "skipping route_features.pt route filter.")
 
         # Load bad routes exclude list if it exists
         bad_routes_path = os.path.join(image_data_root, 'bad_routes.txt')
@@ -323,8 +344,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             route = s.get('route_name', '')
             fid = s.get('frame_id', None)
 
-            # Skip if route has no route_features.pt
-            if route not in route_has_features:
+            # Skip if route has no route_features.pt only in legacy fallback
+            # mode. Ensemble memmap datasets no longer keep per-route packs.
+            if require_route_features_pt and route not in route_has_features:
                 missing_routes.add(route)
                 continue
 
@@ -344,7 +366,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             # Derive transfuser_bev_feature path if missing
             if not s.get('transfuser_bev_feature', ''):
                 if fid is not None:
-                    event = route_name_to_event[route]
+                    event = route_name_to_event.get(route)
+                    if event is None:
+                        missing_routes.add(route)
+                        continue
                     s['transfuser_bev_feature'] = os.path.join(
                         event, route, 'transfuser_feature', f'{int(fid):04d}_feature.pt')
                     patched += 1
@@ -360,8 +385,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if bad_route_dropped > 0:
             print(f"[Rank {rank}] Filtered {bad_route_dropped} samples from {len(bad_routes_set)} bad routes (collisions/crashes).")
         if dropped > 0:
+            missing_reason = (
+                "route_features.pt"
+                if require_route_features_pt
+                else "route/event mapping"
+            )
             print(f"[Rank {rank}] WARNING: Dropped {dropped}/{before_count} samples "
-                  f"({len(missing_routes)} routes missing route_features.pt).")
+                  f"({len(missing_routes)} routes missing {missing_reason}).")
             if len(missing_routes) <= 20:
                 for r in sorted(missing_routes):
                     print(f"  [Rank {rank}]   missing: {r}")
@@ -383,12 +413,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         print(f"Grouped into {len(self._route_groups)} routes for batch sampling.")
 
         # ===== Load feature cache (memmap, shared across DDP ranks) =====
-        if cache_dir is None:
-            cache_dir = os.path.join(image_data_root, 'tmp_data')
-        sfx = f'_{feature_suffix}' if feature_suffix else ''
-        index_path = os.path.join(cache_dir, f'feature_index{sfx}.pkl')
-        feat_bin = os.path.join(cache_dir, f'bev_features_fp16{sfx}.bin')
-        ups_bin = os.path.join(cache_dir, f'bev_upsamples_fp16{sfx}.bin')
         # Prefer pre-upsampled 64x64 detail features when available. This keeps
         # the normal BEV feature cache unchanged while avoiding per-sample CPU
         # bilinear interpolation from the older 32x32 upsample cache.
