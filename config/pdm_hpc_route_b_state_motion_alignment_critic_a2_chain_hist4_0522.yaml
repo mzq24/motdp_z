@@ -8,15 +8,15 @@ device:
   - 4
   - 5
 dataloader:
-  batch_size: 256
+  batch_size: 128
   num_workers: 4
-  persistent_workers: true
+  persistent_workers: false
   pin_memory: false
   prefetch_factor: 2
   train_num_workers: 4
   val_num_workers: 2
-  train_persistent_workers: true
-  val_persistent_workers: true
+  train_persistent_workers: false
+  val_persistent_workers: false
   train_prefetch_factor: 2
   val_prefetch_factor: 1
   val_batch_size: 128
