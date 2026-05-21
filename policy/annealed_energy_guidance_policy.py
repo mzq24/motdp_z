@@ -384,6 +384,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.require_semantic_history = bool(
             route_b_cfg.get('require_semantic_history', False)
         )
+        self.state_conditioned_motion_state_source = str(
+            route_b_cfg.get('state_conditioned_motion_state_source', 'chain')
+        ).lower()
+        valid_state_condition_sources = {'chain', 'direct'}
+        if self.state_conditioned_motion_state_source not in valid_state_condition_sources:
+            raise ValueError(
+                "state_conditioned_motion_state_source must be one of "
+                f"{sorted(valid_state_condition_sources)}, got {self.state_conditioned_motion_state_source}"
+            )
         self.cover_graph_use_traj_context = bool(
             route_b_cfg.get('cover_graph_use_traj_context', False)
         )
@@ -3186,21 +3195,31 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 return_intermediates=True,
             )
             route_steps = int(teacher_forward['route_points'].shape[1])
-            chain_history_state = self._get_semantic_chain_history_state(
-                batch,
-                device=device,
-                model_dtype=model_dtype,
-                route_steps=route_steps,
-                require=False,
-            )
-            raw_scores = teacher.compute_shared_stage1_from_ego_outputs(
-                traj_out=teacher_forward['traj_out'],
-                route_out=teacher_forward['route_out'],
-                speed_out=teacher_forward['speed_out'],
-                route_points=teacher_forward['route_points'],
-                conditioning=teacher_forward['conditioning'],
-                prev_state=chain_history_state,
-            )
+            state_source = self.state_conditioned_motion_state_source
+            if state_source == 'direct':
+                raw_scores = teacher.compute_shared_stage1_direct_from_ego_outputs(
+                    traj_out=teacher_forward['traj_out'],
+                    route_out=teacher_forward['route_out'],
+                    speed_out=teacher_forward['speed_out'],
+                    route_points=teacher_forward['route_points'],
+                    conditioning=teacher_forward['conditioning'],
+                )
+            else:
+                chain_history_state = self._get_semantic_chain_history_state(
+                    batch,
+                    device=device,
+                    model_dtype=model_dtype,
+                    route_steps=route_steps,
+                    require=False,
+                )
+                raw_scores = teacher.compute_shared_stage1_from_ego_outputs(
+                    traj_out=teacher_forward['traj_out'],
+                    route_out=teacher_forward['route_out'],
+                    speed_out=teacher_forward['speed_out'],
+                    route_points=teacher_forward['route_points'],
+                    conditioning=teacher_forward['conditioning'],
+                    prev_state=chain_history_state,
+                )
             branch = self._build_traj_branch_condition_from_stage1_raw(
                 raw_scores=raw_scores,
                 speed_ref=ego_status[:, -1, 0],
@@ -3212,6 +3231,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 model_dtype=model_dtype,
             )
             raw_debug = self._compose_stage1_raw_outputs(raw_scores)
+            raw_debug['state_conditioned_motion_state_source_id'] = torch.full(
+                (trajectory.shape[0],),
+                1.0 if state_source == 'chain' else 0.0,
+                device=device,
+                dtype=model_dtype,
+            )
             return branch.detach(), raw_debug
 
     def reset_semantic_state_cache(self) -> None:

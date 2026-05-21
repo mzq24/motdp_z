@@ -3093,6 +3093,33 @@ class TransformerForDiffusion(ModuleAttrMixin):
             prev_state=prev_state,
         )
 
+    def compute_shared_stage1_direct_from_ego_outputs(
+        self,
+        traj_out: torch.Tensor,
+        route_out: torch.Tensor,
+        speed_out: torch.Tensor,
+        route_points: torch.Tensor,
+        conditioning: torch.Tensor,
+        speed_samples: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Decode current-frame semantic heads without structured chain residuals.
+
+        This is used for state-conditioned motion ablations where M consumes
+        the direct S grounding rather than the intra-frame chain output.
+        """
+        context = self._build_shared_stage1_context(
+            traj_out=traj_out,
+            route_out=route_out,
+            speed_out=speed_out,
+            route_points=route_points,
+            conditioning=conditioning,
+        )
+        return self._decode_shared_stage1_scores(
+            context=context,
+            route_out=route_out,
+            speed_samples=speed_samples,
+        )
+
     def compute_shared_stage1_transition_from_ego_outputs(
         self,
         traj_out: torch.Tensor,

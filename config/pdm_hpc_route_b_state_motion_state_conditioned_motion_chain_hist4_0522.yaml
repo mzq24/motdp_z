@@ -1,0 +1,317 @@
+policy_type: anchor_free
+abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats.npz
+route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
+device:
+  gpu_ids:
+  - 2
+  - 3
+  - 4
+  - 5
+dataloader:
+  batch_size: 256
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: false
+  prefetch_factor: 2
+  train_num_workers: 4
+  val_num_workers: 2
+  train_persistent_workers: true
+  val_persistent_workers: true
+  train_prefetch_factor: 2
+  val_prefetch_factor: 1
+  val_batch_size: 128
+  shuffle: true
+  use_window_weighted_sampler: true
+  use_route_group_sampler: false
+  window_sampler_replacement: true
+  window_sampler_weights:
+    none: 1.0
+    merge: 3.0
+    junction: 4.0
+    borrow: 3.0
+  use_semantic_shift_sampler: true
+  semantic_shift_window_weight: 4.0
+  semantic_shift_phase_weight: 3.0
+  semantic_shift_area_weight: 2.0
+  semantic_shift_edge_weight: 2.0
+  semantic_shift_opportunity_weight: 2.0
+  semantic_shift_max_weight: 8.0
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+  update_interval: 10
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 5.0e-05
+  weight_decay: 0.0001
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+enable_action_normalization: true
+bev_encoder:
+  state_dim: 14
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  n_obs_steps: 4
+  cond_dim: 256
+  obs_as_global_cond: true
+  n_layer: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 6
+  action_horizon: 6
+  traj_can_attend_route: true
+  use_condition_group_dropout: true
+route_b:
+  num_samples: 1
+  num_inference_steps: 10
+  use_split_forward: true
+  use_lidar_bev_detail: false
+  lidar_history_frames: 0
+  train_stage1: false
+  use_stage1_state: true
+  shared_stage1_training_source: clean_then_noisy
+  shared_stage1_training_source_switch_epoch: 30
+  use_speed_profile_head: false
+  use_traj_branch_condition: true
+  semantic_motion_condition_mode: compact_graph
+  semantic_motion_condition_profile: compact_safe
+  semantic_state_supervision_profile: all
+  use_cover_relation_graph_decoder: false
+  cover_graph_use_traj_context: false
+  cover_graph_use_speed_context: false
+  use_route_prev_coarse_memory: false
+  use_route_intent_token: false
+  route_intent_gate_init: 0.1
+  traj_branch_condition_scale: 2.0
+  traj_branch_condition_detach: true
+  traj_branch_condition_gt_prob_start: 1.0
+  traj_branch_condition_gt_prob_end: 0.8
+  traj_branch_condition_gt_decay_epochs: 80
+  traj_branch_condition_affinity_scale: 6.0
+  traj_branch_condition_borrow_time_scale: 8.0
+  traj_branch_condition_boundary_margin_scale: 5.0
+  stage1_boundary_norm_scale: 30.0
+  use_temporary_occupancy_phase: true
+  temporary_occupancy_dim: 13
+  temporary_occupancy_loss_weight: 0.1
+  go_opportunity_loss_weight: 0.06
+  temporary_occupancy_phase_alpha: 0.0
+  use_conflict_timing_state: true
+  conflict_area_status_loss_weight: 0.15
+  conflict_timing_loss_weight: 0.15
+  conflict_timing_dist_norm_scale: 30.0
+  conflict_timing_time_norm_scale: 10.0
+  use_independent_state_consistency_loss: false
+  state_consistency_loss_weight: 1.0
+  state_consistency_prob: 0.0
+  state_consistency_window_weight: 0.01
+  state_consistency_phase_weight: 0.005
+  state_consistency_boundary_weight: 0.01
+  state_consistency_area_weight: 0.05
+  state_consistency_tempocc_weight: 0.05
+  state_consistency_opportunity_weight: 0.02
+  state_consistency_timing_weight: 0.05
+  inside_area_go_loss_weight: 0.05
+  use_chase_front_following_state: true
+  chase_has_lead_loss_weight: 0.05
+  chase_speed_max_loss_weight: 0.15
+  chase_speed_norm_scale: 30.0
+  traj_branch_condition_chase_margin_scale: 5.0
+  current_edge_valid_loss_weight: 0.1
+  current_edge_mode_loss_weight: 0.1
+  future_edge_valid_loss_weight: 0.1
+  future_edge_mode_loss_weight: 0.1
+  current_cover_upper_loss_weight: 0.15
+  future_cover_lower_loss_weight: 0.15
+  front_follow_upper_loss_weight: 0.1
+  merge_flow_lower_loss_weight: 0.1
+  use_edge_speed_consistency_loss: false
+  edge_speed_consistency_loss_weight: 0.05
+  use_semantic_state_transition: false
+  semantic_state_predictor_mode: direct_only
+  semantic_transition_prev_source: offline_gt
+  semantic_transition_loss_weight: 1.0
+  semantic_direct_aux_loss_weight: 0.25
+  semantic_transition_consistency_weight: 0.05
+  semantic_transition_prev_dropout_prob: 0.2
+  semantic_prev_token_dropout_prob: 0.6
+  semantic_prev_window_dropout_prob: 0.9
+  semantic_prev_dir_dropout_prob: 0.9
+  semantic_prev_area_dropout_prob: 0.8
+  semantic_prev_tempocc_dropout_prob: 0.8
+  semantic_prev_phase_dropout_prob: 0.7
+  semantic_prev_graph_dropout_prob: 0.7
+  semantic_prev_boundary_dropout_prob: 0.5
+  semantic_prev_chase_dropout_prob: 0.5
+  semantic_prev_random_replace_prob: 0.2
+  semantic_prev_replace_to_none_prob: 0.5
+  semantic_prev_prefix_dropout_frames: 8
+  semantic_prev_prefix_dropout_prob: 1.0
+  semantic_prev_modulation_scale: 0.2
+  semantic_prev_modulation_dropout_prob: 0.5
+  use_semantic_state_fusion: false
+  semantic_state_fusion_alpha: 0.0
+  semantic_state_fusion_warmup_frames: 0
+  semantic_state_fusion_update_cache: true
+  guidance_scale: 0.0
+  stage1_loss_weight: 1.0
+  speed_loss_weight: 0.2
+  speed_profile_loss_weight: 0.0
+  speed_profile_dt: 0.5
+  stage1_chase_weight: 1.0
+  stage1_meet_weight: 1.0
+  stage1_ped_weight: 1.0
+  stage1_window_weight: 0.25
+  stage1_phase_weight: 0.1
+  stage1_conflict_area_weight: 0.15
+  train_max_timesteps: 1000
+  alignment_loss_weight: 0.0
+  stage1_noisy_training: false
+  alignment_warmup_epochs: 0
+  stage1_grad_clip_norm: 1.0
+  train_stage1_until_epoch: 0
+  train_stage1_after_update_every: 5
+  train_speed_head_until_epoch: 30
+  train_speed_head_after_update_every: 5
+  use_family_boundary_head: false
+  semantic_loss_updates_motion_backbone: false
+  state_motion_training_mode: state_conditioned_motion
+  state_conditioned_motion_state_source: chain
+  use_state_motion_adapter: false
+  state_motion_adapter_zero_init: true
+  state_motion_adapter_state_source: pred_detached
+  state_motion_adapter_modify_route: false
+  state_motion_adapter_gate_init: 1.0
+  state_motion_adapter_speed_norm_scale: 30.0
+  state_motion_adapter_margin_scale: 5.0
+  state_motion_adapter_loss_weight: 1.0
+  state_motion_adapter_norm_weight: 0.01
+  state_motion_adapter_gate_sparsity_weight: 0.001
+  freeze_motion_backbone_for_adapter: true
+  freeze_semantic_state_for_adapter: true
+  use_alignment_critic: false
+  use_alignment_critic_for_adapter: false
+  freeze_alignment_critic_for_adapter: true
+  use_speed_delta_head: false
+  delta_speed_loss_weight: 0.0
+  use_structured_semantic_chain: true
+  semantic_chain_residual_scale: 0.2
+  use_semantic_chain_history: true
+  semantic_chain_history_scale: 0.2
+  semantic_chain_history_dropout_prob: 0.0
+  semantic_chain_window_history_scale: 0.1
+  semantic_chain_history_prefix: hist4
+  require_semantic_history: true
+  use_frozen_semantic_teacher: true
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 1000
+  train_trunc_timesteps: 1000
+  num_diffusion_steps: 10
+  eta: 0.0
+  prediction_type: sample
+  route_loss_weight: 4.0
+  route_final_loss_weight: 2.0
+num_modes: 32
+cls_loss_weight: 0.0
+reg_loss_weight: 6.0
+dataset:
+  use_per_frame: false
+  feature_suffix: ensemble
+  use_fullres_upsample_cache: false
+  stage_feature_cache_to_ram: false
+  cache_source_dir: null
+  cache_dir: null
+  train_warmup_memmap_page_cache: false
+  train_warmup_lidar_page_cache: false
+  train_warmup_max_samples: 0
+  train_filter_bad_routes: false
+  val_filter_bad_routes: true
+  train_retain_bad_routes_for_energy: true
+  val_retain_bad_routes_for_energy: false
+training:
+  num_epochs: 30
+  max_grad_norm: 1.0
+  warmup_epochs: 3
+  use_lr_scheduler: true
+  resume_rebuild_scheduler: true
+  scheduler_total_epochs: 30
+  dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_alignment
+  image_data_root: /workspace1/z_project/dataset/pdm_lite
+  sample_interval: 1
+  lr_final: 1.0e-07
+  validation_freq: 5
+  save_freq: 5
+  max_keep_ckpts: 20
+  early_stopping_patience: 8
+  best_checkpoint_metric: phase_balanced
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_state_conditioned_motion_chain_hist4_0522
+validation:
+  enabled: true
+  use_memmap: true
+  preload_to_ram: false
+  subset_size: 0
+  max_batches: 0
+  ordered_semantic_rollout_enabled: false
+  ordered_semantic_rollout_max_routes: 0
+  ordered_semantic_rollout_max_frames: 0
+logging:
+  use_wandb: true
+  wandb_project: route_b_lidar_bev
+  run_name: route_b_state_motion_state_conditioned_motion_chain_hist4_0522
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_state_conditioned_motion_chain_hist4_0522
+  save_every: 5
+  log_freq: 50
+augmentation:
+  gps_noise:
+    enabled: true
+    sigma: 0.05
+    probability: 1
+    apply_to_route: false
+model_optimization:
+  use_mixed_precision: true
+checkpoint:
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_state_conditioned_motion_chain_hist4_0522
