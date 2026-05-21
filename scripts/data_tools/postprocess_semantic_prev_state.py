@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import os
 import pickle
 from collections import defaultdict
+from collections import deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -77,6 +79,8 @@ PREV_FIELDS = (
     + tuple(f"prev_{field}" for field in MASK_FIELDS)
     + ("prev_semantic_state_valid",)
 )
+
+SEMANTIC_FIELDS = CATEGORICAL_FIELDS + VECTOR_FIELDS + SCALAR_FIELDS + MASK_FIELDS
 
 
 def _atomic_pickle_save(obj: Any, target_path: str) -> None:
@@ -168,6 +172,43 @@ def _neutral_value(field: str, *, route_bins: int, temp_bins: int, speed_cap: fl
     return np.float32(0.0)
 
 
+def _write_neutral_prefixed(
+    sample: Dict[str, Any],
+    prefix: str,
+    *,
+    route_bins: int,
+    temp_bins: int,
+    speed_cap: float,
+) -> None:
+    for field in SEMANTIC_FIELDS:
+        sample[f"{prefix}_{field}"] = _neutral_value(
+            field, route_bins=route_bins, temp_bins=temp_bins, speed_cap=speed_cap
+        )
+    sample[f"{prefix}_semantic_state_valid"] = np.float32(0.0)
+
+
+def _copy_prefixed(
+    sample: Dict[str, Any],
+    source_sample: Dict[str, Any],
+    prefix: str,
+    *,
+    route_bins: int,
+    temp_bins: int,
+    speed_cap: float,
+) -> int:
+    copied = 0
+    for field in SEMANTIC_FIELDS:
+        if field in source_sample:
+            sample[f"{prefix}_{field}"] = _as_copy(source_sample[field])
+            copied += 1
+        else:
+            sample[f"{prefix}_{field}"] = _neutral_value(
+                field, route_bins=route_bins, temp_bins=temp_bins, speed_cap=speed_cap
+            )
+    sample[f"{prefix}_semantic_state_valid"] = np.float32(1.0)
+    return copied
+
+
 def _write_neutral_prev(
     sample: Dict[str, Any],
     *,
@@ -175,11 +216,13 @@ def _write_neutral_prev(
     temp_bins: int,
     speed_cap: float,
 ) -> None:
-    for field in CATEGORICAL_FIELDS + VECTOR_FIELDS + SCALAR_FIELDS + MASK_FIELDS:
-        sample[f"prev_{field}"] = _neutral_value(
-            field, route_bins=route_bins, temp_bins=temp_bins, speed_cap=speed_cap
-        )
-    sample["prev_semantic_state_valid"] = np.float32(0.0)
+    _write_neutral_prefixed(
+        sample,
+        "prev",
+        route_bins=route_bins,
+        temp_bins=temp_bins,
+        speed_cap=speed_cap,
+    )
 
 
 def _copy_prev(
@@ -190,22 +233,32 @@ def _copy_prev(
     temp_bins: int,
     speed_cap: float,
 ) -> int:
-    copied = 0
-    for field in CATEGORICAL_FIELDS + VECTOR_FIELDS + SCALAR_FIELDS + MASK_FIELDS:
-        if field in prev_sample:
-            sample[f"prev_{field}"] = _as_copy(prev_sample[field])
-            copied += 1
-        else:
-            sample[f"prev_{field}"] = _neutral_value(
-                field, route_bins=route_bins, temp_bins=temp_bins, speed_cap=speed_cap
-            )
-    sample["prev_semantic_state_valid"] = np.float32(1.0)
-    return copied
+    return _copy_prefixed(
+        sample,
+        prev_sample,
+        "prev",
+        route_bins=route_bins,
+        temp_bins=temp_bins,
+        speed_cap=speed_cap,
+    )
 
 
-def _clear_existing_prev(sample: Dict[str, Any]) -> None:
+def _history_fields(history_depth: int) -> Tuple[str, ...]:
+    fields: List[str] = []
+    for depth in range(1, max(int(history_depth), 0) + 1):
+        prefix = f"hist{depth}"
+        fields.extend(f"{prefix}_{field}" for field in SEMANTIC_FIELDS)
+        fields.append(f"{prefix}_semantic_state_valid")
+    return tuple(fields)
+
+
+def _clear_existing_prev(sample: Dict[str, Any], *, history_depth: int = 0) -> None:
     for key in PREV_FIELDS:
         sample.pop(key, None)
+    hist_pat = re.compile(r"^hist\d+_(semantic_state_valid|" + "|".join(map(re.escape, SEMANTIC_FIELDS)) + r")$")
+    for key in list(sample.keys()):
+        if hist_pat.match(str(key)):
+            sample.pop(key, None)
 
 
 def _group_samples(samples: Iterable[Dict[str, Any]]):
@@ -239,6 +292,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum allowed frame_id gap for prev link; <=0 disables the gap check.",
     )
     parser.add_argument("--summary-json", default=None)
+    parser.add_argument(
+        "--history-depth",
+        type=int,
+        default=0,
+        help=(
+            "Also write hist1_*..histN_* semantic history fields. "
+            "Default 0 preserves the legacy prev_* only behavior."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -257,17 +319,22 @@ def main() -> None:
         raise TypeError(f"Expected list in {input_path}, got {type(samples).__name__}")
 
     grouped, missing_frame_count = _group_samples(samples)
+    history_depth = max(int(args.history_depth), 0)
     for sample in samples:
-        _clear_existing_prev(sample)
+        _clear_existing_prev(sample, history_depth=history_depth)
 
     linked = 0
     neutral = 0
     gap_rejected = 0
     copied_field_total = 0
+    history_linked = [0 for _ in range(history_depth)]
+    history_neutral = [0 for _ in range(history_depth)]
+    history_gap_rejected = [0 for _ in range(history_depth)]
     for _, rows in grouped.items():
         rows.sort(key=lambda item: (item[0], item[1]))
         prev_frame: Optional[int] = None
         prev_idx: Optional[int] = None
+        history: deque[Tuple[int, int]] = deque(maxlen=max(history_depth, 1))
         for frame, idx in rows:
             sample = samples[idx]
             has_prev = prev_idx is not None
@@ -275,6 +342,7 @@ def main() -> None:
                 if frame - prev_frame > args.max_frame_gap:
                     has_prev = False
                     gap_rejected += 1
+                    history.clear()
             if has_prev and prev_idx is not None:
                 copied_field_total += _copy_prev(
                     sample,
@@ -292,6 +360,38 @@ def main() -> None:
                     speed_cap=args.speed_cap,
                 )
                 neutral += 1
+
+            history_rows = list(history)
+            for depth in range(1, history_depth + 1):
+                prefix = f"hist{depth}"
+                hist_pos = len(history_rows) - depth
+                has_hist = hist_pos >= 0
+                if has_hist:
+                    hist_frame, hist_idx = history_rows[hist_pos]
+                    if args.max_frame_gap > 0 and frame - hist_frame > args.max_frame_gap * depth:
+                        has_hist = False
+                        history_gap_rejected[depth - 1] += 1
+                if has_hist:
+                    copied_field_total += _copy_prefixed(
+                        sample,
+                        samples[hist_idx],
+                        prefix,
+                        route_bins=args.route_bins,
+                        temp_bins=args.temp_bins,
+                        speed_cap=args.speed_cap,
+                    )
+                    history_linked[depth - 1] += 1
+                else:
+                    _write_neutral_prefixed(
+                        sample,
+                        prefix,
+                        route_bins=args.route_bins,
+                        temp_bins=args.temp_bins,
+                        speed_cap=args.speed_cap,
+                    )
+                    history_neutral[depth - 1] += 1
+
+            history.append((frame, idx))
             prev_frame = frame
             prev_idx = idx
 
@@ -311,6 +411,11 @@ def main() -> None:
         "temp_bins": args.temp_bins,
         "speed_cap": args.speed_cap,
         "prev_field_count": len(PREV_FIELDS),
+        "history_depth": history_depth,
+        "history_linked": {f"hist{i + 1}": int(v) for i, v in enumerate(history_linked)},
+        "history_neutral": {f"hist{i + 1}": int(v) for i, v in enumerate(history_neutral)},
+        "history_gap_rejected": {f"hist{i + 1}": int(v) for i, v in enumerate(history_gap_rejected)},
+        "history_field_count": len(_history_fields(history_depth)),
     }
     os.makedirs(os.path.dirname(summary_path), exist_ok=True)
     with open(summary_path, "w", encoding="utf-8") as f:

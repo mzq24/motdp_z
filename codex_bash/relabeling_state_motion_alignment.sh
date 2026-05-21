@@ -23,6 +23,7 @@ SPLIT_ROOT="${SPLIT_ROOT:-/workspace1/z_project/dataset/pdm_lite/tmp_data/full_s
 VAL_SCENE_RATIO="${VAL_SCENE_RATIO:-0.05}"
 SPLIT_SEED="${SPLIT_SEED:-3407}"
 PREV_MAX_FRAME_GAP="${PREV_MAX_FRAME_GAP:-20}"
+SEMANTIC_HISTORY_DEPTH="${SEMANTIC_HISTORY_DEPTH:-4}"
 
 if [[ ! -f "${PADDED_CONSISTENCY}" ]]; then
   echo "Missing upstream padded consistency labels: ${PADDED_CONSISTENCY}" >&2
@@ -58,6 +59,7 @@ echo "[4/4] offline prev semantic state for train/val"
   --output "${SPLIT_ROOT}/train/samples_packed.pkl" \
   --summary-json "${SPLIT_ROOT}/train/prev_state_summary.json" \
   --max-frame-gap "${PREV_MAX_FRAME_GAP}" \
+  --history-depth "${SEMANTIC_HISTORY_DEPTH}" \
   --overwrite
 
 "${PYTHON_BIN}" scripts/data_tools/postprocess_semantic_prev_state.py \
@@ -65,6 +67,7 @@ echo "[4/4] offline prev semantic state for train/val"
   --output "${SPLIT_ROOT}/val/samples_packed.pkl" \
   --summary-json "${SPLIT_ROOT}/val/prev_state_summary.json" \
   --max-frame-gap "${PREV_MAX_FRAME_GAP}" \
+  --history-depth "${SEMANTIC_HISTORY_DEPTH}" \
   --overwrite
 
 echo "Done. Training dataset_path should be:"
