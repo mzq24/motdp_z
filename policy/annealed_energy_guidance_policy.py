@@ -8,6 +8,7 @@ for backward-compatible dashboards.
 """
 
 import os
+import copy
 from collections import deque
 
 import torch
@@ -59,6 +60,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
       - Select best trajectory from num_samples candidates via energy shielding
     """
 
+    @staticmethod
+    def _parse_float_list(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.replace(';', ',').split(',')]
+            return [float(p) for p in parts if p]
+        if isinstance(value, (list, tuple)):
+            return [float(v) for v in value]
+        return [float(value)]
+
     def __init__(self, config: Dict):
         super().__init__()
 
@@ -86,7 +98,10 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'motion_only',
             'semantic_detached',
             'alignment_critic',
+            'alignment_critic_a2',
             'critic_rerank_eval',
+            'm2_a2_rerank',
+            'state_conditioned_motion',
             'adapter_m1',
             'adapter_m2',
         }
@@ -174,8 +189,50 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.alignment_negative_speed_offset_mps = float(
             route_b_cfg.get('alignment_negative_speed_offset_mps', 3.0)
         )
+        self.alignment_critic_version = str(
+            route_b_cfg.get('alignment_critic_version', 'v1')
+        ).lower()
+        self.alignment_a2_speed_min_mps = float(
+            route_b_cfg.get('alignment_a2_speed_min_mps', 0.0)
+        )
+        self.alignment_a2_speed_max_mps = float(
+            route_b_cfg.get('alignment_a2_speed_max_mps', 20.0)
+        )
+        self.alignment_a2_num_speed_candidates = int(
+            route_b_cfg.get('alignment_a2_num_speed_candidates', 41)
+        )
+        self.alignment_a2_targeted_candidate_offsets_mps = self._parse_float_list(
+            route_b_cfg.get('alignment_a2_targeted_candidate_offsets_mps', [-2.0, -1.0, 0.0, 1.0, 2.0])
+        )
+        self.alignment_a2_area_timing_weight = float(
+            route_b_cfg.get('alignment_a2_area_timing_weight', 0.5)
+        )
         self.alignment_risky_passable_weight = float(
             route_b_cfg.get('alignment_risky_passable_weight', 0.25)
+        )
+        self.alignment_critic_checkpoint_path = route_b_cfg.get(
+            'alignment_critic_checkpoint_path', None
+        )
+        self.use_alignment_critic_rerank = bool(
+            route_b_cfg.get('use_alignment_critic_rerank', False)
+        )
+        self.alignment_rerank_candidate_offsets_mps = self._parse_float_list(
+            route_b_cfg.get(
+                'alignment_rerank_candidate_offsets_mps',
+                [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+            )
+        )
+        self.alignment_rerank_score_index = int(
+            route_b_cfg.get('alignment_rerank_score_index', 0)
+        )
+        self.alignment_rerank_anchor_weight = float(
+            route_b_cfg.get('alignment_rerank_anchor_weight', 0.10)
+        )
+        self.alignment_rerank_strength = float(
+            route_b_cfg.get('alignment_rerank_strength', 1.0)
+        )
+        self.alignment_rerank_valid_threshold = float(
+            route_b_cfg.get('alignment_rerank_valid_threshold', 0.5)
         )
         self._current_epoch = 0
         self._current_batch_idx = 0
@@ -302,6 +359,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         self.use_cover_relation_graph_decoder = bool(
             route_b_cfg.get('use_cover_relation_graph_decoder', False)
+        )
+        self.use_structured_semantic_chain = bool(
+            route_b_cfg.get('use_structured_semantic_chain', False)
+        )
+        self.semantic_chain_residual_scale = float(
+            route_b_cfg.get('semantic_chain_residual_scale', 0.2)
+        )
+        self.use_semantic_chain_history = bool(
+            route_b_cfg.get('use_semantic_chain_history', False)
+        )
+        self.semantic_chain_history_scale = float(
+            route_b_cfg.get('semantic_chain_history_scale', 0.2)
+        )
+        self.semantic_chain_history_dropout_prob = float(
+            route_b_cfg.get('semantic_chain_history_dropout_prob', 0.5)
+        )
+        self.semantic_chain_window_history_scale = float(
+            route_b_cfg.get('semantic_chain_window_history_scale', 0.1)
+        )
+        self.semantic_chain_history_prefix = str(
+            route_b_cfg.get('semantic_chain_history_prefix', 'hist1')
+        )
+        self.require_semantic_history = bool(
+            route_b_cfg.get('require_semantic_history', False)
         )
         self.cover_graph_use_traj_context = bool(
             route_b_cfg.get('cover_graph_use_traj_context', False)
@@ -557,6 +638,20 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         self._semantic_state_cache: Optional[dict] = None
         self._semantic_state_cache_frame: int = 0
+        self.semantic_teacher_checkpoint_path = os.environ.get(
+            'SEMANTIC_TEACHER_CHECKPOINT',
+            route_b_cfg.get('semantic_teacher_checkpoint_path', None),
+        )
+        self.use_frozen_semantic_teacher = bool(
+            route_b_cfg.get(
+                'use_frozen_semantic_teacher',
+                self.state_motion_training_mode in (
+                    'state_conditioned_motion',
+                    'alignment_critic_a2',
+                    'm2_a2_rerank',
+                ),
+            )
+        )
 
         if self.state_motion_training_mode == 'motion_only':
             self.train_energy = False
@@ -580,11 +675,31 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             self.semantic_loss_updates_motion_backbone = False
             self.use_family_boundary_head = False
             self.semantic_motion_condition_mode = 'compact_graph'
-        elif self.state_motion_training_mode in ('alignment_critic', 'critic_rerank_eval'):
+        elif self.state_motion_training_mode == 'state_conditioned_motion':
+            self.train_energy = False
+            self.use_traj_branch_condition = True
+            self.use_family_boundary_head = False
+            self.use_state_motion_adapter = False
+            self.use_alignment_critic = False
+            self.semantic_loss_updates_motion_backbone = False
+            self.semantic_motion_condition_mode = 'compact_graph'
+        elif self.state_motion_training_mode in (
+            'alignment_critic',
+            'alignment_critic_a2',
+            'critic_rerank_eval',
+        ):
             self.train_energy = False
             self.use_traj_branch_condition = False
             self.use_family_boundary_head = False
             self.use_alignment_critic = True
+            self.semantic_loss_updates_motion_backbone = False
+            self.semantic_motion_condition_mode = 'compact_graph'
+        elif self.state_motion_training_mode == 'm2_a2_rerank':
+            self.train_energy = False
+            self.use_traj_branch_condition = True
+            self.use_family_boundary_head = False
+            self.use_alignment_critic = True
+            self.use_alignment_critic_rerank = True
             self.semantic_loss_updates_motion_backbone = False
             self.semantic_motion_condition_mode = 'compact_graph'
         elif self.state_motion_training_mode == 'adapter_m1':
@@ -739,6 +854,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             use_cover_relation_graph_decoder=self.use_cover_relation_graph_decoder,
             cover_graph_use_traj_context=self.cover_graph_use_traj_context,
             cover_graph_use_speed_context=self.cover_graph_use_speed_context,
+            use_structured_semantic_chain=self.use_structured_semantic_chain,
+            semantic_chain_residual_scale=self.semantic_chain_residual_scale,
+            use_semantic_chain_history=self.use_semantic_chain_history,
+            semantic_chain_history_scale=self.semantic_chain_history_scale,
+            semantic_chain_history_dropout_prob=self.semantic_chain_history_dropout_prob,
+            semantic_chain_window_history_scale=self.semantic_chain_window_history_scale,
             use_route_prev_coarse_memory=self.use_route_prev_coarse_memory,
             use_route_intent_token=self.use_route_intent_token,
             route_intent_gate_init=self.route_intent_gate_init,
@@ -754,8 +875,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             state_motion_adapter_condition_version=self.state_motion_adapter_condition_version,
         )
         self.model = model
-        self.alignment_feature_dim = 16
-        self.alignment_score_dim = 5
+        self.alignment_score_dim = 7 if self.alignment_critic_version in ('a2', 'v2', 'counterfactual_a2') else 5
+        self.alignment_feature_dim = 24 if self.alignment_score_dim > 5 else 16
         self.alignment_critic = (
             nn.Sequential(
                 nn.Linear(self.alignment_feature_dim, 64),
@@ -839,13 +960,26 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                         and self.use_alignment_critic_for_adapter
                         and not self.freeze_alignment_critic_for_adapter
                     )
-        elif self.state_motion_training_mode == 'alignment_critic':
+        elif self.state_motion_training_mode == 'state_conditioned_motion':
+            # Motion backbone remains trainable; semantic heads are teacher-only in this stage.
+            for name, param in self.model.named_parameters():
+                if (
+                    'shared_stage1' in name
+                    or 'semantic_transition' in name
+                    or 'semantic_prev_' in name
+                    or 'semantic_chain_' in name
+                ):
+                    param.requires_grad_(False)
+            if self.alignment_critic is not None:
+                for param in self.alignment_critic.parameters():
+                    param.requires_grad_(False)
+        elif self.state_motion_training_mode in ('alignment_critic', 'alignment_critic_a2'):
             for param in self.model.parameters():
                 param.requires_grad_(False)
             if self.alignment_critic is not None:
                 for param in self.alignment_critic.parameters():
                     param.requires_grad_(True)
-        elif self.state_motion_training_mode == 'critic_rerank_eval':
+        elif self.state_motion_training_mode in ('critic_rerank_eval', 'm2_a2_rerank'):
             for param in self.model.parameters():
                 param.requires_grad_(False)
             if self.alignment_critic is not None:
@@ -1008,24 +1142,24 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 self._resolve_stage1_batch_key(batch, 'prev_conflict_area_status'),
                 self._resolve_stage1_batch_key(batch, 'prev_conflict_decision_phase'),
                 self._resolve_stage1_batch_key(batch, 'prev_conflict_control_phase'),
-                self._resolve_stage1_batch_key(batch, 'prev_conflict_area_route_mask'),
-                self._resolve_stage1_batch_key(batch, 'prev_temporary_occupancy_cover_bins'),
-                self._resolve_stage1_batch_key(batch, 'prev_temporary_occupancy_cover_valid'),
-                self._resolve_stage1_batch_key(batch, 'prev_go_opportunity_prob'),
-                self._resolve_stage1_batch_key(batch, 'prev_yld_pressure_prob'),
-                self._resolve_stage1_batch_key(batch, 'prev_go_opportunity_valid'),
-                self._resolve_stage1_batch_key(batch, 'prev_conflict_dist_to_entry_m'),
-                self._resolve_stage1_batch_key(batch, 'prev_conflict_dist_to_exit_m'),
-                self._resolve_stage1_batch_key(batch, 'prev_conflict_time_to_entry_s'),
-                self._resolve_stage1_batch_key(batch, 'prev_conflict_timing_valid'),
-                self._resolve_stage1_batch_key(batch, 'prev_merge_yld_max_speed'),
-                self._resolve_stage1_batch_key(batch, 'prev_merge_go_min_speed'),
-                self._resolve_stage1_batch_key(batch, 'prev_junction_yld_max_speed'),
-                self._resolve_stage1_batch_key(batch, 'prev_junction_go_min_speed'),
-                self._resolve_stage1_batch_key(batch, 'prev_borrow_yld_max_speed'),
-                self._resolve_stage1_batch_key(batch, 'prev_borrow_go_min_speed'),
-                self._resolve_stage1_batch_key(batch, 'prev_chase_has_lead'),
-                self._resolve_stage1_batch_key(batch, 'prev_chase_speed_max'),
+                self._resolve_stage1_batch_key(batch, _key('conflict_area_route_mask')),
+                self._resolve_stage1_batch_key(batch, _key('temporary_occupancy_cover_bins')),
+                self._resolve_stage1_batch_key(batch, _key('temporary_occupancy_cover_valid')),
+                self._resolve_stage1_batch_key(batch, _key('go_opportunity_prob')),
+                self._resolve_stage1_batch_key(batch, _key('yld_pressure_prob')),
+                self._resolve_stage1_batch_key(batch, _key('go_opportunity_valid')),
+                self._resolve_stage1_batch_key(batch, _key('conflict_dist_to_entry_m')),
+                self._resolve_stage1_batch_key(batch, _key('conflict_dist_to_exit_m')),
+                self._resolve_stage1_batch_key(batch, _key('conflict_time_to_entry_s')),
+                self._resolve_stage1_batch_key(batch, _key('conflict_timing_valid')),
+                self._resolve_stage1_batch_key(batch, _key('merge_yld_max_speed')),
+                self._resolve_stage1_batch_key(batch, _key('merge_go_min_speed')),
+                self._resolve_stage1_batch_key(batch, _key('junction_yld_max_speed')),
+                self._resolve_stage1_batch_key(batch, _key('junction_go_min_speed')),
+                self._resolve_stage1_batch_key(batch, _key('borrow_yld_max_speed')),
+                self._resolve_stage1_batch_key(batch, _key('borrow_go_min_speed')),
+                self._resolve_stage1_batch_key(batch, _key('chase_has_lead')),
+                self._resolve_stage1_batch_key(batch, _key('chase_speed_max')),
             )
             if any(key is None for key in prev_required):
                 raise ValueError(
@@ -1380,17 +1514,23 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         model_dtype: torch.dtype,
         route_steps: int,
         require: bool = False,
+        prefix: str = 'prev',
     ) -> Optional[dict]:
+        prefix = str(prefix or 'prev').rstrip('_')
+
+        def _key(name: str) -> str:
+            return f"{prefix}_{name}"
+
         valid = self._get_stage1_batch_tensor(
-            batch, 'prev_semantic_state_valid', device=device, model_dtype=model_dtype
+            batch, _key('semantic_state_valid'), device=device, model_dtype=model_dtype
         )
         categorical = {}
         for out_key, batch_key in (
-            ('family', 'prev_conflict_area_family'),
-            ('dir', 'prev_conflict_area_dir'),
-            ('status', 'prev_conflict_area_status'),
-            ('decision_phase', 'prev_conflict_decision_phase'),
-            ('control_phase', 'prev_conflict_control_phase'),
+            ('family', _key('conflict_area_family')),
+            ('dir', _key('conflict_area_dir')),
+            ('status', _key('conflict_area_status')),
+            ('decision_phase', _key('conflict_decision_phase')),
+            ('control_phase', _key('conflict_control_phase')),
         ):
             value = self._get_stage1_long_target(batch, batch_key, device=device)
             if value is None:
@@ -1401,7 +1541,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
 
         if valid is None:
             if require:
-                raise ValueError("semantic transition requires prev_semantic_state_valid")
+                raise ValueError(f"semantic transition requires {_key('semantic_state_valid')}")
             return None
         valid = torch.nan_to_num(valid.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         B = valid.shape[0]
@@ -1432,31 +1572,31 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 return torch.full((B,), default, device=device, dtype=torch.long)
             return value.reshape(B).long().clamp(min=0, max=max_value)
 
-        area_mask = _float_field('prev_conflict_area_route_mask', width=route_steps)
-        temp_bins = _float_field('prev_temporary_occupancy_cover_bins', width=self.temporary_occupancy_dim)
-        temp_valid = _float_field('prev_temporary_occupancy_cover_valid', width=self.temporary_occupancy_dim)
-        go_prob = _float_field('prev_go_opportunity_prob', default=0.5)
-        yld_prob = _float_field('prev_yld_pressure_prob', default=0.5)
-        go_valid = _float_field('prev_go_opportunity_valid')
-        dist_entry = _float_field('prev_conflict_dist_to_entry_m')
-        dist_exit = _float_field('prev_conflict_dist_to_exit_m')
-        time_entry = _float_field('prev_conflict_time_to_entry_s')
-        timing_valid = _float_field('prev_conflict_timing_valid')
+        area_mask = _float_field(_key('conflict_area_route_mask'), width=route_steps)
+        temp_bins = _float_field(_key('temporary_occupancy_cover_bins'), width=self.temporary_occupancy_dim)
+        temp_valid = _float_field(_key('temporary_occupancy_cover_valid'), width=self.temporary_occupancy_dim)
+        go_prob = _float_field(_key('go_opportunity_prob'), default=0.5)
+        yld_prob = _float_field(_key('yld_pressure_prob'), default=0.5)
+        go_valid = _float_field(_key('go_opportunity_valid'))
+        dist_entry = _float_field(_key('conflict_dist_to_entry_m'))
+        dist_exit = _float_field(_key('conflict_dist_to_exit_m'))
+        time_entry = _float_field(_key('conflict_time_to_entry_s'))
+        timing_valid = _float_field(_key('conflict_timing_valid'))
         boundary_values = []
         for key in (
-            'prev_merge_yld_max_speed',
-            'prev_merge_go_min_speed',
-            'prev_junction_yld_max_speed',
-            'prev_junction_go_min_speed',
-            'prev_borrow_yld_max_speed',
-            'prev_borrow_go_min_speed',
+            _key('merge_yld_max_speed'),
+            _key('merge_go_min_speed'),
+            _key('junction_yld_max_speed'),
+            _key('junction_go_min_speed'),
+            _key('borrow_yld_max_speed'),
+            _key('borrow_go_min_speed'),
         ):
             value = _float_field(key)
             if value is None:
                 return None
             boundary_values.append(value.reshape(B))
-        chase_has_lead = _float_field('prev_chase_has_lead')
-        chase_speed = _float_field('prev_chase_speed_max')
+        chase_has_lead = _float_field(_key('chase_has_lead'))
+        chase_speed = _float_field(_key('chase_speed_max'))
         if any(
             value is None
             for value in (
@@ -1495,8 +1635,8 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ],
             dim=-1,
         )
-        prev_current_mode = _optional_long_field('prev_current_cover_edge_mode', max_value=4)
-        prev_future_mode = _optional_long_field('prev_future_cover_edge_mode', max_value=4)
+        prev_current_mode = _optional_long_field(_key('current_cover_edge_mode'), max_value=4)
+        prev_future_mode = _optional_long_field(_key('future_cover_edge_mode'), max_value=4)
         prev_current_mode_oh = F.one_hot(prev_current_mode, num_classes=5).to(
             device=device, dtype=model_dtype
         )
@@ -1505,30 +1645,30 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         graph_values = torch.cat(
             [
-                _optional_float_field('prev_current_cover_edge_valid').clamp(0.0, 1.0),
+                _optional_float_field(_key('current_cover_edge_valid')).clamp(0.0, 1.0),
                 prev_current_mode_oh,
-                _optional_float_field('prev_future_cover_edge_valid').clamp(0.0, 1.0),
+                _optional_float_field(_key('future_cover_edge_valid')).clamp(0.0, 1.0),
                 prev_future_mode_oh,
                 (
-                    _optional_float_field('prev_current_cover_upper_speed_mps')
+                    _optional_float_field(_key('current_cover_upper_speed_mps'))
                     / max(self.stage1_boundary_norm_scale, 1e-6)
                 ).clamp(0.0, 1.0),
                 (
-                    _optional_float_field('prev_future_cover_lower_speed_mps')
+                    _optional_float_field(_key('future_cover_lower_speed_mps'))
                     / max(self.stage1_boundary_norm_scale, 1e-6)
                 ).clamp(0.0, 1.0),
                 (
-                    _optional_float_field('prev_front_follow_upper_speed_mps')
+                    _optional_float_field(_key('front_follow_upper_speed_mps'))
                     / max(self.stage1_boundary_norm_scale, 1e-6)
                 ).clamp(0.0, 1.0),
                 (
-                    _optional_float_field('prev_merge_flow_lower_speed_mps')
+                    _optional_float_field(_key('merge_flow_lower_speed_mps'))
                     / max(self.stage1_boundary_norm_scale, 1e-6)
                 ).clamp(0.0, 1.0),
-                _optional_float_field('prev_current_cover_upper_speed_valid').clamp(0.0, 1.0),
-                _optional_float_field('prev_future_cover_lower_speed_valid').clamp(0.0, 1.0),
-                _optional_float_field('prev_front_follow_upper_speed_valid').clamp(0.0, 1.0),
-                _optional_float_field('prev_merge_flow_lower_speed_valid').clamp(0.0, 1.0),
+                _optional_float_field(_key('current_cover_upper_speed_valid')).clamp(0.0, 1.0),
+                _optional_float_field(_key('future_cover_lower_speed_valid')).clamp(0.0, 1.0),
+                _optional_float_field(_key('front_follow_upper_speed_valid')).clamp(0.0, 1.0),
+                _optional_float_field(_key('merge_flow_lower_speed_valid')).clamp(0.0, 1.0),
             ],
             dim=-1,
         )
@@ -1799,6 +1939,101 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         memory = torch.cat([valid.unsqueeze(-1), window_oh, dir_oh], dim=-1)
         return memory * valid.unsqueeze(-1)
+
+    def _get_semantic_chain_history_state(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        route_steps: int,
+        require: bool = False,
+    ) -> Optional[dict]:
+        """Read weak history state for the structured S chain.
+
+        hist1 is preferred when available. If a dataset has not been upgraded to
+        hist4 yet, this safely falls back to legacy prev_* unless require=True.
+        """
+        if not self.use_semantic_chain_history:
+            return None
+        prefixes = []
+        primary = str(self.semantic_chain_history_prefix or 'hist1').rstrip('_')
+        if primary:
+            prefixes.append(primary)
+        if 'hist1' not in prefixes:
+            prefixes.append('hist1')
+        if 'prev' not in prefixes:
+            prefixes.append('prev')
+        last_error = None
+        for prefix in prefixes:
+            try:
+                state = self._get_semantic_transition_prev_state(
+                    batch=batch,
+                    device=device,
+                    model_dtype=model_dtype,
+                    route_steps=route_steps,
+                    require=require and prefix == prefixes[-1],
+                    prefix=prefix,
+                )
+            except ValueError as exc:
+                last_error = exc
+                state = None
+            if state is not None:
+                return state
+        if require and last_error is not None:
+            raise last_error
+        return None
+
+    def load_semantic_teacher_checkpoint(
+        self,
+        checkpoint_path: Optional[str] = None,
+        *,
+        device: Optional[torch.device] = None,
+        rank: int = 0,
+    ) -> bool:
+        """Load a frozen copy of the semantic model for M/A2 stages.
+
+        The teacher is kept out of this module's registered children to avoid
+        bloating checkpoints with a duplicate model. It is only used under
+        no_grad, so optimizer/DDP do not need to see it.
+        """
+        checkpoint_path = checkpoint_path or os.environ.get(
+            'SEMANTIC_TEACHER_CHECKPOINT', self.semantic_teacher_checkpoint_path
+        )
+        if not checkpoint_path:
+            return False
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"semantic teacher checkpoint not found: {checkpoint_path}")
+        if device is None:
+            device = next(self.parameters()).device
+        teacher = copy.deepcopy(self.model).to(device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        state = ckpt.get('model_state_dict', ckpt)
+        model_state = teacher.state_dict()
+        compatible = {}
+        for key, value in state.items():
+            if key.startswith('module.'):
+                key = key[len('module.'):]
+            if key.startswith('model.'):
+                key = key[len('model.'):]
+            if key in model_state and tuple(model_state[key].shape) == tuple(value.shape):
+                compatible[key] = value
+        model_state.update(compatible)
+        teacher.load_state_dict(model_state, strict=True)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad_(False)
+        self.__dict__['_semantic_teacher_model'] = teacher
+        self.semantic_teacher_checkpoint_path = checkpoint_path
+        if rank == 0:
+            print(
+                f"  ✓ Loaded frozen semantic teacher from {checkpoint_path} "
+                f"({len(compatible)} tensors)"
+            )
+        return True
+
+    def _semantic_teacher_model(self) -> Optional[nn.Module]:
+        return self.__dict__.get('_semantic_teacher_model', None)
 
     def _semantic_head_forward_view(self, shared_forward: dict) -> dict:
         """Return shared decoder outputs for semantic heads.
@@ -2910,6 +3145,75 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             ),
         )
 
+    def _build_state_conditioned_motion_teacher_branch(
+        self,
+        *,
+        batch: Dict[str, torch.Tensor],
+        trajectory: torch.Tensor,
+        route_gt: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        transfuser_lidar_bev: Optional[torch.Tensor],
+        ego_status: torch.Tensor,
+        bev_proj: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[dict]]:
+        teacher = self._semantic_teacher_model()
+        if teacher is None:
+            if self.use_frozen_semantic_teacher:
+                raise RuntimeError(
+                    "state_conditioned_motion requires a frozen S teacher. "
+                    "Set SEMANTIC_TEACHER_CHECKPOINT or route_b.semantic_teacher_checkpoint_path."
+                )
+            return None, None
+        teacher.eval()
+        with torch.no_grad():
+            clean_joint_norm = self.joint_abs_to_norm(trajectory, route_gt)
+            clean_joint_abs = torch.cat([trajectory, route_gt], dim=1)
+            zero_timestep = torch.zeros(trajectory.shape[0], device=device, dtype=torch.long)
+            teacher_forward = teacher.forward_ego(
+                x_t=clean_joint_norm,
+                x_t_abs=clean_joint_abs,
+                timestep=zero_timestep,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                ego_status=ego_status,
+                bev_proj_cached=bev_proj,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+                branch_condition=None,
+                prev_route_coarse_memory=None,
+                return_intermediates=True,
+            )
+            route_steps = int(teacher_forward['route_points'].shape[1])
+            chain_history_state = self._get_semantic_chain_history_state(
+                batch,
+                device=device,
+                model_dtype=model_dtype,
+                route_steps=route_steps,
+                require=False,
+            )
+            raw_scores = teacher.compute_shared_stage1_from_ego_outputs(
+                traj_out=teacher_forward['traj_out'],
+                route_out=teacher_forward['route_out'],
+                speed_out=teacher_forward['speed_out'],
+                route_points=teacher_forward['route_points'],
+                conditioning=teacher_forward['conditioning'],
+                prev_state=chain_history_state,
+            )
+            branch = self._build_traj_branch_condition_from_stage1_raw(
+                raw_scores=raw_scores,
+                speed_ref=ego_status[:, -1, 0],
+                borrow_time_s=self._get_stage1_borrow_time_target(
+                    batch, device=device, model_dtype=model_dtype
+                ),
+                prev_relation_probs=None,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            raw_debug = self._compose_stage1_raw_outputs(raw_scores)
+            return branch.detach(), raw_debug
+
     def reset_semantic_state_cache(self) -> None:
         """Clear the inference-only semantic transition memory."""
         self._semantic_state_cache = None
@@ -3364,6 +3668,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         interval_valid = _float('state_motion_speed_interval_valid')
         relation = _long('state_motion_expert_speed_relation')
         risky = _float('state_motion_risky_passable')
+        dist_entry = _float('conflict_dist_to_entry_m')
+        dist_exit = _float('conflict_dist_to_exit_m')
+        timing_valid = _float('conflict_timing_valid')
         required_values = (lower, upper, lower_valid, upper_valid, interval_valid, relation, risky)
         if any(value is None for value in required_values):
             if require:
@@ -3380,6 +3687,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'interval_valid': interval_valid.clamp(0.0, 1.0) > 0.5,
             'relation': relation.clamp(min=0, max=4),
             'risky_passable': risky.clamp(0.0, 1.0) > 0.5,
+            'dist_to_entry': (dist_entry.clamp(min=0.0) if dist_entry is not None else torch.zeros_like(lower)),
+            'dist_to_exit': (dist_exit.clamp(min=0.0) if dist_exit is not None else torch.zeros_like(lower)),
+            'timing_valid': (timing_valid.clamp(0.0, 1.0) > 0.5 if timing_valid is not None else torch.zeros_like(lower, dtype=torch.bool)),
         }
 
     def _build_alignment_critic_features(
@@ -3414,7 +3724,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         upper_violation = (torch.relu(speed - upper) / margin_scale).clamp(0.0, 3.0)
         relation_oh = F.one_hot(relation.long(), num_classes=5).to(dtype=model_dtype)
 
-        return torch.cat([
+        base_features = [
             speed_norm.unsqueeze(-1),
             lower_norm.unsqueeze(-1),
             upper_norm.unsqueeze(-1),
@@ -3427,7 +3737,39 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             risky.unsqueeze(-1),
             relation_oh,
             interval_valid.unsqueeze(-1),
-        ], dim=-1)
+        ]
+        if int(self.alignment_feature_dim) <= 16:
+            return torch.cat(base_features, dim=-1)
+
+        dist_entry = alignment_targets.get('dist_to_entry')
+        dist_exit = alignment_targets.get('dist_to_exit')
+        timing_valid = alignment_targets.get('timing_valid')
+        if dist_entry is None:
+            dist_entry = torch.zeros_like(speed)
+        else:
+            dist_entry = dist_entry.to(device=device, dtype=model_dtype)
+        if dist_exit is None:
+            dist_exit = torch.zeros_like(speed)
+        else:
+            dist_exit = dist_exit.to(device=device, dtype=model_dtype)
+        if timing_valid is None:
+            timing_valid = torch.zeros_like(speed, dtype=torch.bool)
+        else:
+            timing_valid = timing_valid.to(device=device)
+        safe_speed = torch.maximum(speed, torch.full_like(speed, 0.5))
+        t_entry = (dist_entry / safe_speed).clamp(0.0, 20.0)
+        t_exit = (dist_exit / safe_speed).clamp(0.0, 20.0)
+        timing_features = [
+            (dist_entry / max(float(self.conflict_timing_dist_norm_scale), 1e-6)).clamp(0.0, 2.0).unsqueeze(-1),
+            (dist_exit / max(float(self.conflict_timing_dist_norm_scale), 1e-6)).clamp(0.0, 2.0).unsqueeze(-1),
+            (t_entry / max(float(self.conflict_timing_time_norm_scale), 1e-6)).clamp(0.0, 2.0).unsqueeze(-1),
+            (t_exit / max(float(self.conflict_timing_time_norm_scale), 1e-6)).clamp(0.0, 2.0).unsqueeze(-1),
+            timing_valid.to(dtype=model_dtype).unsqueeze(-1),
+            torch.relu(lower - speed).sign().unsqueeze(-1),
+            torch.relu(speed - upper).sign().unsqueeze(-1),
+            torch.ones_like(speed).unsqueeze(-1),
+        ]
+        return torch.cat([*base_features, *timing_features], dim=-1)
 
     def _alignment_interval_targets(
         self,
@@ -3463,15 +3805,259 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             lower_score = torch.where(risky, torch.maximum(lower_score, floor), lower_score)
             upper_score = torch.where(risky, torch.maximum(upper_score, floor), upper_score)
 
-        # Decomposed score layout:
+        # Decomposed score layout v1:
         # total, phase-speed, edge-speed, chase/upper-speed, interval-core.
+        edge_speed_score = torch.minimum(lower_score, upper_score)
+        if int(self.alignment_score_dim) <= 5:
+            return torch.stack([
+                interval_score,
+                interval_score,
+                edge_speed_score,
+                upper_score,
+                interval_score,
+            ], dim=-1).to(dtype=model_dtype)
+
+        # A2 layout:
+        # total, interval_speed, edge_speed, chase_speed, area_timing,
+        # soft_phase_opportunity, temporal_consistency.
+        dist_entry = alignment_targets.get('dist_to_entry')
+        dist_exit = alignment_targets.get('dist_to_exit')
+        timing_valid = alignment_targets.get('timing_valid')
+        if dist_entry is None or dist_exit is None or timing_valid is None:
+            area_timing_score = interval_score
+        else:
+            dist_entry = dist_entry.to(device=device, dtype=model_dtype)
+            dist_exit = dist_exit.to(device=device, dtype=model_dtype)
+            timing_valid = timing_valid.to(device=device)
+            eps = torch.full_like(speed, 0.5)
+            safe_speed = torch.maximum(speed, eps)
+            t_entry = dist_entry / safe_speed
+            t_exit = dist_exit / safe_speed
+            # Prefer candidates that produce finite, plausible area arrival/exit
+            # times. This is a soft heuristic target, not a hard physical rule.
+            time_penalty = (torch.relu(t_entry - 10.0).square() + torch.relu(-t_exit).square()) / 100.0
+            timing_score = torch.exp(-time_penalty).clamp(0.0, 1.0)
+            area_timing_score = torch.where(timing_valid, timing_score, interval_score)
+        total = (0.55 * interval_score + 0.25 * edge_speed_score + 0.20 * area_timing_score).clamp(0.0, 1.0)
         return torch.stack([
+            total,
             interval_score,
-            interval_score,
-            torch.minimum(lower_score, upper_score),
+            edge_speed_score,
             upper_score,
+            area_timing_score,
+            lower_score,
             interval_score,
         ], dim=-1).to(dtype=model_dtype)
+
+    def _alignment_relation_from_speed(
+        self,
+        speed_mps: torch.Tensor,
+        alignment_targets: dict,
+    ) -> torch.Tensor:
+        device = speed_mps.device
+        speed = speed_mps.reshape(-1)
+        lower = alignment_targets['lower'].to(device=device, dtype=speed.dtype)
+        upper = alignment_targets['upper'].to(device=device, dtype=speed.dtype)
+        lower_valid = alignment_targets['lower_valid'].to(device=device)
+        upper_valid = alignment_targets['upper_valid'].to(device=device)
+        interval_valid = alignment_targets['interval_valid'].to(device=device)
+        relation = torch.zeros_like(speed, dtype=torch.long, device=device)
+        below = interval_valid & lower_valid & (speed < lower)
+        above = interval_valid & upper_valid & (speed > upper)
+        inside = interval_valid & ~below & ~above
+        relation = torch.where(inside, torch.ones_like(relation), relation)
+        relation = torch.where(below, torch.full_like(relation, 2), relation)
+        relation = torch.where(above, torch.full_like(relation, 3), relation)
+        return relation.clamp(min=0, max=4)
+
+    def _build_inference_alignment_targets_from_stage1(
+        self,
+        stage1_scores: Optional[dict],
+        reference_speed_mps: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Optional[dict]:
+        """Build A-critic interval features from predicted semantic state.
+
+        Close-loop has no GT phase-speed interval labels, so A-rerank derives a
+        conservative interval from predicted cover-edge/chase state. This keeps
+        the critic as a runtime compatibility scorer instead of leaking labels.
+        """
+        if stage1_scores is None:
+            return None
+        ref = reference_speed_mps.to(device=device, dtype=model_dtype).reshape(-1)
+        B = ref.shape[0]
+        th = float(self.alignment_rerank_valid_threshold)
+
+        def _prob(name: str) -> torch.Tensor:
+            value = stage1_scores.get(name)
+            if value is None:
+                return torch.zeros((B,), device=device, dtype=model_dtype)
+            return torch.nan_to_num(
+                value.to(device=device, dtype=model_dtype).reshape(-1),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+
+        def _speed(name: str, default: float = 0.0) -> torch.Tensor:
+            value = stage1_scores.get(name)
+            if value is None:
+                return torch.full((B,), float(default), device=device, dtype=model_dtype)
+            return torch.nan_to_num(
+                value.to(device=device, dtype=model_dtype).reshape(-1),
+                nan=float(default),
+                posinf=float(default),
+                neginf=float(default),
+            ).clamp(0.0, float(self.stage1_boundary_norm_scale))
+
+        window_probs = stage1_scores.get('window_probs')
+        if window_probs is None:
+            merge_prob = torch.zeros((B,), device=device, dtype=model_dtype)
+        else:
+            window_probs = window_probs.to(device=device, dtype=model_dtype).reshape(B, -1)
+            merge_prob = window_probs[:, 1] if window_probs.shape[-1] > 1 else torch.zeros((B,), device=device, dtype=model_dtype)
+
+        future_mode_probs = stage1_scores.get('future_cover_edge_mode_probs')
+        if future_mode_probs is None:
+            future_go_before_prob = torch.zeros((B,), device=device, dtype=model_dtype)
+        else:
+            future_mode_probs = future_mode_probs.to(device=device, dtype=model_dtype).reshape(B, -1)
+            future_go_before_prob = (
+                future_mode_probs[:, 2]
+                if future_mode_probs.shape[-1] > 2 else
+                torch.zeros((B,), device=device, dtype=model_dtype)
+            )
+
+        current_valid_prob = _prob('current_cover_edge_valid_prob')
+        future_valid_prob = _prob('future_cover_edge_valid_prob')
+        chase_valid_prob = _prob('chase_has_lead_prob')
+        merge_lower_valid_prob = merge_prob
+        future_lower_valid_prob = future_valid_prob * future_go_before_prob
+
+        current_upper_valid = current_valid_prob > th
+        front_upper_valid = chase_valid_prob > th
+        future_lower_valid = future_lower_valid_prob > th
+        merge_lower_valid = merge_lower_valid_prob > th
+
+        cap = torch.full((B,), float(self.stage1_boundary_norm_scale), device=device, dtype=model_dtype)
+        zero = torch.zeros((B,), device=device, dtype=model_dtype)
+        current_upper = _speed('current_cover_upper_speed_mps', default=float(self.stage1_boundary_norm_scale))
+        front_upper = _speed('front_follow_upper_speed_mps', default=float(self.stage1_boundary_norm_scale))
+        future_lower = _speed('future_cover_lower_speed_mps', default=0.0)
+        merge_lower = _speed('merge_flow_lower_speed_mps', default=0.0)
+
+        upper_values = torch.stack([
+            torch.where(current_upper_valid, current_upper, cap),
+            torch.where(front_upper_valid, front_upper, cap),
+        ], dim=-1)
+        lower_values = torch.stack([
+            torch.where(future_lower_valid, future_lower, zero),
+            torch.where(merge_lower_valid, merge_lower, zero),
+        ], dim=-1)
+        upper_valid = current_upper_valid | front_upper_valid
+        lower_valid = future_lower_valid | merge_lower_valid
+        upper = upper_values.min(dim=-1).values
+        lower = lower_values.max(dim=-1).values
+        interval_valid = lower_valid | upper_valid
+        relation_targets = {
+            'lower': lower,
+            'upper': upper,
+            'lower_valid': lower_valid,
+            'upper_valid': upper_valid,
+            'interval_valid': interval_valid,
+            'relation': torch.zeros((B,), device=device, dtype=torch.long),
+            'risky_passable': torch.zeros((B,), device=device, dtype=torch.bool),
+        }
+        relation_targets['relation'] = self._alignment_relation_from_speed(ref, relation_targets)
+        return relation_targets
+
+    def _expand_alignment_targets_for_candidates(
+        self,
+        alignment_targets: dict,
+        num_candidates: int,
+    ) -> dict:
+        expanded = {}
+        for key, value in alignment_targets.items():
+            expanded[key] = value.unsqueeze(1).expand(-1, num_candidates).reshape(-1)
+        return expanded
+
+    def _rerank_target_speed_with_alignment_critic(
+        self,
+        target_speed_mps: Optional[torch.Tensor],
+        stage1_scores: Optional[dict],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], dict]:
+        debug = {}
+        if (
+            (not self.use_alignment_critic_rerank)
+            or self.alignment_critic is None
+            or target_speed_mps is None
+            or stage1_scores is None
+            or not self.alignment_rerank_candidate_offsets_mps
+        ):
+            return target_speed_mps, debug
+
+        base_speed = target_speed_mps.to(device=device, dtype=model_dtype).reshape(-1)
+        targets = self._build_inference_alignment_targets_from_stage1(
+            stage1_scores,
+            base_speed,
+            device=device,
+            model_dtype=model_dtype,
+        )
+        if targets is None:
+            return target_speed_mps, debug
+
+        offsets = list(self.alignment_rerank_candidate_offsets_mps)
+        if not any(abs(v) < 1e-6 for v in offsets):
+            offsets.append(0.0)
+        offsets_t = torch.tensor(offsets, device=device, dtype=model_dtype)
+        candidates = (base_speed.unsqueeze(-1) + offsets_t.view(1, -1)).clamp(
+            0.0, float(self.stage1_boundary_norm_scale)
+        )
+        B, K = candidates.shape
+        flat_targets = self._expand_alignment_targets_for_candidates(targets, K)
+        features = self._build_alignment_critic_features(
+            candidates.reshape(-1),
+            flat_targets,
+            model_dtype,
+        )
+        logits = self.alignment_critic(features)
+        scores = torch.sigmoid(logits).reshape(B, K, -1).to(dtype=model_dtype)
+        score_idx = min(max(int(self.alignment_rerank_score_index), 0), scores.shape[-1] - 1)
+        score = scores[:, :, score_idx]
+        anchor_penalty = (
+            torch.abs(candidates - base_speed.unsqueeze(-1))
+            / max(float(self.delta_speed_norm_scale), 1e-6)
+        ) * float(self.alignment_rerank_anchor_weight)
+        objective = score - anchor_penalty
+        valid = targets['interval_valid'].to(device=device)
+        best_idx = objective.argmax(dim=-1)
+        selected = candidates.gather(1, best_idx.unsqueeze(-1)).squeeze(-1)
+        strength = float(self.alignment_rerank_strength)
+        selected = base_speed + (selected - base_speed) * strength
+        selected = torch.where(valid, selected, base_speed).clamp(0.0, float(self.stage1_boundary_norm_scale))
+        selected_score = score.gather(1, best_idx.unsqueeze(-1)).squeeze(-1)
+        base_idx = torch.argmin(torch.abs(offsets_t.view(1, -1)), dim=-1).expand(B)
+        base_score = score.gather(1, base_idx.unsqueeze(-1)).squeeze(-1)
+        debug = {
+            'alignment_rerank_enabled': torch.ones((B,), device=device, dtype=model_dtype),
+            'alignment_rerank_valid': valid.to(dtype=model_dtype),
+            'alignment_rerank_base_speed': base_speed,
+            'alignment_rerank_selected_speed': selected,
+            'alignment_rerank_selected_idx': best_idx.to(dtype=model_dtype),
+            'alignment_rerank_base_score': base_score,
+            'alignment_rerank_selected_score': selected_score,
+            'alignment_rerank_candidates': candidates,
+            'alignment_rerank_scores': score,
+            'alignment_rerank_objective': objective,
+            'alignment_rerank_lower_mps': targets['lower'].to(device=device, dtype=model_dtype),
+            'alignment_rerank_upper_mps': targets['upper'].to(device=device, dtype=model_dtype),
+            'alignment_rerank_lower_valid': targets['lower_valid'].to(device=device, dtype=model_dtype),
+            'alignment_rerank_upper_valid': targets['upper_valid'].to(device=device, dtype=model_dtype),
+        }
+        return selected, debug
 
     def _sample_alignment_negative_speed(
         self,
@@ -3526,6 +4112,75 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         valid = alignment_targets['interval_valid'].to(device=device) & good_route_mask.to(device=device)
         if not valid.any():
             return zero, details
+
+        if self.alignment_critic_version in ('a2', 'v2', 'counterfactual_a2'):
+            grid = torch.linspace(
+                float(self.alignment_a2_speed_min_mps),
+                float(self.alignment_a2_speed_max_mps),
+                max(int(self.alignment_a2_num_speed_candidates), 2),
+                device=device,
+                dtype=model_dtype,
+            ).view(1, -1).expand(valid.shape[0], -1)
+            targeted = []
+            offsets = torch.tensor(
+                list(self.alignment_a2_targeted_candidate_offsets_mps),
+                device=device,
+                dtype=model_dtype,
+            )
+            if offsets.numel() == 0:
+                offsets = torch.zeros((1,), device=device, dtype=model_dtype)
+            for key in ('lower', 'upper'):
+                base = alignment_targets[key].to(device=device, dtype=model_dtype).reshape(-1, 1)
+                targeted.append((base + offsets.view(1, -1)).clamp(0.0, float(self.stage1_boundary_norm_scale)))
+            candidates = torch.cat([grid, *targeted], dim=-1).clamp(0.0, float(self.stage1_boundary_norm_scale))
+            Bc, K = candidates.shape
+            flat_targets = self._expand_alignment_targets_for_candidates(alignment_targets, K)
+            flat_speed = candidates.reshape(-1)
+            flat_valid = valid.unsqueeze(1).expand(Bc, K).reshape(-1)
+            features = self._build_alignment_critic_features(
+                flat_speed,
+                flat_targets,
+                model_dtype,
+            ).detach()
+            score_targets = self._alignment_interval_targets(
+                flat_speed,
+                flat_targets,
+                model_dtype,
+                risky_floor=True,
+            ).detach()
+            logits = self.alignment_critic(features[flat_valid])
+            loss = F.binary_cross_entropy_with_logits(
+                logits.float(),
+                score_targets[flat_valid].float(),
+                reduction='mean',
+            )
+            with torch.no_grad():
+                if speed_pred is not None:
+                    pred_speed = self.decode_speed_two_hot(speed_pred.detach(), self.model.speed_classes).to(
+                        device=device, dtype=model_dtype
+                    )
+                elif expert_speed_mps is not None:
+                    pred_speed = expert_speed_mps.to(device=device, dtype=model_dtype).reshape(-1)
+                else:
+                    pred_speed = alignment_targets['upper'].to(device=device, dtype=model_dtype)
+                pred_features = self._build_alignment_critic_features(
+                    pred_speed,
+                    alignment_targets,
+                    model_dtype,
+                ).detach()
+                pred_scores = torch.sigmoid(self.alignment_critic(pred_features[valid])).to(dtype=model_dtype)
+                details.update({
+                    'alignment_interval_loss': loss.detach(),
+                    'alignment_phase_speed_score': pred_scores[:, 1].mean().detach(),
+                    'alignment_edge_speed_score': pred_scores[:, 2].mean().detach(),
+                    'alignment_chase_speed_score': pred_scores[:, 3].mean().detach(),
+                    'alignment_area_timing_score': pred_scores[:, 4].mean().detach(),
+                    'alignment_temporal_consistency_score': pred_scores[:, 6].mean().detach(),
+                    'alignment_valid_frac': valid.to(dtype=model_dtype).mean().detach(),
+                    'alignment_risky_frac': (alignment_targets['risky_passable'].to(device=device) & valid).to(dtype=model_dtype).mean().detach(),
+                    'alignment_a2_candidate_count': torch.tensor(float(K), device=device, dtype=model_dtype),
+                })
+            return loss, details
 
         if expert_speed_mps is None:
             if speed_pred is None:
@@ -3980,6 +4635,15 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         route_steps = self.num_waypoints
         raw_stage1_scores = None
         semantic_shared_forward = self._semantic_head_forward_view(shared_forward)
+        chain_history_state = None
+        if self.use_structured_semantic_chain and self.use_semantic_chain_history:
+            chain_history_state = self._get_semantic_chain_history_state(
+                batch,
+                device=device,
+                model_dtype=model_dtype,
+                route_steps=route_steps,
+                require=self.require_semantic_history,
+            )
         if not transition_only_state:
             raw_stage1_scores = self.model.compute_shared_stage1_from_ego_outputs(
                 traj_out=semantic_shared_forward['traj_out'],
@@ -3987,6 +4651,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 speed_out=semantic_shared_forward['speed_out'],
                 route_points=semantic_shared_forward['route_points'],
                 conditioning=semantic_shared_forward['conditioning'],
+                prev_state=chain_history_state,
             )
             route_steps = raw_stage1_scores['conflict_area_logits'].shape[1]
         transition_stage1_scores = None
@@ -5170,7 +5835,24 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         traj_branch_condition = None
         traj_branch_condition_details = None
         branch_condition_schedule = None
-        if self.use_traj_branch_condition and has_stage1_labels:
+        if self.state_motion_training_mode == 'state_conditioned_motion':
+            traj_branch_condition, traj_branch_condition_details = self._build_state_conditioned_motion_teacher_branch(
+                batch=batch,
+                trajectory=trajectory,
+                route_gt=route_gt,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                transfuser_lidar_bev=transfuser_lidar_bev,
+                ego_status=ego_status,
+                bev_proj=bev_proj,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            if traj_branch_condition is not None:
+                branch_condition_schedule = self._build_traj_condition_schedule(
+                    diff_timesteps, device=device, model_dtype=model_dtype
+                )
+        elif self.use_traj_branch_condition and has_stage1_labels:
             traj_branch_condition, traj_branch_condition_details = self._build_stage1_branch_condition_gt(
                 batch=batch,
                 ego_status=ego_status,
@@ -5450,9 +6132,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             total_loss = motion_loss
         elif self.state_motion_training_mode == 'semantic_detached':
             total_loss = semantic_loss
-        elif self.state_motion_training_mode == 'alignment_critic':
+        elif self.state_motion_training_mode == 'state_conditioned_motion':
+            total_loss = motion_loss
+        elif self.state_motion_training_mode in ('alignment_critic', 'alignment_critic_a2'):
             total_loss = alignment_weighted_loss
-        elif self.state_motion_training_mode == 'critic_rerank_eval':
+        elif self.state_motion_training_mode in ('critic_rerank_eval', 'm2_a2_rerank'):
             total_loss = motion_loss + alignment_weighted_loss * 0.0
         elif self.state_motion_training_mode == 'adapter_m1':
             total_loss = state_motion_adapter_total_loss
@@ -5543,6 +6227,35 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             print(f"  [load_checkpoint] Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
         if unexpected:
             print(f"  [load_checkpoint] Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+        critic_path = config.get('route_b', {}).get('alignment_critic_checkpoint_path', None)
+        critic_path = os.environ.get('ALIGNMENT_CRITIC_CHECKPOINT_OVERRIDE', critic_path)
+        if critic_path:
+            if policy.alignment_critic is None:
+                print(
+                    "  [load_checkpoint] alignment_critic_checkpoint_path is set, "
+                    "but use_alignment_critic=false; skipping critic load"
+                )
+            elif not os.path.exists(critic_path):
+                print(f"  [load_checkpoint] alignment critic checkpoint not found: {critic_path}")
+            else:
+                critic_ckpt = torch.load(critic_path, map_location='cpu', weights_only=False)
+                critic_full_sd = critic_ckpt.get('model_state_dict', critic_ckpt)
+                critic_sd = {}
+                prefix = 'alignment_critic.'
+                for key, value in critic_full_sd.items():
+                    if key.startswith(prefix):
+                        critic_sd[key[len(prefix):]] = value
+                if not critic_sd and all(k in critic_full_sd for k in policy.alignment_critic.state_dict().keys()):
+                    critic_sd = critic_full_sd
+                if critic_sd:
+                    c_missing, c_unexpected = policy.alignment_critic.load_state_dict(critic_sd, strict=False)
+                    print(
+                        f"  [load_checkpoint] Loaded alignment critic from {critic_path}; "
+                        f"missing={len(c_missing)}, unexpected={len(c_unexpected)}"
+                    )
+                else:
+                    print(f"  [load_checkpoint] No alignment_critic.* tensors found in {critic_path}")
 
         policy = policy.to(device)
         policy.eval()
@@ -5937,6 +6650,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 raise RuntimeError("semantic inference produced no stage1 ref scores")
             stage1_ref_scores = self._compose_stage1_outputs(stage1_ref_scores_raw)
 
+        alignment_rerank_debug = {}
+        target_speed_pred, alignment_rerank_debug = self._rerank_target_speed_with_alignment_critic(
+            target_speed_pred,
+            stage1_scores,
+            device=device,
+            model_dtype=model_dtype,
+        )
+
         if phase_go_smoothing_debug is None:
             phase_go_smoothing_debug = {
                 'enabled': float(self.phase_go_smoothing_enable),
@@ -6116,6 +6837,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'best_idx': torch.zeros(B, dtype=torch.long, device=device),  # always 0
             'target_speed': target_speed_pred,        # (B,) m/s
             'target_speed_profile': speed_profile_pred if self.use_speed_profile_head else None,
+            **alignment_rerank_debug,
         }
 
     # ========== Predict Action (standard interface) ==========
@@ -6270,6 +6992,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             'semantic_motion_condition_profile_id',
             'semantic_state_supervision_profile',
             'semantic_state_supervision_profile_id',
+            'alignment_rerank_enabled',
+            'alignment_rerank_valid',
+            'alignment_rerank_base_speed',
+            'alignment_rerank_selected_speed',
+            'alignment_rerank_selected_idx',
+            'alignment_rerank_base_score',
+            'alignment_rerank_selected_score',
+            'alignment_rerank_lower_mps',
+            'alignment_rerank_upper_mps',
+            'alignment_rerank_lower_valid',
+            'alignment_rerank_upper_valid',
         ):
             if sample_result.get(key) is not None:
                 result[key] = sample_result[key].detach().float().cpu().numpy()
@@ -6277,6 +7010,13 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             result['semantic_motion_condition_group_mask'] = (
                 sample_result['semantic_motion_condition_group_mask'].detach().float().cpu().numpy()
             )
+        for key in (
+            'alignment_rerank_candidates',
+            'alignment_rerank_scores',
+            'alignment_rerank_objective',
+        ):
+            if sample_result.get(key) is not None:
+                result[key] = sample_result[key].detach().float().cpu().numpy()
         if sample_result.get('pass1_trajectory') is not None:
             result['pass1_trajectory'] = (
                 sample_result['pass1_trajectory'].detach().float().cpu().numpy()

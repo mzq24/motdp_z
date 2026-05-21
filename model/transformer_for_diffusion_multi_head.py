@@ -1690,6 +1690,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         use_cover_relation_graph_decoder: bool = False,
         cover_graph_use_traj_context: bool = False,
         cover_graph_use_speed_context: bool = False,
+        use_structured_semantic_chain: bool = False,
+        semantic_chain_residual_scale: float = 0.2,
+        use_semantic_chain_history: bool = False,
+        semantic_chain_history_scale: float = 0.2,
+        semantic_chain_history_dropout_prob: float = 0.5,
+        semantic_chain_window_history_scale: float = 0.1,
         use_route_prev_coarse_memory: bool = False,
         use_route_intent_token: bool = False,
         route_intent_gate_init: float = 0.1,
@@ -1748,6 +1754,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.use_cover_relation_graph_decoder = bool(use_cover_relation_graph_decoder)
         self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context)
         self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context)
+        self.use_structured_semantic_chain = bool(use_structured_semantic_chain)
+        self.semantic_chain_residual_scale = float(semantic_chain_residual_scale)
+        self.use_semantic_chain_history = bool(use_semantic_chain_history)
+        self.semantic_chain_history_scale = float(semantic_chain_history_scale)
+        self.semantic_chain_history_dropout_prob = float(semantic_chain_history_dropout_prob)
+        self.semantic_chain_window_history_scale = float(semantic_chain_window_history_scale)
         self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory)
         self.use_route_intent_token = bool(use_route_intent_token)
         self.use_speed_delta_head = bool(use_speed_delta_head)
@@ -2106,6 +2118,24 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.shared_stage1_conflict_area_head = nn.Sequential(
             nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
             nn.Linear(n_emb // 2, 1),
+        )
+
+        # Structured semantic chain residuals. These keep the direct current-frame
+        # feature as the anchor, and only add small group-to-group residual context.
+        self.semantic_chain_window_to_spatial = nn.Sequential(
+            nn.Linear(4, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_chain_spatial_to_temporal = nn.Sequential(
+            nn.Linear(4 + 4 + 4 + 3, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_chain_temporal_to_relation = nn.Sequential(
+            nn.Linear(4 + 4 + 3 + 2, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_chain_relation_to_phase = nn.Sequential(
+            nn.Linear(4 + 2 + 1 + 5 + 1 + 5, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
+        )
+        self.semantic_chain_history_proj = nn.Sequential(
+            nn.Linear(n_emb, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
         )
 
         # Semantic-state transition head: offline previous semantic tokens
@@ -2609,6 +2639,151 @@ class TransformerForDiffusion(ModuleAttrMixin):
             'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
         }
 
+    def _decode_structured_stage1_scores(
+        self,
+        context: dict,
+        route_out: torch.Tensor,
+        semantic_feature: Optional[torch.Tensor] = None,
+        speed_samples: Optional[torch.Tensor] = None,
+        prev_state: Optional[dict] = None,
+    ) -> dict:
+        """Decode semantic heads as a soft intra-frame chain.
+
+        Chain order: window -> spatial/area -> temporal/opportunity ->
+        cover relation -> phase/boundary. The direct feature remains the anchor,
+        so this is intentionally a small residual decoder rather than an
+        autoregressive hard dependency.
+        """
+        if semantic_feature is None:
+            semantic_feature = context['semantic_feature']
+        base = semantic_feature
+        device = base.device
+        dtype = base.dtype
+        scale = float(self.semantic_chain_residual_scale)
+
+        history = None
+        if self.use_semantic_chain_history and prev_state is not None:
+            history_tokens = self._encode_prev_semantic_state(prev_state, context)
+            history = self.semantic_chain_history_proj(history_tokens.mean(dim=1))
+            hist_scale = float(self.semantic_chain_history_scale)
+            if self.training and self.semantic_chain_history_dropout_prob > 0.0:
+                keep = (
+                    torch.rand((base.shape[0], 1), device=device, dtype=dtype)
+                    >= min(max(float(self.semantic_chain_history_dropout_prob), 0.0), 1.0)
+                ).to(dtype=dtype)
+                hist_scale = hist_scale * keep
+            base = base + hist_scale * history
+
+        window_feature = base
+        if history is not None and self.semantic_chain_window_history_scale != self.semantic_chain_history_scale:
+            window_feature = semantic_feature + float(self.semantic_chain_window_history_scale) * history
+        window_logits = self.shared_stage1_window_head(window_feature)
+        window_probs = torch.softmax(window_logits, dim=-1)
+
+        spatial_feature = base + scale * torch.tanh(self.semantic_chain_window_to_spatial(window_probs))
+        dir_logits = self.shared_stage1_dir_head(spatial_feature)
+        area_status_logits = self.shared_stage1_conflict_area_status_head(spatial_feature)
+        timing_values = self.shared_stage1_conflict_timing_head(spatial_feature)
+
+        spatial_vec = torch.cat(
+            [
+                window_probs,
+                torch.softmax(dir_logits, dim=-1),
+                torch.softmax(area_status_logits, dim=-1),
+                timing_values.tanh(),
+            ],
+            dim=-1,
+        )
+        temporal_feature = base + scale * torch.tanh(self.semantic_chain_spatial_to_temporal(spatial_vec))
+        tempocc_logits = self.shared_stage1_temporary_occupancy_head(temporal_feature)
+        go_opportunity_logits = self.shared_stage1_go_opportunity_head(temporal_feature)
+        opportunity_probs = torch.softmax(go_opportunity_logits, dim=-1)
+
+        temporal_vec = torch.cat(
+            [
+                window_probs,
+                torch.softmax(area_status_logits, dim=-1),
+                timing_values.tanh(),
+                opportunity_probs,
+            ],
+            dim=-1,
+        )
+        relation_feature = base + scale * torch.tanh(self.semantic_chain_temporal_to_relation(temporal_vec))
+
+        conflict_area_input = torch.cat([route_out, context['route_geom_tokens']], dim=-1)
+        semantic_route_tokens = relation_feature.unsqueeze(1).expand(-1, route_out.shape[1], -1)
+        graph_route_input = torch.cat(
+            [route_out, context['route_geom_tokens'], semantic_route_tokens],
+            dim=-1,
+        )
+        current_edge_valid_logit = (
+            self.shared_stage1_current_edge_valid_head(relation_feature).squeeze(-1)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_current_edge_valid_head(graph_route_input).squeeze(-1)
+            )
+        )
+        current_edge_mode_logits = (
+            self.shared_stage1_current_edge_mode_head(relation_feature)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_current_edge_mode_head(graph_route_input)
+            )
+        )
+        future_edge_valid_logit = (
+            self.shared_stage1_future_edge_valid_head(relation_feature).squeeze(-1)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_future_edge_valid_head(graph_route_input).squeeze(-1)
+            )
+        )
+        future_edge_mode_logits = (
+            self.shared_stage1_future_edge_mode_head(relation_feature)
+            + self._pool_route_graph_logits(
+                self.shared_stage1_route_future_edge_mode_head(graph_route_input)
+            )
+        )
+
+        relation_vec = torch.cat(
+            [
+                window_probs,
+                opportunity_probs,
+                torch.sigmoid(current_edge_valid_logit).unsqueeze(-1),
+                torch.softmax(current_edge_mode_logits, dim=-1),
+                torch.sigmoid(future_edge_valid_logit).unsqueeze(-1),
+                torch.softmax(future_edge_mode_logits, dim=-1),
+            ],
+            dim=-1,
+        )
+        phase_feature = base + scale * torch.tanh(self.semantic_chain_relation_to_phase(relation_vec))
+        decision_phase_logits = self.shared_stage1_decision_phase_head(phase_feature)
+
+        return {
+            'window_logits': window_logits,
+            'dir_logits': dir_logits,
+            'decision_phase_logits': decision_phase_logits,
+            'decision_phase_logits_base': decision_phase_logits,
+            'control_phase_logits': self.shared_stage1_control_phase_head(phase_feature),
+            'temporary_occupancy_logits': tempocc_logits,
+            'go_opportunity_logits': go_opportunity_logits,
+            'conflict_area_status_logits': area_status_logits,
+            'conflict_timing_values': timing_values,
+            'chase_has_lead_logit': self.shared_stage1_chase_has_lead_head(relation_feature).squeeze(-1),
+            'chase_speed_max': self.shared_stage1_chase_speed_max_head(relation_feature).squeeze(-1),
+            'current_cover_edge_valid_logit': current_edge_valid_logit,
+            'current_cover_edge_mode_logits': current_edge_mode_logits,
+            'future_cover_edge_valid_logit': future_edge_valid_logit,
+            'future_cover_edge_mode_logits': future_edge_mode_logits,
+            'current_cover_upper_speed': self.shared_stage1_current_cover_upper_speed_head(phase_feature).squeeze(-1),
+            'future_cover_lower_speed': self.shared_stage1_future_cover_lower_speed_head(phase_feature).squeeze(-1),
+            'front_follow_upper_speed': self.shared_stage1_front_follow_upper_speed_head(relation_feature).squeeze(-1),
+            'merge_flow_lower_speed': self.shared_stage1_merge_flow_lower_speed_head(phase_feature).squeeze(-1),
+            'merge_yld_max': self.shared_stage1_merge_yld_max_head(phase_feature).squeeze(-1),
+            'merge_go_min': self.shared_stage1_merge_go_min_head(phase_feature).squeeze(-1),
+            'junction_yld_max': self.shared_stage1_junction_yld_max_head(phase_feature).squeeze(-1),
+            'junction_go_min': self.shared_stage1_junction_go_min_head(phase_feature).squeeze(-1),
+            'borrow_yld_max': self.shared_stage1_borrow_yld_max_head(phase_feature).squeeze(-1),
+            'borrow_go_min': self.shared_stage1_borrow_go_min_head(phase_feature).squeeze(-1),
+            'conflict_area_logits': self.shared_stage1_conflict_area_head(conflict_area_input).squeeze(-1),
+        }
+
     def _compute_shared_stage1_scores(
         self,
         traj_out: torch.Tensor,
@@ -2617,6 +2792,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_points: torch.Tensor,
         conditioning: torch.Tensor,
         speed_samples: Optional[torch.Tensor] = None,
+        prev_state: Optional[dict] = None,
     ) -> dict:
         context = self._build_shared_stage1_context(
             traj_out=traj_out,
@@ -2625,6 +2801,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_points=route_points,
             conditioning=conditioning,
         )
+        if self.use_structured_semantic_chain:
+            return self._decode_structured_stage1_scores(
+                context=context,
+                route_out=route_out,
+                speed_samples=speed_samples,
+                prev_state=prev_state,
+            )
         return self._decode_shared_stage1_scores(
             context=context,
             route_out=route_out,
@@ -2898,6 +3081,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         route_points: torch.Tensor,
         conditioning: torch.Tensor,
         speed_samples: Optional[torch.Tensor] = None,
+        prev_state: Optional[dict] = None,
     ) -> dict:
         return self._compute_shared_stage1_scores(
             traj_out=traj_out,
@@ -2906,6 +3090,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_points=route_points,
             conditioning=conditioning,
             speed_samples=speed_samples,
+            prev_state=prev_state,
         )
 
     def compute_shared_stage1_transition_from_ego_outputs(

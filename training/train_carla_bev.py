@@ -2398,6 +2398,17 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False, init_checkpo
             if rank == 0:
                 print("  ✓ AMP scaler state restored")
 
+    # Load optional frozen semantic teacher before DDP wrapping. The teacher is
+    # intentionally kept outside registered submodules by the policy helper.
+    if hasattr(policy, 'load_semantic_teacher_checkpoint'):
+        teacher_requested = bool(
+            config.get('route_b', {}).get('use_frozen_semantic_teacher', False)
+            or os.environ.get('SEMANTIC_TEACHER_CHECKPOINT')
+            or config.get('route_b', {}).get('semantic_teacher_checkpoint_path')
+        )
+        if teacher_requested:
+            policy.load_semantic_teacher_checkpoint(device=device, rank=rank)
+
     # Wrap model with DistributedDataParallel for multi-GPU training
     if world_size > 1:
         policy = torch.nn.parallel.DistributedDataParallel(
