@@ -1702,6 +1702,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         state_motion_adapter_gate_init: float = 1.0,
         state_motion_adapter_speed_norm_scale: float = 30.0,
         state_motion_adapter_margin_scale: float = 5.0,
+        state_motion_adapter_condition_version: str = "m1",
     ) -> None:
         super().__init__()
 
@@ -1762,6 +1763,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.state_motion_adapter_modify_route = bool(state_motion_adapter_modify_route)
         self.state_motion_adapter_speed_norm_scale = float(state_motion_adapter_speed_norm_scale)
         self.state_motion_adapter_margin_scale = float(state_motion_adapter_margin_scale)
+        adapter_condition_version = str(state_motion_adapter_condition_version).lower().strip()
+        if adapter_condition_version in ("m1.5", "m15", "cleanup"):
+            adapter_condition_version = "m15"
+        if adapter_condition_version not in ("m1", "m15"):
+            raise ValueError(
+                "state_motion_adapter_condition_version must be 'm1' or 'm15', "
+                f"got {state_motion_adapter_condition_version}"
+            )
+        self.state_motion_adapter_condition_version = adapter_condition_version
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -2245,7 +2255,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
             if self.use_speed_delta_head else None
         )
 
-        self.state_motion_adapter_condition_dim = self.traj_branch_condition_compact_graph_dim + 1
+        if self.state_motion_adapter_condition_version == "m15":
+            self.state_motion_adapter_condition_dim = (
+                self.traj_window_condition_dim
+                + self.traj_decision_phase_condition_dim
+                + self.traj_control_phase_condition_dim
+                + self.traj_opportunity_condition_dim
+                + self.traj_area_status_condition_dim
+                + self.traj_timing_condition_dim
+                + self.traj_current_edge_condition_dim
+                + self.traj_future_edge_condition_dim
+                + self.traj_edge_margin_dim
+                + self.traj_edge_valid_dim
+                + 1  # current speed
+            )
+        else:
+            self.state_motion_adapter_condition_dim = self.traj_branch_condition_compact_graph_dim + 1
         self.state_motion_adapter_condition_proj = nn.Sequential(
             nn.Linear(self.state_motion_adapter_condition_dim, n_emb),
             nn.SiLU(),
@@ -2964,6 +2989,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
             )
             return (value * speed_scale).clamp(0.0, speed_scale)
 
+        def _float_vec(name: str, dim: int) -> torch.Tensor:
+            value = stage1_scores.get(name)
+            if value is None:
+                return torch.zeros((B, dim), device=device, dtype=dtype)
+            value = torch.nan_to_num(
+                value.to(device=device, dtype=dtype).reshape(B, dim),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            return value
+
         window_probs = _softmax('window_logits', 4, fallback_index=0)
         decision_probs = _softmax('decision_phase_logits', 2, fallback_index=0)
         control_probs = _softmax('control_phase_logits', 4, fallback_index=0)
@@ -2984,6 +3021,47 @@ class TransformerForDiffusion(ModuleAttrMixin):
         future_lower_margin = ((current_speed - future_lower) / margin_scale).clamp(-1.0, 1.0) * future_edge_valid
         front_follow_upper_margin = ((front_follow_upper - current_speed) / margin_scale).clamp(-1.0, 1.0) * chase_has_lead
         merge_flow_lower_margin = ((current_speed - merge_flow_lower) / margin_scale).clamp(-1.0, 1.0) * future_edge_valid
+        edge_valid_flags = torch.stack(
+            [
+                current_edge_valid,
+                future_edge_valid,
+                chase_has_lead,
+                future_edge_valid,
+            ],
+            dim=-1,
+        )
+        edge_margins = torch.stack(
+            [
+                current_upper_margin,
+                future_lower_margin,
+                front_follow_upper_margin,
+                merge_flow_lower_margin,
+            ],
+            dim=-1,
+        )
+        current_edge_cond = torch.cat([current_edge_valid.unsqueeze(-1), current_edge_mode], dim=-1)
+        future_edge_cond = torch.cat([future_edge_valid.unsqueeze(-1), future_edge_mode], dim=-1)
+        current_speed_norm = (current_speed / speed_scale).clamp(0.0, 1.0).unsqueeze(-1)
+
+        if self.state_motion_adapter_condition_version == "m15":
+            area_status_probs = _softmax('conflict_area_status_logits', 4, fallback_index=0)
+            timing_values = _float_vec('conflict_timing_values', 3).clamp(-2.0, 2.0)
+            return torch.cat(
+                [
+                    window_probs,
+                    decision_probs,
+                    control_probs,
+                    opportunity_probs,
+                    area_status_probs,
+                    timing_values,
+                    current_edge_cond,
+                    future_edge_cond,
+                    edge_margins,
+                    edge_valid_flags,
+                    current_speed_norm,
+                ],
+                dim=-1,
+            )
 
         compact_condition = torch.cat(
             [
@@ -2991,31 +3069,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 decision_probs,
                 control_probs,
                 opportunity_probs,
-                torch.cat([current_edge_valid.unsqueeze(-1), current_edge_mode], dim=-1),
-                torch.cat([future_edge_valid.unsqueeze(-1), future_edge_mode], dim=-1),
-                torch.stack(
-                    [
-                        current_upper_margin,
-                        future_lower_margin,
-                        front_follow_upper_margin,
-                        merge_flow_lower_margin,
-                    ],
-                    dim=-1,
-                ),
-                torch.stack(
-                    [
-                        current_edge_valid,
-                        future_edge_valid,
-                        chase_has_lead,
-                        future_edge_valid,
-                    ],
-                    dim=-1,
-                ),
+                current_edge_cond,
+                future_edge_cond,
+                edge_margins,
+                edge_valid_flags,
                 torch.zeros((B, self.traj_borrow_aux_dim), device=device, dtype=dtype),
             ],
             dim=-1,
         )
-        current_speed_norm = (current_speed / speed_scale).clamp(0.0, 1.0).unsqueeze(-1)
         return torch.cat([compact_condition, current_speed_norm], dim=-1)
 
     def _apply_state_motion_adapter(

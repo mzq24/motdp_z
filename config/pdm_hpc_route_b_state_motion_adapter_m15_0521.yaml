@@ -1,6 +1,6 @@
 policy_type: anchor_free
-abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats.npz
-route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
+abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/abs_stats.npz
+route_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/route_abs_stats.npz
 device:
   gpu_ids:
   - 2
@@ -226,6 +226,7 @@ route_b:
   state_motion_adapter_gate_init: 1.0
   state_motion_adapter_speed_norm_scale: 30.0
   state_motion_adapter_margin_scale: 5.0
+  state_motion_adapter_condition_version: m15
   state_motion_adapter_loss_weight: 1.0
   state_motion_adapter_norm_weight: 0.01
   state_motion_adapter_gate_sparsity_weight: 0.001
@@ -278,7 +279,7 @@ training:
   max_keep_ckpts: 20
   early_stopping_patience: 8
   best_checkpoint_metric: phase_balanced
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP-worktrees/state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_m1_adapter_0521
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_m15_adapter_e15_0521
 validation:
   enabled: true
   use_memmap: true
@@ -291,8 +292,8 @@ validation:
 logging:
   use_wandb: true
   wandb_project: route_b_lidar_bev
-  run_name: route_b_state_motion_m1_adapter_0521
-  checkpoint_dir: /media/z/data/mzq/others/MoT-DP-worktrees/state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_m1_adapter_0521
+  run_name: route_b_state_motion_m15_adapter_e15_0521
+  checkpoint_dir: /workspace1/z_project/code/motdp_z_state_motion_decoupled_alignment_v1/checkpoints/route_b_state_motion_m15_adapter_e15_0521
   save_every: 5
   log_freq: 50
 augmentation:

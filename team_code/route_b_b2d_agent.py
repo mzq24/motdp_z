@@ -4924,6 +4924,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		)
 		conflict_area_probs = self.pid_metadata.get('speed_energy_conflict_area_probs')
 
+		def _meta_first(*keys):
+			for key in keys:
+				value = self.pid_metadata.get(key)
+				if value is not None:
+					return value
+			return None
+
 		left_status_lines = [
 			f"frm: {self.step}",
 			f"v: {speed_mps:.2f} m/s",
@@ -4992,15 +4999,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			f"sA[14:20]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_conflict_area_probs'), 14, 20, fmt='.2f')}",
 			f"sOcc[0:7]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_temporary_occupancy_probs'), 0, 7, fmt='.2f')}",
 			f"sOcc[7:13]: {self._format_debug_curve_slice(self.pid_metadata.get('speed_energy_temporary_occupancy_probs'), 7, 13, fmt='.2f')}",
-			f"bcP[y/g]/bt: {self._format_debug_curve(self.pid_metadata.get('traj_decision_phase_condition_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(self.pid_metadata.get('traj_borrow_time_condition'), '.2f')}",
-			f"bcGY[y/o]: {self._format_debug_curve(self.pid_metadata.get('traj_go_opportunity_condition_probs'), fmt='.2f', max_items=2)}",
-			f"bcT: {self._format_debug_curve(self.pid_metadata.get('traj_conflict_timing_condition'), fmt='.2f', max_items=3)}",
-			f"bcCh H/m: {self._format_debug_first(self.pid_metadata.get('traj_chase_has_lead_condition'), '.2f')}/{self._format_debug_first(self.pid_metadata.get('traj_chase_speed_margin_condition'), '.2f')}",
-			f"bm[y/g]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_boundary_margin_condition'), fmt='.2f', max_items=2)}/{self._format_debug_curve(self.pid_metadata.get('lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
-			f"bcW[nmjb]: {self._format_debug_curve(self.pid_metadata.get('traj_window_condition_probs'), fmt='.2f', max_items=4)}",
-			f"bcD[n/s/o/c]: {self._format_debug_curve(self.pid_metadata.get('traj_dir_condition_probs'), fmt='.2f', max_items=4)}",
-			f"bcC[c/s/t/g]: {self._format_debug_curve(self.pid_metadata.get('traj_control_phase_condition_probs'), fmt='.2f', max_items=4)}",
-			f"bcAS[n/b/i/a]: {self._format_debug_curve(self.pid_metadata.get('traj_conflict_area_status_condition_probs'), fmt='.2f', max_items=4)}",
+			f"bcP[y/g]/bt: {self._format_debug_curve(_meta_first('traj_decision_phase_condition_probs', 'speed_energy_decision_phase_probs'), fmt='.2f', max_items=2)}/{self._format_debug_value(_meta_first('traj_borrow_time_condition', 'borrow_observed_time_s'), '.2f')}",
+			f"bcGY[y/o]: {self._format_debug_curve(_meta_first('traj_go_opportunity_condition_probs', 'speed_energy_go_opportunity_probs'), fmt='.2f', max_items=2)}",
+			f"bcT: {self._format_debug_curve(_meta_first('traj_conflict_timing_condition', 'speed_energy_conflict_timing_values'), fmt='.2f', max_items=3)}",
+			f"bcCh H/m: {self._format_debug_first(_meta_first('traj_chase_has_lead_condition', 'speed_energy_chase_has_lead_prob'), '.2f')}/{self._format_debug_first(self.pid_metadata.get('traj_chase_speed_margin_condition'), '.2f')}",
+			f"bm[y/g]/lr: {self._format_debug_curve(self.pid_metadata.get('traj_boundary_margin_condition'), fmt='.2f', max_items=2)}/{self._format_debug_curve(_meta_first('lane_dir_relation_probs', 'prev_lane_dir_relation_probs'), fmt='.2f', max_items=2)}",
+			f"bcW[nmjb]: {self._format_debug_curve(_meta_first('traj_window_condition_probs', 'speed_energy_window_probs'), fmt='.2f', max_items=4)}",
+			f"bcD[n/s/o/c]: {self._format_debug_curve(_meta_first('traj_dir_condition_probs', 'speed_energy_dir_probs'), fmt='.2f', max_items=4)}",
+			f"bcC[c/s/t/g]: {self._format_debug_curve(_meta_first('traj_control_phase_condition_probs', 'speed_energy_control_phase_probs'), fmt='.2f', max_items=4)}",
+			f"bcAS[n/b/i/a]: {self._format_debug_curve(_meta_first('traj_conflict_area_status_condition_probs', 'speed_energy_conflict_area_status_probs'), fmt='.2f', max_items=4)}",
 		]
 
 		line_gap = 18

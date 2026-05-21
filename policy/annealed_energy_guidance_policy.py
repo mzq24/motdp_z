@@ -140,6 +140,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.state_motion_adapter_margin_scale = float(
             route_b_cfg.get('state_motion_adapter_margin_scale', 5.0)
         )
+        self.state_motion_adapter_condition_version = str(
+            route_b_cfg.get('state_motion_adapter_condition_version', 'm1')
+        )
         self.state_motion_adapter_loss_weight = float(
             route_b_cfg.get('state_motion_adapter_loss_weight', 1.0)
         )
@@ -748,6 +751,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             state_motion_adapter_gate_init=self.state_motion_adapter_gate_init,
             state_motion_adapter_speed_norm_scale=self.state_motion_adapter_speed_norm_scale,
             state_motion_adapter_margin_scale=self.state_motion_adapter_margin_scale,
+            state_motion_adapter_condition_version=self.state_motion_adapter_condition_version,
         )
         self.model = model
         self.alignment_feature_dim = 16
