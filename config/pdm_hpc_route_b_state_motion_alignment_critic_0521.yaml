@@ -171,7 +171,7 @@ route_b:
   use_edge_speed_consistency_loss: false
   edge_speed_consistency_loss_weight: 0.05
   use_semantic_state_transition: false
-  semantic_state_predictor_mode: direct_prev_modulated
+  semantic_state_predictor_mode: direct_only
   semantic_transition_prev_source: offline_gt
   semantic_transition_loss_weight: 1.0
   semantic_direct_aux_loss_weight: 0.25
