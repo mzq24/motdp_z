@@ -68,21 +68,6 @@ run_stage() {
   CONFIG="${config}"   INIT_CHECKPOINT="${init_ckpt}"   SEMANTIC_TEACHER_CHECKPOINT="${teacher_ckpt}"   ALIGNMENT_CRITIC_CHECKPOINT_OVERRIDE="${critic_ckpt}"   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"   GPUS="${GPUS}"   MASTER_PORT="${master_port}"   CONDA_ENV="${CONDA_ENV}"   bash scripts/codex_bash/train_state_motion.sh
 }
 
-if [[ "${RUN_DIRECT}" == "1" ]]; then
-  run_stage "Direct Stage S" "${S_DIRECT_CONFIG}" "${NOSTATE_CKPT}" "${DIRECT_S_MASTER_PORT}"
-  [[ -f "${S_DIRECT_CKPT}" ]] || { echo "Missing direct S checkpoint: ${S_DIRECT_CKPT}" >&2; exit 1; }
-  run_stage "Direct Stage M" "${M_DIRECT_CONFIG}" "${S_DIRECT_CKPT}" "${DIRECT_M_MASTER_PORT}" "${S_DIRECT_CKPT}"
-  if [[ "${RUN_A2}" == "1" ]]; then
-    [[ -f "${M_DIRECT_CKPT}" ]] || { echo "Missing direct M checkpoint: ${M_DIRECT_CKPT}" >&2; exit 1; }
-    run_stage "Direct Stage A2" "${A2_DIRECT_CONFIG}" "${M_DIRECT_CKPT}" "${DIRECT_A2_MASTER_PORT}" "${S_DIRECT_CKPT}"
-  fi
-  if [[ "${RUN_M2}" == "1" ]]; then
-    [[ -f "${M_DIRECT_CKPT}" ]] || { echo "Missing direct M checkpoint: ${M_DIRECT_CKPT}" >&2; exit 1; }
-    [[ -f "${A2_DIRECT_CKPT}" ]] || { echo "Missing direct A2 checkpoint: ${A2_DIRECT_CKPT}" >&2; exit 1; }
-    run_stage "Direct Stage M2" "${M2_DIRECT_CONFIG}" "${M_DIRECT_CKPT}" "${DIRECT_M2_MASTER_PORT}" "${S_DIRECT_CKPT}" "${A2_DIRECT_CKPT}"
-  fi
-fi
-
 if [[ "${RUN_CHAIN}" == "1" ]]; then
   run_stage "Chain Stage S" "${S_CHAIN_CONFIG}" "${NOSTATE_CKPT}" "${CHAIN_S_MASTER_PORT}"
   [[ -f "${S_CHAIN_CKPT}" ]] || { echo "Missing chain S checkpoint: ${S_CHAIN_CKPT}" >&2; exit 1; }
@@ -95,6 +80,21 @@ if [[ "${RUN_CHAIN}" == "1" ]]; then
     [[ -f "${M_CHAIN_CKPT}" ]] || { echo "Missing chain M checkpoint: ${M_CHAIN_CKPT}" >&2; exit 1; }
     [[ -f "${A2_CHAIN_CKPT}" ]] || { echo "Missing chain A2 checkpoint: ${A2_CHAIN_CKPT}" >&2; exit 1; }
     run_stage "Chain Stage M2" "${M2_CHAIN_CONFIG}" "${M_CHAIN_CKPT}" "${CHAIN_M2_MASTER_PORT}" "${S_CHAIN_CKPT}" "${A2_CHAIN_CKPT}"
+  fi
+fi
+
+if [[ "${RUN_DIRECT}" == "1" ]]; then
+  run_stage "Direct Stage S" "${S_DIRECT_CONFIG}" "${NOSTATE_CKPT}" "${DIRECT_S_MASTER_PORT}"
+  [[ -f "${S_DIRECT_CKPT}" ]] || { echo "Missing direct S checkpoint: ${S_DIRECT_CKPT}" >&2; exit 1; }
+  run_stage "Direct Stage M" "${M_DIRECT_CONFIG}" "${S_DIRECT_CKPT}" "${DIRECT_M_MASTER_PORT}" "${S_DIRECT_CKPT}"
+  if [[ "${RUN_A2}" == "1" ]]; then
+    [[ -f "${M_DIRECT_CKPT}" ]] || { echo "Missing direct M checkpoint: ${M_DIRECT_CKPT}" >&2; exit 1; }
+    run_stage "Direct Stage A2" "${A2_DIRECT_CONFIG}" "${M_DIRECT_CKPT}" "${DIRECT_A2_MASTER_PORT}" "${S_DIRECT_CKPT}"
+  fi
+  if [[ "${RUN_M2}" == "1" ]]; then
+    [[ -f "${M_DIRECT_CKPT}" ]] || { echo "Missing direct M checkpoint: ${M_DIRECT_CKPT}" >&2; exit 1; }
+    [[ -f "${A2_DIRECT_CKPT}" ]] || { echo "Missing direct A2 checkpoint: ${A2_DIRECT_CKPT}" >&2; exit 1; }
+    run_stage "Direct Stage M2" "${M2_DIRECT_CONFIG}" "${M_DIRECT_CKPT}" "${DIRECT_M2_MASTER_PORT}" "${S_DIRECT_CKPT}" "${A2_DIRECT_CKPT}"
   fi
 fi
 

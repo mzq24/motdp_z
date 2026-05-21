@@ -2129,10 +2129,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(4 + 4 + 4 + 3, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
         )
         self.semantic_chain_temporal_to_relation = nn.Sequential(
-            nn.Linear(4 + 4 + 3 + 2, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
+            # window + spatial(dir/status/timing) + tempocc + opportunity
+            nn.Linear(4 + 4 + 4 + 3 + 13 + 2, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
         )
         self.semantic_chain_relation_to_phase = nn.Sequential(
-            nn.Linear(4 + 2 + 1 + 5 + 1 + 5, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
+            # window + spatial + tempocc/opportunity + current/future edge relation
+            nn.Linear(4 + 4 + 4 + 3 + 13 + 2 + 1 + 5 + 1 + 5, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
         )
         self.semantic_chain_history_proj = nn.Sequential(
             nn.Linear(n_emb, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb),
@@ -2699,11 +2701,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         go_opportunity_logits = self.shared_stage1_go_opportunity_head(temporal_feature)
         opportunity_probs = torch.softmax(go_opportunity_logits, dim=-1)
 
+        tempocc_probs = torch.sigmoid(tempocc_logits)
         temporal_vec = torch.cat(
             [
                 window_probs,
+                torch.softmax(dir_logits, dim=-1),
                 torch.softmax(area_status_logits, dim=-1),
                 timing_values.tanh(),
+                tempocc_probs,
                 opportunity_probs,
             ],
             dim=-1,
@@ -2744,6 +2749,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         relation_vec = torch.cat(
             [
                 window_probs,
+                torch.softmax(dir_logits, dim=-1),
+                torch.softmax(area_status_logits, dim=-1),
+                timing_values.tanh(),
+                tempocc_probs,
                 opportunity_probs,
                 torch.sigmoid(current_edge_valid_logit).unsqueeze(-1),
                 torch.softmax(current_edge_mode_logits, dim=-1),
