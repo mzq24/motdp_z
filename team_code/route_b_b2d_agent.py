@@ -1984,7 +1984,27 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print("[USE_MOT=False] Skipping MoT model loading.")
 
 			# ========== Load TransFuser Backbone(s) for DP features ==========
-			transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
+			transfuser_config_path = os.environ.get(
+				"TRANSFUSER_CONFIG_PATH",
+				os.environ.get("GARAGE2_PRETRAINED_DIR", ""),
+			)
+			if not transfuser_config_path:
+				transfuser_candidates = [
+					"/workspace1/z_project/models/pretrained_models/all_towns",
+					"/media/z/data/models/garage2/pretrained_models/all_towns",
+				]
+				transfuser_config_path = next(
+					(
+						path for path in transfuser_candidates
+						if os.path.exists(os.path.join(path, "config.json"))
+					),
+					transfuser_candidates[0],
+				)
+			if not os.path.exists(os.path.join(transfuser_config_path, "config.json")):
+				raise FileNotFoundError(
+					f"TransFuser config not found under {transfuser_config_path}. "
+					"Set TRANSFUSER_CONFIG_PATH to the garage2 all_towns directory."
+				)
 			transfuser_model_paths = [
 				os.path.join(transfuser_config_path, "model_0030_0.pth"),
 				os.path.join(transfuser_config_path, "model_0030_1.pth"),

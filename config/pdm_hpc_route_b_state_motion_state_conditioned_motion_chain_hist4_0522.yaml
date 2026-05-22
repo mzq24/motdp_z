@@ -253,11 +253,11 @@ truncated_diffusion:
   num_diffusion_steps: 10
   eta: 0.0
   prediction_type: sample
-  route_loss_weight: 4.0
+  route_loss_weight: 5.0
   route_final_loss_weight: 2.0
 num_modes: 32
 cls_loss_weight: 0.0
-reg_loss_weight: 6.0
+reg_loss_weight: 3.0
 dataset:
   use_per_frame: false
   feature_suffix: ensemble
@@ -275,9 +275,10 @@ dataset:
 training:
   num_epochs: 30
   max_grad_norm: 1.0
-  warmup_epochs: 3
+  warmup_epochs: 0
   use_lr_scheduler: true
   resume_rebuild_scheduler: true
+  resume_override_lr: 5.0e-06
   scheduler_total_epochs: 30
   dataset_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_alignment
   image_data_root: /workspace1/z_project/dataset/pdm_lite
