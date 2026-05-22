@@ -3168,7 +3168,11 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         device: torch.device,
         model_dtype: torch.dtype,
     ) -> Tuple[Optional[torch.Tensor], Optional[dict]]:
-        teacher = self._semantic_teacher_model()
+        # The teacher is stored directly on the instance. Accessing
+        # self._semantic_teacher_model returns the module itself and calling it
+        # would hit TransformerForDiffusion.forward(), which is not implemented
+        # for this Route-B-only model.
+        teacher = self.__dict__.get('_semantic_teacher_model', None)
         if teacher is None:
             if self.use_frozen_semantic_teacher:
                 raise RuntimeError(
@@ -3220,7 +3224,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                     conditioning=teacher_forward['conditioning'],
                     prev_state=chain_history_state,
                 )
-            branch = self._build_traj_branch_condition_from_stage1_raw(
+            branch, branch_details = self._build_traj_branch_condition_from_stage1_raw(
                 raw_scores=raw_scores,
                 speed_ref=ego_status[:, -1, 0],
                 borrow_time_s=self._get_stage1_borrow_time_target(
@@ -3230,7 +3234,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 device=device,
                 model_dtype=model_dtype,
             )
-            raw_debug = self._compose_stage1_raw_outputs(raw_scores)
+            raw_debug = self._compose_stage1_outputs(raw_scores)
+            if branch_details is not None:
+                raw_debug.update(branch_details)
             raw_debug['state_conditioned_motion_state_source_id'] = torch.full(
                 (trajectory.shape[0],),
                 1.0 if state_source == 'chain' else 0.0,

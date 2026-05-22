@@ -1,6 +1,6 @@
 policy_type: anchor_free
-abs_stats_path: /media/z/data/dataset/pdm_lite_mini/abs_stats.npz
-route_abs_stats_path: /media/z/data/dataset/pdm_lite_mini/route_abs_stats.npz
+abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/abs_stats.npz
+route_abs_stats_path: /workspace1/z_project/dataset/pdm_lite/tmp_data/route_abs_stats.npz
 device:
   gpu_ids:
   - 2
