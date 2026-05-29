@@ -78,13 +78,14 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         # Route B specific config
         route_b_cfg = config.get('route_b', {})
         self.route_b_cfg = route_b_cfg
+        self.motion_only_model = bool(route_b_cfg.get('motion_only_model', False))
         self.num_samples = route_b_cfg.get('num_samples', 1)  # diffusion denoising: single mode
         self.num_inference_steps = route_b_cfg.get('num_inference_steps', 10)
         self.guidance_scale = route_b_cfg.get('guidance_scale', 0.0)
         self.use_split_forward = route_b_cfg.get('use_split_forward', True)
 
-        self.train_energy = route_b_cfg.get('train_stage1', route_b_cfg.get('train_energy', True))
-        self.use_stage1_state = route_b_cfg.get(
+        self.train_energy = False if self.motion_only_model else route_b_cfg.get('train_stage1', route_b_cfg.get('train_energy', True))
+        self.use_stage1_state = False if self.motion_only_model else route_b_cfg.get(
             'use_stage1_state',
             route_b_cfg.get('use_stage1_speed_energy', True),
         )
@@ -104,7 +105,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self._current_epoch = 0
         self._current_batch_idx = 0
         self.route_abs_stats_path = config.get('route_abs_stats_path', None)
-        self.use_lidar_bev_detail = route_b_cfg.get('use_lidar_bev_detail', False)
+        self.use_lidar_bev_detail = bool(route_b_cfg.get('use_lidar_bev_detail', False)) and not self.motion_only_model
         self.lidar_history_frames = max(int(route_b_cfg.get('lidar_history_frames', self.n_obs_steps)), 1)
 
         self.energy_chase_weight = route_b_cfg.get(
@@ -157,7 +158,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.stage1_query_brake_mps2 = float(route_b_cfg.get('stage1_query_brake_mps2', 6.0))
         self.stage1_query_accel_mps2 = float(route_b_cfg.get('stage1_query_accel_mps2', 2.5))
         self.stage1_speed_offsets = torch.tensor([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0], dtype=torch.float32)
-        self.use_traj_branch_condition = bool(route_b_cfg.get('use_traj_branch_condition', False))
+        self.use_traj_branch_condition = bool(route_b_cfg.get('use_traj_branch_condition', False)) and not self.motion_only_model
         self.traj_branch_condition_scale = float(route_b_cfg.get('traj_branch_condition_scale', 2.0))
         self.traj_branch_condition_detach = bool(route_b_cfg.get('traj_branch_condition_detach', True))
         self.traj_branch_condition_gt_prob_start = float(route_b_cfg.get('traj_branch_condition_gt_prob_start', 1.0))
@@ -223,19 +224,19 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         self.use_cover_relation_graph_decoder = bool(
             route_b_cfg.get('use_cover_relation_graph_decoder', False)
-        )
+        ) and not self.motion_only_model
         self.cover_graph_use_traj_context = bool(
             route_b_cfg.get('cover_graph_use_traj_context', False)
-        )
+        ) and not self.motion_only_model
         self.cover_graph_use_speed_context = bool(
             route_b_cfg.get('cover_graph_use_speed_context', False)
-        )
+        ) and not self.motion_only_model
         self.use_route_prev_coarse_memory = bool(
             route_b_cfg.get('use_route_prev_coarse_memory', False)
-        )
+        ) and not self.motion_only_model
         self.use_route_intent_token = bool(
             route_b_cfg.get('use_route_intent_token', False)
-        )
+        ) and not self.motion_only_model
         self.route_intent_gate_init = float(
             route_b_cfg.get('route_intent_gate_init', 0.1)
         )
@@ -358,7 +359,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.use_chase_front_following_state = _env_bool(
             'USE_CHASE_FRONT_FOLLOWING_STATE',
             bool(route_b_cfg.get('use_chase_front_following_state', False)),
-        )
+        ) and not self.motion_only_model
         self.chase_has_lead_loss_weight = float(
             route_b_cfg.get('chase_has_lead_loss_weight', 0.05)
         )
@@ -373,7 +374,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         )
         self.use_semantic_state_transition = bool(
             route_b_cfg.get('use_semantic_state_transition', False)
-        )
+        ) and not self.motion_only_model
         semantic_state_predictor_mode = str(
             route_b_cfg.get('semantic_state_predictor_mode', 'direct_plus_transition')
         ).lower()
@@ -603,6 +604,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             use_lidar_bev_detail=self.use_lidar_bev_detail,
             lidar_bev_history_frames=self.lidar_history_frames,
             use_condition_group_dropout=policy_cfg.get('use_condition_group_dropout', False),
+            motion_only_model=self.motion_only_model,
             use_chase_front_following_state=self.use_chase_front_following_state,
             semantic_motion_condition_mode=self.semantic_motion_condition_mode,
             semantic_motion_condition_profile=self.semantic_motion_condition_profile,

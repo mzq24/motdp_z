@@ -1684,6 +1684,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         use_lidar_bev_detail: bool = False,
         lidar_bev_history_frames: int = 1,
         use_condition_group_dropout: bool = False,
+        motion_only_model: bool = False,
         use_chase_front_following_state: bool = True,
         semantic_motion_condition_mode: str = "full",
         semantic_motion_condition_profile: str = "all",
@@ -1711,10 +1712,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.T = horizon
         self.output_dim = output_dim
         self.ego_joint_horizon = horizon + num_waypoints
-        self.use_lidar_bev_detail = use_lidar_bev_detail
+        self.motion_only_model = bool(motion_only_model)
+        self.use_lidar_bev_detail = bool(use_lidar_bev_detail) and not self.motion_only_model
         self.lidar_bev_history_frames = max(int(lidar_bev_history_frames), 1)
         self.use_condition_group_dropout = use_condition_group_dropout
-        self.use_chase_front_following_state = bool(use_chase_front_following_state)
+        self.use_chase_front_following_state = bool(use_chase_front_following_state) and not self.motion_only_model
         self.semantic_motion_condition_mode = str(semantic_motion_condition_mode).lower()
         if self.semantic_motion_condition_mode not in ("full", "compact_graph"):
             raise ValueError(
@@ -1735,11 +1737,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 "semantic_motion_condition_profile must be one of "
                 f"{sorted(profile_choices)}, got {semantic_motion_condition_profile}"
             )
-        self.use_cover_relation_graph_decoder = bool(use_cover_relation_graph_decoder)
-        self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context)
-        self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context)
-        self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory)
-        self.use_route_intent_token = bool(use_route_intent_token)
+        self.use_cover_relation_graph_decoder = bool(use_cover_relation_graph_decoder) and not self.motion_only_model
+        self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context) and not self.motion_only_model
+        self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context) and not self.motion_only_model
+        self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory) and not self.motion_only_model
+        self.use_route_intent_token = bool(use_route_intent_token) and not self.motion_only_model
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64
@@ -1802,12 +1804,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
             + self.traj_edge_valid_dim
             + self.traj_borrow_aux_dim
         )
-        self.traj_branch_condition_dim = (
+        self.traj_branch_condition_dim = 0 if self.motion_only_model else (
             self.traj_branch_condition_compact_graph_dim
             if self.semantic_motion_condition_mode == "compact_graph"
             else self.traj_branch_condition_full_dim
         )
-        if self.semantic_motion_condition_mode == "compact_graph":
+        if self.motion_only_model:
+            group_names = ()
+            profile_groups = {self.semantic_motion_condition_profile: ()}
+        elif self.semantic_motion_condition_mode == "compact_graph":
             group_names = (
                 "window",
                 "decision",
@@ -1864,76 +1869,77 @@ class TransformerForDiffusion(ModuleAttrMixin):
             torch.tensor([1.0 if name in enabled_groups else 0.0 for name in group_names], dtype=torch.float32),
             persistent=False,
         )
-        self.traj_window_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_window_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_dir_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_dir_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_decision_phase_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_decision_phase_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_control_phase_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_control_phase_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_boundary_margin_proj = nn.Sequential(
-            nn.Linear(self.traj_boundary_margin_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_opportunity_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_opportunity_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_area_status_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_area_status_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_timing_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_timing_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_chase_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_chase_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_current_edge_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_current_edge_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_future_edge_condition_proj = nn.Sequential(
-            nn.Linear(self.traj_future_edge_condition_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_edge_margin_proj = nn.Sequential(
-            nn.Linear(self.traj_edge_margin_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_edge_valid_proj = nn.Sequential(
-            nn.Linear(self.traj_edge_valid_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.traj_borrow_aux_proj = nn.Sequential(
-            nn.Linear(self.traj_borrow_aux_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
+        if not self.motion_only_model:
+            self.traj_window_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_window_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_dir_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_dir_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_decision_phase_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_decision_phase_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_control_phase_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_control_phase_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_boundary_margin_proj = nn.Sequential(
+                nn.Linear(self.traj_boundary_margin_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_opportunity_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_opportunity_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_area_status_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_area_status_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_timing_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_timing_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_chase_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_chase_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_current_edge_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_current_edge_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_future_edge_condition_proj = nn.Sequential(
+                nn.Linear(self.traj_future_edge_condition_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_edge_margin_proj = nn.Sequential(
+                nn.Linear(self.traj_edge_margin_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_edge_valid_proj = nn.Sequential(
+                nn.Linear(self.traj_edge_valid_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.traj_borrow_aux_proj = nn.Sequential(
+                nn.Linear(self.traj_borrow_aux_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
 
         # Route-specific conditioning generator
         self.route_status_proj = nn.Sequential(
@@ -1942,27 +1948,29 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(n_emb, n_emb),
         )
         self.route_prev_coarse_memory_dim = 9  # valid + prev window(4) + prev dir(4)
-        self.route_prev_coarse_memory_proj = nn.Sequential(
-            nn.Linear(self.route_prev_coarse_memory_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
+        if self.use_route_prev_coarse_memory:
+            self.route_prev_coarse_memory_proj = nn.Sequential(
+                nn.Linear(self.route_prev_coarse_memory_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
         # Explicit route-intent embedding: command(6) + target_point(2) + next_target_point(2).
         # It is added as a small gated route-only residual so target intent is audible for
         # branch/exit decisions without becoming a hard planner override.
         self.route_intent_dim = 10
-        self.route_intent_proj = nn.Sequential(
-            nn.Linear(self.route_intent_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        route_intent_gate_init = min(max(float(route_intent_gate_init), 1e-4), 1.0 - 1e-4)
-        self.route_intent_gate = nn.Parameter(
-            torch.tensor(
-                math.log(route_intent_gate_init / (1.0 - route_intent_gate_init)),
-                dtype=torch.float32,
+        if self.use_route_intent_token:
+            self.route_intent_proj = nn.Sequential(
+                nn.Linear(self.route_intent_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
             )
-        )
+            route_intent_gate_init = min(max(float(route_intent_gate_init), 1e-4), 1.0 - 1e-4)
+            self.route_intent_gate = nn.Parameter(
+                torch.tensor(
+                    math.log(route_intent_gate_init / (1.0 - route_intent_gate_init)),
+                    dtype=torch.float32,
+                )
+            )
 
         # ========== Unified Decoder (UnifiedDecoderOnlyTransformer) ==========
         # Handles: BEV feature projection, GridSampleCrossBEVAttention, route queries,
@@ -1979,7 +1987,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             num_waypoints=num_waypoints,
             traj_can_attend_route=traj_can_attend_route,
             ego_detail_activation_t=ego_detail_activation_t,
-            use_lidar_bev_detail=use_lidar_bev_detail,
+            use_lidar_bev_detail=self.use_lidar_bev_detail,
             lidar_bev_history_frames=self.lidar_bev_history_frames,
         )
 
@@ -1999,190 +2007,191 @@ class TransformerForDiffusion(ModuleAttrMixin):
             num_heads=n_head,
         )
 
-        self.shared_stage1_route_geom_proj = nn.Sequential(
-            nn.Linear(self.num_waypoints * self.output_dim, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.shared_stage1_pool_attn = nn.MultiheadAttention(
-            embed_dim=n_emb,
-            num_heads=n_head,
-            batch_first=True,
-        )
-        self.shared_stage1_pool_norm = nn.LayerNorm(n_emb)
-        self.shared_stage1_traj_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
-        self.shared_stage1_route_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
-        self.shared_stage1_neck = nn.Sequential(
-            nn.Linear(5 * n_emb, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-            nn.LayerNorm(n_emb),
-        )
-        self.shared_stage1_speed_query_proj = nn.Sequential(
-            nn.Linear(1, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.shared_stage1_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
-        self.shared_stage1_query_attn = nn.MultiheadAttention(
-            embed_dim=n_emb,
-            num_heads=n_head,
-            batch_first=True,
-        )
-        self.shared_stage1_query_norm = nn.LayerNorm(n_emb)
+        if not self.motion_only_model:
+            self.shared_stage1_route_geom_proj = nn.Sequential(
+                nn.Linear(self.num_waypoints * self.output_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.shared_stage1_pool_attn = nn.MultiheadAttention(
+                embed_dim=n_emb,
+                num_heads=n_head,
+                batch_first=True,
+            )
+            self.shared_stage1_pool_norm = nn.LayerNorm(n_emb)
+            self.shared_stage1_traj_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.shared_stage1_route_summary_query = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.shared_stage1_neck = nn.Sequential(
+                nn.Linear(5 * n_emb, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+                nn.LayerNorm(n_emb),
+            )
+            self.shared_stage1_speed_query_proj = nn.Sequential(
+                nn.Linear(1, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.shared_stage1_query_token = nn.Parameter(torch.randn(1, 1, n_emb))
+            self.shared_stage1_query_attn = nn.MultiheadAttention(
+                embed_dim=n_emb,
+                num_heads=n_head,
+                batch_first=True,
+            )
+            self.shared_stage1_query_norm = nn.LayerNorm(n_emb)
 
-        def _make_shared_stage1_scalar_head(out_dim: int = 1):
-            return nn.Sequential(
-                nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, out_dim),
+            def _make_shared_stage1_scalar_head(out_dim: int = 1):
+                return nn.Sequential(
+                    nn.Linear(n_emb, n_emb // 2), nn.SiLU(),
+                    nn.Linear(n_emb // 2, out_dim),
+                )
+
+            def _make_route_stage1_head(out_dim: int = 1):
+                return nn.Sequential(
+                    nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
+                    nn.Linear(n_emb // 2, out_dim),
+                )
+
+            self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
+            self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.shared_stage1_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
+            self.shared_stage1_chase_has_lead_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_chase_speed_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_current_edge_valid_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+            self.shared_stage1_future_edge_valid_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+            self.shared_stage1_route_current_edge_valid_head = _make_route_stage1_head()
+            self.shared_stage1_route_current_edge_mode_head = _make_route_stage1_head(out_dim=5)
+            self.shared_stage1_route_future_edge_valid_head = _make_route_stage1_head()
+            self.shared_stage1_route_future_edge_mode_head = _make_route_stage1_head(out_dim=5)
+            self.shared_stage1_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_merge_flow_lower_speed_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_junction_go_min_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_yld_max_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_borrow_go_min_head = _make_shared_stage1_scalar_head()
+            self.shared_stage1_conflict_area_head = nn.Sequential(
+                nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
+                nn.Linear(n_emb // 2, 1),
             )
 
-        def _make_route_stage1_head(out_dim: int = 1):
-            return nn.Sequential(
+            # Semantic-state transition head: offline previous semantic tokens
+            # plus current decoder context predict the current semantic state.
+            self.semantic_transition_num_slots = 8
+            self.semantic_transition_slot_embed = nn.Parameter(
+                torch.randn(1, self.semantic_transition_num_slots, n_emb)
+            )
+            self.semantic_transition_prev_valid_proj = nn.Sequential(
+                nn.Linear(1, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_family_embed = nn.Embedding(4, n_emb)
+            self.semantic_transition_dir_embed = nn.Embedding(4, n_emb)
+            self.semantic_transition_status_embed = nn.Embedding(4, n_emb)
+            self.semantic_transition_decision_embed = nn.Embedding(3, n_emb)
+            self.semantic_transition_control_embed = nn.Embedding(5, n_emb)
+            self.semantic_transition_area_proj = nn.Sequential(
+                nn.Linear(self.num_waypoints, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_tempocc_proj = nn.Sequential(
+                nn.Linear(2 * 13, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_opportunity_proj = nn.Sequential(
+                nn.Linear(3, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_timing_proj = nn.Sequential(
+                nn.Linear(4, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_boundary_proj = nn.Sequential(
+                nn.Linear(6, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_chase_proj = nn.Sequential(
+                nn.Linear(2, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            self.semantic_transition_graph_proj = nn.Sequential(
+                nn.Linear(20, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
+            transition_layer = nn.TransformerEncoderLayer(
+                d_model=n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * n_emb,
+                dropout=p_drop_emb,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.semantic_transition_encoder = nn.TransformerEncoder(
+                transition_layer,
+                num_layers=1,
+            )
+            self.semantic_transition_norm = nn.LayerNorm(n_emb)
+            self.semantic_transition_window_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.semantic_transition_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
+            self.semantic_transition_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
+            self.semantic_transition_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
+            self.semantic_transition_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
+            self.semantic_transition_chase_has_lead_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_chase_speed_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_current_edge_valid_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+            self.semantic_transition_future_edge_valid_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
+            self.semantic_transition_route_current_edge_valid_head = _make_route_stage1_head()
+            self.semantic_transition_route_current_edge_mode_head = _make_route_stage1_head(out_dim=5)
+            self.semantic_transition_route_future_edge_valid_head = _make_route_stage1_head()
+            self.semantic_transition_route_future_edge_mode_head = _make_route_stage1_head(out_dim=5)
+            self.semantic_transition_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_merge_flow_lower_speed_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_merge_yld_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_merge_go_min_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_junction_yld_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_junction_go_min_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_borrow_yld_max_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_borrow_go_min_head = _make_shared_stage1_scalar_head()
+            self.semantic_transition_conflict_area_head = nn.Sequential(
                 nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
-                nn.Linear(n_emb // 2, out_dim),
+                nn.Linear(n_emb // 2, 1),
             )
-
-        self.shared_stage1_window_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.shared_stage1_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.shared_stage1_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
-        self.shared_stage1_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.shared_stage1_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
-        self.shared_stage1_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
-        self.shared_stage1_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.shared_stage1_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
-        self.shared_stage1_chase_has_lead_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_chase_speed_max_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_current_edge_valid_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
-        self.shared_stage1_future_edge_valid_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
-        self.shared_stage1_route_current_edge_valid_head = _make_route_stage1_head()
-        self.shared_stage1_route_current_edge_mode_head = _make_route_stage1_head(out_dim=5)
-        self.shared_stage1_route_future_edge_valid_head = _make_route_stage1_head()
-        self.shared_stage1_route_future_edge_mode_head = _make_route_stage1_head(out_dim=5)
-        self.shared_stage1_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_merge_flow_lower_speed_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_merge_yld_max_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_merge_go_min_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_junction_yld_max_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_junction_go_min_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_borrow_yld_max_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_borrow_go_min_head = _make_shared_stage1_scalar_head()
-        self.shared_stage1_conflict_area_head = nn.Sequential(
-            nn.Linear(2 * n_emb, n_emb // 2), nn.SiLU(),
-            nn.Linear(n_emb // 2, 1),
-        )
-
-        # Semantic-state transition head: offline previous semantic tokens
-        # plus current decoder context predict the current semantic state.
-        self.semantic_transition_num_slots = 8
-        self.semantic_transition_slot_embed = nn.Parameter(
-            torch.randn(1, self.semantic_transition_num_slots, n_emb)
-        )
-        self.semantic_transition_prev_valid_proj = nn.Sequential(
-            nn.Linear(1, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_family_embed = nn.Embedding(4, n_emb)
-        self.semantic_transition_dir_embed = nn.Embedding(4, n_emb)
-        self.semantic_transition_status_embed = nn.Embedding(4, n_emb)
-        self.semantic_transition_decision_embed = nn.Embedding(3, n_emb)
-        self.semantic_transition_control_embed = nn.Embedding(5, n_emb)
-        self.semantic_transition_area_proj = nn.Sequential(
-            nn.Linear(self.num_waypoints, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_tempocc_proj = nn.Sequential(
-            nn.Linear(2 * 13, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_opportunity_proj = nn.Sequential(
-            nn.Linear(3, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_timing_proj = nn.Sequential(
-            nn.Linear(4, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_boundary_proj = nn.Sequential(
-            nn.Linear(6, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_chase_proj = nn.Sequential(
-            nn.Linear(2, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        self.semantic_transition_graph_proj = nn.Sequential(
-            nn.Linear(20, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
-        transition_layer = nn.TransformerEncoderLayer(
-            d_model=n_emb,
-            nhead=n_head,
-            dim_feedforward=4 * n_emb,
-            dropout=p_drop_emb,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.semantic_transition_encoder = nn.TransformerEncoder(
-            transition_layer,
-            num_layers=1,
-        )
-        self.semantic_transition_norm = nn.LayerNorm(n_emb)
-        self.semantic_transition_window_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.semantic_transition_dir_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.semantic_transition_decision_phase_head = _make_shared_stage1_scalar_head(out_dim=2)
-        self.semantic_transition_control_phase_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.semantic_transition_temporary_occupancy_head = _make_shared_stage1_scalar_head(out_dim=13)
-        self.semantic_transition_go_opportunity_head = _make_shared_stage1_scalar_head(out_dim=2)
-        self.semantic_transition_conflict_area_status_head = _make_shared_stage1_scalar_head(out_dim=4)
-        self.semantic_transition_conflict_timing_head = _make_shared_stage1_scalar_head(out_dim=3)
-        self.semantic_transition_chase_has_lead_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_chase_speed_max_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_current_edge_valid_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_current_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
-        self.semantic_transition_future_edge_valid_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_future_edge_mode_head = _make_shared_stage1_scalar_head(out_dim=5)
-        self.semantic_transition_route_current_edge_valid_head = _make_route_stage1_head()
-        self.semantic_transition_route_current_edge_mode_head = _make_route_stage1_head(out_dim=5)
-        self.semantic_transition_route_future_edge_valid_head = _make_route_stage1_head()
-        self.semantic_transition_route_future_edge_mode_head = _make_route_stage1_head(out_dim=5)
-        self.semantic_transition_current_cover_upper_speed_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_future_cover_lower_speed_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_front_follow_upper_speed_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_merge_flow_lower_speed_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_merge_yld_max_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_merge_go_min_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_junction_yld_max_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_junction_go_min_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_borrow_yld_max_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_borrow_go_min_head = _make_shared_stage1_scalar_head()
-        self.semantic_transition_conflict_area_head = nn.Sequential(
-            nn.Linear(3 * n_emb, n_emb // 2), nn.SiLU(),
-            nn.Linear(n_emb // 2, 1),
-        )
-        self.semantic_prev_modulation_proj = nn.Sequential(
-            nn.Linear(n_emb, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, 2 * n_emb),
-        )
-        self.semantic_prev_route_modulation_proj = nn.Sequential(
-            nn.Linear(n_emb, n_emb),
-            nn.SiLU(),
-            nn.Linear(n_emb, n_emb),
-        )
+            self.semantic_prev_modulation_proj = nn.Sequential(
+                nn.Linear(n_emb, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, 2 * n_emb),
+            )
+            self.semantic_prev_route_modulation_proj = nn.Sequential(
+                nn.Linear(n_emb, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
 
         # Route head: (B, num_waypoints, n_emb) -> (B, num_waypoints, 2)
         # AdaLN modulation from ego_status for stable closed-loop route prediction
