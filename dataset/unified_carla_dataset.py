@@ -296,13 +296,34 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     route_name_to_event[route_entry.name] = entry.name
         print(f"[Rank {rank}] Scanned {len(route_name_to_event)} routes on disk.")
 
-        # Build set of routes that have route_features.pt
+        # Build set of routes that have route_features.pt. On 40G/new packed
+        # datasets, per-route feature files may be cleaned after the shared
+        # memmap is built, so fall back to feature_index{suffix}.pkl before
+        # filtering out all samples.
         route_has_features = set()
         for rn, ev in route_name_to_event.items():
             feat_pt = os.path.join(image_data_root, ev, rn, 'transfuser_feature', 'route_features.pt')
             if os.path.exists(feat_pt):
                 route_has_features.add(rn)
         print(f"[Rank {rank}] Routes with route_features.pt: {len(route_has_features)}/{len(route_name_to_event)}")
+        if not route_has_features and not use_per_frame:
+            filter_cache_dir = cache_dir or os.path.join(image_data_root, 'tmp_data')
+            filter_sfx = f'_{feature_suffix}' if feature_suffix else ''
+            filter_index_path = os.path.join(filter_cache_dir, f'feature_index{filter_sfx}.pkl')
+            if os.path.exists(filter_index_path):
+                try:
+                    with open(filter_index_path, 'rb') as f:
+                        filter_meta = pickle.load(f)
+                    for packed_path in filter_meta.get('index', {}).keys():
+                        route_name = os.path.basename(os.path.dirname(os.path.dirname(packed_path)))
+                        if route_name:
+                            route_has_features.add(route_name)
+                    print(
+                        f"[Rank {rank}] Routes with memmap feature_index{filter_sfx}: "
+                        f"{len(route_has_features)}/{len(route_name_to_event)}"
+                    )
+                except Exception as exc:
+                    print(f"[Rank {rank}] WARNING: failed to read memmap feature index for route filter: {exc}")
 
         # Load bad routes exclude list if it exists
         bad_routes_path = os.path.join(image_data_root, 'bad_routes.txt')

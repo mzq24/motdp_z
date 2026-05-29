@@ -2504,12 +2504,6 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             model_dtype=model_dtype,
             require=self.use_cover_relation_graph_decoder,
         )
-        graph_targets = self._get_cover_relation_graph_targets(
-            batch,
-            device=device,
-            model_dtype=model_dtype,
-            require=self.use_cover_relation_graph_decoder,
-        )
         if graph_targets is not None:
             current_edge_mode_probs = F.one_hot(
                 graph_targets['current_mode'].clamp(min=0, max=4),
@@ -3422,6 +3416,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
                 require=True,
             )
             if self.use_chase_front_following_state else None
+        )
+        graph_targets = self._get_cover_relation_graph_targets(
+            batch,
+            device=device,
+            model_dtype=model_dtype,
+            require=self.use_cover_relation_graph_decoder,
         )
 
         stage1_training_source = self.shared_stage1_training_source
