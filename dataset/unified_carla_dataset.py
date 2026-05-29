@@ -192,6 +192,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self._ups_mmap = None        # numpy memmap for bev_upsamples
         self._ups_is_fullres = False # True when upsample cache is already 64x64
         self._feat_index = None      # dict: packed_path -> {offset, n_frames, frame_num_to_idx}
+        self._feat_index_by_route_rel = None  # route-relative alias for migrated absolute paths
         # LRU fallback (used when memmap cache not built yet)
         self._route_pack_cache = {}
         self._route_pack_cache_maxsize = 32
@@ -436,6 +437,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     ups_path = fullres_ups_bin
                     upsample_cache = 'fullres_64x64'
             self._feat_index = cache_meta['index']
+            self._feat_index_by_route_rel = self._build_feature_route_alias_index(self._feat_index)
             self._feat_mmap = np.memmap(feat_bin, dtype=np.float16, mode='r',
                                         shape=tuple(cache_meta['bev_feat_shape']))
             self._ups_mmap = np.memmap(ups_path, dtype=np.float16, mode='r',
@@ -467,6 +469,65 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 print(f"[Rank {rank}] WARNING: LiDAR BEV memmap not found. "
                       f"Falling back to per-frame .npy loading. "
                       f"Run: python scripts/data_tools/build_lidar_bev_cache.py")
+
+    @staticmethod
+    def _feature_route_rel_from_path(path: str) -> Optional[str]:
+        if not path:
+            return None
+        norm = os.path.normpath(str(path))
+        parts = norm.split(os.sep)
+        if len(parts) < 4:
+            return norm
+        # Memmap indices may come from a different machine root
+        # (/workspace1/... vs /data/...), but the final route-relative suffix is
+        # stable: <scenario>/<route>/transfuser_feature/route_features.pt.
+        return os.path.join(*parts[-4:])
+
+    def _build_feature_route_alias_index(self, feature_index: dict) -> dict:
+        alias = {}
+        for packed_path, route_info in feature_index.items():
+            route_rel = self._feature_route_rel_from_path(packed_path)
+            if route_rel:
+                alias[route_rel] = route_info
+        return alias
+
+    def _lookup_feature_route_info(self, packed_path: str, feat_rel: Optional[str] = None):
+        if self._feat_index is None:
+            return None
+        route_info = self._feat_index.get(packed_path)
+        if route_info is not None:
+            return route_info
+        if self._feat_index_by_route_rel is None:
+            return None
+
+        candidates = []
+        if feat_rel:
+            candidates.append(os.path.join(os.path.dirname(feat_rel), 'route_features.pt'))
+        candidates.append(self._feature_route_rel_from_path(packed_path))
+        try:
+            candidates.append(os.path.relpath(packed_path, self.image_data_root))
+        except ValueError:
+            pass
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            route_info = self._feat_index_by_route_rel.get(os.path.normpath(candidate))
+            if route_info is not None:
+                return route_info
+        return None
+
+    @staticmethod
+    def _feature_abs_idx_from_route_info(route_info: dict, frame_id) -> Optional[int]:
+        if route_info is None or frame_id is None:
+            return None
+        frame_id = int(frame_id)
+        frame_map = route_info.get('frame_num_to_idx') or {}
+        local_idx = frame_map.get(frame_id, frame_id)
+        n_frames = route_info.get('n_frames', len(frame_map) if frame_map else 0)
+        if local_idx < 0 or local_idx >= n_frames:
+            return None
+        return int(route_info['offset']) + int(local_idx)
 
     def get_route_batch_sampler(self, batch_size, shuffle=True, drop_last=False):
         """Return a RouteBatchSampler for this dataset."""
@@ -507,16 +568,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             sample = self._sample_cache[idx]
             if 'transfuser_bev_feature' not in sample:
                 continue
-            bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
+            feat_rel = sample['transfuser_bev_feature']
+            bev_feature_path = os.path.join(self.image_data_root, feat_rel)
             packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
             frame_id = sample.get('frame_id')
-            route_info = train_dataset._feat_index.get(packed_path)
-            if route_info is None or frame_id is None:
+            route_info = train_dataset._lookup_feature_route_info(packed_path, feat_rel)
+            abs_idx = train_dataset._feature_abs_idx_from_route_info(route_info, frame_id)
+            if abs_idx is None:
                 continue
-            n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
-            if frame_id >= n_frames:
-                continue
-            sidx_to_abs[idx] = route_info['offset'] + frame_id
+            sidx_to_abs[idx] = abs_idx
 
         # Pass 2: read unique abs_idx in sorted order (sequential memmap access = fast IO)
         unique_abs = sorted(set(sidx_to_abs.values()))
@@ -554,13 +614,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             bev_feature_path = os.path.join(self.image_data_root, feat_rel)
             packed_path = os.path.join(os.path.dirname(bev_feature_path), 'route_features.pt')
             frame_id = sample.get('frame_id')
-            route_info = self._feat_index.get(packed_path)
-            if route_info is None or frame_id is None:
+            route_info = self._lookup_feature_route_info(packed_path, feat_rel)
+            abs_idx = self._feature_abs_idx_from_route_info(route_info, frame_id)
+            if abs_idx is None:
                 continue
-            n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
-            if int(frame_id) >= n_frames:
-                continue
-            abs_indices.append(route_info['offset'] + int(frame_id))
+            abs_indices.append(abs_idx)
         return sorted(set(abs_indices))
 
     def _lidar_abs_indices_for_samples(self, sample_indices=None, max_samples=None):
@@ -817,30 +875,31 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                                 ups_tensor.unsqueeze(0).float(), size=(64, 64),
                                 mode='bilinear', align_corners=False).squeeze(0).half()
             elif self._feat_index is not None:
-                # Fast path: memmap (zero IO after pages are faulted in)
-                route_info = self._feat_index.get(packed_path)
-                if route_info is not None:
-                    n_frames = route_info.get('n_frames', len(route_info['frame_num_to_idx']))
-                    if frame_id is not None and frame_id < n_frames:
-                        abs_idx = route_info['offset'] + frame_id
-                        # np.copy() already detaches from mmap storage; avoid
-                        # sending these large tensors through the generic clone
-                        # loop again.
-                        transfuser_bev_feature = torch.from_numpy(
-                            self._feat_mmap[abs_idx].copy())  # (1512, 8, 8) float16
-                        ups_tensor = torch.from_numpy(self._ups_mmap[abs_idx].copy())
-                        if self._ups_is_fullres:
-                            transfuser_bev_feature_upsample = ups_tensor
-                        else:
-                            transfuser_bev_feature_upsample = F.interpolate(
-                                ups_tensor.unsqueeze(0).float(), size=(64, 64),
-                                mode='bilinear', align_corners=False).squeeze(0).half()
+                # Fast path: memmap (zero IO after pages are faulted in). Look
+                # up by route-relative alias as well as absolute path so caches
+                # built on 80G (/workspace1/...) still work on 40G (/data/...).
+                route_info = self._lookup_feature_route_info(packed_path, sample.get('transfuser_bev_feature'))
+                abs_idx = self._feature_abs_idx_from_route_info(route_info, frame_id)
+                if abs_idx is not None:
+                    # np.copy() already detaches from mmap storage; avoid
+                    # sending these large tensors through the generic clone
+                    # loop again.
+                    transfuser_bev_feature = torch.from_numpy(
+                        self._feat_mmap[abs_idx].copy())  # (1512, 8, 8) float16
+                    ups_tensor = torch.from_numpy(self._ups_mmap[abs_idx].copy())
+                    if self._ups_is_fullres:
+                        transfuser_bev_feature_upsample = ups_tensor
                     else:
-                        import warnings
-                        warnings.warn(
-                            f"[Dataset] frame_id {frame_id} out of range "
-                            f"(n_frames={n_frames}) for {packed_path}",
-                            stacklevel=2)
+                        transfuser_bev_feature_upsample = F.interpolate(
+                            ups_tensor.unsqueeze(0).float(), size=(64, 64),
+                            mode='bilinear', align_corners=False).squeeze(0).half()
+                elif route_info is not None:
+                    import warnings
+                    n_frames = route_info.get('n_frames', len(route_info.get('frame_num_to_idx', {})))
+                    warnings.warn(
+                        f"[Dataset] frame_id {frame_id} out of range "
+                        f"(n_frames={n_frames}) for {packed_path}",
+                        stacklevel=2)
                 else:
                     import warnings
                     warnings.warn(
