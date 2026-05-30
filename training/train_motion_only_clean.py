@@ -17,7 +17,7 @@ import torch.distributed as dist
 import yaml
 from diffusers.training_utils import EMAModel
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler, WeightedRandomSampler
 from tqdm import tqdm
 
 try:
@@ -64,6 +64,240 @@ def is_main(rank: int) -> bool:
 def move_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     return {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
+
+
+
+class WeightedDistributedSampler(Sampler):
+    """DDP sampler for per-sample weights.
+
+    All ranks draw the same weighted global index list for each epoch and take
+    rank-strided slices, keeping per-rank batch counts aligned.
+    """
+
+    def __init__(
+        self,
+        weights,
+        num_replicas=None,
+        rank=None,
+        replacement=True,
+        drop_last=True,
+        seed=0,
+    ):
+        if num_replicas is None:
+            if not dist.is_available() or not dist.is_initialized():
+                num_replicas = 1
+            else:
+                num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available() or not dist.is_initialized():
+                rank = 0
+            else:
+                rank = dist.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank={rank}, num_replicas={num_replicas}")
+
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        if self.weights.dim() != 1:
+            raise ValueError(f"weights must be 1-D, got {tuple(self.weights.shape)}")
+        if len(self.weights) == 0:
+            raise ValueError("weights must be non-empty")
+        if not torch.isfinite(self.weights).all() or float(self.weights.sum()) <= 0.0:
+            raise ValueError("weights must be finite and have positive sum")
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.replacement = bool(replacement)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        dataset_len = len(self.weights)
+        if self.drop_last and dataset_len % self.num_replicas != 0:
+            self.num_samples = int(np.ceil(max(dataset_len - self.num_replicas, 0) / self.num_replicas))
+        else:
+            self.num_samples = int(np.ceil(dataset_len / self.num_replicas))
+        self.total_size = int(self.num_samples * self.num_replicas)
+        if not self.replacement and self.total_size > dataset_len:
+            raise ValueError(
+                "replacement=False requires total_size <= dataset length; "
+                f"got total_size={self.total_size}, dataset_len={dataset_len}"
+            )
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.weights,
+            self.total_size,
+            replacement=self.replacement,
+            generator=generator,
+        ).tolist()
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+
+def _sample_float(sample, keys, default=0.0):
+    for key in keys:
+        if key not in sample:
+            continue
+        try:
+            value = sample.get(key)
+            if isinstance(value, np.ndarray):
+                value = float(np.asarray(value).reshape(-1)[0])
+            else:
+                value = float(value)
+            if np.isfinite(value):
+                return value
+        except Exception:
+            continue
+    return float(default)
+
+
+def _sample_int(sample, keys, default=-1):
+    value = _sample_float(sample, keys, default=float(default))
+    if not np.isfinite(value):
+        return int(default)
+    return int(round(value))
+
+
+def build_window_sample_weights(dataset, dataloader_cfg):
+    """Build window/transition-aware weights from cached semantic labels."""
+    samples = getattr(dataset, '_sample_cache', None)
+    if samples is None:
+        raise AttributeError("window-aware sampler requires dataset._sample_cache")
+
+    weight_cfg = dataloader_cfg.get('window_sampler_weights', {}) or {}
+    none_weight = float(weight_cfg.get('none', dataloader_cfg.get('window_sampler_none_weight', 1.0)))
+    merge_weight = float(weight_cfg.get('merge', dataloader_cfg.get('window_sampler_merge_weight', 3.0)))
+    junction_weight = float(weight_cfg.get('junction', dataloader_cfg.get('window_sampler_junction_weight', 3.0)))
+    borrow_weight = float(weight_cfg.get('borrow', dataloader_cfg.get('window_sampler_borrow_weight', 5.0)))
+    use_semantic_shift_sampler = bool(dataloader_cfg.get('use_semantic_shift_sampler', False))
+    shift_window_weight = float(dataloader_cfg.get('semantic_shift_window_weight', 4.0))
+    shift_phase_weight = float(dataloader_cfg.get('semantic_shift_phase_weight', 3.0))
+    shift_area_weight = float(dataloader_cfg.get('semantic_shift_area_weight', 2.0))
+    shift_edge_weight = float(dataloader_cfg.get('semantic_shift_edge_weight', 2.0))
+    shift_opportunity_weight = float(dataloader_cfg.get('semantic_shift_opportunity_weight', 2.0))
+    shift_max_weight = float(dataloader_cfg.get('semantic_shift_max_weight', 8.0))
+
+    weights = np.full(len(samples), none_weight, dtype=np.float64)
+    counts = {'none': 0, 'merge': 0, 'junction': 0, 'borrow': 0}
+    shift_counts = {'window': 0, 'phase': 0, 'area': 0, 'edge': 0, 'opportunity': 0}
+    for idx, sample in enumerate(samples):
+        family = int(round(_sample_float(sample, ('conflict_area_family',), default=-1.0)))
+        merge_active = _sample_float(sample, ('merge_active', 'merge_episode_active')) > 0.5
+        junction_active = _sample_float(
+            sample,
+            ('junction_cross_active', 'junction_cross_episode_active', 'cross_active', 'cross_episode_active'),
+        ) > 0.5
+        borrow_active = _sample_float(sample, ('borrow_cross_active', 'borrow_cross_episode_active')) > 0.5
+        borrow_active = borrow_active or family == 1
+        merge_active = merge_active or family == 2
+        junction_active = junction_active or family == 3
+
+        sample_weight = none_weight
+        if merge_active:
+            sample_weight = max(sample_weight, merge_weight)
+            counts['merge'] += 1
+        if junction_active:
+            sample_weight = max(sample_weight, junction_weight)
+            counts['junction'] += 1
+        if borrow_active:
+            sample_weight = max(sample_weight, borrow_weight)
+            counts['borrow'] += 1
+        if not (merge_active or junction_active or borrow_active):
+            counts['none'] += 1
+
+        if use_semantic_shift_sampler:
+            shift_bonus = 0.0
+            prev_family = _sample_int(sample, ('prev_conflict_area_family',), default=-1)
+            if prev_family >= 0 and family >= 0 and prev_family != family:
+                shift_bonus += shift_window_weight
+                shift_counts['window'] += 1
+
+            decision = _sample_int(sample, ('conflict_decision_phase',), default=-1)
+            prev_decision = _sample_int(sample, ('prev_conflict_decision_phase',), default=-1)
+            control = _sample_int(sample, ('conflict_control_phase',), default=-1)
+            prev_control = _sample_int(sample, ('prev_conflict_control_phase',), default=-1)
+            phase_shift = (
+                prev_decision > 0 and decision > 0 and prev_decision != decision
+            ) or (
+                prev_control > 0 and control > 0 and prev_control != control
+            )
+            if phase_shift:
+                shift_bonus += shift_phase_weight
+                shift_counts['phase'] += 1
+
+            status = _sample_int(sample, ('conflict_area_status',), default=-1)
+            prev_status = _sample_int(sample, ('prev_conflict_area_status',), default=-1)
+            if prev_status >= 0 and status >= 0 and prev_status != status:
+                shift_bonus += shift_area_weight
+                shift_counts['area'] += 1
+
+            has_prev_edge = (
+                'prev_current_cover_edge_valid' in sample
+                or 'prev_future_cover_edge_valid' in sample
+            )
+            if has_prev_edge:
+                current_edge_valid = _sample_float(sample, ('current_cover_edge_valid',), default=0.0) > 0.5
+                prev_current_edge_valid = _sample_float(sample, ('prev_current_cover_edge_valid',), default=0.0) > 0.5
+                future_edge_valid = _sample_float(sample, ('future_cover_edge_valid',), default=0.0) > 0.5
+                prev_future_edge_valid = _sample_float(sample, ('prev_future_cover_edge_valid',), default=0.0) > 0.5
+                current_mode = _sample_int(sample, ('current_cover_edge_mode',), default=-1)
+                prev_current_mode = _sample_int(sample, ('prev_current_cover_edge_mode',), default=-1)
+                future_mode = _sample_int(sample, ('future_cover_edge_mode',), default=-1)
+                prev_future_mode = _sample_int(sample, ('prev_future_cover_edge_mode',), default=-1)
+                edge_shift = (
+                    current_edge_valid != prev_current_edge_valid
+                    or future_edge_valid != prev_future_edge_valid
+                    or (
+                        current_edge_valid and prev_current_edge_valid
+                        and current_mode >= 0 and prev_current_mode >= 0
+                        and current_mode != prev_current_mode
+                    )
+                    or (
+                        future_edge_valid and prev_future_edge_valid
+                        and future_mode >= 0 and prev_future_mode >= 0
+                        and future_mode != prev_future_mode
+                    )
+                )
+                if edge_shift:
+                    shift_bonus += shift_edge_weight
+                    shift_counts['edge'] += 1
+
+            go_prob = _sample_float(sample, ('go_opportunity_prob',), default=0.5)
+            prev_go_prob = _sample_float(sample, ('prev_go_opportunity_prob',), default=0.5)
+            yld_prob = _sample_float(sample, ('yld_pressure_prob',), default=0.5)
+            prev_yld_prob = _sample_float(sample, ('prev_yld_pressure_prob',), default=0.5)
+            go_cross = (prev_go_prob < 0.5 <= go_prob) or (prev_go_prob >= 0.5 > go_prob)
+            yld_cross = (prev_yld_prob < 0.5 <= yld_prob) or (prev_yld_prob >= 0.5 > yld_prob)
+            if go_cross or yld_cross:
+                shift_bonus += shift_opportunity_weight
+                shift_counts['opportunity'] += 1
+
+            sample_weight = min(sample_weight + shift_bonus, shift_max_weight)
+        weights[idx] = sample_weight
+
+    weights = np.maximum(weights, 1e-6)
+    summary = {
+        'counts': counts,
+        'shift_counts': shift_counts,
+        'weights': {
+            'none': none_weight,
+            'merge': merge_weight,
+            'junction': junction_weight,
+            'borrow': borrow_weight,
+            'semantic_shift_enabled': float(use_semantic_shift_sampler),
+            'semantic_shift_max': shift_max_weight,
+        },
+        'mean_weight': float(weights.mean()) if weights.size else 0.0,
+        'max_weight': float(weights.max()) if weights.size else 0.0,
+    }
+    return weights, summary
 
 def build_datasets(config: Dict):
     training_cfg = config['training']
@@ -118,7 +352,40 @@ def make_loader(dataset, config: Dict, train: bool, rank: int, world_size: int):
         workers = int(dl_cfg.get('val_num_workers', 1))
         prefetch = int(dl_cfg.get('val_prefetch_factor', 1))
         persistent = bool(dl_cfg.get('val_persistent_workers', False))
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=train, drop_last=train) if world_size > 1 else None
+    sampler = None
+    use_weighted = train and bool(dl_cfg.get('use_window_weighted_sampler', False))
+    if use_weighted:
+        weights, summary = build_window_sample_weights(dataset, dl_cfg)
+        if is_main(rank):
+            print(
+                "Using motion-only window-aware weighted sampler: "
+                f"counts={summary['counts']}, shift_counts={summary['shift_counts']}, "
+                f"weights={summary['weights']}, mean_weight={summary['mean_weight']:.3f}, "
+                f"max_weight={summary['max_weight']:.3f}, "
+                f"replacement={bool(dl_cfg.get('window_sampler_replacement', True))}"
+            )
+        replacement = bool(dl_cfg.get('window_sampler_replacement', True))
+        seed = int(dl_cfg.get('window_sampler_seed', 0))
+        if world_size > 1:
+            sampler = WeightedDistributedSampler(
+                weights,
+                num_replicas=world_size,
+                rank=rank,
+                replacement=replacement,
+                drop_last=train,
+                seed=seed,
+            )
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            sampler = WeightedRandomSampler(
+                torch.as_tensor(weights, dtype=torch.double),
+                num_samples=len(weights),
+                replacement=replacement,
+                generator=generator,
+            )
+    elif world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=train, drop_last=train)
     kwargs = {
         'batch_size': batch_size,
         'shuffle': train and sampler is None,
@@ -305,7 +572,7 @@ def train(config_path: str, resume: Optional[str] = None, val_only: bool = False
     best_value = float('inf')
 
     for epoch in range(start_epoch, num_epochs):
-        if train_sampler is not None:
+        if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
             train_sampler.set_epoch(epoch)
         set_optimizer_lr(optimizer, lr_for_epoch(config, epoch))
         policy.train()
