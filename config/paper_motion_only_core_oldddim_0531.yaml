@@ -1,0 +1,143 @@
+policy_type: paper_motion_only
+abs_stats_path: /data/z_project/dataset/pdm_lite/tmp_data/abs_stats.npz
+route_abs_stats_path: /data/z_project/dataset/pdm_lite/tmp_data/route_abs_stats.npz
+
+dataloader:
+  batch_size: 128
+  val_batch_size: 96
+  num_workers: 2
+  train_num_workers: 2
+  val_num_workers: 1
+  prefetch_factor: 1
+  train_prefetch_factor: 1
+  val_prefetch_factor: 1
+  pin_memory: false
+  persistent_workers: false
+  train_persistent_workers: false
+  val_persistent_workers: false
+  use_window_weighted_sampler: false
+  use_semantic_shift_sampler: false
+
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+
+enable_action_normalization: true
+bev_encoder:
+  state_dim: 14
+transfuser_encoder:
+  bev_feature_dim: 1512
+  bev_feature_upsample_dim: 64
+
+shape_meta:
+  action:
+    shape: [2]
+  obs:
+    agent_pos:
+      shape: [2]
+      type: low_dim
+    image:
+      shape: [3, 96, 96]
+      type: rgb
+    speed:
+      shape: [1]
+      type: low_dim
+    theta:
+      shape: [1]
+      type: low_dim
+    target_point:
+      shape: [2]
+      type: low_dim
+
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  action_horizon: 6
+  n_obs_steps: 4
+  n_layer: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  traj_can_attend_route: true
+
+route_b:
+  num_waypoints: 20
+  num_samples: 1
+  num_inference_steps: 10
+  train_max_timesteps: 1000
+  paper_sampling_mode: old_pred_x0_ddim
+  speed_loss_weight: 0.2
+  speed_profile_dt: 0.5
+
+truncated_diffusion:
+  num_train_timesteps: 1000
+  num_diffusion_steps: 10
+  eta: 0.0
+  prediction_type: sample
+  route_loss_weight: 5.0
+  route_final_loss_weight: 2.0
+
+reg_loss_weight: 3.0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+  update_interval: 10
+
+dataset:
+  use_per_frame: false
+  feature_suffix: ensemble
+  use_fullres_upsample_cache: false
+  train_filter_bad_routes: false
+  val_filter_bad_routes: true
+  cache_dir: null
+
+training:
+  num_epochs: 65
+  max_grad_norm: 1.0
+  warmup_epochs: 3
+  use_lr_scheduler: true
+  resume_rebuild_scheduler: true
+  scheduler_total_epochs: 65
+  dataset_path: /data/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_prevstate
+  image_data_root: /data/z_project/dataset/pdm_lite
+  lr_final: 1.0e-7
+  validation_freq: 5
+  save_freq: 5
+  max_keep_ckpts: 20
+  best_checkpoint_metric: L2_avg
+  checkpoint_dir: /data/z_project/code/motdp_z_semantic_state_strict_ablation_v1/checkpoints/paper_motion_only_core_oldddim_0531
+
+validation:
+  enabled: true
+  use_memmap: true
+  max_batches: 0
+
+logging:
+  use_wandb: false
+  run_name: paper_motion_only_core_oldddim_0531
+  checkpoint_dir: /data/z_project/code/motdp_z_semantic_state_strict_ablation_v1/checkpoints/paper_motion_only_core_oldddim_0531
+  log_freq: 50
+
+augmentation:
+  gps_noise:
+    enabled: true
+    sigma: 0.05
+    probability: 1
+    apply_to_route: false
+
+model_optimization:
+  use_mixed_precision: true

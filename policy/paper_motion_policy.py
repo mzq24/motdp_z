@@ -30,6 +30,7 @@ class PaperMotionPolicy(nn.Module):
         self.train_max_timesteps = int(route_cfg.get('train_max_timesteps', diffusion_cfg.get('num_train_timesteps', 1000)))
         self.num_train_timesteps = int(diffusion_cfg.get('num_train_timesteps', self.train_max_timesteps))
         self.prediction_type = str(diffusion_cfg.get('prediction_type', 'sample'))
+        self.paper_sampling_mode = str(route_cfg.get('paper_sampling_mode', 'diffusers_step'))
         self.eta = float(diffusion_cfg.get('eta', 0.0))
         self.speed_profile_dt = float(route_cfg.get('speed_profile_dt', 0.5))
         self.reg_loss_weight = float(config.get('reg_loss_weight', 3.0))
@@ -68,6 +69,28 @@ class PaperMotionPolicy(nn.Module):
         self.register_buffer('global_abs_std', None)
         self.register_buffer('route_abs_mean', None)
         self.register_buffer('route_abs_std', None)
+
+    def build_roll_timesteps(self, num_steps: Optional[int] = None, device: Optional[torch.device] = None) -> torch.Tensor:
+        """Old Route-B DDIM timestep schedule used by the legacy motion-only policy."""
+        if num_steps is None:
+            num_steps = self.num_inference_steps
+        num_steps = int(num_steps)
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
+
+        max_t = int(self.train_max_timesteps)
+        if max_t <= 0:
+            raise ValueError(f"train_max_timesteps must be positive, got {max_t}")
+
+        if num_steps == 1:
+            timesteps = np.array([max_t - 1], dtype=np.int64)
+        else:
+            step_ratio = max_t / num_steps
+            timesteps = (np.arange(0, num_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+            timesteps = np.clip(timesteps, 0, max_t - 1)
+
+        timesteps = torch.from_numpy(timesteps)
+        return timesteps.to(device) if device is not None else timesteps
 
     @property
     def device(self) -> torch.device:
@@ -262,17 +285,43 @@ class PaperMotionPolicy(nn.Module):
         joint_len = self.horizon + self.num_waypoints
         x = torch.randn(B, joint_len, 2, device=device, dtype=torch.float32)
         steps = int(num_inference_steps or self.num_inference_steps)
-        self.diffusion_scheduler.set_timesteps(steps, device=device)
         speed_logits = None
-        for t in self.diffusion_scheduler.timesteps:
-            t_batch = torch.full((B,), int(t.item()), device=device, dtype=torch.long)
-            noisy_abs = self.joint_norm_to_abs(x.to(dtype=dtype))
-            pred = self.model.forward_denoise(noisy_abs, t_batch, bev, bev_up, ego_status)
-            pred_joint = torch.cat([pred['traj_norm'], pred['route_norm']], dim=-2).float()
-            speed_logits = pred['speed_logits']
-            step_out = self.diffusion_scheduler.step(pred_joint, t, x, eta=self.eta)
-            x = step_out.prev_sample
-        joint_abs = self.joint_norm_to_abs(x.to(dtype=dtype))
+        pred_joint = None
+        if self.paper_sampling_mode == 'old_pred_x0_ddim':
+            timesteps = self.build_roll_timesteps(steps, device=device)
+            alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
+            for step_i, t in enumerate(timesteps):
+                t_cur = int(t.item())
+                t_next = int(timesteps[step_i + 1].item()) if step_i + 1 < len(timesteps) else 0
+                t_batch = torch.full((B,), t_cur, device=device, dtype=torch.long)
+                noisy_abs = self.joint_norm_to_abs(x.to(dtype=dtype))
+                pred = self.model.forward_denoise(noisy_abs, t_batch, bev, bev_up, ego_status)
+                pred_joint = torch.cat([pred['traj_norm'], pred['route_norm']], dim=-2).float()
+                speed_logits = pred['speed_logits']
+
+                alpha_t = alphas_cumprod[t_cur]
+                alpha_next = alphas_cumprod[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
+                pred_eps = (x - alpha_t.sqrt() * pred_joint) / (1 - alpha_t).sqrt().clamp(min=1e-8)
+                x = alpha_next.sqrt() * pred_joint + (1 - alpha_next).sqrt() * pred_eps
+            if pred_joint is None:
+                raise RuntimeError('old_pred_x0_ddim sampling produced no prediction')
+            joint_abs = self.joint_norm_to_abs(pred_joint.to(dtype=dtype))
+        elif self.paper_sampling_mode == 'diffusers_step':
+            self.diffusion_scheduler.set_timesteps(steps, device=device)
+            for t in self.diffusion_scheduler.timesteps:
+                t_batch = torch.full((B,), int(t.item()), device=device, dtype=torch.long)
+                noisy_abs = self.joint_norm_to_abs(x.to(dtype=dtype))
+                pred = self.model.forward_denoise(noisy_abs, t_batch, bev, bev_up, ego_status)
+                pred_joint = torch.cat([pred['traj_norm'], pred['route_norm']], dim=-2).float()
+                speed_logits = pred['speed_logits']
+                step_out = self.diffusion_scheduler.step(pred_joint, t, x, eta=self.eta)
+                x = step_out.prev_sample
+            joint_abs = self.joint_norm_to_abs(x.to(dtype=dtype))
+        else:
+            raise ValueError(
+                f"Unsupported paper_sampling_mode={self.paper_sampling_mode!r}; "
+                "expected 'diffusers_step' or 'old_pred_x0_ddim'"
+            )
         return {
             'trajectory': joint_abs[:, :self.horizon],
             'route': joint_abs[:, self.horizon:],
