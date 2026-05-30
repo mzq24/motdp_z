@@ -2,10 +2,10 @@
 set -euo pipefail
 
 CODE_DIR=${CODE_DIR:-/data/z_project/code/motdp_z_semantic_state_strict_ablation_v1}
-CONFIG=${CONFIG:-config/paper_motion_only_core_oldddim_0531.yaml}
+CONFIG=${CONFIG:-config/paper_motion_unified_no_detail_0531.yaml}
 GPUS=${GPUS:-4}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
-MASTER_PORT=${MASTER_PORT:-29597}
+MASTER_PORT=${MASTER_PORT:-29598}
 RESUME=${RESUME:-}
 VAL_ONLY=${VAL_ONLY:-0}
 

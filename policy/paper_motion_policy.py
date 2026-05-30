@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from model.paper_motion_diffusion_core import PaperMotionDiffusionCore
+from model.paper_motion_unified_no_detail_core import PaperMotionUnifiedNoDetailCore
 
 
 class PaperMotionPolicy(nn.Module):
@@ -37,9 +38,10 @@ class PaperMotionPolicy(nn.Module):
         self.route_loss_weight = float(diffusion_cfg.get('route_loss_weight', 5.0))
         self.route_final_loss_weight = float(diffusion_cfg.get('route_final_loss_weight', 2.0))
         self.speed_loss_weight = float(route_cfg.get('speed_loss_weight', 0.2))
+        self.paper_motion_core = str(route_cfg.get('paper_motion_core', 'simple'))
 
         transfuser_cfg = config.get('transfuser_encoder', {})
-        self.model = PaperMotionDiffusionCore(
+        core_kwargs = dict(
             input_dim=action_dim,
             output_dim=action_dim,
             horizon=self.horizon,
@@ -55,6 +57,18 @@ class PaperMotionPolicy(nn.Module):
             transfuser_bev_upsample_dim=int(transfuser_cfg.get('bev_feature_upsample_dim', 64)),
             traj_can_attend_route=bool(policy_cfg.get('traj_can_attend_route', True)),
         )
+        if self.paper_motion_core == 'simple':
+            self.model = PaperMotionDiffusionCore(**core_kwargs)
+        elif self.paper_motion_core == 'unified_no_detail':
+            self.model = PaperMotionUnifiedNoDetailCore(
+                **core_kwargs,
+                ego_detail_activation_t=int(policy_cfg.get('ego_detail_activation_t', -1)),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported paper_motion_core={self.paper_motion_core!r}; "
+                "expected 'simple' or 'unified_no_detail'"
+            )
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             steps_offset=1,
