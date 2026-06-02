@@ -1,0 +1,63 @@
+# NuPlan White-Noise Diffusion Config
+# Stable source pretrain with 4 large CL14 tasks, capped to 100k each
+
+train_cache_dirs:
+  - /workspace2/z_project/exp/nuplan/cache_plantf_train_singapore/
+  - /workspace2/z_project/exp/nuplan/cache_plantf_train_boston/
+  - /workspace2/z_project/exp/nuplan/cache_plantf_train_pittsburgh/
+max_samples: null
+allowed_target_types:
+  - stationary_in_traffic
+  - starting_straight_traffic_light_intersection_traversal
+  - high_magnitude_speed
+  - stopping_with_lead
+samples_per_target_type: 100000
+repeat_small_target_types: false
+sampling_seed: 0
+default_target_type_partition_index: 0
+norm_stats_path: null
+
+hidden_dim: 192
+num_heads: 6
+encoder_depth: 3
+decoder_depth: 3
+agent_num: 32
+static_objects_num: 5
+static_objects_state_dim: 10
+lane_num: 30
+lane_len: 20
+route_num: 10
+route_len: 20
+time_len: 21
+future_len: 80
+predicted_neighbor_num: 10
+
+encoder_drop_path_rate: 0.0
+decoder_drop_path_rate: 0.1
+
+num_train_timesteps: 1000
+num_inference_steps: 10
+
+batch_size: 64
+learning_rate: 5.0e-4
+weight_decay: 0.01
+train_epochs: 500
+warmup_epochs: 5
+max_grad_norm: 5.0
+use_amp: true
+num_workers: 8
+
+use_ema: true
+ema_decay: 0.999
+ema_update_interval: 10
+
+checkpoint_dir: /workspace2/z_project/exp/nuplan/nuplan_whitenoise_diffusion_v1/pretrain_source_balanced_4x100k_20260516/checkpoints/
+save_freq: 20
+max_keep_ckpts: 3
+
+use_wandb: true
+wandb_project: nuplan_diffusion
+wandb_run_name: nuplan_whitenoise_pretrain_source_balanced_4x100k_gpu45
+
+policy:
+  n_obs_steps: 1

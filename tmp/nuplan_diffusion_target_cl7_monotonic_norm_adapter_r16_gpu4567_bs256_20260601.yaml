@@ -1,0 +1,100 @@
+# Sequential 7-class target finetune, reordered to reduce late recovery.
+# Normal adapter rank 16.
+# Source-overlap target types use partition index 1, i.e. the second partition.
+
+train_cache_dirs:
+  - /workspace2/z_project/exp/nuplan/cache_plantf_train_singapore/
+  - /workspace2/z_project/exp/nuplan/cache_plantf_train_boston/
+  - /workspace2/z_project/exp/nuplan/cache_plantf_train_pittsburgh/
+max_samples: null
+samples_per_target_type: 100000
+repeat_small_target_types: false
+sampling_seed: 0
+default_target_type_partition_index: 0
+target_type_partition_indices:
+  starting_straight_traffic_light_intersection_traversal: 1
+  stationary_in_traffic: 1
+norm_stats_path: /home/z/code/nuplan_whitenoise_diffusion_v1/configs/norm_stats/source_overlap_3x100k_partition0.json
+
+hidden_dim: 192
+num_heads: 6
+encoder_depth: 3
+decoder_depth: 3
+agent_num: 32
+static_objects_num: 5
+static_objects_state_dim: 10
+lane_num: 30
+lane_len: 20
+route_num: 10
+route_len: 20
+time_len: 21
+future_len: 80
+predicted_neighbor_num: 10
+
+encoder_drop_path_rate: 0.0
+decoder_drop_path_rate: 0.1
+
+num_train_timesteps: 1000
+num_inference_steps: 10
+
+peft_config:
+  type: adapter
+  rank: 16
+
+batch_size: 256
+learning_rate: 2.0e-4
+weight_decay: 0.01
+train_epochs: 60
+warmup_epochs: 5
+max_grad_norm: 5.0
+use_amp: true
+num_workers: 16
+prefetch_factor: 8
+persistent_workers: true
+use_tqdm: true
+
+val_cache_dirs:
+  - /workspace2/z_project/exp/nuplan/cache_plantf_val/
+val_every_epochs: 5
+enable_validation_in_ddp: true
+val_batch_size: 64
+val_num_batches: 20
+val_num_workers: 8
+val_prefetch_factor: 4
+val_persistent_workers: true
+val_task_num_batches: 10
+
+use_ema: true
+ema_decay: 0.999
+ema_update_interval: 10
+
+checkpoint_dir: /workspace2/z_project/exp/nuplan/nuplan_whitenoise_diffusion_v1/target_cl7_monotonic_norm_adapter_r16_gpu4567_bs256_20260601/checkpoints/
+save_freq: 5
+max_keep_ckpts: 3
+
+use_wandb: true
+wandb_project: nuplan_diffusion
+wandb_run_name: nuplan_whitenoise_target_cl7_monotonic_norm_adapter_gpu4567_bs256_r16
+
+continual_learning:
+  enable: true
+  epochs_per_task: 60
+  target_tasks:
+    - starting_straight_traffic_light_intersection_traversal
+    - following_lane_with_lead
+    - high_lateral_acceleration
+    - near_multiple_vehicles
+    - waiting_for_pedestrian_to_cross
+    - traversing_pickup_dropoff
+    - stationary_in_traffic
+  validation:
+    mode: seen_targets
+
+policy:
+  n_obs_steps: 1
+  num_inference_steps: 10
+  noise_scheduler_type: ddim
+  beta_schedule: squaredcos_cap_v2
+  clip_sample: true
+  prediction_type: epsilon
+  eta: 0.0

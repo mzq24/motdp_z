@@ -1,0 +1,20 @@
+{
+  "mean": [
+    21.403062604772586,
+    0.06905053604919964
+  ],
+  "std": [
+    23.811296828447066,
+    5.701485474041786
+  ],
+  "point_count": 24000000,
+  "sample_count": 300000,
+  "source_config": "/home/z/code/nuplan_whitenoise_diffusion_v1/configs/nuplan_diffusion_source_overlap_3x100k.yaml",
+  "allowed_target_types": [
+    "stationary_in_traffic",
+    "starting_straight_traffic_light_intersection_traversal",
+    "high_magnitude_speed"
+  ],
+  "samples_per_target_type": 100000,
+  "default_target_type_partition_index": 0
+}

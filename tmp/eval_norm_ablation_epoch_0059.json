@@ -1,0 +1,104 @@
+{
+  "identity_norm": {
+    "checkpoint_path": "/workspace2/z_project/exp/nuplan/nuplan_whitenoise_diffusion_v1/source_overlap_3x100k_norm_20260517/checkpoints/epoch_0059.pth",
+    "load_state": {
+      "missing_keys": [],
+      "unexpected_keys": []
+    },
+    "mode": "identity_norm",
+    "norm_stats_path": "/home/z/code/nuplan_whitenoise_diffusion_v1/configs/norm_stats/source_overlap_3x100k_partition0.json",
+    "overall": {
+      "ego_ADE": 39.05709323883057,
+      "ego_FDE": 74.7123046875,
+      "ego_loss": 8.904185461997987,
+      "gt_final_disp": 76.820560836792,
+      "loss": 14.348804140090943,
+      "neighbor_loss": 5.444618678092956,
+      "pred_final_disp": 2.320517897605896,
+      "sample_count": 1280
+    },
+    "tasks": {
+      "high_magnitude_speed": {
+        "ego_ADE": 39.04224853515625,
+        "ego_FDE": 74.66364097595215,
+        "ego_loss": 8.920453929901123,
+        "gt_final_disp": 76.78457412719726,
+        "loss": 14.363243770599365,
+        "neighbor_loss": 5.442789840698242,
+        "pred_final_disp": 2.320413422584534,
+        "sample_count": 640
+      },
+      "starting_straight_traffic_light_intersection_traversal": {
+        "ego_ADE": 26.8351692199707,
+        "ego_FDE": 52.27381591796875,
+        "ego_loss": 6.079058456420898,
+        "gt_final_disp": 53.81587104797363,
+        "loss": 9.306447982788086,
+        "neighbor_loss": 3.2273895025253294,
+        "pred_final_disp": 2.242380952835083,
+        "sample_count": 640
+      },
+      "stationary_in_traffic": {
+        "ego_ADE": 4.644547939300537,
+        "ego_FDE": 9.442071771621704,
+        "ego_loss": 0.923844039440155,
+        "gt_final_disp": 8.90660924911499,
+        "loss": 1.7810794949531554,
+        "neighbor_loss": 0.857235449552536,
+        "pred_final_disp": 0.9464986383914947,
+        "sample_count": 640
+      }
+    }
+  },
+  "with_norm": {
+    "checkpoint_path": "/workspace2/z_project/exp/nuplan/nuplan_whitenoise_diffusion_v1/source_overlap_3x100k_norm_20260517/checkpoints/epoch_0059.pth",
+    "load_state": {
+      "missing_keys": [],
+      "unexpected_keys": []
+    },
+    "mode": "with_norm",
+    "norm_stats_path": "/home/z/code/nuplan_whitenoise_diffusion_v1/configs/norm_stats/source_overlap_3x100k_partition0.json",
+    "overall": {
+      "ego_ADE": 4.130788207054138,
+      "ego_FDE": 8.118251323699951,
+      "ego_loss": 0.03688550898805261,
+      "gt_final_disp": 76.820560836792,
+      "loss": 0.07737824358046055,
+      "neighbor_loss": 0.04049273412674666,
+      "pred_final_disp": 71.35465793609619,
+      "sample_count": 1280
+    },
+    "tasks": {
+      "high_magnitude_speed": {
+        "ego_ADE": 3.930236291885376,
+        "ego_FDE": 7.719536685943604,
+        "ego_loss": 0.03724164310842752,
+        "gt_final_disp": 76.78457412719726,
+        "loss": 0.0792166993021965,
+        "neighbor_loss": 0.04197505675256252,
+        "pred_final_disp": 71.57587661743165,
+        "sample_count": 640
+      },
+      "starting_straight_traffic_light_intersection_traversal": {
+        "ego_ADE": 5.125865840911866,
+        "ego_FDE": 9.77624444961548,
+        "ego_loss": 0.04897796101868153,
+        "gt_final_disp": 53.81587104797363,
+        "loss": 0.09885628744959832,
+        "neighbor_loss": 0.0498783253133297,
+        "pred_final_disp": 48.47344055175781,
+        "sample_count": 640
+      },
+      "stationary_in_traffic": {
+        "ego_ADE": 1.3539166271686554,
+        "ego_FDE": 2.7469881653785704,
+        "ego_loss": 0.011735678231343628,
+        "gt_final_disp": 8.90660924911499,
+        "loss": 0.0418850589543581,
+        "neighbor_loss": 0.030149380676448345,
+        "pred_final_disp": 8.082905721664428,
+        "sample_count": 640
+      }
+    }
+  }
+}
