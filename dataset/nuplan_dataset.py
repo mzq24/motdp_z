@@ -109,7 +109,7 @@ def convert_plantf_to_tensors(feature: dict, trajectory: dict) -> tuple:
 
     # === Ego future ===
     ego_target = agent['target'][0]  # (80, 3) = [x, y, heading]
-    ego_fut = torch.tensor(ego_target[:, :2], dtype=torch.float32)
+    ego_fut = torch.tensor(ego_target[:, :3], dtype=torch.float32)
 
     # === Neighbor agents past (32, 21, 11) ===
     num_agents_total = agent['position'].shape[0]
@@ -149,10 +149,13 @@ def convert_plantf_to_tensors(feature: dict, trajectory: dict) -> tuple:
     for i in range(1, min(num_agents_total, 11)):
         out_idx = i - 1
         target = agent['target'][i]  # (80, 3)
-        neighbor_fut[out_idx, :, 0] = torch.tensor(target[:, 0], dtype=torch.float32)
-        neighbor_fut[out_idx, :, 1] = torch.tensor(target[:, 1], dtype=torch.float32)
-        neighbor_fut[out_idx, :, 2] = torch.cos(torch.tensor(target[:, 2], dtype=torch.float32))
-        neighbor_fut[out_idx, :, 3] = torch.sin(torch.tensor(target[:, 2], dtype=torch.float32))
+        target_tensor = torch.tensor(target, dtype=torch.float32)
+        valid_future = torch.sum(torch.ne(target_tensor[:, :3], 0), dim=-1) != 0
+        neighbor_fut[out_idx, :, 0] = target_tensor[:, 0]
+        neighbor_fut[out_idx, :, 1] = target_tensor[:, 1]
+        neighbor_fut[out_idx, :, 2] = torch.cos(target_tensor[:, 2])
+        neighbor_fut[out_idx, :, 3] = torch.sin(target_tensor[:, 2])
+        neighbor_fut[out_idx, ~valid_future] = 0.0
 
     # === Lanes (30, 20, 12) ===
     M = min(map_data['point_position'].shape[0], 30)

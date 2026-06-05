@@ -850,13 +850,14 @@ def validate(
             num_steps=inference_steps,
         )
         pred_ego = sampled['trajectory'][:, 0, :, :2]
-        ego_error = torch.linalg.vector_norm(pred_ego - ego_future, dim=-1)
+        ego_future_xy = ego_future[..., :2]
+        ego_error = torch.linalg.vector_norm(pred_ego - ego_future_xy, dim=-1)
         ego_ade = ego_error.mean(dim=-1)
         ego_fde = ego_error[:, -1]
         pred_final_disp = torch.linalg.vector_norm(pred_ego[:, -1, :], dim=-1)
-        gt_final_disp = torch.linalg.vector_norm(ego_future[:, -1, :], dim=-1)
+        gt_final_disp = torch.linalg.vector_norm(ego_future_xy[:, -1, :], dim=-1)
 
-        batch_size = ego_future.shape[0]
+        batch_size = ego_future_xy.shape[0]
         total_samples += batch_size
         total_loss += loss_dict['loss'].item() * batch_size
         total_ego_loss += loss_dict['ego_loss'].item() * batch_size
@@ -928,7 +929,9 @@ def main():
     # Create model
     policy = NuPlanDiffusionPolicy(config).cuda()
 
-    # Load normalization stats if provided, otherwise keep identity scaling.
+    # Load legacy data-estimated stats if provided; otherwise keep the
+    # policy's configured default normalization (Diffusion-Planner fixed norm
+    # for new configs).
     norm_stats_path = config.get('norm_stats_path')
     if norm_stats_path:
         with open(norm_stats_path, 'r') as f:
@@ -939,8 +942,8 @@ def main():
                 f"Loaded normalization stats from {norm_stats_path}: "
                 f"mean={norm_stats['mean']} std={norm_stats['std']}"
             )
-    elif rank == 0:
-        print("Using identity normalization (no stats file)")
+    if rank == 0:
+        print(f"Normalization summary: {policy.normalization_summary()}")
 
     # DDP wrapping
     if world_size > 1:
