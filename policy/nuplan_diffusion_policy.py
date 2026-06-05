@@ -346,6 +346,12 @@ class NuPlanDiffusionPolicy(nn.Module):
         weight_decay = training_config.get('weight_decay', 0.01)
         warmup_epochs = training_config.get('warmup_epochs', 5)
         total_epochs = training_config.get('train_epochs', 500)
+        final_lr = training_config.get(
+            'final_learning_rate',
+            training_config.get('min_learning_rate', 0.0),
+        )
+        final_lr = max(0.0, float(final_lr))
+        final_lr_ratio = min(final_lr / float(lr), 1.0) if lr > 0 else 0.0
         steps_per_epoch = max(1, int(steps_per_epoch))
         warmup_steps = max(0, int(warmup_epochs * steps_per_epoch))
         total_steps = max(1, int(total_epochs * steps_per_epoch))
@@ -377,11 +383,14 @@ class NuPlanDiffusionPolicy(nn.Module):
                 return 1.0
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             progress = min(max(progress, 0.0), 1.0)
-            return 0.5 * (1 + np.cos(np.pi * progress))
+            cosine = 0.5 * (1 + np.cos(np.pi * progress))
+            return final_lr_ratio + (1.0 - final_lr_ratio) * cosine
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         scheduler.lr_schedule_unit = 'step'
         scheduler.total_steps = total_steps
         scheduler.warmup_steps = warmup_steps
+        scheduler.final_learning_rate = final_lr
+        scheduler.final_lr_ratio = final_lr_ratio
 
         return optimizer, scheduler

@@ -1576,6 +1576,7 @@ def main():
                     'global_step': scheduler.last_epoch,
                     'steps_per_epoch': steps_per_epoch,
                     'scheduler_total_steps': getattr(scheduler, 'total_steps', total_epochs * steps_per_epoch),
+                    'scheduler_final_learning_rate': getattr(scheduler, 'final_learning_rate', 0.0),
                     'lr_schedule_unit': getattr(scheduler, 'lr_schedule_unit', 'step'),
                     **pegp_state,
                 }, ckpt_path)
