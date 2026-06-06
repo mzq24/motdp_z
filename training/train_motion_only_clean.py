@@ -550,7 +550,13 @@ def train(config_path: str, resume: Optional[str] = None, val_only: bool = False
             print(f"Resumed {resume} at epoch {start_epoch}")
 
     if world_size > 1:
-        policy = DDP(policy, device_ids=[device.index], output_device=device.index, find_unused_parameters=False)
+        ddp_find_unused = bool(config.get('training', {}).get('ddp_find_unused_parameters', False))
+        policy = DDP(
+            policy,
+            device_ids=[device.index],
+            output_device=device.index,
+            find_unused_parameters=ddp_find_unused,
+        )
 
     if val_only:
         model = policy.module if isinstance(policy, DDP) else policy

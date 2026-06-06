@@ -32,6 +32,7 @@ sys.path = [str(p) for p in sys.path]
 
 from leaderboard.autoagents import autonomous_agent
 from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
+from policy.paper_motion_policy import PaperMotionPolicy
 from team_code.simlingo.nav_planner import RoutePlanner, LateralPIDController, get_throttle
 from agents.navigation.local_planner import RoadOption
 import team_code.simlingo.transfuser_utils as t_u  
@@ -332,7 +333,11 @@ def load_best_model(checkpoint_path, config, device):
         sys.modules['numpy._core'] = np.core
         sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 
-    policy, ckpt = AnnealedEnergyGuidancePolicy.load_checkpoint(checkpoint_path, config, device)
+    policy_type = str(config.get('policy_type', '')).strip().lower()
+    if policy_type == 'paper_motion_only':
+        policy, ckpt = PaperMotionPolicy.load_checkpoint(checkpoint_path, config, device)
+    else:
+        policy, ckpt = AnnealedEnergyGuidancePolicy.load_checkpoint(checkpoint_path, config, device)
 
     epoch = ckpt.get('epoch', 'N/A')
     val_loss = ckpt.get('val_loss', 'N/A')
@@ -1984,7 +1989,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print("[USE_MOT=False] Skipping MoT model loading.")
 
 			# ========== Load TransFuser Backbone(s) for DP features ==========
-			transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
+			transfuser_config_path = os.environ.get(
+				"TRANSFUSER_PRETRAINED_ROOT",
+				"/data/z_project/models/pretrained_models/all_towns",
+			)
+			if not os.path.exists(os.path.join(transfuser_config_path, "config.json")):
+				legacy_transfuser_config_path = "/media/z/data/models/garage2/pretrained_models/all_towns"
+				if os.path.exists(os.path.join(legacy_transfuser_config_path, "config.json")):
+					transfuser_config_path = legacy_transfuser_config_path
 			transfuser_model_paths = [
 				os.path.join(transfuser_config_path, "model_0030_0.pth"),
 				os.path.join(transfuser_config_path, "model_0030_1.pth"),

@@ -343,6 +343,34 @@ class PaperMotionPolicy(nn.Module):
             'speed_mps': self.decode_speed(speed_logits, self.model.speed_classes) if speed_logits is not None else None,
         }
 
+    @torch.no_grad()
+    def predict_action(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        no_noise: bool = True,
+        reset_semantic_state_cache: bool = False,
+        disable_semantic_state_cache: bool = False,
+        num_inference_steps: Optional[int] = None,
+        **_: object,
+    ) -> Dict[str, object]:
+        # Compatibility wrapper for route_b_b2d_agent. Semantic cache arguments are
+        # accepted but intentionally ignored by this motion-only policy.
+        out = self.sample(obs_dict, num_inference_steps=num_inference_steps)
+        traj = out['trajectory'].detach().float().cpu().numpy()
+        route = out['route'].detach().float().cpu()
+        speed_mps = out.get('speed_mps')
+        if speed_mps is not None:
+            target_speed = speed_mps.detach().float().cpu().numpy()
+        else:
+            target_speed = None
+        return {
+            'action': traj,
+            'route_pred': route,
+            'target_speed': target_speed,
+            'speed_logits': out.get('speed_logits'),
+            'speed_mps': target_speed,
+        }
+
     @classmethod
     def load_checkpoint(cls, checkpoint_path: str, config: Dict, device: str = 'cuda'):
         policy = cls(config)

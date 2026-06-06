@@ -113,6 +113,7 @@ training:
   warmup_epochs: 3
   use_lr_scheduler: true
   resume_rebuild_scheduler: true
+  ddp_find_unused_parameters: true
   scheduler_total_epochs: 65
   dataset_path: /data/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_prevstate
   image_data_root: /data/z_project/dataset/pdm_lite
