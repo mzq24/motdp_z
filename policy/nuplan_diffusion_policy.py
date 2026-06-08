@@ -21,6 +21,7 @@ from typing import Dict, Optional, Union, List
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from model.nuplan_diffusion_model import NuPlanDiffusionModel
+from model.nuplan_multisource_diffusion_model import NuPlanMultiSourceDiffusionModel
 
 
 # =============================================================================
@@ -76,7 +77,16 @@ class NuPlanDiffusionPolicy(nn.Module):
         self.n_obs_steps = policy_cfg.get('n_obs_steps', 1)
 
         # Model
-        self.model = NuPlanDiffusionModel(config)
+        self.model_type = str(config.get('model_type', 'simple')).lower()
+        if self.model_type in {'n2_multisource', 'multisource', 'n2'}:
+            self.model = NuPlanMultiSourceDiffusionModel(config)
+        elif self.model_type in {'simple', 'dit', 'diffusion_planner'}:
+            self.model = NuPlanDiffusionModel(config)
+        else:
+            raise ValueError(
+                f"Unsupported model_type '{self.model_type}'. "
+                "Expected simple or n2_multisource."
+            )
 
         # Diffusion scheduler
         self.num_train_timesteps = config.get('num_train_timesteps', 1000)
@@ -123,12 +133,59 @@ class NuPlanDiffusionPolicy(nn.Module):
             )
         )
         self.neighbor_loss_weight = float(config.get('neighbor_loss_weight', 1.0))
+        self.predict_route_tokens = bool(getattr(self.model, 'predict_route_tokens', False))
+        self.route_points = int(config.get('route_points', config.get('route_token_points', 50)))
+        self.route_step_m = float(config.get('route_step_m', 1.0))
+        self.route_loss_weight = float(config.get('route_loss_weight', 1.0))
 
         # Ego future key used by model output reshaping
         self.horizon = config.get('future_len', 80)
         self.predicted_neighbor_num = config.get('predicted_neighbor_num', 10)
         self.P = 1 + self.predicted_neighbor_num
         self.output_dim = self.model.output_dim
+
+    def build_ego_route_targets(self, ego_future_xy: torch.Tensor) -> tuple:
+        """Build arc-length route geometry targets from ego future xy.
+
+        Returns:
+            route_abs: (B, route_points, 2), tail-held beyond valid path length.
+            route_mask: (B, route_points), True for supervised points.
+        """
+        B, T, _ = ego_future_xy.shape
+        origin = torch.zeros(B, 1, 2, device=ego_future_xy.device, dtype=ego_future_xy.dtype)
+        path = torch.cat([origin, ego_future_xy], dim=1)
+        delta = path[:, 1:] - path[:, :-1]
+        segment_len = torch.linalg.vector_norm(delta, dim=-1)
+        cumdist = torch.cat(
+            [torch.zeros(B, 1, device=path.device, dtype=path.dtype), segment_len.cumsum(dim=1)],
+            dim=1,
+        )
+
+        target_dist = (
+            torch.arange(1, self.route_points + 1, device=path.device, dtype=path.dtype)
+            * self.route_step_m
+        )
+        target = target_dist.unsqueeze(0).expand(B, -1)
+        total = cumdist[:, -1:]
+        route_mask = target <= total
+
+        idx = torch.searchsorted(cumdist.contiguous(), target.contiguous(), right=False)
+        idx = idx.clamp(min=1, max=T)
+        prev_idx = idx - 1
+
+        gather_idx = idx.unsqueeze(-1).expand(-1, -1, 2)
+        gather_prev_idx = prev_idx.unsqueeze(-1).expand(-1, -1, 2)
+        p0 = torch.gather(path, dim=1, index=gather_prev_idx)
+        p1 = torch.gather(path, dim=1, index=gather_idx)
+
+        cum0 = torch.gather(cumdist, dim=1, index=prev_idx)
+        cum1 = torch.gather(cumdist, dim=1, index=idx)
+        ratio = ((target - cum0) / (cum1 - cum0).clamp_min(1e-6)).unsqueeze(-1)
+        route_abs = p0 + ratio * (p1 - p0)
+
+        final_pose = path[:, -1:, :].expand(-1, self.route_points, -1)
+        route_abs = torch.where(route_mask.unsqueeze(-1), route_abs, final_pose)
+        return route_abs, route_mask
 
     # =========================================================================
     # Normalization
@@ -327,6 +384,20 @@ class NuPlanDiffusionPolicy(nn.Module):
         noisy_future = noisy_future_flat.reshape(B, self.P, self.horizon, 4)
         noisy = torch.cat([cur_states.unsqueeze(2), noisy_future], dim=2)
 
+        route_target_norm = None
+        route_target_mask = None
+        noisy_route = None
+        if self.predict_route_tokens:
+            route_target_abs, route_target_mask = self.build_ego_route_targets(ego_future[..., :2])
+            route_target_norm = self.abs_to_norm(route_target_abs)
+            route_noise = torch.randn_like(route_target_norm)
+            noisy_route_flat = self.noise_scheduler.add_noise(
+                route_target_norm.reshape(B * self.route_points, 2),
+                route_noise.reshape(B * self.route_points, 2),
+                timesteps.repeat_interleave(self.route_points),
+            )
+            noisy_route = noisy_route_flat.reshape(B, self.route_points, 2)
+
         model_inputs = {
             'neighbor_agents_past': obs['neighbor_past'],
             'static_objects': obs['static_objects'],
@@ -338,6 +409,8 @@ class NuPlanDiffusionPolicy(nn.Module):
             'diffusion_time': timesteps,
             'neighbor_current_mask': neighbor_cur_mask,
         }
+        if self.predict_route_tokens:
+            model_inputs['sampled_route'] = noisy_route
 
         outputs = self.model(model_inputs)
         pred_future = outputs['score'][:, :, 1:, :]  # (B, P, T, 4)
@@ -352,13 +425,26 @@ class NuPlanDiffusionPolicy(nn.Module):
             neighbor_loss = torch.tensor(0.0, device=device)
 
         weighted_neighbor_loss = self.neighbor_loss_weight * neighbor_loss
-        total_loss = ego_loss + weighted_neighbor_loss
+        route_loss = torch.tensor(0.0, device=device)
+        weighted_route_loss = torch.tensor(0.0, device=device)
+        if self.predict_route_tokens:
+            if 'route_score' not in outputs:
+                raise KeyError('predict_route_tokens=True but model output has no route_score')
+            route_pred = outputs['route_score']
+            route_loss_all = F.l1_loss(route_pred, route_target_norm, reduction='none').mean(dim=-1)
+            if route_target_mask.any():
+                route_loss = route_loss_all[route_target_mask].mean()
+            weighted_route_loss = self.route_loss_weight * route_loss
+
+        total_loss = ego_loss + weighted_neighbor_loss + weighted_route_loss
 
         return {
             'loss': total_loss,
             'ego_loss': ego_loss,
             'neighbor_loss': neighbor_loss,
             'weighted_neighbor_loss': weighted_neighbor_loss,
+            'route_loss': route_loss,
+            'weighted_route_loss': weighted_route_loss,
         }
 
     # =========================================================================
@@ -401,6 +487,9 @@ class NuPlanDiffusionPolicy(nn.Module):
 
         noise = torch.randn(B, self.P, self.horizon, 4, device=device)
         x_t = torch.cat([cur_states.unsqueeze(2), noise], dim=2)
+        route_t = None
+        if self.predict_route_tokens:
+            route_t = torch.randn(B, self.route_points, 2, device=device, dtype=x_t.dtype)
 
         self.noise_scheduler.set_timesteps(num_steps)
 
@@ -417,6 +506,8 @@ class NuPlanDiffusionPolicy(nn.Module):
                 'diffusion_time': t_batch,
                 'neighbor_current_mask': neighbor_cur_mask,
             }
+            if self.predict_route_tokens:
+                model_inputs['sampled_route'] = route_t
 
             outputs = self.model(model_inputs)
             pred_x0 = outputs['score']
@@ -429,11 +520,24 @@ class NuPlanDiffusionPolicy(nn.Module):
             x_t = x_next_flat.reshape(B, self.P, self.horizon + 1, 4)
             x_t[:, :, 0, :] = cur_states
 
+            if self.predict_route_tokens:
+                route_pred = outputs['route_score']
+                route_next_flat = self.noise_scheduler.step(
+                    route_pred.reshape(B * self.route_points, 2),
+                    t,
+                    route_t.reshape(B * self.route_points, 2),
+                    return_dict=False,
+                )[0]
+                route_t = route_next_flat.reshape(B, self.route_points, 2)
+
         trajectory = x_t[:, :, 1:, :]
         trajectory_abs = trajectory.clone()
         trajectory_abs[..., :2] = self.norm_to_abs(trajectory[..., :2])
 
-        return {'trajectory': trajectory_abs}
+        result = {'trajectory': trajectory_abs}
+        if self.predict_route_tokens and route_t is not None:
+            result['route'] = self.norm_to_abs(route_t)
+        return result
 
     # =========================================================================
     # Optimizer
