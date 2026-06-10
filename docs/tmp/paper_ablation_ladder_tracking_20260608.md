@@ -47,6 +47,7 @@ Short name:
 
 ```text
 legacy_routeb_nostate
+legacy_routeb_nostate_0519_e60
 ```
 
 Role:
@@ -64,30 +65,119 @@ Structure:
 - The checkpoint may still contain many unused semantic/stage1 modules because
   it comes from the larger research code path.
 - Uses the legacy decoder stack and old sampling behavior.
+- Important: this is "nostate" in the sense that semantic/stage1 supervision
+  and semantic-to-motion conditioning are disabled. It is not the same as the
+  later minimal paper motion-only core.
+- The recovered e60 checkpoint has `use_route_intent_token=true`, so it includes
+  the route-intent / TG token path. This may be one of the important differences
+  from N1/N2.
 
-Known config / checkpoint:
+Original important version:
 
 ```text
-config:
+run name:
+  route_b_simple_diffusion_nostate_0519
+
+config recovered from checkpoint:
   config/tmp/pdm_hpc_route_b_lidar_bev_simple_diffusion_nostate.yaml
 
 checkpoint:
-  checkpoints/route_b_simple_diffusion_nostate_0519/dit_policy_epoch55.pt
+  checkpoints/route_b_simple_diffusion_nostate_0519/dit_policy_epoch60.pt
+
+local artifact:
+  /media/z/data/mzq/others/MoT-DP-worktrees/semantic_state_strict_ablation_v1/
+    checkpoints/route_b_simple_diffusion_nostate_0519/dit_policy_epoch60.pt
 ```
 
-Close-loop result:
+Recovered e60 config highlights:
 
 ```text
-/data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0531_nostate_0519_epoch55_skip23695_24071
+policy_type: anchor_free
+dataset_path:
+  /workspace1/z_project/dataset/pdm_lite/tmp_data/full_scene_refresh_scene_split_95_5_prevstate
+feature_suffix: ensemble
+use_lidar_bev_detail: false
+
+train_stage1: false
+use_stage1_state: false
+use_semantic_state_transition: false
+use_traj_branch_condition: false
+use_cover_relation_graph_decoder: false
+use_route_prev_coarse_memory: false
+use_route_intent_token: true
+
+num_inference_steps: 10
+train_max_timesteps: 1000
+reg_loss_weight: 3.0
+route_loss_weight: 5.0
+route_final_loss_weight: 2.0
+speed_loss_weight: 0.2
+optimizer.lr: 5e-5
+lr_final: 1e-7
+warmup_epochs: 3
+num_epochs: 60
+batch_size: 128
+use_window_weighted_sampler: false
+use_semantic_shift_sampler: false
+
+gps_noise:
+  enabled: true
+  sigma: 0.05
+  probability: 1
+  apply_to_route: false
+```
+
+Open-loop e60 metrics from checkpoint:
+
+```text
+val_L2_avg:      not stored in compact key, legacy val_loss=2.7574
+val_reg_loss:    0.4558
+val_route_L2:    0.0841
+val_route_final: 0.1714
+val_route_loss:  0.2637
+speed_MAE:
+  speed_head:    0.8516
+  traj_1s:       0.5406
+```
+
+Original close-loop result:
+
+```text
+/data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0519_white_noise_none_e60
+```
+
+Original close-loop score via `Bench2Drive/cal_score.py`:
+
+```text
+routes:        220 / 220
+valid:         220
+success:       173
+Driving Score: 91.270
+Success Rate:  78.64%
+```
+
+Later rerun / confusing name:
+
+```text
+launcher:
+  /data/z_project/code/Bench2Drive/bash_commands/0519_white_noise_none_e60.sh
+
+later default checkpoint in that launcher:
+  checkpoints/route_b_simple_diffusion_nostate_0519/dit_policy_epoch55.pt
+
+later result:
+  /data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0531_nostate_0519_epoch55_skip23695_24071
 ```
 
 Notes:
 
-- Earlier partial close-loop had 192/218 routes before resume; later the missing
-  routes were resumed.
-- Use `Bench2Drive/cal_score.py` for final score because it excludes missing and
-  zero-score routes according to the current project convention.
-- This is not paper-clean, but it is an important sanity reference.
+- Do not infer the original e60 checkpoint from the later `0519_white_noise_none_e60.sh`
+  file alone. That launcher was later edited/defaulted to `epoch55`.
+- The original e60 artifact is preserved locally and should be treated as an
+  important strong no-state reference.
+- This is not paper-clean, but it is a key sanity reference and likely includes
+  useful tricks: legacy decoder stack, route-intent token, GPS noise, and no
+  semantic loss interference.
 
 ## N1: paper_simple_oldddim_nostate
 
@@ -272,6 +362,7 @@ Open-loop:
 
 ```text
 model                         ckpt      L2_avg   route_L2   route_final   speed_MAE
+legacy_routeb_nostate          e60       -        0.0841     0.1714        0.8516(head) / 0.5406(traj_1s)
 paper_simple_oldddim_nostate   e45/best  1.1054   0.1154     0.2319        0.4331
 paper_unified_no_detail        e35/best  1.0168   0.0997     0.1922        0.4095
 paper_unified_no_detail        e65       1.0827   0.0937     0.1809        0.4008
@@ -281,10 +372,11 @@ Close-loop:
 
 ```text
 model                         ckpt       steps  routes      valid  Driving Score  Success Rate
+legacy_routeb_nostate          e60        10     220/220     220    91.270         78.64%
 paper_simple_oldddim_nostate   best/e45   10     218/218     218    88.718         -
 paper_unified_no_detail        best/e35   10     218/218     218    88.650         69.72%
 paper_unified_no_detail        best/e35   1      200/218*    199    88.826         70.35%
-legacy_routeb_nostate          e55        10     resumed; final score should be recomputed
+legacy_routeb_nostate          e55        10     later rerun; keep separate from original e60
 ```
 
 `*` The 1-step N2 result is a partial close-loop run. `cal_score.py` excluded one
