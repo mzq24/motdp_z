@@ -737,6 +737,12 @@ Only add one major mechanism per ladder step. If a step changes both model
 structure and training trick, split it.
 ```
 
+State ladder implementation plan:
+
+```text
+docs/tmp/paper_state_ladder_s0_s2_plan_20260611.md
+```
+
 ## N3: paper_unified_route_intent_nostate
 
 Short name:
