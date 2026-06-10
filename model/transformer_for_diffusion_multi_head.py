@@ -1741,7 +1741,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.cover_graph_use_traj_context = bool(cover_graph_use_traj_context) and not self.motion_only_model
         self.cover_graph_use_speed_context = bool(cover_graph_use_speed_context) and not self.motion_only_model
         self.use_route_prev_coarse_memory = bool(use_route_prev_coarse_memory) and not self.motion_only_model
-        self.use_route_intent_token = bool(use_route_intent_token) and not self.motion_only_model
+        # Route intent is a motion-only signal (command + current/next target
+        # point), not a semantic-state path. Keep it available for clean
+        # no-state ablations while semantic/graph modules stay disabled.
+        self.use_route_intent_token = bool(use_route_intent_token)
         
         # ========== Route B waypoint embeddings ==========
         self.anchor_pos_hidden_dim = 64

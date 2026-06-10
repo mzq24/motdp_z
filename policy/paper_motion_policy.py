@@ -63,6 +63,8 @@ class PaperMotionPolicy(nn.Module):
             self.model = PaperMotionUnifiedNoDetailCore(
                 **core_kwargs,
                 ego_detail_activation_t=int(policy_cfg.get('ego_detail_activation_t', -1)),
+                use_route_intent_token=bool(route_cfg.get('use_route_intent_token', False)),
+                route_intent_gate_init=float(route_cfg.get('route_intent_gate_init', 0.1)),
             )
         else:
             raise ValueError(

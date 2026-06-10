@@ -26,6 +26,7 @@ The first ladder levels are motion-only baselines:
 N0 = legacy_routeb_nostate
 N1 = paper_simple_oldddim_nostate
 N2 = paper_unified_no_detail_nostate
+N3 = paper_unified_route_intent_nostate
 ```
 
 Future levels should add one major capability at a time, for example detail
@@ -713,11 +714,11 @@ denoising. The direct speed head carries most timing/speed responsibility.
 Candidate next steps:
 
 ```text
-N3 = paper_unified_base_detail_nostate
-  Add selected detail attention back, still nostate.
+N3 = paper_unified_route_intent_nostate
+  Add route-intent / TG token on top of N2, still nostate.
 
-N4 = paper_unified_route_intent_nostate
-  Add route intent / TG token only.
+N4 = paper_unified_base_detail_nostate
+  Add selected detail attention back, still nostate.
 
 S0 = add semantic state heads, no semantic-to-motion condition
   Test whether semantic supervision alone changes the shared latent.
@@ -735,3 +736,64 @@ Guideline:
 Only add one major mechanism per ladder step. If a step changes both model
 structure and training trick, split it.
 ```
+
+## N3: paper_unified_route_intent_nostate
+
+Short name:
+
+```text
+paper_unified_route_intent_nostate
+```
+
+Role:
+
+```text
+Test whether the strong legacy nostate e60 result is mainly explained by the
+route-intent / TG token rather than detail attention, lidar history, or semantic
+state.
+```
+
+Structure:
+
+- Starts from N2 (`paper_unified_no_detail_nostate`).
+- Keeps the clean `PaperMotionPolicy` path.
+- Keeps the legacy unified decoder skeleton through `PaperMotionUnifiedNoDetailCore`.
+- Keeps semantic/stage1/graph/tempocc/chase/alignment/lidar/detail paths disabled.
+- Adds only route intent:
+
+```text
+route_intent = command(6) + target_point(2) + target_point_next(2)
+```
+
+This is projected to the route-token embedding with a learnable gate initialized
+to `0.1`, matching the recovered legacy e60 recipe.
+
+Config / script:
+
+```text
+config:
+  config/paper_motion_unified_route_intent_0610.yaml
+
+training script:
+  scripts/codex_bash/train_paper_motion_unified_route_intent_0610.sh
+
+checkpoint dir:
+  checkpoints/paper_motion_unified_route_intent_0610
+```
+
+Expected comparison:
+
+```text
+N2:
+  unified decoder, no detail, no route intent
+
+N3:
+  unified decoder, no detail, route intent enabled
+
+legacy e60:
+  legacy large route-b path, route intent enabled, not paper-clean
+```
+
+If N3 closes much of the gap to legacy e60, route intent should be treated as a
+core nostate component. If it does not, the remaining gap is likely from older
+decoder/path details rather than TG token alone.

@@ -3,8 +3,8 @@
 This is the second clean paper ablation step: keep the old Route-B unified
 motion decoder skeleton (UnifiedDecoderOnlyTransformer / MultiSourceAttentionBlock
 / base grid BEV point sampling), but expose the same forward_denoise API as the
-simple paper motion core. Semantic, graph, route-intent, branch-condition, lidar,
-and detail residual paths stay disabled.
+simple paper motion core. Semantic, graph, branch-condition, lidar, and detail
+residual paths stay disabled. Route intent is optional for the N3 ablation.
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ class PaperMotionUnifiedNoDetailCore(nn.Module):
         transfuser_bev_upsample_dim: int = 64,
         traj_can_attend_route: bool = True,
         ego_detail_activation_t: int = -1,
+        use_route_intent_token: bool = False,
+        route_intent_gate_init: float = 0.1,
     ):
         super().__init__()
         self.horizon = horizon
@@ -81,8 +83,8 @@ class PaperMotionUnifiedNoDetailCore(nn.Module):
             cover_graph_use_traj_context=False,
             cover_graph_use_speed_context=False,
             use_route_prev_coarse_memory=False,
-            use_route_intent_token=False,
-            route_intent_gate_init=0.1,
+            use_route_intent_token=use_route_intent_token,
+            route_intent_gate_init=route_intent_gate_init,
         )
         self.speed_classes = list(self.model.speed_classes)
 
