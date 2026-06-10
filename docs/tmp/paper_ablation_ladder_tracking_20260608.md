@@ -1,0 +1,521 @@
+# Paper Ablation Ladder Tracking
+
+Date: 2026-06-08
+
+Worktree:
+
+```text
+/media/z/data/mzq/others/MoT-DP-worktrees/semantic_state_strict_ablation_v1
+```
+
+40G HPC mirror:
+
+```text
+/data/z_project/code/motdp_z_semantic_state_strict_ablation_v1
+```
+
+## Purpose
+
+This document tracks the clean paper ablation ladder. The goal is not to stop at
+nostate baselines, but to rebuild the final strong system step by step and
+attribute which components matter.
+
+The first ladder levels are motion-only baselines:
+
+```text
+N0 = legacy_routeb_nostate
+N1 = paper_simple_oldddim_nostate
+N2 = paper_unified_no_detail_nostate
+```
+
+Future levels should add one major capability at a time, for example detail
+attention, route intent / TG token, semantic state heads, semantic-to-motion
+conditioning, and training tricks.
+
+## Naming Rules
+
+- `N*` means a nostate / motion-only ladder level.
+- Later semantic levels can use a new prefix if useful, but should still refer
+  back to the nearest `N*` base.
+- Each entry should record structure, config, ckpt, open-loop metrics, close-loop
+  result path, and current interpretation.
+- Do not mix checkpoint identity and experiment result identity. Keep both paths.
+
+## N0: legacy_routeb_nostate
+
+Short name:
+
+```text
+legacy_routeb_nostate
+```
+
+Role:
+
+```text
+Old Route-B nostate reference. This is the strongest legacy motion-only style
+baseline and is used as the practical reference for whether clean paper code
+has recovered the known route/speed capability.
+```
+
+Structure:
+
+- Uses the legacy Route-B large model / policy path.
+- No semantic supervision is used for this nostate run.
+- The checkpoint may still contain many unused semantic/stage1 modules because
+  it comes from the larger research code path.
+- Uses the legacy decoder stack and old sampling behavior.
+
+Known config / checkpoint:
+
+```text
+config:
+  config/tmp/pdm_hpc_route_b_lidar_bev_simple_diffusion_nostate.yaml
+
+checkpoint:
+  checkpoints/route_b_simple_diffusion_nostate_0519/dit_policy_epoch55.pt
+```
+
+Close-loop result:
+
+```text
+/data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0531_nostate_0519_epoch55_skip23695_24071
+```
+
+Notes:
+
+- Earlier partial close-loop had 192/218 routes before resume; later the missing
+  routes were resumed.
+- Use `Bench2Drive/cal_score.py` for final score because it excludes missing and
+  zero-score routes according to the current project convention.
+- This is not paper-clean, but it is an important sanity reference.
+
+## N1: paper_simple_oldddim_nostate
+
+Short name:
+
+```text
+paper_simple_oldddim_nostate
+```
+
+Role:
+
+```text
+Clean paper motion-only model with the simple decoder core, but using the old
+pred_x0 DDIM sampling logic. This tests whether a minimal clean motion-only
+model can match the old nostate behavior.
+```
+
+Structure:
+
+- Uses `PaperMotionPolicy`.
+- Uses `PaperMotionDiffusionCore`.
+- Keeps only BEV feature projection, ego/status/history conditioning, traj
+  diffusion, route diffusion, and speed head.
+- Does not include semantic/stage1/graph/tempocc/chase/alignment/route-intent.
+- Uses old pred_x0 DDIM sampling after the sampling alignment fix.
+
+Known config / checkpoint:
+
+```text
+config:
+  config/paper_motion_only_core_oldddim_0531.yaml
+
+training script:
+  scripts/codex_bash/train_paper_motion_only_oldddim_0531.sh
+
+checkpoint:
+  checkpoints/paper_motion_only_core_oldddim_0531/dit_policy_best.pt
+```
+
+Open-loop reference:
+
+```text
+best epoch:
+  e45
+
+metrics:
+  val_L2_avg:      1.1054
+  val_route_L2:    0.1154
+  val_route_final: 0.2319
+  speed_MAE:       0.4331
+
+e65:
+  val_L2_avg:      1.1329
+  val_route_L2:    0.1104
+  val_route_final: 0.2259
+  speed_MAE:       0.4303
+```
+
+Close-loop result:
+
+```text
+/data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0531_paper_oldddim_best_skip23695_24071
+```
+
+Close-loop score:
+
+```text
+Driving Score: 88.718
+routes:        218 / 218
+missing:       0
+zero-score:    0
+```
+
+Interpretation:
+
+- The sampling alignment fixed the catastrophic clean-paper route metric issue.
+- N1 is readable and clean, but route metrics still lag the legacy Route-B style
+  skeleton.
+
+## N2: paper_unified_no_detail_nostate
+
+Short name:
+
+```text
+paper_unified_no_detail_nostate
+```
+
+Role:
+
+```text
+Clean paper policy/training path, but with the legacy unified decoder skeleton
+reintroduced without detail attention. This isolates whether the old
+UnifiedDecoderOnlyTransformer / MultiSourceAttentionBlock / base grid BEV
+skeleton is important.
+```
+
+Structure:
+
+- Uses `PaperMotionPolicy`.
+- Uses `PaperMotionUnifiedNoDetailCore`.
+- Wraps the legacy motion skeleton through `TransformerForDiffusion` with
+  `motion_only_model=true`.
+- Reintroduces the old unified decoder / multi-source attention / base grid BEV
+  style.
+- Explicitly keeps detail attention disabled.
+- Does not include semantic/stage1/graph/tempocc/chase/alignment/route-intent.
+- Uses old pred_x0 DDIM sampling.
+
+Known config / checkpoint:
+
+```text
+config:
+  config/paper_motion_unified_no_detail_0531.yaml
+
+training script:
+  scripts/codex_bash/train_paper_motion_unified_no_detail_0531.sh
+
+checkpoint:
+  checkpoints/paper_motion_unified_no_detail_0531/dit_policy_best.pt
+```
+
+Open-loop reference:
+
+```text
+best by L2:
+  e35 / dit_policy_best.pt
+
+e35 metrics:
+  val_L2_avg:      1.0168
+  val_route_L2:    0.0997
+  val_route_final: 0.1922
+  speed_MAE:       0.4095
+
+e65 metrics:
+  val_L2_avg:      1.0827
+  val_route_L2:    0.0937
+  val_route_final: 0.1809
+  speed_MAE:       0.4008
+```
+
+Close-loop result:
+
+```text
+10-step result:
+  /data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0608_n2_unified_no_detail_best_skip23695_24071
+
+1-step result:
+  /data/z_project/code/Bench2Drive/eval/results/route_b_b2d_0609_n2_unified_no_detail_best_1step_skip23695_24071
+
+ckpt:
+  checkpoints/paper_motion_unified_no_detail_0531/dit_policy_best.pt
+
+cal_score.py result:
+  10-step:
+    routes:        218 / 218
+    valid:         218
+    success:       152
+    Driving Score: 88.650
+    Success Rate:  69.72%
+
+  1-step:
+    routes:        200 / 218 partial run
+    valid:         199 after excluding one zero-score route
+    success:       140
+    Driving Score: 88.826
+    Success Rate:  70.35%
+```
+
+Interpretation:
+
+- N2 clearly improves over N1 in open-loop.
+- The unified decoder / base grid BEV skeleton appears important for route
+  learning.
+- N2 10-step and 1-step close-loop are very close under the current scoring
+  convention.
+- The 1-step number is partial because only 200 routes were merged. Treat it as
+  evidence for step-count insensitivity, not as the final full-set score.
+
+## Current Comparison
+
+Open-loop:
+
+```text
+model                         ckpt      L2_avg   route_L2   route_final   speed_MAE
+paper_simple_oldddim_nostate   e45/best  1.1054   0.1154     0.2319        0.4331
+paper_unified_no_detail        e35/best  1.0168   0.0997     0.1922        0.4095
+paper_unified_no_detail        e65       1.0827   0.0937     0.1809        0.4008
+```
+
+Close-loop:
+
+```text
+model                         ckpt       steps  routes      valid  Driving Score  Success Rate
+paper_simple_oldddim_nostate   best/e45   10     218/218     218    88.718         -
+paper_unified_no_detail        best/e35   10     218/218     218    88.650         69.72%
+paper_unified_no_detail        best/e35   1      200/218*    199    88.826         70.35%
+legacy_routeb_nostate          e55        10     resumed; final score should be recomputed
+```
+
+`*` The 1-step N2 result is a partial close-loop run. `cal_score.py` excluded one
+zero-score route, so the averaged score is over 199 valid routes.
+
+## Diffusion Interpretation Note
+
+Current working hypothesis:
+
+```text
+In this Route-B motion-only setting, DDIM behaves more like a
+scene-conditioned denoising/refinement decoder than a strong multimodal
+trajectory generator.
+```
+
+The model has three conceptually different inputs:
+
+```text
+scene/context tokens:
+  BEV, ego status, command / target information.
+
+traj/route token identity:
+  learnable query/type/segment/position embeddings that tell the decoder which
+  slots are trajectory waypoints and which slots are route waypoints.
+
+x_t noisy waypoint tokens:
+  noisy trajectory/route coordinates. During training these are noisy GT at a
+  random timestep; during inference they start from white noise and are updated
+  through DDIM.
+```
+
+Important clarification:
+
+```text
+The traj/route learnable queries are not random latent tokens at inference.
+They are fixed learned type/task priors. The random part is x_t.
+```
+
+Behavioral view:
+
+```text
+one-shot decoder:
+  scene -> motion
+
+current DDIM denoising policy:
+  scene + noisy motion proposal + timestep -> clean motion estimate
+  repeated for several steps
+```
+
+Because the dataset is mostly single-expert imitation, the conditional decoder
+can learn to map different noisy proposals back to the same dominant expert
+solution. In that case DDIM stochasticity is weak, and the noise mainly acts as:
+
+```text
+denoising regularization
+iterative refinement
+test-time proposal perturbation / implicit ensemble
+```
+
+This means we should be careful not to oversell the current method as a
+multimodal generator. A more honest paper framing is:
+
+```text
+scene-conditioned denoising policy
+```
+
+or:
+
+```text
+conditional diffusion as robust iterative motion refinement
+```
+
+DDPM may preserve more stochasticity because it injects noise at each reverse
+step, but with one expert trajectory per scene it may still collapse to the same
+expert mode unless we add explicit multimodal labels, mode tokens, diversity
+losses, critic/rerank, or RL-style exploration.
+
+## Proposed Noise-Sensitivity Experiment
+
+Purpose:
+
+```text
+Measure whether DDIM initial noise actually produces diverse traj/route outputs,
+or whether the model collapses to a nearly deterministic scene-to-motion mapper.
+```
+
+Protocol:
+
+```text
+For each selected validation / close-loop frame:
+  fix scene features, ego status, command, and checkpoint
+  sample K different initial x_T noises, e.g. K=16 or K=32
+  run the same DDIM sampler for each seed
+  measure final traj/route diversity
+```
+
+Suggested metrics:
+
+```text
+route_endpoint_std
+route_mean_pairwise_L2
+traj_endpoint_std
+traj_mean_pairwise_L2
+speed_class_entropy
+speed_mps_std
+```
+
+Useful splits:
+
+```text
+easy straight / lane follow
+junction
+merge
+borrow / obstacle
+high route curvature
+window-active semantic scenes
+```
+
+Expected result:
+
+```text
+Route diversity is probably very small.
+Trajectory diversity may be slightly larger near speed / interaction-sensitive
+scenes, but likely remains much smaller than a true multimodal policy.
+```
+
+Interpretation:
+
+```text
+If diversity is tiny, DDIM should be described as robust denoising/refinement.
+If diversity is meaningful in interaction scenes, then noise may still provide a
+limited multimodal proposal mechanism.
+```
+
+## 1-Step vs 10-Step Close-Loop Observation
+
+Observation:
+
+```text
+N2 1-step close-loop is close to the 10-step close-loop result.
+```
+
+This supports the "DDIM as scene-conditioned denoising/refinement" hypothesis,
+but it should not be attributed to DDIM collapse alone. There is an important
+task-structure reason:
+
+```text
+Our current motion output is effectively split into:
+
+route:
+  diffusion output, spatial waypoints at roughly 1m intervals.
+
+speed:
+  direct speed head output, not generated through the diffusion loop.
+
+trajectory / control:
+  downstream behavior is strongly influenced by route + direct speed.
+```
+
+The route prediction task is mostly spatial:
+
+```text
+route ~= road structure + scene geometry + target point / command
+```
+
+It is much less tied to exact timing and vehicle interaction than a full
+time-indexed trajectory. Therefore, 1-step route denoising and 10-step route
+denoising can be very similar:
+
+```text
+route has low temporal/interactor ambiguity
+route waypoints are dense spatial samples
+route is strongly constrained by BEV/road/target-point context
+```
+
+At the same time, speed is direct:
+
+```text
+speed does not benefit from, or degrade with, the number of DDIM route steps.
+```
+
+So the close-loop result can stay nearly unchanged even if the diffusion loop is
+reduced from 10 steps to 1 step:
+
+```text
+1-step route ~= 10-step route
+speed unchanged
+controller sees nearly the same route + speed
+=> close-loop score nearly unchanged
+```
+
+Important implication:
+
+```text
+The 1-step result does not necessarily mean diffusion is useless for all motion
+prediction. It may mean that route diffusion is an easy spatial denoising task.
+A time-indexed trajectory diffusion head could show a larger 1-step vs 10-step
+gap because timing, speed, and interactions are entangled in trajectory.
+```
+
+For paper framing, this suggests:
+
+```text
+Our current diffusion route head is best interpreted as robust spatial route
+denoising. The direct speed head carries most timing/speed responsibility.
+```
+
+## Next Ladder Candidates
+
+Candidate next steps:
+
+```text
+N3 = paper_unified_base_detail_nostate
+  Add selected detail attention back, still nostate.
+
+N4 = paper_unified_route_intent_nostate
+  Add route intent / TG token only.
+
+S0 = add semantic state heads, no semantic-to-motion condition
+  Test whether semantic supervision alone changes the shared latent.
+
+S1 = compact semantic-to-motion condition
+  Add the smallest useful state-to-motion path.
+
+S2 = final SOTA-style semantic mode chain
+  Add the components required by the paper story, one at a time.
+```
+
+Guideline:
+
+```text
+Only add one major mechanism per ladder step. If a step changes both model
+structure and training trick, split it.
+```
