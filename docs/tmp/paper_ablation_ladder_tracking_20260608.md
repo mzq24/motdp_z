@@ -419,6 +419,99 @@ If diversity is meaningful in interaction scenes, then noise may still provide a
 limited multimodal proposal mechanism.
 ```
 
+## Noise-Sensitivity Eval Result
+
+Experiment:
+
+```text
+model:
+  N2 paper_unified_no_detail_nostate
+
+checkpoint:
+  checkpoints/paper_motion_unified_no_detail_0531/dit_policy_best.pt
+
+config:
+  config/paper_motion_unified_no_detail_0531.yaml
+
+sampling:
+  old_pred_x0_ddim
+
+dataset:
+  validation split, first 128 samples after bad-route filtering
+
+seeds:
+  32 initial x_T noise seeds per fixed scene
+```
+
+Output files:
+
+```text
+10-step:
+  outputs/noise_sensitivity/n2_best_10step_k32_n128_20260610.json
+  outputs/noise_sensitivity/n2_best_10step_k32_n128_20260610.csv
+
+1-step:
+  outputs/noise_sensitivity/n2_best_1step_k32_n128_20260610.json
+  outputs/noise_sensitivity/n2_best_1step_k32_n128_20260610.csv
+```
+
+Aggregate diversity:
+
+```text
+metric                         10-step mean   10-step median   10-step p95    1-step mean   1-step median   1-step p95
+route_point_std                0.00625        0.000025         0.000163       0.00959       0.00573         0.00849
+route_endpoint_std             0.00644        0.000010         0.000033       0.00882       0.00189         0.00561
+route_pairwise_l2_per_point    0.00770        0.00176          0.00403        0.01342       0.00858         0.01831
+traj_point_std                 0.12475        0.00322          0.74222        0.03995       0.01190         0.13790
+traj_endpoint_std              0.29013        0.00387          1.51576        0.09329       0.01704         0.30605
+traj_pairwise_l2_per_point     0.17473        0.00394          1.06469        0.06269       0.01906         0.20969
+speed_mps_std                  0.03164        0.00101          0.16509        0.01444       0.00325         0.05680
+speed_entropy                  0.30901        0.09130          0.75273        0.31491       0.09503         0.76866
+```
+
+Interpretation:
+
+```text
+Route is almost deterministic for most scenes under different initial noise.
+The 10-step median route endpoint std is only about 1e-5 m, and even the p95 is
+only about 3e-5 m. This strongly supports the view that route diffusion is
+mostly scene-conditioned spatial denoising / refinement rather than meaningful
+multimodal route sampling.
+```
+
+The 1-step route has slightly larger small jitter:
+
+```text
+route_pairwise_l2_per_point:
+  10-step median: 0.00176 m
+  1-step median:  0.00858 m
+```
+
+but this is still tiny relative to the 1m-ish route waypoint spacing.
+
+Trajectory has a different shape:
+
+```text
+Most traj samples are also stable, but there is a long tail.
+10-step traj diversity can be larger than 1-step in outlier scenes.
+```
+
+This means repeated denoising does not create broad multimodality, but it can
+amplify proposal differences for a small subset of interaction-sensitive
+frames. For paper framing:
+
+```text
+Route diffusion:
+  robust spatial route refiner.
+
+Trajectory output:
+  mostly deterministic, with limited noise sensitivity in long-tail scenes.
+
+Current policy as a whole:
+  not a strong multimodal generator; better described as conditional denoising
+  / robust iterative motion refinement.
+```
+
 ## 1-Step vs 10-Step Close-Loop Observation
 
 Observation:
