@@ -148,6 +148,8 @@ def evaluate(args: argparse.Namespace) -> Tuple[Dict, List[Dict]]:
         route_stack = torch.stack(routes, dim=0)
         traj_stack = torch.stack(trajs, dim=0)
         bsz = route_stack.shape[1]
+        gt_traj = batch["agent_pos"].to(device=device, dtype=traj_stack.dtype)[:, : policy.horizon]
+        gt_route = batch["route"].to(device=device, dtype=route_stack.dtype)[:, : policy.num_waypoints]
 
         route_std = route_stack.std(dim=0, unbiased=False)
         traj_std = traj_stack.std(dim=0, unbiased=False)
@@ -159,6 +161,10 @@ def evaluate(args: argparse.Namespace) -> Tuple[Dict, List[Dict]]:
         traj_pairwise = offdiag_pairwise_l2(traj_stack)
         route_pairwise_per_point = route_pairwise / float(np.sqrt(route_stack.shape[2]))
         traj_pairwise_per_point = traj_pairwise / float(np.sqrt(traj_stack.shape[2]))
+        route_l2 = torch.linalg.norm(route_stack - gt_route.unsqueeze(0), dim=-1).mean(dim=-1)
+        route_fde = torch.linalg.norm(route_stack[:, :, -1] - gt_route[:, -1].unsqueeze(0), dim=-1)
+        traj_ade = torch.linalg.norm(traj_stack - gt_traj.unsqueeze(0), dim=-1).mean(dim=-1)
+        traj_fde = torch.linalg.norm(traj_stack[:, :, -1] - gt_traj[:, -1].unsqueeze(0), dim=-1)
 
         if speeds:
             speed_stack = torch.stack(speeds, dim=0)
@@ -186,6 +192,18 @@ def evaluate(args: argparse.Namespace) -> Tuple[Dict, List[Dict]]:
                     "traj_endpoint_std": float(traj_endpoint_std[i].cpu()),
                     "traj_pairwise_l2": float(traj_pairwise[i].cpu()),
                     "traj_pairwise_l2_per_point": float(traj_pairwise_per_point[i].cpu()),
+                    "route_l2_mean": float(route_l2[:, i].mean().cpu()),
+                    "route_l2_best": float(route_l2[:, i].min().cpu()),
+                    "route_l2_worst": float(route_l2[:, i].max().cpu()),
+                    "route_fde_mean": float(route_fde[:, i].mean().cpu()),
+                    "route_fde_best": float(route_fde[:, i].min().cpu()),
+                    "route_fde_worst": float(route_fde[:, i].max().cpu()),
+                    "traj_ade_mean": float(traj_ade[:, i].mean().cpu()),
+                    "traj_ade_best": float(traj_ade[:, i].min().cpu()),
+                    "traj_ade_worst": float(traj_ade[:, i].max().cpu()),
+                    "traj_fde_mean": float(traj_fde[:, i].mean().cpu()),
+                    "traj_fde_best": float(traj_fde[:, i].min().cpu()),
+                    "traj_fde_worst": float(traj_fde[:, i].max().cpu()),
                     "speed_mps_std": float(speed_std[i].cpu()),
                     "speed_entropy": float(entropy[i].cpu()),
                 }
@@ -201,6 +219,18 @@ def evaluate(args: argparse.Namespace) -> Tuple[Dict, List[Dict]]:
         "traj_endpoint_std",
         "traj_pairwise_l2",
         "traj_pairwise_l2_per_point",
+        "route_l2_mean",
+        "route_l2_best",
+        "route_l2_worst",
+        "route_fde_mean",
+        "route_fde_best",
+        "route_fde_worst",
+        "traj_ade_mean",
+        "traj_ade_best",
+        "traj_ade_worst",
+        "traj_fde_mean",
+        "traj_fde_best",
+        "traj_fde_worst",
         "speed_mps_std",
         "speed_entropy",
     ]
