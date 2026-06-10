@@ -469,6 +469,37 @@ speed_mps_std                  0.03164        0.00101          0.16509        0.
 speed_entropy                  0.30901        0.09130          0.75273        0.31491       0.09503         0.76866
 ```
 
+GT error under the same noise-sensitivity protocol:
+
+```text
+metric                         10-step mean   10-step median   10-step p95    1-step mean   1-step median   1-step p95
+traj_ade_mean                  0.62993        0.31861          2.41510        0.59341       0.25582         2.20063
+traj_ade_best_of_32            0.45322        0.21925          1.93622        0.53610       0.21528         2.01206
+traj_ade_worst_of_32           0.84224        0.35591          3.15761        0.66016       0.28314         2.45598
+traj_fde_mean                  1.47905        0.46243          6.14399        1.37107       0.34937         5.55761
+traj_fde_best_of_32            1.06914        0.26339          5.08519        1.20716       0.21032         5.00793
+traj_fde_worst_of_32           1.96806        0.58955          7.59154        1.56401       0.44415         6.38878
+```
+
+The GT-error result answers the natural follow-up question:
+
+```text
+For a normal single sampled output, 1-step is slightly closer to GT than
+10-step on this 128-sample subset.
+
+For oracle best-of-32, 10-step can sometimes contain a better candidate, but it
+also produces worse candidates and a larger long tail.
+```
+
+Interpretation:
+
+```text
+10-step increases proposal spread more than it consistently improves accuracy.
+This is useful evidence that iterative DDIM is not giving reliable refinement in
+the current route/speed-split setup. It mostly adds small route perturbation and
+occasionally larger trajectory variation.
+```
+
 Interpretation:
 
 ```text
