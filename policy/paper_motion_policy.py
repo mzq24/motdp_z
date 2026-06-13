@@ -62,6 +62,7 @@ class PaperMotionPolicy(nn.Module):
         elif self.paper_motion_core == 'unified_no_detail':
             self.model = PaperMotionUnifiedNoDetailCore(
                 **core_kwargs,
+                n_cond_layers=int(policy_cfg.get('n_cond_layers', 4)),
                 ego_detail_activation_t=int(policy_cfg.get('ego_detail_activation_t', -1)),
                 use_route_intent_token=bool(route_cfg.get('use_route_intent_token', False)),
                 route_intent_gate_init=float(route_cfg.get('route_intent_gate_init', 0.1)),

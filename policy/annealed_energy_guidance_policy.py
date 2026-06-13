@@ -236,7 +236,7 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         ) and not self.motion_only_model
         self.use_route_intent_token = bool(
             route_b_cfg.get('use_route_intent_token', False)
-        ) and not self.motion_only_model
+        )
         self.route_intent_gate_init = float(
             route_b_cfg.get('route_intent_gate_init', 0.1)
         )
