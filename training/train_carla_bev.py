@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from collections import defaultdict
 import argparse
 import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from torch.distributed.elastic.multiprocessing.errors import record
 from diffusers.training_utils import EMAModel
@@ -34,6 +35,14 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.annealed_energy_guidance_policy import AnnealedEnergyGuidancePolicy
+from training.recovery_ladder_utils import (
+    apply_recovery_initialization,
+    freeze_unused_semantic_modules,
+    save_initial_checkpoint,
+    set_global_seed,
+    trainable_parameters,
+    write_structure_manifest,
+)
 
 
 CURRENT_ADAPTIVE_WEIGHTS = {
@@ -1763,6 +1772,9 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         )
         
         torch.cuda.set_device(device)
+
+    seed = int(config.get('training', {}).get('seed', 0))
+    set_global_seed(seed)
     
     # Enable performance optimizations
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -2314,6 +2326,42 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
     else:
         raise ValueError("route_abs_stats_path is required for Route B ego diffusion")
 
+    init_report = apply_recovery_initialization(policy, config)
+    route_b_cfg = config.get('route_b', {})
+    if bool(route_b_cfg.get('freeze_unused_semantic_modules', False)):
+        frozen_params, frozen_tensors = freeze_unused_semantic_modules(policy)
+        if rank == 0:
+            print(
+                "  Frozen unused semantic modules: "
+                f"{frozen_tensors} tensors / {frozen_params:,} parameters"
+            )
+
+    configured_lr = float(config.get('optimizer', {}).get('lr', 5e-5))
+    scale_lr = bool(config.get('optimizer', {}).get('scale_lr', True))
+    effective_lr = configured_lr * world_size if scale_lr and world_size > 1 else configured_lr
+
+    if rank == 0:
+        checkpoint_dir_for_manifest = Path(
+            config.get('training', {}).get(
+                'checkpoint_dir',
+                "/media/z/data/mzq/others/MoT-DP/checkpoints/carla_dit",
+            )
+        )
+        manifest_path = write_structure_manifest(
+            model=policy,
+            config=config,
+            config_path=config_path,
+            checkpoint_dir=checkpoint_dir_for_manifest,
+            policy_class=type(policy).__name__,
+            effective_lr=effective_lr,
+            init_report=init_report,
+            project_root=Path(project_root),
+        )
+        print(f"  structure_manifest={manifest_path}")
+        if bool(config.get('training', {}).get('save_initial_checkpoint', False)):
+            initial_path = save_initial_checkpoint(policy, checkpoint_dir_for_manifest, config)
+            print(f"  initial_checkpoint={initial_path}")
+
     # Resume from checkpoint if specified
     start_epoch = 0
     checkpoint = None
@@ -2381,24 +2429,28 @@ def train_pdm_policy(config_path, resume_path=None, val_only=False):
         if rank == 0:
             print(f"Single GPU | n_action_steps: {policy.n_action_steps}")
     
-    lr = config.get('optimizer', {}).get('lr', 5e-5)
+    lr = effective_lr
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     
     # Linear learning rate scaling for distributed training
     # With N GPUs and same batch_size per GPU, effective batch_size = N * batch_size
     # Scale learning rate linearly: lr_scaled = lr * world_size
-    scale_lr = config.get('optimizer', {}).get('scale_lr', True)  # Default to True
     if scale_lr and world_size > 1:
-        lr_scaled = lr * world_size
         if rank == 0:
-            print(f"✓ Learning rate scaled for {world_size} GPUs: {lr} -> {lr_scaled}")
-        lr = lr_scaled
+            print(
+                f"✓ Learning rate scaled for {world_size} GPUs: "
+                f"{configured_lr} -> {effective_lr}"
+            )
     
     # ========== Optimizer Setup ==========
     policy_for_params = policy.module if world_size > 1 else policy
     route_b_cfg = config.get('route_b', {})
     route_b_phase = 'split' if route_b_cfg.get('use_split_forward', False) else 'unified'
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        trainable_parameters(policy_for_params),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
     if rank == 0:
         print("✓ Single optimizer: Route B semantic-state model")
 

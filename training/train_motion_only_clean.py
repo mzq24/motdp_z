@@ -36,6 +36,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.paper_motion_policy import PaperMotionPolicy
+from training.recovery_ladder_utils import (
+    apply_recovery_initialization,
+    save_initial_checkpoint,
+    set_global_seed,
+    trainable_parameters,
+    write_structure_manifest,
+)
 
 
 def setup_distributed():
@@ -400,10 +407,10 @@ def make_loader(dataset, config: Dict, train: bool, rank: int, world_size: int):
     return DataLoader(dataset, **kwargs), sampler
 
 
-def lr_for_epoch(config: Dict, epoch_idx: int) -> float:
+def lr_for_epoch(config: Dict, epoch_idx: int, lr_scale: float = 1.0) -> float:
     opt_cfg = config.get('optimizer', {})
     train_cfg = config.get('training', {})
-    lr0 = float(opt_cfg.get('lr', 5e-5))
+    lr0 = float(opt_cfg.get('lr', 5e-5)) * float(lr_scale)
     lr_final = float(train_cfg.get('lr_final', 1e-7))
     total = max(int(train_cfg.get('scheduler_total_epochs', train_cfg.get('num_epochs', 60))), 1)
     warmup = int(train_cfg.get('warmup_epochs', 0))
@@ -508,6 +515,8 @@ def train(config_path: str, resume: Optional[str] = None, val_only: bool = False
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     device, rank, world_size, _ = setup_distributed()
+    seed = int(config.get('training', {}).get('seed', 0))
+    set_global_seed(seed)
     checkpoint_dir = Path(config['training']['checkpoint_dir'])
     if is_main(rank):
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -521,9 +530,13 @@ def train(config_path: str, resume: Optional[str] = None, val_only: bool = False
 
     policy = PaperMotionPolicy(config).to(device)
     policy.register_norm_stats_from_config(config)
+    init_report = apply_recovery_initialization(policy, config)
+    configured_lr = float(config.get('optimizer', {}).get('lr', 5e-5))
+    scale_lr = bool(config.get('optimizer', {}).get('scale_lr', False))
+    effective_lr = configured_lr * world_size if scale_lr else configured_lr
     optimizer = torch.optim.AdamW(
-        policy.parameters(),
-        lr=float(config.get('optimizer', {}).get('lr', 5e-5)),
+        trainable_parameters(policy),
+        lr=effective_lr,
         weight_decay=float(config.get('optimizer', {}).get('weight_decay', 1e-4)),
         betas=tuple(config.get('optimizer', {}).get('betas', [0.9, 0.999])),
         eps=float(config.get('optimizer', {}).get('eps', 1e-8)),
@@ -533,6 +546,22 @@ def train(config_path: str, resume: Optional[str] = None, val_only: bool = False
     ema_cfg = config.get('ema', {})
     ema_model = EMAModel(policy.parameters(), max_value=float(ema_cfg.get('max_value', 0.9999)))
     ema_model.to(device)
+
+    if is_main(rank):
+        manifest_path = write_structure_manifest(
+            model=policy,
+            config=config,
+            config_path=config_path,
+            checkpoint_dir=checkpoint_dir,
+            policy_class=type(policy).__name__,
+            effective_lr=effective_lr,
+            init_report=init_report,
+            project_root=PROJECT_ROOT,
+        )
+        print(f"structure_manifest={manifest_path}")
+        if bool(config.get('training', {}).get('save_initial_checkpoint', False)):
+            initial_path = save_initial_checkpoint(policy, checkpoint_dir, config)
+            print(f"initial_checkpoint={initial_path}")
 
     start_epoch = 0
     if resume:
@@ -580,7 +609,8 @@ def train(config_path: str, resume: Optional[str] = None, val_only: bool = False
     for epoch in range(start_epoch, num_epochs):
         if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
             train_sampler.set_epoch(epoch)
-        set_optimizer_lr(optimizer, lr_for_epoch(config, epoch))
+        lr_scale = world_size if scale_lr and world_size > 1 else 1.0
+        set_optimizer_lr(optimizer, lr_for_epoch(config, epoch, lr_scale=lr_scale))
         policy.train()
         iterator = train_loader if not is_main(rank) else tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}')
         running = defaultdict(float)
