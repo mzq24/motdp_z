@@ -118,6 +118,29 @@ checkpoint.
 Only a stage reaching `route_L2 < 0.09` and `route_final < 0.18`, while
 improving over the previous rung, is promoted to close-loop evaluation.
 
+## Close-Loop Launchers
+
+All launchers default to four GPUs (`0,1,2,3`), eight tasks, ten inference
+steps, and the 218-route `bench2drive220_skip_23695_24071` set. Existing result
+shards resume in place through the evaluator's `--resume=True` behavior.
+
+```bash
+bash scripts/codex_bash/closeloop_legacy_e60_r0_0615.sh
+bash scripts/codex_bash/closeloop_legacy_e60_r1_0615.sh
+bash scripts/codex_bash/closeloop_legacy_e60_r2_0615.sh
+bash scripts/codex_bash/closeloop_legacy_e60_r3_natural_0615.sh
+bash scripts/codex_bash/closeloop_legacy_e60_r3_common_0615.sh
+bash scripts/codex_bash/closeloop_legacy_e60_r4_0615.sh
+```
+
+Default candidate epochs are R0 e45, R1 e60, R2 e55, R3-natural e55,
+R3-common e55, and R4 e55. Override any candidate without editing a file:
+
+```bash
+CKPT_EPOCH=60 CUDA_VISIBLE_DEVICES=4,5,6,7 \
+  bash scripts/codex_bash/closeloop_legacy_e60_r3_natural_0615.sh
+```
+
 ## Interpretation
 
 - R1 improvement isolates condition encoder depth.
