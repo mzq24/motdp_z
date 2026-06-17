@@ -109,15 +109,18 @@ checkpoint.
 | Stage | Commit | Tested epoch | L2 avg | Route L2 | Route final | Speed MAE | Close-loop |
 |---|---|---:|---:|---:|---:|---:|---:|
 | R0 | `ff874cf` | - | - | - | - | - | - |
-| R1 | `ef5f851` | e60 | 1.1188 | 0.0930 | 0.1785 | 0.3844 | 89.829 / 74.77% / 218 |
-| R2 | `7426d08` | e55 | 1.0739 | 0.0859 | 0.1860 | 0.8593 | 89.680 / 74.31% / 218 |
+| R1 | `ef5f851` | e60 | 1.1188 | 0.0930 | 0.1785 | 0.3844 | 89.829 raw; 89.921 corrected / 75.00% / 220 |
+| R2 | `7426d08` | e55 | 1.0739 | 0.0859 | 0.1860 | 0.8593 | 89.680 raw; 89.773 corrected / 74.55% / 220 |
 | R3-natural | `6f6e472` | - | - | - | - | - | - |
 | R3-common | `6f6e472` | - | - | - | - | - | - |
 | R4 | `db7db9c` | - | - | - | - | - | - |
 
 Close-loop values are `Driving Score / Success Rate / route count`, computed
-with `Bench2Drive/cal_score.py`. R1 and R2 both use the 218-route
-`bench2drive220_skip_23695_24071` set.
+with `Bench2Drive/cal_score.py`. R1 and R2 were measured on the 218-route
+`bench2drive220_skip_23695_24071` set. The corrected 220-route scores add the
+two skipped routes, `RouteScenario_23695_rep0` and `RouteScenario_24071_rep0`,
+as 100-point completed routes, matching the old e60 nostate record for those
+two routes.
 
 Only a stage reaching `route_L2 < 0.09` and `route_final < 0.18`, while
 improving over the previous rung, is promoted to close-loop evaluation.

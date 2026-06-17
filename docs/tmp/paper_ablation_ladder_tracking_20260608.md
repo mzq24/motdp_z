@@ -378,12 +378,16 @@ paper_simple_oldddim_nostate   best/e45   10     218/218     218    88.718      
 paper_unified_no_detail        best/e35   10     218/218     218    88.650         69.72%
 paper_unified_no_detail        best/e35   1      200/218*    199    88.826         70.35%
 legacy_routeb_nostate          e55        10     later rerun; keep separate from original e60
-legacy_recovery_R1_cond6       e60        10     218/218     218    89.829         74.77%
-legacy_recovery_R2_motion_only e55        10     218/218     218    89.680         74.31%
+legacy_recovery_R1_cond6       e60        10     218+2/220   220    89.829 raw / 89.921 corr  74.77% raw / 75.00% corr
+legacy_recovery_R2_motion_only e55        10     218+2/220   220    89.680 raw / 89.773 corr  74.31% raw / 74.55% corr
 ```
 
 `*` The 1-step N2 result is a partial close-loop run. `cal_score.py` excluded one
 zero-score route, so the averaged score is over 199 valid routes.
+
+`corr` for R1/R2 adds `RouteScenario_23695_rep0` and
+`RouteScenario_24071_rep0` as 100-point completed routes. In the old e60
+nostate 220-route run, both skipped routes scored 100.
 
 ## Diffusion Interpretation Note
 
