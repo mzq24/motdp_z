@@ -378,6 +378,8 @@ paper_simple_oldddim_nostate   best/e45   10     218/218     218    88.718      
 paper_unified_no_detail        best/e35   10     218/218     218    88.650         69.72%
 paper_unified_no_detail        best/e35   1      200/218*    199    88.826         70.35%
 legacy_routeb_nostate          e55        10     later rerun; keep separate from original e60
+legacy_recovery_R1_cond6       e60        10     218/218     218    89.829         74.77%
+legacy_recovery_R2_motion_only e55        10     218/218     218    89.680         74.31%
 ```
 
 `*` The 1-step N2 result is a partial close-loop run. `cal_score.py` excluded one
