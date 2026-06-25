@@ -20,6 +20,7 @@ the same four-GPU linear scaling, so the effective initial learning rate is
 | R2 | legacy | R1 + legacy policy/train wrapper and legacy motion recipe | `motion_only_model=true` |
 | R3-natural | legacy | R2 + full state topology | state paths off; semantic params frozen |
 | R3-common | legacy | R3-natural + R2 epoch-0 motion initialization | state paths off; semantic params frozen |
+| R3T-direct | legacy | R3-natural + direct transformer objective | state paths off; semantic params frozen |
 | R4 | legacy | legacy-exact full topology and optimizer/DDP behavior | state paths off; semantic params remain in optimizer |
 
 R2, R3 and R4 share the recovered legacy config skeleton. R2 changes only
@@ -77,6 +78,10 @@ R3-natural -> R3-common
   training.init_scope: motion_common
   training.init_checkpoint: R2/initial_model.pt
 
+R3-natural -> R3T-direct
+  route_b.motion_objective: diffusion -> direct_transformer
+  training and inference use zero joint token + timestep 0, no noise or DDIM loop
+
 R3-natural -> R4
   route_b.freeze_unused_semantic_modules: true -> false
   semantic parameters remain unused but are retained in optimizer/EMA behavior
@@ -93,7 +98,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 GPUS=4 \
   bash scripts/codex_bash/train_legacy_e60_r0_0614.sh
 ```
 
-Replace `r0` with `r1`, `r2`, `r3_natural`, `r3_common`, or `r4` for the other
+Replace `r0` with `r1`, `r2`, `r3_natural`, `r3_common`, `r3t_direct`, or `r4` for the other
 entry points. Run the complete sequence with:
 
 ```bash
@@ -111,9 +116,10 @@ checkpoint.
 | R0 | `ff874cf` | - | - | - | - | - | - |
 | R1 | `ef5f851` | e60 | 1.1188 | 0.0930 | 0.1785 | 0.3844 | 89.829 raw; 89.921 corrected / 75.00% / 220 |
 | R2 | `7426d08` | e55 | 1.0739 | 0.0859 | 0.1860 | 0.8593 | 89.680 raw; 89.773 corrected / 74.55% / 220 |
-| R3-natural | `6f6e472` | - | - | - | - | - | - |
-| R3-common | `6f6e472` | - | - | - | - | - | - |
-| R4 | `db7db9c` | - | - | - | - | - | - |
+| R3-natural | `6f6e472` | e55 | 1.0712 | 0.0864 | 0.1708 | 0.8730 | 90.212 raw; 90.301 corrected / 74.55% / 220 |
+| R3-common | `6f6e472` | e55 | 1.2022 | 0.0913 | 0.1777 | 0.8933 | 90.613 raw; 90.698 corrected / 74.09% / 220 |
+| R3T-direct | pending | - | - | - | - | - | pending |
+| R4 | `db7db9c` | e55 | 1.0443 | 0.0823 | 0.1612 | 0.8411 | 89.328 raw; 89.425 corrected / 72.73% / 220 |
 
 Close-loop values are `Driving Score / Success Rate / route count`, computed
 with `Bench2Drive/cal_score.py`. R1 and R2 were measured on the 218-route
@@ -137,11 +143,12 @@ bash scripts/codex_bash/closeloop_legacy_e60_r1_0615.sh
 bash scripts/codex_bash/closeloop_legacy_e60_r2_0615.sh
 bash scripts/codex_bash/closeloop_legacy_e60_r3_natural_0615.sh
 bash scripts/codex_bash/closeloop_legacy_e60_r3_common_0615.sh
+bash scripts/codex_bash/closeloop_legacy_e60_r3t_direct_transformer_0625.sh
 bash scripts/codex_bash/closeloop_legacy_e60_r4_0615.sh
 ```
 
 Default candidate epochs are R0 e45, R1 e60, R2 e55, R3-natural e55,
-R3-common e55, and R4 e55. Override any candidate without editing a file:
+R3-common e55, R3T-direct e60, and R4 e55. Override any candidate without editing a file:
 
 ```bash
 CKPT_EPOCH=60 CUDA_VISIBLE_DEVICES=4,5,6,7 \
@@ -156,8 +163,23 @@ CKPT_EPOCH=60 CUDA_VISIBLE_DEVICES=4,5,6,7 \
   initialization basin, not semantic information.
 - R3-common improvement despite identical motion initialization requires an
   audit for an unintended state-to-motion path.
+- R3T-direct isolates whether the diffusion objective itself matters after the
+  1-step vs 10-step DDIM close-loop gap was found to be small.
 - R4 improvement over R3 confirms that retaining unused semantic parameters in
   the original optimizer/DDP/EMA path changes optimization behavior.
+
+Final close-loop results on 2026-06-20 favored the frozen ghost-state topology
+rather than the legacy-exact topology. R3-common achieved the best corrected
+Driving Score (`90.698`), followed by R3-natural (`90.301`). R4 had the best
+open-loop route metrics (`route_L2=0.0823`, `route_final=0.1612`) but lower
+closed-loop score (`89.425` corrected), so better open-loop route regression did
+not transfer to better closed-loop driving in this ladder.
+
+The useful engineering takeaway is conservative: keeping the frozen semantic
+topology appears to improve closed-loop stability, but this should be described
+as a topology/training-dynamics effect rather than evidence that semantic
+supervision itself helps, because all state paths, state losses, and
+semantic-to-motion conditioning were disabled.
 
 ## Git Record
 
@@ -169,3 +191,4 @@ CKPT_EPOCH=60 CUDA_VISIBLE_DEVICES=4,5,6,7 \
 | R2 config | `7426d08` |
 | R3 natural/common controls | `6f6e472` |
 | R4 exact config and launch sequence | `db7db9c` |
+| R3T direct-transformer objective | pending |

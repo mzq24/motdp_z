@@ -194,6 +194,7 @@ def write_structure_manifest(
             key: route_cfg.get(key)
             for key in (
                 "motion_only_model",
+                "motion_objective",
                 "train_stage1",
                 "use_stage1_state",
                 "use_traj_branch_condition",

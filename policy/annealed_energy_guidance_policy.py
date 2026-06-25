@@ -83,6 +83,12 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         self.num_inference_steps = route_b_cfg.get('num_inference_steps', 10)
         self.guidance_scale = route_b_cfg.get('guidance_scale', 0.0)
         self.use_split_forward = route_b_cfg.get('use_split_forward', True)
+        self.motion_objective = str(route_b_cfg.get('motion_objective', 'diffusion')).lower()
+        if self.motion_objective not in ('diffusion', 'direct_transformer'):
+            raise ValueError(
+                f"Unsupported route_b.motion_objective={self.motion_objective!r}; "
+                "expected 'diffusion' or 'direct_transformer'"
+            )
 
         self.train_energy = False if self.motion_only_model else route_b_cfg.get('train_stage1', route_b_cfg.get('train_energy', True))
         self.use_stage1_state = False if self.motion_only_model else route_b_cfg.get(
@@ -4645,13 +4651,17 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
         if route_gt.shape[1] != self.num_waypoints:
             raise ValueError(f"Expected route_gt with {self.num_waypoints} waypoints, got {route_gt.shape}")
         traj_route_normed = self.joint_abs_to_norm(trajectory, route_gt)  # (B, T_joint, 2)
-        diff_timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
-        noise = torch.randn(B, self.horizon + self.num_waypoints, D, dtype=torch.float32, device=device)
-        noisy_flat = self.diffusion_scheduler.add_noise(
-            original_samples=traj_route_normed,
-            noise=noise,
-            timesteps=diff_timesteps,
-        )
+        if self.motion_objective == 'direct_transformer':
+            diff_timesteps = torch.zeros((B,), device=device, dtype=torch.long)
+            noisy_flat = torch.zeros_like(traj_route_normed)
+        else:
+            diff_timesteps = torch.randint(0, self.train_max_timesteps, (B,), device=device).long()
+            noise = torch.randn(B, self.horizon + self.num_waypoints, D, dtype=torch.float32, device=device)
+            noisy_flat = self.diffusion_scheduler.add_noise(
+                original_samples=traj_route_normed,
+                noise=noise,
+                timesteps=diff_timesteps,
+            )
         noisy_joint = noisy_flat.unsqueeze(1)  # (B, 1, T_joint, 2)
         noisy_joint_abs = self.joint_norm_to_abs(noisy_joint)
 
@@ -4988,17 +4998,9 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             raise NotImplementedError(f"Joint Route B ego diffusion currently expects num_samples=1, got {M}")
         self._require_route_abs_stats()
 
-        # Start from pure Gaussian noise in joint normalized traj+route space
-        x_t = torch.randn(B, M, joint_T, 2, device=device, dtype=torch.float32)
         bev_proj = self.model.decoder.compute_bev_proj(
             transfuser_bev_feature.to(device=device, dtype=model_dtype)
         )
-
-        # Set up DDIM timestep schedule
-        num_steps = self.num_inference_steps
-        roll_timesteps = self.build_roll_timesteps(num_steps=num_steps, device=device)
-
-        alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device)
 
         poses_cls = None
         route_pred = None
@@ -5037,151 +5039,180 @@ class AnnealedEnergyGuidancePolicy(nn.Module):
             model_dtype=model_dtype,
         )
 
-        for step_i, k in enumerate(roll_timesteps):
-            t_cur = k.item()
-            t_next = roll_timesteps[step_i + 1].item() if step_i + 1 < len(roll_timesteps) else 0
-
-            # Get annealed energy weights for current noise level
-            # ========== Forward pass 1: denoise x_t → pred_x0 ==========
-            x_input = x_t.to(dtype=model_dtype)
+        if self.motion_objective == 'direct_transformer':
+            x_input = torch.zeros(B, M, joint_T, 2, device=device, dtype=model_dtype)
             x_t_abs = self.joint_norm_to_abs(x_input)
-
-            t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
-
-            # Legacy anchor-energy guidance was removed in this Route B-only cleanup.
+            t_tensor = torch.zeros((B,), dtype=torch.long, device=device)
             with torch.no_grad():
-                pass1_shared = None
-                if self.use_traj_branch_condition and self.use_stage1_speed_energy:
-                    pass1_shared = self.model.forward_ego(
-                        x_t=x_input,
-                        x_t_abs=x_t_abs,
-                        timestep=t_tensor,
-                        transfuser_bev_feature=transfuser_bev_feature,
-                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                        ego_status=ego_status,
-                        bev_proj_cached=bev_proj,
-                        transfuser_lidar_bev=transfuser_lidar_bev,
-                        return_intermediates=True,
-                        prev_route_coarse_memory=prev_route_coarse_memory,
-                    )
-                    poses_reg = pass1_shared['poses_reg']
-                    route_pred = pass1_shared['route_pred']
-                    speed_pred = pass1_shared['speed_pred']
-                    speed_profile_pred = pass1_shared['speed_profile_pred']
-                else:
-                    poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-                        x_t=x_input,
-                        x_t_abs=x_t_abs,
-                        timestep=t_tensor,
-                        transfuser_bev_feature=transfuser_bev_feature,
-                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                        ego_status=ego_status,
-                        bev_proj_cached=bev_proj,
-                        transfuser_lidar_bev=transfuser_lidar_bev,
-                        prev_route_coarse_memory=prev_route_coarse_memory,
-                    )
-                pass1_trajectory = self.norm_to_abs(poses_reg.detach())
-                if self.use_traj_branch_condition and self.use_stage1_speed_energy:
-                    route_pred_abs = self.route_norm_to_abs(route_pred.detach())
-                    branch_speed_ref = (
-                        self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
-                        if speed_pred is not None else
-                        ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
-                    )
-                    stage1_raw_scores = None
-                    if pass1_shared is not None:
-                        stage1_speed_samples = self._build_local_phase_energy_samples(
-                            branch_speed_ref.detach(), device, model_dtype
-                        )
-                        if not transition_only_state:
-                            stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
-                                traj_out=pass1_shared['traj_out'],
-                                route_out=pass1_shared['route_out'],
-                                speed_out=pass1_shared['speed_out'],
-                                route_points=pass1_shared['route_points'],
-                                conditioning=pass1_shared['conditioning'],
-                                speed_samples=stage1_speed_samples,
-                            )
-                        if use_infer_semantic_transition and semantic_prev_state is not None:
-                            transition_stage1_raw_scores = (
-                                self._compute_semantic_transition_scores_from_shared(
-                                    pass1_shared,
-                                    prev_state=semantic_prev_state,
-                                    speed_samples=stage1_speed_samples,
-                                )
-                            )
-                            if transition_only_state:
-                                stage1_raw_scores = transition_stage1_raw_scores
-                                semantic_fusion_debug = {
-                                    'enabled': torch.ones((), device=device, dtype=model_dtype),
-                                    'gate': torch.ones((B,), device=device, dtype=model_dtype),
-                                }
-                            elif direct_prev_modulated_state:
-                                stage1_raw_scores = transition_stage1_raw_scores
-                                semantic_fusion_debug = {
-                                    'enabled': torch.zeros((), device=device, dtype=model_dtype),
-                                    'gate': semantic_prev_valid.detach() if semantic_prev_valid is not None else torch.zeros((B,), device=device, dtype=model_dtype),
-                                }
-                            else:
-                                stage1_raw_scores, semantic_fusion_debug = self._fuse_stage1_raw_scores(
-                                    stage1_raw_scores,
-                                    transition_stage1_raw_scores,
-                                    semantic_prev_valid,
-                                )
-                    traj_branch_condition_probs, traj_branch_condition_details = self._infer_traj_branch_condition(
-                        stage1_raw_scores=stage1_raw_scores,
-                        speed_ref=branch_speed_ref.detach(),
-                        borrow_time_s=borrow_time_s,
-                        prev_relation_probs=prev_relation_probs,
-                        device=device,
-                        model_dtype=model_dtype,
-                    )
-                    (
-                        traj_branch_condition_probs,
-                        traj_branch_condition_details,
-                        phase_go_smoothing_debug,
-                        phase_go_smoothing_history_just_updated,
-                    ) = self._apply_phase_go_smoothing_override(
-                        traj_branch_condition_probs,
-                        traj_branch_condition_details,
-                        update_history=not phase_go_smoothing_history_updated,
-                        device=device,
-                        model_dtype=model_dtype,
-                    )
-                    phase_go_smoothing_history_updated = (
-                        phase_go_smoothing_history_updated
-                        or phase_go_smoothing_history_just_updated
-                    )
-                    branch_schedule = self._build_traj_condition_schedule(
-                        t_tensor, device=device, model_dtype=model_dtype
-                    )
-                    branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
-                    poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
-                        x_t=x_input,
-                        x_t_abs=x_t_abs,
-                        timestep=t_tensor,
-                        transfuser_bev_feature=transfuser_bev_feature,
-                        transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                        ego_status=ego_status,
-                        bev_proj_cached=bev_proj,
-                        transfuser_lidar_bev=transfuser_lidar_bev,
-                        branch_condition=branch_input,
-                        branch_condition_scale=self.traj_branch_condition_scale,
-                        branch_condition_schedule=branch_schedule,
-                        prev_route_coarse_memory=prev_route_coarse_memory,
-                    )
-            energy_scores = None
+                poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                    x_t=x_input,
+                    x_t_abs=x_t_abs,
+                    timestep=t_tensor,
+                    transfuser_bev_feature=transfuser_bev_feature,
+                    transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                    ego_status=ego_status,
+                    bev_proj_cached=bev_proj,
+                    transfuser_lidar_bev=transfuser_lidar_bev,
+                    prev_route_coarse_memory=prev_route_coarse_memory,
+                )
             pred_x0_corrected = torch.cat([
                 poses_reg.float(),
                 route_pred.unsqueeze(1).float(),
             ], dim=2)
+        else:
+            # Start from pure Gaussian noise in joint normalized traj+route space.
+            x_t = torch.randn(B, M, joint_T, 2, device=device, dtype=torch.float32)
 
-            # ========== DDIM Step with corrected pred_x0 ==========
-            alpha_t = alphas_cumprod[t_cur]
-            alpha_next = alphas_cumprod[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
+            # Set up DDIM timestep schedule.
+            num_steps = self.num_inference_steps
+            roll_timesteps = self.build_roll_timesteps(num_steps=num_steps, device=device)
+            alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device)
 
-            pred_eps = (x_t - alpha_t.sqrt() * pred_x0_corrected) / (1 - alpha_t).sqrt().clamp(min=1e-8)
-            x_t = alpha_next.sqrt() * pred_x0_corrected + (1 - alpha_next).sqrt() * pred_eps
+            for step_i, k in enumerate(roll_timesteps):
+                t_cur = k.item()
+                t_next = roll_timesteps[step_i + 1].item() if step_i + 1 < len(roll_timesteps) else 0
+
+                # Get annealed energy weights for current noise level
+                # ========== Forward pass 1: denoise x_t → pred_x0 ==========
+                x_input = x_t.to(dtype=model_dtype)
+                x_t_abs = self.joint_norm_to_abs(x_input)
+
+                t_tensor = torch.full((B,), t_cur, dtype=torch.long, device=device)
+
+                # Legacy anchor-energy guidance was removed in this Route B-only cleanup.
+                with torch.no_grad():
+                    pass1_shared = None
+                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
+                        pass1_shared = self.model.forward_ego(
+                            x_t=x_input,
+                            x_t_abs=x_t_abs,
+                            timestep=t_tensor,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj_cached=bev_proj,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            return_intermediates=True,
+                            prev_route_coarse_memory=prev_route_coarse_memory,
+                        )
+                        poses_reg = pass1_shared['poses_reg']
+                        route_pred = pass1_shared['route_pred']
+                        speed_pred = pass1_shared['speed_pred']
+                        speed_profile_pred = pass1_shared['speed_profile_pred']
+                    else:
+                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                            x_t=x_input,
+                            x_t_abs=x_t_abs,
+                            timestep=t_tensor,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj_cached=bev_proj,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            prev_route_coarse_memory=prev_route_coarse_memory,
+                        )
+                    pass1_trajectory = self.norm_to_abs(poses_reg.detach())
+                    if self.use_traj_branch_condition and self.use_stage1_speed_energy:
+                        route_pred_abs = self.route_norm_to_abs(route_pred.detach())
+                        branch_speed_ref = (
+                            self.decode_speed_two_hot(speed_pred, self.model.speed_classes)
+                            if speed_pred is not None else
+                            ego_status[:, -1, 0].to(device=device, dtype=model_dtype)
+                        )
+                        stage1_raw_scores = None
+                        if pass1_shared is not None:
+                            stage1_speed_samples = self._build_local_phase_energy_samples(
+                                branch_speed_ref.detach(), device, model_dtype
+                            )
+                            if not transition_only_state:
+                                stage1_raw_scores = self.model.compute_shared_stage1_from_ego_outputs(
+                                    traj_out=pass1_shared['traj_out'],
+                                    route_out=pass1_shared['route_out'],
+                                    speed_out=pass1_shared['speed_out'],
+                                    route_points=pass1_shared['route_points'],
+                                    conditioning=pass1_shared['conditioning'],
+                                    speed_samples=stage1_speed_samples,
+                                )
+                            if use_infer_semantic_transition and semantic_prev_state is not None:
+                                transition_stage1_raw_scores = (
+                                    self._compute_semantic_transition_scores_from_shared(
+                                        pass1_shared,
+                                        prev_state=semantic_prev_state,
+                                        speed_samples=stage1_speed_samples,
+                                    )
+                                )
+                                if transition_only_state:
+                                    stage1_raw_scores = transition_stage1_raw_scores
+                                    semantic_fusion_debug = {
+                                        'enabled': torch.ones((), device=device, dtype=model_dtype),
+                                        'gate': torch.ones((B,), device=device, dtype=model_dtype),
+                                    }
+                                elif direct_prev_modulated_state:
+                                    stage1_raw_scores = transition_stage1_raw_scores
+                                    semantic_fusion_debug = {
+                                        'enabled': torch.zeros((), device=device, dtype=model_dtype),
+                                        'gate': semantic_prev_valid.detach() if semantic_prev_valid is not None else torch.zeros((B,), device=device, dtype=model_dtype),
+                                    }
+                                else:
+                                    stage1_raw_scores, semantic_fusion_debug = self._fuse_stage1_raw_scores(
+                                        stage1_raw_scores,
+                                        transition_stage1_raw_scores,
+                                        semantic_prev_valid,
+                                    )
+                        traj_branch_condition_probs, traj_branch_condition_details = self._infer_traj_branch_condition(
+                            stage1_raw_scores=stage1_raw_scores,
+                            speed_ref=branch_speed_ref.detach(),
+                            borrow_time_s=borrow_time_s,
+                            prev_relation_probs=prev_relation_probs,
+                            device=device,
+                            model_dtype=model_dtype,
+                        )
+                        (
+                            traj_branch_condition_probs,
+                            traj_branch_condition_details,
+                            phase_go_smoothing_debug,
+                            phase_go_smoothing_history_just_updated,
+                        ) = self._apply_phase_go_smoothing_override(
+                            traj_branch_condition_probs,
+                            traj_branch_condition_details,
+                            update_history=not phase_go_smoothing_history_updated,
+                            device=device,
+                            model_dtype=model_dtype,
+                        )
+                        phase_go_smoothing_history_updated = (
+                            phase_go_smoothing_history_updated
+                            or phase_go_smoothing_history_just_updated
+                        )
+                        branch_schedule = self._build_traj_condition_schedule(
+                            t_tensor, device=device, model_dtype=model_dtype
+                        )
+                        branch_input = traj_branch_condition_probs.detach() if self.traj_branch_condition_detach else traj_branch_condition_probs
+                        poses_reg, route_pred, _, _, speed_pred, speed_profile_pred = self.model.forward_ego(
+                            x_t=x_input,
+                            x_t_abs=x_t_abs,
+                            timestep=t_tensor,
+                            transfuser_bev_feature=transfuser_bev_feature,
+                            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                            ego_status=ego_status,
+                            bev_proj_cached=bev_proj,
+                            transfuser_lidar_bev=transfuser_lidar_bev,
+                            branch_condition=branch_input,
+                            branch_condition_scale=self.traj_branch_condition_scale,
+                            branch_condition_schedule=branch_schedule,
+                            prev_route_coarse_memory=prev_route_coarse_memory,
+                        )
+                energy_scores = None
+                pred_x0_corrected = torch.cat([
+                    poses_reg.float(),
+                    route_pred.unsqueeze(1).float(),
+                ], dim=2)
+
+                # ========== DDIM Step with corrected pred_x0 ==========
+                alpha_t = alphas_cumprod[t_cur]
+                alpha_next = alphas_cumprod[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
+
+                pred_eps = (x_t - alpha_t.sqrt() * pred_x0_corrected) / (1 - alpha_t).sqrt().clamp(min=1e-8)
+                x_t = alpha_next.sqrt() * pred_x0_corrected + (1 - alpha_next).sqrt() * pred_eps
 
         # ========== Output trajectory ==========
         final_joint_abs = self.joint_norm_to_abs(pred_x0_corrected)  # (B, 1, T_joint, 2)

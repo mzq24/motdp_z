@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE=${STAGE:?Set STAGE to r0, r1, r2, r3-natural, r3-common, or r4}
+STAGE=${STAGE:?Set STAGE to r0, r1, r2, r3-natural, r3-common, r3t-direct, or r4}
 DATA_ROOT=${DATA_ROOT:-/data/z_project}
 CODE_DIR=${CODE_DIR:-${DATA_ROOT}/code/motdp_z_semantic_state_strict_ablation_v1}
 B2D_ROOT=${B2D_ROOT:-${DATA_ROOT}/code/Bench2Drive}
@@ -34,6 +34,11 @@ case "${STAGE}" in
     CONFIG_REL=config/recovery/legacy_e60_r3_full_state_frozen_common_init_0614.yaml
     CKPT_DIR=checkpoints/legacy_e60_recovery_r3_full_state_frozen_common_init_0614
     DEFAULT_EPOCH=55
+    ;;
+  r3t-direct)
+    CONFIG_REL=config/recovery/legacy_e60_r3t_direct_transformer_0625.yaml
+    CKPT_DIR=checkpoints/legacy_e60_recovery_r3t_direct_transformer_0625
+    DEFAULT_EPOCH=60
     ;;
   r4)
     CONFIG_REL=config/recovery/legacy_e60_r4_legacy_exact_0614.yaml

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE=${STAGE:?Set STAGE to r0, r1, r2, r3-natural, r3-common, or r4}
+STAGE=${STAGE:?Set STAGE to r0, r1, r2, r3-natural, r3-common, r3t-direct, or r4}
 CODE_DIR=${CODE_DIR:-/data/z_project/code/motdp_z_semantic_state_strict_ablation_v1}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
 GPUS=${GPUS:-4}
@@ -33,6 +33,10 @@ case "${STAGE}" in
       echo "Run R2 first so its deterministic epoch-0 checkpoint is materialized." >&2
       exit 1
     fi
+    ;;
+  r3t-direct)
+    CONFIG=config/recovery/legacy_e60_r3t_direct_transformer_0625.yaml
+    TRAINER=training/train_carla_bev.py
     ;;
   r4)
     CONFIG=config/recovery/legacy_e60_r4_legacy_exact_0614.yaml
